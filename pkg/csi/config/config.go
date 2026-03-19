@@ -16,6 +16,8 @@ limitations under the License.
 package config
 
 import (
+	"strings"
+
 	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/viper"
 	"k8s.io/klog/v2"
@@ -25,9 +27,14 @@ const (
 	//Config var names
 	OpenNebulaRPCEndpointVar = "ONE_XMLRPC"
 	OpenNebulaCredentialsVar = "ONE_AUTH"
+	DefaultDatastoresVar     = "ONE_CSI_DEFAULT_DATASTORES"
+	DatastorePolicyVar       = "ONE_CSI_DATASTORE_SELECTION_POLICY"
+	AllowedDatastoreTypesVar = "ONE_CSI_ALLOWED_DATASTORE_TYPES"
 
 	//Default values
 	defaultOpenNebulaRPCEndpoint = "http://localhost:2633/RPC2"
+	defaultDatastorePolicy       = "least-used"
+	defaultAllowedDatastoreTypes = "local"
 )
 
 // CSIPluginConfig holds the configuration for the CSI plugin
@@ -61,6 +68,8 @@ func initViper() *viper.Viper {
 	})
 
 	viper.SetDefault(OpenNebulaRPCEndpointVar, defaultOpenNebulaRPCEndpoint)
+	viper.SetDefault(DatastorePolicyVar, defaultDatastorePolicy)
+	viper.SetDefault(AllowedDatastoreTypesVar, defaultAllowedDatastoreTypes)
 
 	viper.AutomaticEnv()
 	viper.SetTypeByDefaultValue(true)
@@ -91,6 +100,33 @@ func (c *CSIPluginConfig) GetInt32(key string) (int32, bool) {
 	return value, c.viper.IsSet(key)
 }
 
+func (c *CSIPluginConfig) GetStringSlice(key string) ([]string, bool) {
+	if !c.viper.IsSet(key) {
+		return nil, false
+	}
+
+	if raw := c.viper.GetStringSlice(key); len(raw) > 0 {
+		return normalizeCSVValues(raw), true
+	}
+
+	return normalizeCSVValues(strings.Split(c.viper.GetString(key), ",")), true
+}
+
 func (c *CSIPluginConfig) OverrideVal(key string, value any) {
 	c.viper.Set(key, value)
+}
+
+func normalizeCSVValues(values []string) []string {
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			trimmed := strings.TrimSpace(part)
+			if trimmed == "" {
+				continue
+			}
+			normalized = append(normalized, trimmed)
+		}
+	}
+
+	return normalized
 }

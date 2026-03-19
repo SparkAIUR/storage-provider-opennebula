@@ -25,6 +25,10 @@ import (
 )
 
 func TestOpenNebulaClientProbe(t *testing.T) {
+	if os.Getenv("RUN_OPENNEBULA_INTEGRATION_TESTS") != "1" {
+		t.Skip("set RUN_OPENNEBULA_INTEGRATION_TESTS=1 to run OpenNebula integration tests")
+	}
+
 	cfg := OpenNebulaConfig{
 		Endpoint:    os.Getenv(config.OpenNebulaRPCEndpointVar),
 		Credentials: os.Getenv(config.OpenNebulaCredentialsVar),

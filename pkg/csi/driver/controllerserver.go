@@ -91,7 +91,6 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		Volume: &csi.Volume{
 			VolumeId:      name,
 			CapacityBytes: requiredBytes,
-			VolumeContext: req.GetParameters(),
 		},
 	}
 
@@ -109,22 +108,38 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 
 	}
 
-	params := req.GetParameters()
-	fsType := volumeCapabilities[0].GetMount().GetFsType()
+	rawParams := req.GetParameters()
+	params := filterProvisioningParams(rawParams)
+	fsType := getRequestedFSType(rawParams, volumeCapabilities[0])
 	immutableVolume := accessMode.Mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
-
-	err := s.volumeProvider.CreateVolume(ctx, name, requiredBytes, DefaultDriverName, immutableVolume, fsType, params)
+	selection, err := s.driver.GetDatastoreSelectionConfig(rawParams)
 	if err != nil {
+		klog.V(0).ErrorS(err, "Invalid datastore configuration", "method", "CreateVolume", "params", rawParams)
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	response.Volume.VolumeContext = params
+
+	result, err := s.volumeProvider.CreateVolume(ctx, name, requiredBytes, DefaultDriverName, immutableVolume, fsType, params, selection)
+	if err != nil {
+		switch {
+		case opennebula.IsDatastoreConfigError(err):
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		case opennebula.IsDatastoreCapacityError(err):
+			return nil, status.Error(codes.ResourceExhausted, err.Error())
+		}
 		klog.V(0).ErrorS(err, "Failed to create volume",
 			"method", "CreateVolume", "volumeName", name, "requiredBytes", requiredBytes,
 			"defaultDriverName", DefaultDriverName, "immutableVolume", immutableVolume,
-			"params", params)
+			"policy", selection.Policy, "datastores", selection.Identifiers, "params", params)
 		return nil, status.Error(codes.Internal, "failed to create volume")
 	}
 
 	klog.V(1).InfoS("Volume created successfully",
 		"method", "CreateVolume", "volumeName", name, "requiredBytes",
 		requiredBytes, "defaultDriverName", DefaultDriverName, "immutableVolume", immutableVolume,
+		"policy", selection.Policy, "datastores", selection.Identifiers,
+		"selectedDatastoreID", result.Datastore.ID, "selectedDatastoreName", result.Datastore.Name,
 		"params", params)
 
 	return response, nil
@@ -375,8 +390,20 @@ func (s *ControllerServer) ListVolumes(ctx context.Context, req *csi.ListVolumes
 func (s *ControllerServer) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
 	klog.V(1).InfoS("GetCapacity called", "req", protosanitizer.StripSecrets(req))
 
-	availableCapacity, err := s.volumeProvider.GetCapacity(ctx)
+	selection, err := s.driver.GetDatastoreSelectionConfig(req.GetParameters())
 	if err != nil {
+		klog.V(0).ErrorS(err, "Invalid datastore configuration", "method", "GetCapacity")
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	availableCapacity, err := s.volumeProvider.GetCapacity(ctx, selection)
+	if err != nil {
+		switch {
+		case opennebula.IsDatastoreConfigError(err):
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		case opennebula.IsDatastoreCapacityError(err):
+			return nil, status.Error(codes.ResourceExhausted, err.Error())
+		}
 		klog.V(0).ErrorS(err, "Failed to get available capacity", "method", "GetCapacity")
 		return nil, status.Error(codes.Internal, "failed to get capacity")
 	}

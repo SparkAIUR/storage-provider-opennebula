@@ -36,12 +36,12 @@ type OpenNebulaProvider struct {
 }
 
 type OpenNebulaVolumeProvider interface {
-	CreateVolume(ctx context.Context, name string, size int64, owner string, immutable bool, fsType string, params map[string]string) error
+	CreateVolume(ctx context.Context, name string, size int64, owner string, immutable bool, fsType string, params map[string]string, selection DatastoreSelectionConfig) (*VolumeCreateResult, error)
 	DeleteVolume(ctx context.Context, volume string) error
 	AttachVolume(ctx context.Context, volume string, node string, immutable bool, params map[string]string) error
 	DetachVolume(ctx context.Context, volume string, node string) error
 	ListVolumes(ctx context.Context, owner string, maxEntries int32, startingToken string) ([]string, error)
-	GetCapacity(ctx context.Context) (int64, error)
+	GetCapacity(ctx context.Context, selection DatastoreSelectionConfig) (int64, error)
 	VolumeExists(ctx context.Context, volume string) (int, int, error)
 	NodeExists(ctx context.Context, node string) (int, error)
 	GetVolumeInNode(ctx context.Context, volumeID int, nodeID int) (string, error)

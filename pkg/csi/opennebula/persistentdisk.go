@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/OpenNebula/one/src/oca/go/src/goca"
@@ -52,19 +53,24 @@ func NewPersistentDiskVolumeProvider(client *OpenNebulaClient) (*PersistentDiskV
 	}, nil
 }
 
-func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name string, size int64, owner string, immutable bool, fsType string, params map[string]string) error {
+func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name string, size int64, owner string, immutable bool, fsType string, params map[string]string, selection DatastoreSelectionConfig) (*VolumeCreateResult, error) {
 	if name == "" {
-		return fmt.Errorf("volume name cannot be empty")
+		return nil, fmt.Errorf("volume name cannot be empty")
 	}
 
 	if size <= 0 {
-		return fmt.Errorf("invalid volume size: must be greater than 0")
+		return nil, fmt.Errorf("invalid volume size: must be greater than 0")
 	}
 
 	// size is in bytes and we need it in MB
 	sizeMB := size / sizeConversion
 	if sizeMB <= 0 {
-		return fmt.Errorf("invalid volume size: must be greater than 0 MB")
+		return nil, fmt.Errorf("invalid volume size: must be greater than 0 MB")
+	}
+
+	candidates, err := p.resolveProvisioningDatastores(ctx, selection)
+	if err != nil {
+		return nil, err
 	}
 
 	tpl := img.NewTemplate()
@@ -84,16 +90,34 @@ func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name st
 		tpl.Add(imk.DevPrefix, params["devPrefix"])
 	}
 
-	imageID, err := p.ctrl.Images().Create(tpl.String(), 1)
-	if err != nil {
-		return fmt.Errorf("failed to create volume: %w", err)
+	var insufficientCapacity []string
+	for _, datastore := range candidates {
+		if datastore.FreeBytes < size {
+			insufficientCapacity = append(insufficientCapacity, fmt.Sprintf("%d", datastore.ID))
+			continue
+		}
+
+		imageID, err := p.ctrl.Images().CreateContext(ctx, tpl.String(), uint(datastore.ID))
+		if err != nil {
+			if isInsufficientCapacityError(err) {
+				insufficientCapacity = append(insufficientCapacity, fmt.Sprintf("%d", datastore.ID))
+				continue
+			}
+
+			return nil, fmt.Errorf("failed to create volume on datastore %d: %w", datastore.ID, err)
+		}
+
+		err = p.waitForResourceStatus(imageID, timeout, p.volumeReady)
+		if err != nil {
+			return nil, fmt.Errorf("failed to wait for volume readiness: %w", err)
+		}
+
+		return &VolumeCreateResult{Datastore: datastore}, nil
 	}
 
-	err = p.waitForResourceStatus(imageID, timeout, p.volumeReady)
-	if err != nil {
-		return fmt.Errorf("failed to wait for volume readiness: %w", err)
+	return nil, &datastoreCapacityError{
+		message: fmt.Sprintf("none of the configured datastores had enough free capacity for %d bytes; attempted datastores: %s", size, strings.Join(insufficientCapacity, ",")),
 	}
-	return nil
 }
 
 func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume string) error {
@@ -290,17 +314,32 @@ func (p *PersistentDiskVolumeProvider) ListVolumes(ctx context.Context, owner st
 	return volumeIDs, nil
 }
 
-func (p *PersistentDiskVolumeProvider) GetCapacity(ctx context.Context) (int64, error) {
+func (p *PersistentDiskVolumeProvider) GetCapacity(ctx context.Context, selection DatastoreSelectionConfig) (int64, error) {
+	candidates, err := p.resolveProvisioningDatastores(ctx, selection)
+	if err != nil {
+		return 0, err
+	}
+
+	return SumDatastoreCapacity(candidates), nil
+}
+
+func (p *PersistentDiskVolumeProvider) resolveProvisioningDatastores(ctx context.Context, selection DatastoreSelectionConfig) ([]Datastore, error) {
 	datastores, err := p.ctrl.Datastores().Info()
 	if err != nil {
-		return 0, fmt.Errorf("failed to get datastores info: %w", err)
+		return nil, fmt.Errorf("failed to get datastores info: %w", err)
 	}
-	for _, ds := range datastores.Datastores {
-		if ds.Name == "default" {
-			return int64(ds.FreeMB) * 1024 * 1024, nil
-		}
+
+	resolved, err := ResolveDatastores(datastores.Datastores, selection)
+	if err != nil {
+		return nil, err
 	}
-	return 0, fmt.Errorf("default datastore not found")
+
+	ordered, err := OrderDatastores(resolved, selection.Policy)
+	if err != nil {
+		return nil, err
+	}
+
+	return ordered, nil
 }
 
 func (p *PersistentDiskVolumeProvider) VolumeExists(ctx context.Context, volume string) (int, int, error) {
@@ -313,6 +352,30 @@ func (p *PersistentDiskVolumeProvider) VolumeExists(ctx context.Context, volume 
 		return -1, -1, fmt.Errorf("failed to get volume info: %w", err)
 	}
 	return imgID, (img.Size * sizeConversion), nil
+}
+
+func isInsufficientCapacityError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	message := strings.ToLower(err.Error())
+	fragments := []string{
+		"not enough space",
+		"not enough free space",
+		"insufficient space",
+		"insufficient capacity",
+		"no space left",
+		"not enough capacity",
+	}
+
+	for _, fragment := range fragments {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (p *PersistentDiskVolumeProvider) VolumeReadyWithTimeout(volumeID int) (bool, error) {

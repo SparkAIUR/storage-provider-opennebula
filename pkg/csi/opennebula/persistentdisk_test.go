@@ -36,6 +36,10 @@ const (
 )
 
 func TestPersistentDiskLifecycle(t *testing.T) {
+	if os.Getenv("RUN_OPENNEBULA_INTEGRATION_TESTS") != "1" {
+		t.Skip("set RUN_OPENNEBULA_INTEGRATION_TESTS=1 to run OpenNebula integration tests")
+	}
+
 	cfg := OpenNebulaConfig{
 		Endpoint:    os.Getenv(config.OpenNebulaRPCEndpointVar),
 		Credentials: os.Getenv(config.OpenNebulaCredentialsVar),
@@ -61,13 +65,18 @@ func TestPersistentDiskLifecycle(t *testing.T) {
 	}
 
 	ctx := context.Background()
+	selection := DatastoreSelectionConfig{
+		Identifiers:  getIntegrationTestDatastores(),
+		Policy:       DatastoreSelectionPolicyLeastUsed,
+		AllowedTypes: []string{"local"},
+	}
 
 	params := map[string]string{
 		"devPrefix": "vd",
 	}
 
 	volumeTestName := fmt.Sprintf("%s-%s", volumeName, uuid.New().String())
-	err = volumeProvider.CreateVolume(ctx, volumeTestName, volumeSize, testDriverName, false, "ext4", params)
+	_, err = volumeProvider.CreateVolume(ctx, volumeTestName, volumeSize, testDriverName, false, "ext4", params, selection)
 	if err != nil {
 		t.Fatalf("failed to create volume: %v", err)
 	}
@@ -86,7 +95,7 @@ func TestPersistentDiskLifecycle(t *testing.T) {
 	t.Logf("found %d volumes after creation", len(volumes))
 	t.Logf("volumes: %v", volumes)
 
-	dataStoreSize, err := volumeProvider.GetCapacity(ctx)
+	dataStoreSize, err := volumeProvider.GetCapacity(ctx, selection)
 	if err != nil {
 		t.Fatalf("failed to list volumes: %v", err)
 	}
@@ -97,4 +106,13 @@ func TestPersistentDiskLifecycle(t *testing.T) {
 		t.Fatalf("failed to delete volume %s: %v", volumeTestName, err)
 	}
 	t.Logf("volume %s deleted successfully", volumeTestName)
+}
+
+func getIntegrationTestDatastores() []string {
+	values := config.LoadConfiguration()
+	if datastores, ok := values.GetStringSlice(config.DefaultDatastoresVar); ok && len(datastores) > 0 {
+		return datastores
+	}
+
+	return []string{"default"}
 }

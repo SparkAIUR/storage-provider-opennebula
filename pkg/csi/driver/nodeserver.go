@@ -206,7 +206,7 @@ func (ns *NodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageV
 	klog.V(3).InfoS("Cleaning staging target path volume mount point",
 		"method", "NodeUnstageVolume", "volumeID", volumeID, "stagingTargetPath", stagingTargetPath)
 
-	err := mount.CleanupMountPoint(stagingTargetPath, ns.mounter, true)
+	err := mount.CleanupMountPoint(stagingTargetPath, ns.mounter.Interface, true)
 	if err != nil {
 		klog.V(0).ErrorS(err, "Failed to clean mount point of staging target path",
 			"method", "NodeUnstageVolume", "volumeID", volumeID, "stagingTargetPath", stagingTargetPath)
@@ -412,7 +412,7 @@ func (ns *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubl
 	klog.V(3).InfoS("Unpublishing volume",
 		"volumeID", volumeID, "targetPath", targetPath)
 
-	err := mount.CleanupMountPoint(targetPath, ns.mounter, true)
+	err := mount.CleanupMountPoint(targetPath, ns.mounter.Interface, true)
 	if err != nil {
 		klog.V(0).ErrorS(err, "Failed to unmount volume at target path",
 			"method", "NodeUnpublishVolume", "volumeID", volumeID, "targetPath", targetPath)

@@ -21,6 +21,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -32,11 +34,16 @@ const (
 )
 
 func getTestControllerServer(mockProvider *MockOpenNebulaVolumeProviderTestify) *ControllerServer {
+	pluginConfig := config.LoadConfiguration()
+	pluginConfig.OverrideVal(config.DefaultDatastoresVar, "100,101")
+	pluginConfig.OverrideVal(config.AllowedDatastoreTypesVar, "local")
+
 	driver := &Driver{
 		name:               DefaultDriverName,
 		version:            driverVersion,
 		grpcServerEndpoint: DefaultGRPCServerEndpoint,
 		nodeID:             "test-controller-id",
+		PluginConfig:       pluginConfig,
 	}
 
 	return NewControllerServer(driver, mockProvider)
@@ -72,8 +79,8 @@ func TestCreateVolume(t *testing.T) {
 					},
 				},
 				Parameters: map[string]string{
-					"datastore": "default",
-					"type":      "BLOCK",
+					storageClassParamDatastoreIDs: "100",
+					"type":                        "BLOCK",
 				},
 			},
 			expectResponse: &csi.CreateVolumeResponse{
@@ -86,8 +93,21 @@ func TestCreateVolume(t *testing.T) {
 			setupMock: func(m *MockOpenNebulaVolumeProviderTestify) {
 				m.On("VolumeExists", mock.Anything, "test-volume").
 					Return(-1, -1, nil)
-				m.On("CreateVolume", mock.Anything, "test-volume", volumeSize, mock.Anything, false, "", map[string]string{"datastore": "default", "type": "BLOCK"}).
-					Return(nil)
+				m.On(
+					"CreateVolume",
+					mock.Anything,
+					"test-volume",
+					volumeSize,
+					mock.Anything,
+					false,
+					"",
+					map[string]string{"type": "BLOCK"},
+					opennebula.DatastoreSelectionConfig{
+						Identifiers:  []string{"100"},
+						Policy:       opennebula.DatastoreSelectionPolicyLeastUsed,
+						AllowedTypes: []string{"local"},
+					},
+				).Return(&opennebula.VolumeCreateResult{Datastore: opennebula.Datastore{ID: 100, Name: "ds-100"}}, nil)
 			},
 		},
 		{
@@ -351,7 +371,15 @@ func TestGetCapacity(t *testing.T) {
 				},
 			},
 			setupMock: func(m *MockOpenNebulaVolumeProviderTestify) {
-				m.On("GetCapacity", mock.Anything).Return(int64(datastoreSize), nil)
+				m.On(
+					"GetCapacity",
+					mock.Anything,
+					opennebula.DatastoreSelectionConfig{
+						Identifiers:  []string{"100", "101"},
+						Policy:       opennebula.DatastoreSelectionPolicyLeastUsed,
+						AllowedTypes: []string{"local"},
+					},
+				).Return(int64(datastoreSize), nil)
 			},
 			expectError: false,
 			expectResponse: &csi.GetCapacityResponse{
@@ -441,9 +469,12 @@ type MockOpenNebulaVolumeProviderTestify struct {
 	mock.Mock
 }
 
-func (m *MockOpenNebulaVolumeProviderTestify) CreateVolume(ctx context.Context, name string, size int64, owner string, immutable bool, fsType string, params map[string]string) error {
-	args := m.Called(ctx, name, size, owner, immutable, fsType, params)
-	return args.Error(0)
+func (m *MockOpenNebulaVolumeProviderTestify) CreateVolume(ctx context.Context, name string, size int64, owner string, immutable bool, fsType string, params map[string]string, selection opennebula.DatastoreSelectionConfig) (*opennebula.VolumeCreateResult, error) {
+	args := m.Called(ctx, name, size, owner, immutable, fsType, params, selection)
+	if result := args.Get(0); result != nil {
+		return result.(*opennebula.VolumeCreateResult), args.Error(1)
+	}
+	return nil, args.Error(1)
 }
 
 func (m *MockOpenNebulaVolumeProviderTestify) DeleteVolume(ctx context.Context, volume string) error {
@@ -466,8 +497,8 @@ func (m *MockOpenNebulaVolumeProviderTestify) ListVolumes(ctx context.Context, v
 	return args.Get(0).([]string), args.Error(1)
 }
 
-func (m *MockOpenNebulaVolumeProviderTestify) GetCapacity(ctx context.Context) (int64, error) {
-	args := m.Called(ctx)
+func (m *MockOpenNebulaVolumeProviderTestify) GetCapacity(ctx context.Context, selection opennebula.DatastoreSelectionConfig) (int64, error) {
+	args := m.Called(ctx, selection)
 	return args.Get(0).(int64), args.Error(1)
 }
 
