@@ -1,32 +1,198 @@
-[//]: # ( vim: set wrap : )
+# SparkAI OpenNebula CSI
 
-# OpenNebula Kubernetes CSI Driver
+`storage-provider-opennebula` is the SparkAI fork of the OpenNebula CSI driver for Kubernetes. It publishes container images to `ghcr.io/SparkAIUR/opennebula-csi:<tag>` and Helm charts to `https://sparkaiur.github.io/storage-provider-opennebula/charts/`.
 
-This repository provides an implementation of a [Container Storage Interface](https://kubernetes-csi.github.io/docs/) (CSI) driver for Kubernetes on OpenNebula environments, enabling the definition of persistent volumes in [CAPONE](https://github.com/OpenNebula/cluster-api-provider-opennebula) clusters.
+This fork is focused on Omni deployments on OpenNebula and removes the old requirement that a datastore literally named `default` must exist for PVC provisioning.
 
-Current implementation includes support for PersistentVolumes with `ReadWriteOnce` and `ReadOnlyMany` access modes, as well as `Filesystem` and `Block` volume modes.
+## Current scope
 
-## Documentation
+- Provision PVCs on explicitly configured OpenNebula datastores.
+- Support global driver datastore defaults and per-StorageClass overrides.
+- Support `least-used` and `ordered` datastore selection policies.
+- Support `Filesystem` and `Block` volume modes.
+- Support `ReadWriteOnce` and `ReadOnlyMany` access modes.
+- Support `local` datastores today.
+- Keep the internal selection/provider structure ready for future `ceph` and `nfs` support.
 
-* [Wiki Pages](https://github.com/OpenNebula/storage-provider-opennebula/wiki)
+## Release artifacts
 
-## Contributing
+- Container image: `ghcr.io/SparkAIUR/opennebula-csi:<tag>`
+- Helm repo: `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
+- Chart name: `opennebula-csi`
+- Source repo: `https://github.com/SparkAIUR/storage-provider-opennebula`
 
-* [Development and issue tracking](https://github.com/OpenNebula/storage-provider-opennebula/issues)
+## Datastore selection
 
-## Contact Information
+The driver now resolves its provisioning datastores from two layers:
 
-* [OpenNebula web site](https://opennebula.io)
-* [Enterprise Services](https://opennebula.io/enterprise)
+1. StorageClass parameters
+2. Driver defaults from environment or Helm values
 
-## License
+If both are present, the StorageClass wins.
 
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+### Supported control parameters
 
-Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+These parameters are reserved by the CSI driver:
 
-## Author Information
+- `datastoreIDs`: CSV list of datastore identifiers, for example `100`, `100,101,102`, or `default`
+- `datastoreSelectionPolicy`: `least-used` or `ordered`
+- `fsType`: filesystem hint for filesystem volumes
 
-Copyright 2002-2025, OpenNebula Project, OpenNebula Systems
+All other StorageClass parameters are passed through to the existing disk/image handling logic. That allows tuning values such as `devPrefix`, `cache`, `driver`, and similar OpenNebula disk options.
 
-## Acknowledgments
+### Driver environment variables
+
+- `ONE_CSI_DEFAULT_DATASTORES`: global CSV datastore list, for example `100,101`
+- `ONE_CSI_DATASTORE_SELECTION_POLICY`: `least-used` or `ordered`
+- `ONE_CSI_ALLOWED_DATASTORE_TYPES`: CSV list, default `local`
+
+### Policy behavior
+
+- `least-used`: sort eligible datastores by free capacity descending, then try them in that order
+- `ordered`: use the configured order as-is
+
+If a candidate datastore does not have enough free capacity, the driver falls through to the next eligible datastore. If no configured datastore can satisfy the request, provisioning fails with a capacity error.
+
+## Helm installation
+
+Add the SparkAI chart repo:
+
+```bash
+helm repo add sparkai-opennebula https://sparkaiur.github.io/storage-provider-opennebula/charts/
+helm repo update
+```
+
+### Option 1: Existing Secret
+
+Create a Secret with the OpenNebula credentials:
+
+```bash
+kubectl -n kube-system create secret generic opennebula-csi-auth \
+  --from-literal=credentials='oneadmin:changeme'
+```
+
+Install the chart:
+
+```bash
+helm upgrade --install opennebula-csi sparkai-opennebula/opennebula-csi \
+  --namespace kube-system \
+  --create-namespace \
+  --values examples/helm-values-existing-secret.yaml
+```
+
+### Option 2: Inline credentials
+
+This is supported for convenience, but an existing Secret is the recommended production path.
+
+```bash
+helm upgrade --install opennebula-csi sparkai-opennebula/opennebula-csi \
+  --namespace kube-system \
+  --create-namespace \
+  --values examples/helm-values-single-datastore.yaml
+```
+
+## Helm values model
+
+The chart no longer renders a fixed set of StorageClasses. Instead it accepts a `storageClasses[]` list and flexible deployment settings.
+
+### Key values
+
+- `credentials.existingSecret.name`
+- `credentials.existingSecret.key`
+- `credentials.inlineAuth`
+- `driver.defaultDatastores`
+- `driver.datastoreSelectionPolicy`
+- `driver.allowedDatastoreTypes`
+- `driver.env`
+- `controller.resources`
+- `controller.nodeSelector`
+- `controller.tolerations`
+- `controller.affinity`
+- `controller.podAnnotations`
+- `controller.extraArgs`
+- `controller.extraEnv`
+- `node.resources`
+- `node.nodeSelector`
+- `node.tolerations`
+- `node.affinity`
+- `node.podAnnotations`
+- `node.extraArgs`
+- `node.extraEnv`
+- `imagePullSecrets`
+- `storageClasses[]`
+
+### StorageClass schema
+
+Each item under `storageClasses` supports:
+
+- `name`
+- `annotations`
+- `labels`
+- `reclaimPolicy`
+- `allowVolumeExpansion`
+- `mountOptions`
+- `volumeBindingMode`
+- `parameters`
+
+## Example values files
+
+- Single datastore by ID: [examples/helm-values-single-datastore.yaml](examples/helm-values-single-datastore.yaml)
+- Multiple datastores with `least-used`: [examples/helm-values-multi-datastore.yaml](examples/helm-values-multi-datastore.yaml)
+- Existing Secret with `default` alias: [examples/helm-values-existing-secret.yaml](examples/helm-values-existing-secret.yaml)
+- Omni-oriented example: [examples/omni-values.yaml](examples/omni-values.yaml)
+
+## Omni deployment notes
+
+For Omni on OpenNebula, the common pattern is:
+
+1. Create or reference an existing Secret with `ONE_AUTH`
+2. Set `driver.defaultDatastores` to the datastores that Omni should consume
+3. Create one or more StorageClasses under `storageClasses[]`
+4. Use StorageClass-specific `parameters` to tune the underlying datastore behavior
+
+The driver currently validates configured provisioning datastores against the allowed datastore type list, which defaults to `local`.
+
+## Local development
+
+Build the binary:
+
+```bash
+go build ./cmd/opennebula-csi
+```
+
+Run the Go test suite:
+
+```bash
+go test ./...
+```
+
+Render the chart with example values:
+
+```bash
+helm lint helm/opennebula-csi
+helm template opennebula-csi helm/opennebula-csi --values examples/helm-values-multi-datastore.yaml
+```
+
+### Opt-in test suites
+
+These suites are disabled by default because they require real infrastructure:
+
+- `RUN_CSI_SANITY_TESTS=1 go test ./pkg/csi/driver -run TestDriver`
+- `RUN_OPENNEBULA_INTEGRATION_TESTS=1 go test ./pkg/csi/opennebula`
+- `RUN_OPENNEBULA_E2E_TESTS=1 go test ./pkg/csi/test/e2e`
+
+## Release flow
+
+Push a semantic tag such as `v0.1.0` to trigger the release workflow.
+
+The workflow will:
+
+1. Build and publish `ghcr.io/SparkAIUR/opennebula-csi:<tag>` and `latest`
+2. Package the Helm chart
+3. Publish the chart tarball and `index.yaml` to `gh-pages/charts/`
+4. Re-index the Helm repo with `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
+5. Create a GitHub release for the tag
+
+## Upstream
+
+This project is derived from the OpenNebula storage provider. The fork keeps the Apache 2.0 license and focuses on SparkAI-specific OpenNebula and Omni requirements.

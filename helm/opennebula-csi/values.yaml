@@ -1,10 +1,52 @@
 # Default values for opennebula-csi.
-# This is a YAML-formatted file.
-# Declare variables to be passed into your templates.
 
-oneAuth: "oneadmin:changeme"
+nameOverride: ""
+fullnameOverride: ""
+namespaceOverride: ""
+
 oneApiEndpoint: "http://localhost:2633/RPC2"
+
+credentials:
+  existingSecret:
+    name: ""
+    key: "credentials"
+  inlineAuth: ""
+
 image:
   repository: "ghcr.io/SparkAIUR/opennebula-csi"
   tag: "latest"
   pullPolicy: "IfNotPresent"
+
+imagePullSecrets: []
+debugPort: null
+
+driver:
+  logLevel: 5
+  defaultDatastores: []
+  datastoreSelectionPolicy: "least-used"
+  allowedDatastoreTypes:
+    - "local"
+  extraArgs: []
+  env: []
+
+controller:
+  replicaCount: 1
+  podAnnotations: {}
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraArgs: []
+  extraEnv: []
+
+node:
+  podAnnotations: {}
+  resources: {}
+  nodeSelector: {}
+  tolerations:
+    - operator: "Exists"
+  affinity: {}
+  extraArgs: []
+  extraEnv: []
+
+storageClasses: []
