@@ -18,7 +18,9 @@ package driver
 
 import (
 	"context"
+	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
@@ -78,8 +80,15 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		requiredBytes = DefaultVolumeSizeBytes
 	}
 
-	if err := validateAccessMode(volumeCapabilities); err != nil {
-		return nil, status.Error(codes.InvalidArgument, "unsupported access mode")
+	rawParams := req.GetParameters()
+	selection, err := s.driver.GetDatastoreSelectionConfig(rawParams)
+	if err != nil {
+		klog.V(0).ErrorS(err, "Invalid datastore configuration", "method", "CreateVolume", "params", rawParams)
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	if err := validateAccessMode(volumeCapabilities, selection.AllowedTypes); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
 	accessMode := volumeCapabilities[0].GetAccessMode()
@@ -109,15 +118,9 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 
 	}
 
-	rawParams := req.GetParameters()
 	params := filterProvisioningParams(rawParams)
 	fsType := getRequestedFSType(rawParams, volumeCapabilities[0])
 	immutableVolume := accessMode.Mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
-	selection, err := s.driver.GetDatastoreSelectionConfig(rawParams)
-	if err != nil {
-		klog.V(0).ErrorS(err, "Invalid datastore configuration", "method", "CreateVolume", "params", rawParams)
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
 
 	response.Volume.VolumeContext = params
 
@@ -329,10 +332,10 @@ func (s *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req *
 		return nil, status.Error(codes.NotFound, "volume not found")
 	}
 
-	if err := validateAccessMode(req.VolumeCapabilities); err != nil {
+	if err := validateAccessMode(req.VolumeCapabilities, s.driver.getAllowedDatastoreTypes()); err != nil {
 		klog.V(0).ErrorS(err, "Unsupported access mode",
 			"method", "ValidateVolumeCapabilities", "volumeID", req.VolumeId, "volumeCapabilities", req.VolumeCapabilities)
-		return nil, status.Error(codes.InvalidArgument, "unsupported access mode")
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
 	klog.V(1).InfoS("Volume capabilities validated successfully",
@@ -498,17 +501,97 @@ func (s *ControllerServer) testConnectivity() {
 		"method", "testConnectivity", "endpoint", endpoint)
 }
 
-func validateAccessMode(volumeCapabilities []*csi.VolumeCapability) error {
+func validateAccessMode(volumeCapabilities []*csi.VolumeCapability, allowedBackends []string) error {
 	supportedModes := make(map[csi.VolumeCapability_AccessMode_Mode]bool)
 	for _, mode := range supportedAccessModes {
 		supportedModes[mode] = true
 	}
+
+	backendProfiles := backendCapabilityProfiles(allowedBackends)
 	for _, cap := range volumeCapabilities {
-		if cap.AccessMode == nil || !supportedModes[cap.AccessMode.Mode] {
-			klog.V(0).ErrorS(nil, "Unsupported access mode",
-				"method", "CreateVolume", "accessMode", cap.AccessMode.Mode)
-			return status.Error(codes.InvalidArgument, "unsupported access mode")
+		if cap.AccessMode == nil {
+			klog.V(0).ErrorS(nil, "Unsupported access mode", "method", "CreateVolume", "accessMode", "<nil>")
+			return fmt.Errorf("missing access mode")
 		}
+
+		mode := cap.AccessMode.Mode
+		if supportedModes[mode] {
+			continue
+		}
+
+		if isUnsupportedMultiNodeWriteMode(mode) {
+			err := unsupportedRWXError(mode, backendProfiles)
+			klog.V(0).ErrorS(nil, "Unsupported access mode",
+				"method", "CreateVolume", "accessMode", mode, "reason", err.Error())
+			return err
+		}
+
+		klog.V(0).ErrorS(nil, "Unsupported access mode",
+			"method", "CreateVolume", "accessMode", mode)
+		return fmt.Errorf("unsupported access mode %q; supported modes are %s",
+			mode.String(),
+			strings.Join(supportedAccessModeNames(), ", "))
 	}
 	return nil
+}
+
+func isUnsupportedMultiNodeWriteMode(mode csi.VolumeCapability_AccessMode_Mode) bool {
+	switch mode {
+	case csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
+		csi.VolumeCapability_AccessMode_MULTI_NODE_SINGLE_WRITER:
+		return true
+	default:
+		return false
+	}
+}
+
+func unsupportedRWXError(mode csi.VolumeCapability_AccessMode_Mode, profiles []opennebula.BackendCapabilityProfile) error {
+	backends := unsupportedFilesystemRWXBackends(profiles)
+	return fmt.Errorf(
+		"access mode %q is not supported: this driver provisions VM-attached block disks and does not provide a shared-filesystem publish path; true ReadWriteMany requires a shared-filesystem backend such as NFS or CephFS. Current backends without filesystem RWX support: %s",
+		mode.String(),
+		strings.Join(backends, ", "),
+	)
+}
+
+func backendCapabilityProfiles(backends []string) []opennebula.BackendCapabilityProfile {
+	if len(backends) == 0 {
+		backends = []string{"local", "ceph"}
+	}
+
+	profiles := make([]opennebula.BackendCapabilityProfile, 0, len(backends))
+	seen := make(map[string]struct{}, len(backends))
+	for _, backend := range backends {
+		profile := opennebula.GetBackendCapabilityProfile(backend)
+		if _, ok := seen[profile.Backend]; ok {
+			continue
+		}
+		seen[profile.Backend] = struct{}{}
+		profiles = append(profiles, profile)
+	}
+
+	return profiles
+}
+
+func unsupportedFilesystemRWXBackends(profiles []opennebula.BackendCapabilityProfile) []string {
+	backends := make([]string, 0, len(profiles))
+	for _, profile := range profiles {
+		if !profile.SupportsFilesystemRWX {
+			backends = append(backends, profile.Backend)
+		}
+	}
+	if len(backends) == 0 {
+		return []string{"configured backends"}
+	}
+
+	return backends
+}
+
+func supportedAccessModeNames() []string {
+	names := make([]string, 0, len(supportedAccessModes))
+	for _, mode := range supportedAccessModes {
+		names = append(names, mode.String())
+	}
+
+	return names
 }

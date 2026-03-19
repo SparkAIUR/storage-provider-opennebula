@@ -48,6 +48,16 @@ type DatastoreBackendProfile struct {
 	validate          func(datastoreSchema.Datastore) error
 }
 
+type BackendCapabilityProfile struct {
+	Backend               string
+	SupportsFilesystemRWO bool
+	SupportsFilesystemROX bool
+	SupportsFilesystemRWX bool
+	SupportsBlockRWO      bool
+	SupportsBlockROX      bool
+	SupportsBlockRWX      bool
+}
+
 func (p DatastoreBackendProfile) ValidateDatastore(ds datastoreSchema.Datastore) error {
 	if p.validate == nil {
 		return nil
@@ -92,6 +102,31 @@ func GetDatastoreBackendProfile(typ string) (DatastoreBackendProfile, error) {
 		}, nil
 	default:
 		return DatastoreBackendProfile{}, &datastoreConfigError{message: fmt.Sprintf("unsupported datastore backend %q", typ)}
+	}
+}
+
+func GetBackendCapabilityProfile(backend string) BackendCapabilityProfile {
+	switch normalizeAllowedDatastoreType(backend) {
+	case datastoreTypeCeph:
+		return BackendCapabilityProfile{
+			Backend:               datastoreTypeCeph,
+			SupportsFilesystemRWO: true,
+			SupportsFilesystemROX: true,
+			SupportsFilesystemRWX: false,
+			SupportsBlockRWO:      true,
+			SupportsBlockROX:      true,
+			SupportsBlockRWX:      false,
+		}
+	default:
+		return BackendCapabilityProfile{
+			Backend:               datastoreTypeLocal,
+			SupportsFilesystemRWO: true,
+			SupportsFilesystemROX: true,
+			SupportsFilesystemRWX: false,
+			SupportsBlockRWO:      true,
+			SupportsBlockROX:      true,
+			SupportsBlockRWX:      false,
+		}
 	}
 }
 

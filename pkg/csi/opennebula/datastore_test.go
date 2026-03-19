@@ -193,6 +193,27 @@ func TestResolveDeploymentMode(t *testing.T) {
 	assert.Equal(t, DeploymentModeUnknown, resolveDeploymentMode(newTestDatastore(202, "other", "", "shared", nil)))
 }
 
+func TestGetBackendCapabilityProfileReportsNoFilesystemRWXForCurrentBackends(t *testing.T) {
+	localProfile := GetBackendCapabilityProfile("local")
+	cephProfile := GetBackendCapabilityProfile("ceph")
+
+	assert.Equal(t, "local", localProfile.Backend)
+	assert.True(t, localProfile.SupportsFilesystemRWO)
+	assert.True(t, localProfile.SupportsFilesystemROX)
+	assert.False(t, localProfile.SupportsFilesystemRWX)
+	assert.True(t, localProfile.SupportsBlockRWO)
+	assert.True(t, localProfile.SupportsBlockROX)
+	assert.False(t, localProfile.SupportsBlockRWX)
+
+	assert.Equal(t, "ceph", cephProfile.Backend)
+	assert.True(t, cephProfile.SupportsFilesystemRWO)
+	assert.True(t, cephProfile.SupportsFilesystemROX)
+	assert.False(t, cephProfile.SupportsFilesystemRWX)
+	assert.True(t, cephProfile.SupportsBlockRWO)
+	assert.True(t, cephProfile.SupportsBlockROX)
+	assert.False(t, cephProfile.SupportsBlockRWX)
+}
+
 func TestOrderDatastoresLeastUsedSortsByFreeCapacity(t *testing.T) {
 	ordered, err := OrderDatastores([]Datastore{
 		{ID: 100, FreeBytes: 10},

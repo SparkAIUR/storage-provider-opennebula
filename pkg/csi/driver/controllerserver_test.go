@@ -166,6 +166,38 @@ func TestCreateVolume(t *testing.T) {
 	}
 }
 
+func TestCreateVolumeRejectsReadWriteMany(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	cs := getTestControllerServer(mockProvider)
+
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name: "rwx-volume",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: int64(1024 * 1024 * 1024),
+		},
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessType: &csi.VolumeCapability_Mount{
+					Mount: &csi.VolumeCapability_MountVolume{FsType: "xfs"},
+				},
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
+				},
+			},
+		},
+		Parameters: map[string]string{
+			storageClassParamDatastoreIDs: "100",
+		},
+	})
+
+	assert.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	assert.Contains(t, err.Error(), "VM-attached block disks")
+	assert.Contains(t, err.Error(), "ReadWriteMany")
+	assert.Contains(t, err.Error(), "shared-filesystem backend")
+	mockProvider.AssertExpectations(t)
+}
+
 func TestDeleteVolume(t *testing.T) {
 	tcs := []struct {
 		name                string
