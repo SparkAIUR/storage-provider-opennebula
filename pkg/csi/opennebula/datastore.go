@@ -257,7 +257,7 @@ func inferDatastoreType(source datastoreSchema.Datastore) string {
 
 	for _, value := range values {
 		switch value {
-		case "local", "ceph", "nfs", "nas":
+		case "local", "ceph", "nfs", "nas", "fs_lvm", "fs_lvm_ssh":
 			return value
 		case "fs":
 			if strings.EqualFold(source.TMMad, "local") {
@@ -280,7 +280,7 @@ func normalizeAllowedDatastoreType(value string) string {
 	switch normalized {
 	case "", "nas":
 		return "nfs"
-	case "fs":
+	case "fs", "fs_lvm", "fs_lvm_ssh":
 		return "local"
 	default:
 		return normalized

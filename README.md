@@ -208,6 +208,7 @@ Each item under `storageClasses` supports:
 - Ceph RBD with Ceph System Datastore mode: [examples/helm-values-ceph-ceph-mode.yaml](examples/helm-values-ceph-ceph-mode.yaml)
 - Ceph RBD with SSH System Datastore mode: [examples/helm-values-ceph-ssh-mode.yaml](examples/helm-values-ceph-ssh-mode.yaml)
 - Omni-oriented Ceph example: [examples/omni-values-ceph.yaml](examples/omni-values-ceph.yaml)
+- Staging-lab Omni Ceph example: [examples/omni-values-staging-ceph.yaml](examples/omni-values-staging-ceph.yaml)
 
 ## Omni deployment notes
 
@@ -219,6 +220,7 @@ For Omni on OpenNebula, the common pattern is:
 4. Use StorageClass-specific `parameters` to tune the underlying datastore behavior
 
 The driver currently validates configured provisioning datastores against the allowed datastore type list, which defaults to `local,ceph`.
+For OpenNebula local-style datastores, the driver treats `local`, `fs`, `fs_lvm`, and `fs_lvm_ssh` as local-compatible.
 If you want PVC resizing in Omni, set `allowVolumeExpansion: true` on the relevant StorageClasses and ensure workloads are using attached volumes when expansion is requested.
 
 For Ceph-backed Omni deployments:
@@ -228,6 +230,8 @@ For Ceph-backed Omni deployments:
 3. Set `driver.defaultDatastores` or StorageClass `datastoreIDs` to the Ceph Image Datastore IDs.
 4. Keep `driver.allowedDatastoreTypes` including `ceph`.
 5. If workloads run in SSH System Datastore mode, expect OpenNebula SSH mode limitations for Ceph-backed images.
+
+For the SparkAI staging lab on `on.lab.sprkinfra.com`, use the dedicated example at `examples/omni-values-staging-ceph.yaml` and point `datastoreIDs` at the validated `one-csi` Ceph-backed datastore exposed by the staging OpenNebula frontend.
 
 ## Local development
 

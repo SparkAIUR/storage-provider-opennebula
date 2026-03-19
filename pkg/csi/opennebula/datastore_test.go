@@ -25,6 +25,24 @@ func TestResolveDatastoresSupportsDefaultAliasAndIDLookup(t *testing.T) {
 	assert.Equal(t, "local", resolved[0].Type)
 }
 
+func TestResolveDatastoresTreatsFSLVMBackendsAsLocal(t *testing.T) {
+	pool := []datastoreSchema.Datastore{
+		{ID: 110, Name: "lvm-local", DSMad: "fs_lvm", TMMad: "fs_lvm", StateRaw: 0, FreeMB: 512},
+		{ID: 111, Name: "lvm-local-ssh", DSMad: "fs_lvm_ssh", TMMad: "fs_lvm_ssh", StateRaw: 0, FreeMB: 1024},
+	}
+
+	resolved, err := ResolveDatastores(pool, DatastoreSelectionConfig{
+		Identifiers:  []string{"110", "111"},
+		AllowedTypes: []string{"local"},
+	})
+	require.NoError(t, err)
+	require.Len(t, resolved, 2)
+	assert.Equal(t, "local", resolved[0].Type)
+	assert.Equal(t, "local", resolved[1].Type)
+	assert.Equal(t, "local", resolved[0].Backend)
+	assert.Equal(t, "local", resolved[1].Backend)
+}
+
 func TestResolveDatastoresRejectsUnknownIdentifier(t *testing.T) {
 	_, err := ResolveDatastores([]datastoreSchema.Datastore{
 		{ID: 100, Name: "fast-local", DSMad: "fs", TMMad: "local", StateRaw: 0},
