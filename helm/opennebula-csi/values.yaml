@@ -14,7 +14,7 @@ credentials:
 
 image:
   repository: "ghcr.io/sparkaiur/opennebula-csi"
-  tag: "latest"
+  tag: "v0.3.1"
   pullPolicy: "IfNotPresent"
 
 imagePullSecrets: []

@@ -11,6 +11,7 @@ This fork is focused on Omni deployments on OpenNebula and removes the old requi
 - Support `least-used` and `ordered` datastore selection policies.
 - Support `Filesystem` and `Block` volume modes.
 - Support `ReadWriteOnce` and `ReadOnlyMany` access modes.
+- Reject `ReadWriteMany` and other multi-node write access modes until a separate shared-filesystem path exists.
 - Support CSI volume expansion for attached volumes, including node-side filesystem growth.
 - Support `local` and OpenNebula Ceph RBD datastores.
 - Keep the internal selection/provider structure ready for future `cephfs` and `nfs` support.
@@ -55,6 +56,40 @@ All other StorageClass parameters are passed through to the existing disk/image 
 - `ordered`: use the configured order as-is
 
 If a candidate datastore does not have enough free capacity, the driver falls through to the next eligible datastore. If no configured datastore can satisfy the request, provisioning fails with a capacity error.
+
+## Datastore category support
+
+Provisioning targets must be OpenNebula datastore categories that can accept image allocation.
+
+Current rules:
+
+- `IMAGE`: supported for PVC provisioning
+- `FILE`: accepted by the driver as an allocatable datastore category, but not treated as a generic Kubernetes RWX backend
+- `SYSTEM`: rejected for `CreateVolume`
+
+For OpenNebula local-style datastores, the driver treats `local`, `fs`, `fs_lvm`, and `fs_lvm_ssh` as local-compatible backends.
+
+## Access mode support
+
+The current driver provisions an OpenNebula image, attaches it to a VM, then formats and mounts the resulting block device on the node. That architecture is safe for single-writer or read-only multi-node access, but not for shared read-write filesystem access across nodes.
+
+Current access mode matrix:
+
+- `ReadWriteOnce`: supported
+- `ReadOnlyMany`: supported
+- `ReadWriteMany`: not supported
+- other multi-node write modes: not supported
+
+### Why RWX is rejected
+
+This driver currently provisions VM-attached block disks. Enabling filesystem `ReadWriteMany` on that path would mean multiple nodes mounting the same ext4 or xfs filesystem concurrently, which is unsafe. True RWX support requires a separate shared-filesystem publish path and a backend that exposes shared filesystem semantics directly to Kubernetes nodes.
+
+### What to use instead for RWX
+
+- Databases and other single-writer application data: use this driver with OpenNebula `IMAGE` datastores
+- Shared caches, model stores, or other multi-node RWX workloads: use a shared-filesystem CSI or backend such as NFS CSI, CephFS CSI, or another RWX-capable shared-fs provider
+
+Do not use OpenNebula `FILE` datastores as a substitute for normal Kubernetes RWX PVCs with this driver.
 
 ## Ceph RBD support
 
@@ -225,6 +260,7 @@ The driver currently validates configured provisioning datastores against the al
 For OpenNebula local-style datastores, the driver treats `local`, `fs`, `fs_lvm`, and `fs_lvm_ssh` as local-compatible.
 Provisioning targets still need to be OpenNebula `IMAGE` or `FILE` datastores. `SYSTEM` datastores cannot be used for `CreateVolume`.
 If you want PVC resizing in Omni, set `allowVolumeExpansion: true` on the relevant StorageClasses and ensure workloads are using attached volumes when expansion is requested.
+If you need `ReadWriteMany`, use a separate shared-filesystem StorageClass and not this OpenNebula disk-attached CSI path.
 
 For Ceph-backed Omni deployments:
 
