@@ -12,8 +12,8 @@ This fork is focused on Omni deployments on OpenNebula and removes the old requi
 - Support `Filesystem` and `Block` volume modes.
 - Support `ReadWriteOnce` and `ReadOnlyMany` access modes.
 - Support CSI volume expansion for attached volumes, including node-side filesystem growth.
-- Support `local` datastores today.
-- Keep the internal selection/provider structure ready for future `ceph` and `nfs` support.
+- Support `local` and OpenNebula Ceph RBD datastores.
+- Keep the internal selection/provider structure ready for future `cephfs` and `nfs` support.
 
 ## Release artifacts
 
@@ -45,7 +45,7 @@ All other StorageClass parameters are passed through to the existing disk/image 
 
 - `ONE_CSI_DEFAULT_DATASTORES`: global CSV datastore list, for example `100,101`
 - `ONE_CSI_DATASTORE_SELECTION_POLICY`: `least-used` or `ordered`
-- `ONE_CSI_ALLOWED_DATASTORE_TYPES`: CSV list, default `local`
+- `ONE_CSI_ALLOWED_DATASTORE_TYPES`: CSV list, default `local,ceph`
 
 ### Policy behavior
 
@@ -53,6 +53,59 @@ All other StorageClass parameters are passed through to the existing disk/image 
 - `ordered`: use the configured order as-is
 
 If a candidate datastore does not have enough free capacity, the driver falls through to the next eligible datastore. If no configured datastore can satisfy the request, provisioning fails with a capacity error.
+
+## Ceph RBD support
+
+Ceph support in this fork means OpenNebula Ceph **RBD** datastores. It does not include CephFS.
+
+Current Ceph support matrix:
+
+- Ceph Image Datastore + Ceph System Datastore
+- Ceph Image Datastore + SSH System Datastore
+
+The driver validates Ceph datastores before provisioning and also validates the target VM deployment mode before attach.
+
+For Ceph Image Datastores the driver requires:
+
+- `DS_MAD=ceph`
+- `TM_MAD=ceph`
+- `DISK_TYPE=RBD`
+- `POOL_NAME`
+- `CEPH_HOST`
+- `CEPH_USER`
+- `CEPH_SECRET`
+- `BRIDGE_LIST`
+
+For Ceph System Datastores in Ceph mode the driver requires:
+
+- `TM_MAD=ceph`
+- `DISK_TYPE=RBD`
+- the same Ceph connection identity as the image datastore:
+  `POOL_NAME`, `CEPH_HOST`, `CEPH_USER`, `CEPH_SECRET`
+- if defined on both sides, `CEPH_CONF` and `CEPH_KEY` must also match
+
+If the target VM is running on an SSH System Datastore, attach is allowed and the driver logs that OpenNebula SSH mode caveats apply.
+
+### Ceph prerequisites
+
+Operators must prepare the OpenNebula environment before using Ceph-backed StorageClasses:
+
+- Ceph client tools must be installed on the OpenNebula frontend and hypervisor nodes.
+- OpenNebula nodes using Ceph must be configured as Ceph clients.
+- The libvirt secret referenced by `CEPH_SECRET` must exist on the hypervisor nodes.
+- The required Ceph keyring/key material must be present where OpenNebula expects it.
+- Ceph Image and System Datastores must be created in OpenNebula with the required attributes above.
+- OpenNebula should inherit datastore attributes needed for VM disk deployment, typically:
+  `CEPH_HOST`, `CEPH_SECRET`, `CEPH_USER`, `CEPH_CONF`, `POOL_NAME`, `DISK_TYPE`
+- If you rely on formatted datablocks, the filesystem requested through `fsType` must be supported by the OpenNebula datastore drivers and `mkfs.<fs>` must be available on the relevant nodes.
+
+Optional Ceph datastore attributes supported by the driver and documentation:
+
+- `CEPH_CONF`
+- `CEPH_KEY`
+- `RBD_FORMAT`
+- `EC_POOL_NAME`
+- `CEPH_TRASH`
 
 ## Volume expansion
 
@@ -152,6 +205,9 @@ Each item under `storageClasses` supports:
 - Multiple datastores with `least-used`: [examples/helm-values-multi-datastore.yaml](examples/helm-values-multi-datastore.yaml)
 - Existing Secret with `default` alias: [examples/helm-values-existing-secret.yaml](examples/helm-values-existing-secret.yaml)
 - Omni-oriented example: [examples/omni-values.yaml](examples/omni-values.yaml)
+- Ceph RBD with Ceph System Datastore mode: [examples/helm-values-ceph-ceph-mode.yaml](examples/helm-values-ceph-ceph-mode.yaml)
+- Ceph RBD with SSH System Datastore mode: [examples/helm-values-ceph-ssh-mode.yaml](examples/helm-values-ceph-ssh-mode.yaml)
+- Omni-oriented Ceph example: [examples/omni-values-ceph.yaml](examples/omni-values-ceph.yaml)
 
 ## Omni deployment notes
 
@@ -162,8 +218,16 @@ For Omni on OpenNebula, the common pattern is:
 3. Create one or more StorageClasses under `storageClasses[]`
 4. Use StorageClass-specific `parameters` to tune the underlying datastore behavior
 
-The driver currently validates configured provisioning datastores against the allowed datastore type list, which defaults to `local`.
+The driver currently validates configured provisioning datastores against the allowed datastore type list, which defaults to `local,ceph`.
 If you want PVC resizing in Omni, set `allowVolumeExpansion: true` on the relevant StorageClasses and ensure workloads are using attached volumes when expansion is requested.
+
+For Ceph-backed Omni deployments:
+
+1. Create the OpenNebula Ceph Image Datastore and, if needed, the Ceph System Datastore.
+2. Ensure Ceph prerequisites are satisfied on the frontend and hypervisor nodes.
+3. Set `driver.defaultDatastores` or StorageClass `datastoreIDs` to the Ceph Image Datastore IDs.
+4. Keep `driver.allowedDatastoreTypes` including `ceph`.
+5. If workloads run in SSH System Datastore mode, expect OpenNebula SSH mode limitations for Ceph-backed images.
 
 ## Local development
 
@@ -184,6 +248,7 @@ Render the chart with example values:
 ```bash
 helm lint helm/opennebula-csi
 helm template opennebula-csi helm/opennebula-csi --values examples/helm-values-multi-datastore.yaml
+helm template opennebula-csi helm/opennebula-csi --values examples/helm-values-ceph-ceph-mode.yaml
 ```
 
 ### Opt-in test suites

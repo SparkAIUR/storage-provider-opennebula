@@ -36,3 +36,6 @@ jobs:
 
       - name: Render chart with existing secret
         run: helm template opennebula-csi helm/opennebula-csi --values examples/helm-values-existing-secret.yaml
+
+      - name: Render chart with Ceph example
+        run: helm template opennebula-csi helm/opennebula-csi --values examples/helm-values-ceph-ceph-mode.yaml
