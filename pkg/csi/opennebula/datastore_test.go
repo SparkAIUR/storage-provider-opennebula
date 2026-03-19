@@ -27,8 +27,8 @@ func TestResolveDatastoresSupportsDefaultAliasAndIDLookup(t *testing.T) {
 
 func TestResolveDatastoresTreatsFSLVMBackendsAsLocal(t *testing.T) {
 	pool := []datastoreSchema.Datastore{
-		{ID: 110, Name: "lvm-local", DSMad: "fs_lvm", TMMad: "fs_lvm", StateRaw: 0, FreeMB: 512},
-		{ID: 111, Name: "lvm-local-ssh", DSMad: "fs_lvm_ssh", TMMad: "fs_lvm_ssh", StateRaw: 0, FreeMB: 1024},
+		{ID: 110, Name: "lvm-local", DSMad: "fs_lvm", TMMad: "fs_lvm", Type: "IMAGE", StateRaw: 0, FreeMB: 512},
+		{ID: 111, Name: "lvm-local-ssh", DSMad: "fs_lvm_ssh", TMMad: "fs_lvm_ssh", Type: "IMAGE", StateRaw: 0, FreeMB: 1024},
 	}
 
 	resolved, err := ResolveDatastores(pool, DatastoreSelectionConfig{
@@ -41,6 +41,18 @@ func TestResolveDatastoresTreatsFSLVMBackendsAsLocal(t *testing.T) {
 	assert.Equal(t, "local", resolved[1].Type)
 	assert.Equal(t, "local", resolved[0].Backend)
 	assert.Equal(t, "local", resolved[1].Backend)
+}
+
+func TestResolveDatastoresRejectsSystemDatastoreForProvisioning(t *testing.T) {
+	_, err := ResolveDatastores([]datastoreSchema.Datastore{
+		{ID: 110, Name: "lvm-system", DSMad: "fs_lvm", TMMad: "fs_lvm", Type: "SYSTEM", StateRaw: 0, FreeMB: 512},
+	}, DatastoreSelectionConfig{
+		Identifiers:  []string{"110"},
+		AllowedTypes: []string{"local"},
+	})
+	require.Error(t, err)
+	assert.True(t, IsDatastoreConfigError(err))
+	assert.Contains(t, err.Error(), "IMAGE or FILE datastore")
 }
 
 func TestResolveDatastoresRejectsUnknownIdentifier(t *testing.T) {

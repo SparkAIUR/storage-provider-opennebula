@@ -27,6 +27,7 @@ type DatastoreSelectionConfig struct {
 type Datastore struct {
 	ID        int
 	Name      string
+	Category  string
 	Type      string
 	Backend   string
 	DSMad     string
@@ -130,6 +131,10 @@ func ResolveDatastores(pool []datastoreSchema.Datastore, selection DatastoreSele
 			return nil, &datastoreConfigError{message: fmt.Sprintf("datastore %q is not enabled", identifier)}
 		}
 
+		if err := validateProvisioningDatastoreCategory(candidate); err != nil {
+			return nil, err
+		}
+
 		if _, ok := allowedTypes[normalized.Type]; !ok {
 			return nil, &datastoreConfigError{
 				message: fmt.Sprintf("datastore %d resolved as type %q, which is not allowed", normalized.ID, normalized.Type),
@@ -228,6 +233,7 @@ func datastoreFromSchema(source datastoreSchema.Datastore) Datastore {
 	return Datastore{
 		ID:        source.ID,
 		Name:      source.Name,
+		Category:  strings.ToUpper(strings.TrimSpace(source.Type)),
 		Type:      normalizeAllowedDatastoreType(inferDatastoreType(source)),
 		Backend:   normalizeAllowedDatastoreType(inferDatastoreType(source)),
 		DSMad:     strings.ToLower(strings.TrimSpace(source.DSMad)),
@@ -273,6 +279,17 @@ func inferDatastoreType(source datastoreSchema.Datastore) string {
 	}
 
 	return "unknown"
+}
+
+func validateProvisioningDatastoreCategory(source datastoreSchema.Datastore) error {
+	switch strings.ToUpper(strings.TrimSpace(source.Type)) {
+	case "", string(datastoreSchema.Image), string(datastoreSchema.File):
+		return nil
+	default:
+		return &datastoreConfigError{
+			message: fmt.Sprintf("datastore %d has OpenNebula type %q and cannot be used for CSI provisioning; select an IMAGE or FILE datastore", source.ID, source.Type),
+		}
+	}
 }
 
 func normalizeAllowedDatastoreType(value string) string {

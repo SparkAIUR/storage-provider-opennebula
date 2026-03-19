@@ -223,6 +223,7 @@ For Omni on OpenNebula, the common pattern is:
 
 The driver currently validates configured provisioning datastores against the allowed datastore type list, which defaults to `local,ceph`.
 For OpenNebula local-style datastores, the driver treats `local`, `fs`, `fs_lvm`, and `fs_lvm_ssh` as local-compatible.
+Provisioning targets still need to be OpenNebula `IMAGE` or `FILE` datastores. `SYSTEM` datastores cannot be used for `CreateVolume`.
 If you want PVC resizing in Omni, set `allowVolumeExpansion: true` on the relevant StorageClasses and ensure workloads are using attached volumes when expansion is requested.
 
 For Ceph-backed Omni deployments:
