@@ -7,7 +7,7 @@ credentials:
     key: credentials
 
 image:
-  repository: "ghcr.io/SparkAIUR/opennebula-csi"
+  repository: "ghcr.io/sparkaiur/opennebula-csi"
   tag: "latest"
   pullPolicy: IfNotPresent
 

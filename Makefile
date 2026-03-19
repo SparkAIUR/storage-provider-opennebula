@@ -33,7 +33,7 @@ CLOSEST_TAG ?= $(shell git -C $(SELF) describe --tags --abbrev=0 2>/dev/null || 
 LOCAL_TAG ?= latest
 LOCAL_REGISTRY ?= localhost:5005
 # Registry to use for building/pushing image targets
-REMOTE_REGISTRY ?= ghcr.io/SparkAIUR
+REMOTE_REGISTRY ?= ghcr.io/sparkaiur
 
 # CONTAINER_TOOL defines the container tool to be used for building images.
 # Be aware that the target commands are only tested with Docker which is

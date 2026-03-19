@@ -1,6 +1,6 @@
 # SparkAI OpenNebula CSI
 
-`storage-provider-opennebula` is the SparkAI fork of the OpenNebula CSI driver for Kubernetes. It publishes container images to `ghcr.io/SparkAIUR/opennebula-csi:<tag>` and Helm charts to `https://sparkaiur.github.io/storage-provider-opennebula/charts/`.
+`storage-provider-opennebula` is the SparkAI fork of the OpenNebula CSI driver for Kubernetes. It publishes container images to `ghcr.io/sparkaiur/opennebula-csi:<tag>` and Helm charts to `https://sparkaiur.github.io/storage-provider-opennebula/charts/`.
 
 This fork is focused on Omni deployments on OpenNebula and removes the old requirement that a datastore literally named `default` must exist for PVC provisioning.
 
@@ -17,7 +17,7 @@ This fork is focused on Omni deployments on OpenNebula and removes the old requi
 
 ## Release artifacts
 
-- Container image: `ghcr.io/SparkAIUR/opennebula-csi:<tag>`
+- Container image: `ghcr.io/sparkaiur/opennebula-csi:<tag>`
 - Helm repo: `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
 - Chart name: `opennebula-csi`
 - Source repo: `https://github.com/SparkAIUR/storage-provider-opennebula`
@@ -200,7 +200,7 @@ Push a semantic tag such as `v0.1.0` to trigger the release workflow.
 
 The workflow will:
 
-1. Build and publish `ghcr.io/SparkAIUR/opennebula-csi:<tag>` and `latest`
+1. Build and publish `ghcr.io/sparkaiur/opennebula-csi:<tag>` and `latest`
 2. Package the Helm chart
 3. Publish the chart tarball and `index.yaml` to `gh-pages/charts/`
 4. Re-index the Helm repo with `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
