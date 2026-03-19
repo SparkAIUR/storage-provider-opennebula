@@ -71,6 +71,14 @@ func IsDatastoreCapacityError(err error) bool {
 	return ok
 }
 
+func NewDatastoreConfigError(message string) error {
+	return &datastoreConfigError{message: message}
+}
+
+func NewDatastoreCapacityError(message string) error {
+	return &datastoreCapacityError{message: message}
+}
+
 func NormalizeDatastoreSelectionPolicy(policy string) DatastoreSelectionPolicy {
 	switch strings.ToLower(strings.TrimSpace(policy)) {
 	case "", string(DatastoreSelectionPolicyLeastUsed):

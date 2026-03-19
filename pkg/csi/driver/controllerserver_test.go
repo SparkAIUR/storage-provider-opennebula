@@ -26,6 +26,8 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -261,6 +263,32 @@ func TestControllerPublishVolume(t *testing.T) {
 			},
 			expectError: false,
 		},
+		{
+			name: "TestCephAttachValidationFailureMapsToFailedPrecondition",
+			controllerPublishVolumeRequest: &csi.ControllerPublishVolumeRequest{
+				VolumeId: "1234",
+				NodeId:   "test-node-id",
+				VolumeCapability: &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Mount{
+						Mount: &csi.VolumeCapability_MountVolume{
+							FsType: "ext4",
+						},
+					},
+					AccessMode: &csi.VolumeCapability_AccessMode{
+						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+					},
+				},
+			},
+			setupMock: func(m *MockOpenNebulaVolumeProviderTestify) {
+				m.On("VolumeExists", mock.Anything, "1234").Return(1, 1, nil)
+				m.On("NodeExists", mock.Anything, "test-node-id").Return(1, nil)
+				m.On("GetVolumeInNode", mock.Anything, 1, 1).Once().Return("", errors.New("volume not attached to node"))
+				m.On("AttachVolume", mock.Anything, "1234", "test-node-id", false, mock.Anything).
+					Return(opennebula.NewDatastoreConfigError("ceph datastore mismatch"))
+			},
+			expectResponse: nil,
+			expectError:    true,
+		},
 	}
 
 	for _, tc := range tcs {
@@ -275,6 +303,9 @@ func TestControllerPublishVolume(t *testing.T) {
 
 			if tc.expectError {
 				assert.Error(t, err)
+				if tc.name == "TestCephAttachValidationFailureMapsToFailedPrecondition" {
+					assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+				}
 			} else {
 				assert.NoError(t, err)
 			}

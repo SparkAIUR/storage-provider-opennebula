@@ -221,6 +221,12 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID)
 	err = s.volumeProvider.AttachVolume(ctx, req.VolumeId, req.NodeId, immutableVolume, params)
 	if err != nil {
+		switch {
+		case opennebula.IsDatastoreConfigError(err):
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		case opennebula.IsDatastoreCapacityError(err):
+			return nil, status.Error(codes.ResourceExhausted, err.Error())
+		}
 		klog.V(0).ErrorS(err, "Failed to attach volume",
 			"method", "ControllerPublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
 		return nil, status.Error(codes.Internal, "failed to attach volume")

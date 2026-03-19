@@ -25,11 +25,13 @@ import (
 
 	"github.com/OpenNebula/one/src/oca/go/src/goca"
 	"github.com/OpenNebula/one/src/oca/go/src/goca/parameters"
+	datastoreSchema "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/datastore"
 	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/image"
 	img "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/image"
 	imk "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/image/keys"
 	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/shared"
 	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/vm"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -207,6 +209,32 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 	if err != nil || volumeID == -1 {
 		return fmt.Errorf("failed to check if volume exists: %w", err)
 	}
+
+	report, err := p.inspectAttachmentEnvironment(ctx, volumeID, nodeID)
+	if err != nil {
+		return err
+	}
+	if report != nil {
+		klog.V(1).InfoS("Validated volume attachment environment",
+			"volumeID", volumeID,
+			"nodeID", nodeID,
+			"imageDatastoreID", report.ImageDatastore.ID,
+			"imageDatastoreName", report.ImageDatastore.Name,
+			"imageDatastoreType", report.ImageDatastore.Type,
+			"backendProfile", report.ImageDatastore.Backend,
+			"deploymentMode", report.DeploymentMode)
+		if report.SystemDatastore != nil {
+			klog.V(1).InfoS("Resolved target system datastore for attachment",
+				"volumeID", volumeID,
+				"nodeID", nodeID,
+				"systemDatastoreID", report.SystemDatastore.ID,
+				"systemDatastoreName", report.SystemDatastore.Name,
+				"systemDatastoreTMMAD", report.SystemDatastore.TMMad)
+		}
+		for _, warning := range report.Warnings {
+			klog.Warningf("volume %s attach validation warning: %s", volume, warning)
+		}
+	}
 	disk := shared.NewDisk()
 	disk.Add(shared.ImageID, volumeID)
 	addDiskParams(disk, params)
@@ -224,6 +252,77 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		return fmt.Errorf("failed to wait for node readiness: %w", err)
 	}
 	return nil
+}
+
+func (p *PersistentDiskVolumeProvider) inspectAttachmentEnvironment(ctx context.Context, volumeID, nodeID int) (*DatastoreEnvironmentReport, error) {
+	imageInfo, err := p.ctrl.Image(volumeID).Info(true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect image %d before attach: %w", volumeID, err)
+	}
+
+	if imageInfo.DatastoreID == nil {
+		return nil, &datastoreConfigError{message: fmt.Sprintf("volume %d does not expose a source datastore ID", volumeID)}
+	}
+
+	datastorePool, err := p.ctrl.Datastores().Info()
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect datastores before attach: %w", err)
+	}
+
+	imageDatastore, err := findDatastoreByID(datastorePool.Datastores, *imageInfo.DatastoreID)
+	if err != nil {
+		return nil, err
+	}
+
+	report := &DatastoreEnvironmentReport{
+		ImageDatastore: datastoreFromSchema(imageDatastore),
+		DeploymentMode: DeploymentModeUnknown,
+	}
+
+	if report.ImageDatastore.Type != datastoreTypeCeph {
+		return report, nil
+	}
+
+	if err := validateCephImageDatastore(imageDatastore); err != nil {
+		return nil, err
+	}
+
+	vmInfo, err := p.ctrl.VM(nodeID).Info(true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect node %d before attach: %w", nodeID, err)
+	}
+
+	systemDatastoreID, err := latestHistoryDatastoreID(vmInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	systemDatastore, err := findDatastoreByID(datastorePool.Datastores, systemDatastoreID)
+	if err != nil {
+		return nil, err
+	}
+
+	normalizedSystemDatastore := datastoreFromSchema(systemDatastore)
+	report.SystemDatastore = &normalizedSystemDatastore
+	report.DeploymentMode = resolveDeploymentMode(systemDatastore)
+
+	switch report.DeploymentMode {
+	case DeploymentModeCeph:
+		if err := validateCephSystemDatastore(systemDatastore); err != nil {
+			return nil, err
+		}
+		if err := compareCephConnectionIdentity(imageDatastore, systemDatastore); err != nil {
+			return nil, err
+		}
+	case DeploymentModeSSH:
+		report.Warnings = append(report.Warnings, "target VM is using an SSH system datastore; OpenNebula SSH mode limitations apply to Ceph-backed images")
+	default:
+		return nil, &datastoreConfigError{
+			message: fmt.Sprintf("system datastore %d uses unsupported TM_MAD %q for ceph-backed volume %d", systemDatastore.ID, systemDatastore.TMMad, volumeID),
+		}
+	}
+
+	return report, nil
 }
 
 func addDiskParams(disk *shared.Disk, params map[string]string) {
@@ -574,4 +673,37 @@ func (p *PersistentDiskVolumeProvider) GetVolumeInNode(ctx context.Context, volu
 		}
 	}
 	return "", fmt.Errorf("volume %d not found on node %d", volumeID, nodeID)
+}
+
+func findDatastoreByID(pool []datastoreSchema.Datastore, id int) (datastoreSchema.Datastore, error) {
+	for _, ds := range pool {
+		if ds.ID == id {
+			return ds, nil
+		}
+	}
+
+	return datastoreSchema.Datastore{}, &datastoreConfigError{message: fmt.Sprintf("datastore %d was not found", id)}
+}
+
+func latestHistoryDatastoreID(vmInfo *vm.VM) (int, error) {
+	if vmInfo == nil {
+		return 0, &datastoreConfigError{message: "target VM information is not available"}
+	}
+
+	var latest *vm.HistoryRecord
+	for idx := range vmInfo.HistoryRecords {
+		record := &vmInfo.HistoryRecords[idx]
+		if record.DSID <= 0 {
+			continue
+		}
+		if latest == nil || record.SEQ > latest.SEQ {
+			latest = record
+		}
+	}
+
+	if latest == nil {
+		return 0, &datastoreConfigError{message: fmt.Sprintf("target VM %d does not expose a system datastore history record", vmInfo.ID)}
+	}
+
+	return latest.DSID, nil
 }

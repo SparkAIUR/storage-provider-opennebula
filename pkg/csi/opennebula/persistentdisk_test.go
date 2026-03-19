@@ -23,8 +23,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/vm"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -115,4 +118,26 @@ func getIntegrationTestDatastores() []string {
 	}
 
 	return []string{"default"}
+}
+
+func TestLatestHistoryDatastoreID(t *testing.T) {
+	vmInfo := &vm.VM{
+		ID: 42,
+		HistoryRecords: []vm.HistoryRecord{
+			{SEQ: 0, DSID: 100},
+			{SEQ: 1, DSID: 200},
+			{SEQ: 2, DSID: 150},
+		},
+	}
+
+	dsID, err := latestHistoryDatastoreID(vmInfo)
+	require.NoError(t, err)
+	assert.Equal(t, 150, dsID)
+}
+
+func TestLatestHistoryDatastoreIDRequiresSystemDatastoreHistory(t *testing.T) {
+	_, err := latestHistoryDatastoreID(&vm.VM{ID: 42})
+	require.Error(t, err)
+	assert.True(t, IsDatastoreConfigError(err))
+	assert.Contains(t, err.Error(), "system datastore history")
 }
