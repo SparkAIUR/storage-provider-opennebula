@@ -278,12 +278,23 @@ func TestNodeExpandVolume(t *testing.T) {
 		expectError    bool
 	}{
 		{
-			name: "[ERROR] Test unimplemented",
+			name: "[SUCCESS] Test block volume expansion",
 			request: &csi.NodeExpandVolumeRequest{
-				VolumeId: "test-volume-id",
+				VolumeId:   "test-volume-id",
+				VolumePath: tempDir,
+				CapacityRange: &csi.CapacityRange{
+					RequiredBytes: 2 * 1024 * 1024 * 1024,
+				},
+				VolumeCapability: &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Block{
+						Block: &csi.VolumeCapability_BlockVolume{},
+					},
+				},
 			},
-			expectResponse: &csi.NodeExpandVolumeResponse{},
-			expectError:    true,
+			expectResponse: &csi.NodeExpandVolumeResponse{
+				CapacityBytes: 2 * 1024 * 1024 * 1024,
+			},
+			expectError: false,
 		},
 	}
 
@@ -322,6 +333,13 @@ func TestNodeGetCapabilities(t *testing.T) {
 						Type: &csi.NodeServiceCapability_Rpc{
 							Rpc: &csi.NodeServiceCapability_RPC{
 								Type: csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
+							},
+						},
+					},
+					{
+						Type: &csi.NodeServiceCapability_Rpc{
+							Rpc: &csi.NodeServiceCapability_RPC{
+								Type: csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
 							},
 						},
 					},

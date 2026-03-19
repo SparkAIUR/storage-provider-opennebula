@@ -11,6 +11,7 @@ This fork is focused on Omni deployments on OpenNebula and removes the old requi
 - Support `least-used` and `ordered` datastore selection policies.
 - Support `Filesystem` and `Block` volume modes.
 - Support `ReadWriteOnce` and `ReadOnlyMany` access modes.
+- Support CSI volume expansion for attached volumes, including node-side filesystem growth.
 - Support `local` datastores today.
 - Keep the internal selection/provider structure ready for future `ceph` and `nfs` support.
 
@@ -52,6 +53,17 @@ All other StorageClass parameters are passed through to the existing disk/image 
 - `ordered`: use the configured order as-is
 
 If a candidate datastore does not have enough free capacity, the driver falls through to the next eligible datastore. If no configured datastore can satisfy the request, provisioning fails with a capacity error.
+
+## Volume expansion
+
+The chart supports `allowVolumeExpansion`, and the controller deployment now includes the CSI external resizer sidecar required by Kubernetes for PVC resize workflows.
+
+Current behavior:
+
+- Controller expansion is supported for OpenNebula volumes that are attached to a VM.
+- Filesystem expansion is supported on the node for mounted filesystem volumes.
+- Block volumes do not require node-side filesystem expansion.
+- Detached-volume expansion is not currently supported by the driver, because the OpenNebula API surface used by this fork only exposes a documented disk-resize path for attached VM disks.
 
 ## Helm installation
 
@@ -151,6 +163,7 @@ For Omni on OpenNebula, the common pattern is:
 4. Use StorageClass-specific `parameters` to tune the underlying datastore behavior
 
 The driver currently validates configured provisioning datastores against the allowed datastore type list, which defaults to `local`.
+If you want PVC resizing in Omni, set `allowVolumeExpansion: true` on the relevant StorageClasses and ensure workloads are using attached volumes when expansion is requested.
 
 ## Local development
 

@@ -41,7 +41,7 @@ storageClasses:
     annotations:
       storageclass.kubernetes.io/is-default-class: "false"
     reclaimPolicy: Delete
-    allowVolumeExpansion: false
+    allowVolumeExpansion: true
     volumeBindingMode: Immediate
     mountOptions: []
     parameters:

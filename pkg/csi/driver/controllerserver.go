@@ -35,6 +35,7 @@ var (
 		csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 		csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
 		csi.ControllerServiceCapability_RPC_GET_CAPACITY,
+		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 	}
 
 	supportedAccessModes = []csi.VolumeCapability_AccessMode_Mode{
@@ -412,6 +413,44 @@ func (s *ControllerServer) GetCapacity(ctx context.Context, req *csi.GetCapacity
 		"method", "GetCapacity", "availableCapacity", availableCapacity)
 	return &csi.GetCapacityResponse{
 		AvailableCapacity: availableCapacity,
+	}, nil
+}
+
+func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
+	klog.V(1).InfoS("ControllerExpandVolume called", "req", protosanitizer.StripSecrets(req))
+
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "missing volume ID")
+	}
+
+	capacityRange := req.GetCapacityRange()
+	if capacityRange == nil || capacityRange.GetRequiredBytes() <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "missing required capacity range")
+	}
+
+	newSize, err := s.volumeProvider.ExpandVolume(ctx, req.GetVolumeId(), capacityRange.GetRequiredBytes())
+	if err != nil {
+		switch {
+		case opennebula.IsDatastoreConfigError(err):
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		case opennebula.IsDatastoreCapacityError(err):
+			return nil, status.Error(codes.ResourceExhausted, err.Error())
+		}
+
+		klog.V(0).ErrorS(err, "Failed to expand volume", "method", "ControllerExpandVolume", "volumeID", req.GetVolumeId())
+		return nil, status.Error(codes.Internal, "failed to expand volume")
+	}
+
+	nodeExpansionRequired := true
+	if capability := req.GetVolumeCapability(); capability != nil {
+		if _, ok := capability.GetAccessType().(*csi.VolumeCapability_Block); ok {
+			nodeExpansionRequired = false
+		}
+	}
+
+	return &csi.ControllerExpandVolumeResponse{
+		CapacityBytes:         newSize,
+		NodeExpansionRequired: nodeExpansionRequired,
 	}, nil
 }
 

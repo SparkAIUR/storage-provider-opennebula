@@ -413,6 +413,79 @@ func TestGetCapacity(t *testing.T) {
 	}
 }
 
+func TestControllerExpandVolume(t *testing.T) {
+	const expandedSize = int64(2 * 1024 * 1024 * 1024)
+
+	tcs := []struct {
+		name             string
+		request          *csi.ControllerExpandVolumeRequest
+		setupMock        func(m *MockOpenNebulaVolumeProviderTestify)
+		expectError      bool
+		expectNodeExpand bool
+	}{
+		{
+			name: "FilesystemVolumeRequiresNodeExpansion",
+			request: &csi.ControllerExpandVolumeRequest{
+				VolumeId: "test-volume",
+				CapacityRange: &csi.CapacityRange{
+					RequiredBytes: expandedSize,
+				},
+				VolumeCapability: &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Mount{
+						Mount: &csi.VolumeCapability_MountVolume{
+							FsType: "ext4",
+						},
+					},
+				},
+			},
+			setupMock: func(m *MockOpenNebulaVolumeProviderTestify) {
+				m.On("ExpandVolume", mock.Anything, "test-volume", expandedSize).Return(expandedSize, nil)
+			},
+			expectNodeExpand: true,
+		},
+		{
+			name: "BlockVolumeSkipsNodeExpansion",
+			request: &csi.ControllerExpandVolumeRequest{
+				VolumeId: "test-volume",
+				CapacityRange: &csi.CapacityRange{
+					RequiredBytes: expandedSize,
+				},
+				VolumeCapability: &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Block{
+						Block: &csi.VolumeCapability_BlockVolume{},
+					},
+				},
+			},
+			setupMock: func(m *MockOpenNebulaVolumeProviderTestify) {
+				m.On("ExpandVolume", mock.Anything, "test-volume", expandedSize).Return(expandedSize, nil)
+			},
+			expectNodeExpand: false,
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+			if tc.setupMock != nil {
+				tc.setupMock(mockProvider)
+			}
+
+			cs := getTestControllerServer(mockProvider)
+			response, err := cs.ControllerExpandVolume(context.Background(), tc.request)
+
+			if tc.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, expandedSize, response.CapacityBytes)
+				assert.Equal(t, tc.expectNodeExpand, response.NodeExpansionRequired)
+			}
+
+			mockProvider.AssertExpectations(t)
+		})
+	}
+}
+
 func TestControllerUnpublishVolume(t *testing.T) {
 	tcs := []struct {
 		name                             string
@@ -480,6 +553,11 @@ func (m *MockOpenNebulaVolumeProviderTestify) CreateVolume(ctx context.Context, 
 func (m *MockOpenNebulaVolumeProviderTestify) DeleteVolume(ctx context.Context, volume string) error {
 	args := m.Called(ctx, volume)
 	return args.Error(0)
+}
+
+func (m *MockOpenNebulaVolumeProviderTestify) ExpandVolume(ctx context.Context, volume string, size int64) (int64, error) {
+	args := m.Called(ctx, volume, size)
+	return args.Get(0).(int64), args.Error(1)
 }
 
 func (m *MockOpenNebulaVolumeProviderTestify) AttachVolume(ctx context.Context, volume string, node string, immutable bool, params map[string]string) error {

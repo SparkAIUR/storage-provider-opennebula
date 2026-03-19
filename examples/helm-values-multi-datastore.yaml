@@ -15,7 +15,7 @@ driver:
 storageClasses:
   - name: opennebula-local-balanced
     reclaimPolicy: Delete
-    allowVolumeExpansion: false
+    allowVolumeExpansion: true
     volumeBindingMode: Immediate
     mountOptions: []
     parameters:

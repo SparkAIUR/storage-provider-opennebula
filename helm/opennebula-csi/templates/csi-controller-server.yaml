@@ -101,6 +101,19 @@ spec:
           volumeMounts:
             - name: csi-socket-dir
               mountPath: /csi
+        - name: csi-resizer
+          image: registry.k8s.io/sig-storage/csi-resizer:v1.13.2
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--v=5"
+            - "--csi-address=$(ADDRESS)"
+            - "--leader-election"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: csi-socket-dir
+              mountPath: /csi
         - name: liveness-probe
           imagePullPolicy: IfNotPresent
           image: registry.k8s.io/sig-storage/livenessprobe:v2.16.0

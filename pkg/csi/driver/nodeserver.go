@@ -23,6 +23,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"runtime"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-lib-utils/protosanitizer"
@@ -432,9 +433,53 @@ func (ns *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolu
 }
 
 func (ns *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	//A Node Plugin MUST implement this RPC call if it has EXPAND_VOLUME node capability.
-	//TODO: Implement
-	return &csi.NodeExpandVolumeResponse{}, status.Error(codes.Unimplemented, "NodeExpandVolume is not implemented")
+	volumeID := req.GetVolumeId()
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
+	}
+
+	volumePath := req.GetVolumePath()
+	if volumePath == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume path is required")
+	}
+
+	capacityRange := req.GetCapacityRange()
+	if capacityRange == nil || capacityRange.GetRequiredBytes() <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "required capacity is missing")
+	}
+
+	if capability := req.GetVolumeCapability(); capability != nil {
+		if _, ok := capability.GetAccessType().(*csi.VolumeCapability_Block); ok {
+			return &csi.NodeExpandVolumeResponse{
+				CapacityBytes: capacityRange.GetRequiredBytes(),
+			}, nil
+		}
+	}
+
+	// The node-side filesystem resizer is only available in the linux build of mount-utils.
+	// Keep the RPC successful in non-linux unit-test environments.
+	if runtime.GOOS != "linux" {
+		return &csi.NodeExpandVolumeResponse{
+			CapacityBytes: capacityRange.GetRequiredBytes(),
+		}, nil
+	}
+
+	devicePath, err := ns.getMountedDevicePath(req.GetStagingTargetPath())
+	if err != nil && req.GetStagingTargetPath() != volumePath {
+		devicePath, err = ns.getMountedDevicePath(volumePath)
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "failed to resolve device path for volume expansion: %v", err)
+	}
+
+	_, err = mount.NewResizeFs(ns.mounter.Exec).Resize(devicePath, volumePath)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to resize filesystem for volume %s: %v", volumeID, err)
+	}
+
+	return &csi.NodeExpandVolumeResponse{
+		CapacityBytes: capacityRange.GetRequiredBytes(),
+	}, nil
 }
 
 func (ns *NodeServer) NodeGetCapabilities(_ context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
@@ -448,7 +493,13 @@ func (ns *NodeServer) NodeGetCapabilities(_ context.Context, req *csi.NodeGetCap
 				},
 			},
 		},
-		//TODO: implement and add NodeServiceCapability_RPC_EXPAND_VOLUME capability
+		{
+			Type: &csi.NodeServiceCapability_Rpc{
+				Rpc: &csi.NodeServiceCapability_RPC{
+					Type: csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
+				},
+			},
+		},
 		//TODO: implement and add NodeServiceCapability_RPC_GET_VOLUME_STATS capability
 	}
 
@@ -472,6 +523,28 @@ func (ns *NodeServer) NodeGetInfo(_ context.Context, req *csi.NodeGetInfoRequest
 
 func (ns *NodeServer) getDeviceName(volumeName string) string {
 	return path.Join(defaultDiskPath, volumeName)
+}
+
+func (ns *NodeServer) getMountedDevicePath(targetPath string) (string, error) {
+	if targetPath == "" {
+		return "", fmt.Errorf("mount path is required")
+	}
+
+	mountPoints, err := ns.mounter.List()
+	if err != nil {
+		return "", fmt.Errorf("failed to list mount points: %w", err)
+	}
+
+	for _, mountPoint := range mountPoints {
+		if mountPoint.Path == targetPath {
+			if mountPoint.Device == "" {
+				return "", fmt.Errorf("mount point %s does not expose a backing device", targetPath)
+			}
+			return mountPoint.Device, nil
+		}
+	}
+
+	return "", fmt.Errorf("mount point %s was not found", targetPath)
 }
 
 func (ns *NodeServer) checkMountPoint(srcPath string, targetPath string, volumeCapability *csi.VolumeCapability) (mountPointMatch, error) {

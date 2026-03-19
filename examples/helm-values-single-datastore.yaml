@@ -13,7 +13,7 @@ driver:
 storageClasses:
   - name: opennebula-local-single
     reclaimPolicy: Delete
-    allowVolumeExpansion: false
+    allowVolumeExpansion: true
     volumeBindingMode: Immediate
     mountOptions: []
     parameters:
