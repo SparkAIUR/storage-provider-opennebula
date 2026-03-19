@@ -34,6 +34,7 @@ LOCAL_TAG ?= latest
 LOCAL_REGISTRY ?= localhost:5005
 # Registry to use for building/pushing image targets
 REMOTE_REGISTRY ?= ghcr.io/sparkaiur
+DOCKERHUB_REGISTRY ?= docker.io/nudevco
 
 # CONTAINER_TOOL defines the container tool to be used for building images.
 # Be aware that the target commands are only tested with Docker which is
@@ -110,7 +111,12 @@ docker-release: $(addprefix docker-release-,$(IMAGE_NAMES))
 docker-release-%:
 	-$(CONTAINER_TOOL) buildx create --name $*-builder
 	$(CONTAINER_TOOL) buildx use $*-builder
-	$(CONTAINER_TOOL) buildx build --push --platform=$(_PLATFORMS) -t $(REMOTE_REGISTRY)/$*:$(CLOSEST_TAG) -t $(REMOTE_REGISTRY)/$*:latest -f Dockerfile .
+	$(CONTAINER_TOOL) buildx build --push --platform=$(_PLATFORMS) \
+		-t $(REMOTE_REGISTRY)/$*:$(CLOSEST_TAG) \
+		-t $(REMOTE_REGISTRY)/$*:latest \
+		-t $(DOCKERHUB_REGISTRY)/$*:$(CLOSEST_TAG) \
+		-t $(DOCKERHUB_REGISTRY)/$*:latest \
+		-f Dockerfile .
 	-$(CONTAINER_TOOL) buildx rm $*-builder
 
 # Helm
