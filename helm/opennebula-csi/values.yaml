@@ -26,6 +26,7 @@ driver:
   datastoreSelectionPolicy: "least-used"
   allowedDatastoreTypes:
     - "local"
+    - "ceph"
   extraArgs: []
   env: []
 

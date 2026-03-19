@@ -28,10 +28,13 @@ type Datastore struct {
 	ID        int
 	Name      string
 	Type      string
+	Backend   string
 	DSMad     string
 	TMMad     string
+	DiskType  string
 	FreeBytes int64
 	Enabled   bool
+	Ceph      *CephDatastoreAttributes
 }
 
 type VolumeCreateResult struct {
@@ -125,6 +128,15 @@ func ResolveDatastores(pool []datastoreSchema.Datastore, selection DatastoreSele
 			}
 		}
 
+		profile, err := GetDatastoreBackendProfile(normalized.Type)
+		if err != nil {
+			return nil, err
+		}
+		if err := profile.ValidateDatastore(candidate); err != nil {
+			return nil, err
+		}
+		normalized.Backend = profile.Type
+
 		if _, ok := seen[normalized.ID]; ok {
 			continue
 		}
@@ -209,11 +221,23 @@ func datastoreFromSchema(source datastoreSchema.Datastore) Datastore {
 		ID:        source.ID,
 		Name:      source.Name,
 		Type:      normalizeAllowedDatastoreType(inferDatastoreType(source)),
+		Backend:   normalizeAllowedDatastoreType(inferDatastoreType(source)),
 		DSMad:     strings.ToLower(strings.TrimSpace(source.DSMad)),
 		TMMad:     strings.ToLower(strings.TrimSpace(source.TMMad)),
+		DiskType:  normalizeDiskType(source),
 		FreeBytes: int64(source.FreeMB) * mib,
 		Enabled:   enabled,
+		Ceph:      datastoreCephAttributes(source),
 	}
+}
+
+func datastoreCephAttributes(source datastoreSchema.Datastore) *CephDatastoreAttributes {
+	if normalizeAllowedDatastoreType(inferDatastoreType(source)) != datastoreTypeCeph {
+		return nil
+	}
+
+	attrs := extractCephDatastoreAttributes(source)
+	return &attrs
 }
 
 func inferDatastoreType(source datastoreSchema.Datastore) string {

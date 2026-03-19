@@ -34,7 +34,7 @@ const (
 	//Default values
 	defaultOpenNebulaRPCEndpoint = "http://localhost:2633/RPC2"
 	defaultDatastorePolicy       = "least-used"
-	defaultAllowedDatastoreTypes = "local"
+	defaultAllowedDatastoreTypes = "local,ceph"
 )
 
 // CSIPluginConfig holds the configuration for the CSI plugin

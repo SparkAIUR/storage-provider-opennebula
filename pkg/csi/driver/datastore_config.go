@@ -85,7 +85,7 @@ func (d *Driver) getDefaultDatastorePolicy() string {
 func (d *Driver) getAllowedDatastoreTypes() []string {
 	values, ok := d.PluginConfig.GetStringSlice(config.AllowedDatastoreTypesVar)
 	if !ok {
-		return []string{"local"}
+		return []string{"local", "ceph"}
 	}
 
 	return values

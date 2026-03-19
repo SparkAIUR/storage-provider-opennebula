@@ -56,3 +56,11 @@ func TestFilterProvisioningParamsRemovesReservedKeys(t *testing.T) {
 		"cache":  "none",
 	}, filtered)
 }
+
+func TestGetAllowedDatastoreTypesUsesCephEnabledDefault(t *testing.T) {
+	pluginConfig := config.LoadConfiguration()
+
+	driver := &Driver{PluginConfig: pluginConfig}
+
+	assert.Equal(t, []string{"local", "ceph"}, driver.getAllowedDatastoreTypes())
+}
