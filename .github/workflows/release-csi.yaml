@@ -16,6 +16,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -43,7 +46,7 @@ jobs:
       - name: Re-index charts
         working-directory: ./gh-pages/charts/
         run: |
-          ../../bin/helm repo index ./ --url https://sparkaiur.github.io/storage-provider-opennebula/charts/
+          helm repo index ./ --url https://sparkaiur.github.io/storage-provider-opennebula/charts/
 
       - name: Push gh-pages
         working-directory: ./gh-pages/charts/
