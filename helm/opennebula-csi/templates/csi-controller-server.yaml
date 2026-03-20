@@ -149,6 +149,24 @@ spec:
           volumeMounts:
             - name: csi-socket-dir
               mountPath: /csi
+        {{- if .Values.snapshotter.enabled }}
+        - name: csi-snapshotter
+          image: {{ .Values.snapshotter.image | quote }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--v=5"
+            - "--csi-address=$(ADDRESS)"
+            - "--leader-election"
+            {{- with .Values.snapshotter.extraArgs }}
+{{ toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: csi-socket-dir
+              mountPath: /csi
+        {{- end }}
         - name: liveness-probe
           imagePullPolicy: IfNotPresent
           image: registry.k8s.io/sig-storage/livenessprobe:v2.16.0

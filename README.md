@@ -8,10 +8,13 @@ This fork is focused on Omni deployments on OpenNebula and removes the old requi
 
 - Provision PVCs on explicitly configured OpenNebula datastores.
 - Support global driver datastore defaults and per-StorageClass overrides.
-- Support `least-used` and `ordered` datastore selection policies.
+- Support `least-used`, `ordered`, and `autopilot` datastore selection policies.
 - Support `Filesystem` and `Block` volume modes.
 - Support `ReadWriteOnce`, `ReadOnlyMany`, and CephFS-backed `ReadWriteMany` filesystem volumes.
 - Support CSI volume expansion for attached volumes, including node-side filesystem growth.
+- Support `NodeGetVolumeStats`, driver-native Prometheus metrics, Kubernetes Events, and PV placement annotations.
+- Support preflight validation through the binary and an optional Helm Job.
+- Support CSI snapshots plus PVC-to-PVC clone for disk-backed OpenNebula volumes.
 - Support `local`, OpenNebula Ceph RBD, and SparkAI CephFS datastores.
 - Keep the internal selection/provider structure ready for future `nfs` support.
 
@@ -38,7 +41,7 @@ If both are present, the StorageClass wins.
 These parameters are reserved by the CSI driver:
 
 - `datastoreIDs`: CSV list of datastore identifiers, for example `100`, `100,101,102`, or `default`
-- `datastoreSelectionPolicy`: `least-used` or `ordered`
+- `datastoreSelectionPolicy`: `least-used`, `ordered`, or `autopilot`
 - `fsType`: filesystem hint for filesystem volumes
 
 All other StorageClass parameters are passed through to the existing disk/image handling logic. That allows tuning values such as `devPrefix`, `cache`, `driver`, and similar OpenNebula disk options.
@@ -46,15 +49,19 @@ All other StorageClass parameters are passed through to the existing disk/image 
 ### Driver environment variables
 
 - `ONE_CSI_DEFAULT_DATASTORES`: global CSV datastore list, for example `100,101`
-- `ONE_CSI_DATASTORE_SELECTION_POLICY`: `least-used` or `ordered`
+- `ONE_CSI_DATASTORE_SELECTION_POLICY`: `least-used`, `ordered`, or `autopilot`
 - `ONE_CSI_ALLOWED_DATASTORE_TYPES`: CSV list, default `local,ceph,cephfs`
+- `ONE_CSI_FEATURE_GATES`: CSV feature-gate map for alpha features
+- `ONE_CSI_METRICS_ENDPOINT`: driver-native metrics endpoint, default `:9810`
 
 ### Policy behavior
 
 - `least-used`: sort eligible datastores by free capacity descending, then try them in that order
 - `ordered`: use the configured order as-is
+- `autopilot`: score eligible datastores by free-space ratio, absolute free space, recent provisioning failures, and current in-flight selections
 
 If a candidate datastore does not have enough free capacity, the driver falls through to the next eligible datastore. If no configured datastore can satisfy the request, provisioning fails with a capacity error.
+When the driver falls back to a later datastore, it emits `DatastoreFallback` events and records the chosen placement on the resulting PV annotations.
 
 ## Datastore category support
 
@@ -205,9 +212,30 @@ Current behavior:
 - CephFS shared-filesystem volumes do not support expansion in `v0.4.0`.
 - Detached-volume expansion is not currently supported by the driver, because the OpenNebula API surface used by this fork only exposes a documented disk-resize path for attached VM disks.
 
+## Snapshots and clones
+
+Stable disk-path data-management features in `v0.4.0`:
+
+- CSI `CreateSnapshot`, `DeleteSnapshot`, and `ListSnapshots` for OpenNebula image-backed volumes
+- PVC-to-PVC clone through CSI `VolumeContentSource.volume`
+- the chart can deploy the external `csi-snapshotter` sidecar
+
+Current limitations:
+
+- restoring a new PVC from an OpenNebula image snapshot is not supported by the current backend path
+- CephFS snapshots and clones remain alpha-off and are not exposed as stable features in `v0.4.0`
+
+Example objects:
+
+- VolumeSnapshotClass: [examples/volumesnapshotclass.yaml](examples/volumesnapshotclass.yaml)
+- VolumeSnapshot: [examples/volumesnapshot.yaml](examples/volumesnapshot.yaml)
+- PVC clone: [examples/pvc-clone.yaml](examples/pvc-clone.yaml)
+
 ## Metrics and Prometheus
 
-The Helm chart can now expose Prometheus-scrapable CSI sidecar metrics for:
+The Helm chart can now expose Prometheus-scrapable CSI sidecar metrics and driver-native metrics.
+
+Sidecar metrics are exposed for:
 
 - `csi-provisioner`
 - `csi-attacher`
@@ -215,6 +243,16 @@ The Helm chart can now expose Prometheus-scrapable CSI sidecar metrics for:
 - `csi-node-driver-registrar`
 
 These metrics cover CSI controller and node operations such as provisioning, attaching, resizing, request latency, and sidecar work-queue behavior.
+
+Driver-native metrics add low-cardinality counters and gauges for:
+
+- operation totals and latency
+- datastore selection outcomes
+- attach validation outcomes
+- CephFS subvolume operations
+- snapshot operations
+- preflight checks
+- datastore free and total bytes
 
 Important distinction:
 
@@ -240,6 +278,9 @@ Relevant Helm values:
 metrics:
   enabled: true
   path: /metrics
+  driver:
+    enabled: true
+    port: 9810
   controller:
     service:
       annotations: {}
@@ -275,6 +316,47 @@ metrics:
     serviceMonitor:
       enabled: true
 ```
+
+Example values enabling driver metrics and ServiceMonitors:
+
+- [examples/driver-metrics-servicemonitor-values.yaml](examples/driver-metrics-servicemonitor-values.yaml)
+
+## Preflight validation
+
+The binary now supports a preflight mode that validates OpenNebula connectivity, datastore configuration, Ceph tooling, monitor reachability, referenced Kubernetes secrets, and optional CRD dependencies.
+
+CLI example:
+
+```bash
+./opennebula-csi \
+  --mode=preflight \
+  --output=text \
+  --preflight-datastores=111,300 \
+  --preflight-node-stage-secrets=kube-system/cephfs-node-stage \
+  --preflight-provisioner-secrets=kube-system/cephfs-provisioner \
+  --require-snapshot-crds \
+  --require-servicemonitor-crds
+```
+
+Helm can also run preflight as an optional Job, including as a release-blocking hook:
+
+- [examples/helm-values-preflight.yaml](examples/helm-values-preflight.yaml)
+
+## Feature gates
+
+Stable features are enabled by default. Higher-risk features remain behind feature gates.
+
+Current gates:
+
+- `compatibilityAwareSelection=true`
+- `detachedDiskExpansion=false`
+- `cephfsExpansion=false`
+- `cephfsSnapshots=false`
+- `cephfsClones=false`
+- `cephfsSelfHealing=false`
+- `topologyAccessibility=false`
+
+The chart renders these into `ONE_CSI_FEATURE_GATES`. `cephfsSelfHealing` now controls stale CephFS remount attempts after a stale mount is detected during node stage.
 
 ## Helm installation
 
@@ -343,6 +425,10 @@ The chart no longer renders a fixed set of StorageClasses. Instead it accepts a 
 - `node.extraEnv`
 - `imagePullSecrets`
 - `storageClasses[]`
+- `featureGates`
+- `metrics.driver`
+- `preflight`
+- `snapshotter`
 
 ### StorageClass schema
 
@@ -367,8 +453,14 @@ Each item under `storageClasses` supports:
 - Ceph RBD with SSH System Datastore mode: [examples/helm-values-ceph-ssh-mode.yaml](examples/helm-values-ceph-ssh-mode.yaml)
 - CephFS static RWX example: [examples/helm-values-cephfs-static.yaml](examples/helm-values-cephfs-static.yaml)
 - CephFS dynamic RWX example: [examples/helm-values-cephfs-dynamic.yaml](examples/helm-values-cephfs-dynamic.yaml)
+- Snapshotter/clone example values: [examples/helm-values-snapshotter.yaml](examples/helm-values-snapshotter.yaml)
+- Preflight job example values: [examples/helm-values-preflight.yaml](examples/helm-values-preflight.yaml)
 - CephFS node-stage secret example: [examples/cephfs-node-stage-secret.yaml](examples/cephfs-node-stage-secret.yaml)
 - CephFS provisioner secret example: [examples/cephfs-provisioner-secret.yaml](examples/cephfs-provisioner-secret.yaml)
+- Driver metrics + ServiceMonitor example values: [examples/driver-metrics-servicemonitor-values.yaml](examples/driver-metrics-servicemonitor-values.yaml)
+- VolumeSnapshotClass example: [examples/volumesnapshotclass.yaml](examples/volumesnapshotclass.yaml)
+- VolumeSnapshot example: [examples/volumesnapshot.yaml](examples/volumesnapshot.yaml)
+- PVC clone example: [examples/pvc-clone.yaml](examples/pvc-clone.yaml)
 - CephFS RWX demo workload: [examples/demo-busybox-cephfs-rwx.yaml](examples/demo-busybox-cephfs-rwx.yaml)
 - Omni-oriented Ceph example: [examples/omni-values-ceph.yaml](examples/omni-values-ceph.yaml)
 - Staging-lab Omni Ceph example: [examples/omni-values-staging-ceph.yaml](examples/omni-values-staging-ceph.yaml)

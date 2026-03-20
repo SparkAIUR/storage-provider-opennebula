@@ -37,6 +37,7 @@ type OpenNebulaProvider struct {
 
 type OpenNebulaVolumeProvider interface {
 	CreateVolume(ctx context.Context, name string, size int64, owner string, immutable bool, fsType string, params map[string]string, selection DatastoreSelectionConfig) (*VolumeCreateResult, error)
+	CloneVolume(ctx context.Context, name string, sourceVolume string, selection DatastoreSelectionConfig) (*VolumeCreateResult, error)
 	DeleteVolume(ctx context.Context, volume string) error
 	ExpandVolume(ctx context.Context, volume string, size int64) (int64, error)
 	AttachVolume(ctx context.Context, volume string, node string, immutable bool, params map[string]string) error
@@ -44,6 +45,9 @@ type OpenNebulaVolumeProvider interface {
 	ListVolumes(ctx context.Context, owner string, maxEntries int32, startingToken string) ([]string, error)
 	GetCapacity(ctx context.Context, selection DatastoreSelectionConfig) (int64, error)
 	VolumeExists(ctx context.Context, volume string) (int, int, error)
+	CreateSnapshot(ctx context.Context, sourceVolume string, snapshotName string) (*VolumeSnapshot, error)
+	DeleteSnapshot(ctx context.Context, snapshotID string) error
+	ListSnapshots(ctx context.Context, snapshotID string, sourceVolumeID string, maxEntries int32, startingToken string) ([]VolumeSnapshot, string, error)
 	NodeExists(ctx context.Context, node string) (int, error)
 	GetVolumeInNode(ctx context.Context, volumeID int, nodeID int) (string, error)
 	VolumeReadyWithTimeout(volumeID int) (bool, error)

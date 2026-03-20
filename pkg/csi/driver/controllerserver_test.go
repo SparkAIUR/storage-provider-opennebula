@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
@@ -260,6 +261,86 @@ func TestCreateVolumeRejectsReadWriteManyBlockVolume(t *testing.T) {
 	assert.Contains(t, err.Error(), "filesystem volume capability")
 	mockProvider.AssertExpectations(t)
 	sharedProvider.AssertExpectations(t)
+}
+
+func TestCreateVolumeClonesFromSourceVolume(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	sharedProvider := &MockSharedFilesystemProviderTestify{}
+	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local")
+
+	mockProvider.On("CloneVolume", mock.Anything, "clone-volume", "source-volume", opennebula.DatastoreSelectionConfig{
+		Identifiers:  []string{"100"},
+		Policy:       opennebula.DatastoreSelectionPolicyLeastUsed,
+		AllowedTypes: []string{"local"},
+	}).Return(&opennebula.VolumeCreateResult{
+		Datastore:     opennebula.Datastore{ID: 100, Name: "fast-local", Backend: "local"},
+		CapacityBytes: int64(1024 * 1024 * 1024),
+	}, nil)
+
+	resp, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name: "clone-volume",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: int64(1024 * 1024 * 1024),
+		},
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessType: &csi.VolumeCapability_Mount{
+					Mount: &csi.VolumeCapability_MountVolume{FsType: "xfs"},
+				},
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+		},
+		Parameters: map[string]string{
+			storageClassParamDatastoreIDs: "100",
+		},
+		VolumeContentSource: &csi.VolumeContentSource{
+			Type: &csi.VolumeContentSource_Volume{
+				Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "source-volume"},
+			},
+		},
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, "clone-volume", resp.GetVolume().GetVolumeId())
+	assert.Equal(t, int64(1024*1024*1024), resp.GetVolume().GetCapacityBytes())
+	mockProvider.AssertExpectations(t)
+}
+
+func TestCreateVolumeRejectsSnapshotRestoreForDiskPath(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	sharedProvider := &MockSharedFilesystemProviderTestify{}
+	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local")
+
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name: "restore-volume",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: int64(1024 * 1024 * 1024),
+		},
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessType: &csi.VolumeCapability_Mount{
+					Mount: &csi.VolumeCapability_MountVolume{FsType: "xfs"},
+				},
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+		},
+		Parameters: map[string]string{
+			storageClassParamDatastoreIDs: "100",
+		},
+		VolumeContentSource: &csi.VolumeContentSource{
+			Type: &csi.VolumeContentSource_Snapshot{
+				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "image-snapshot:10:1"},
+			},
+		},
+	})
+
+	assert.Error(t, err)
+	assert.Equal(t, codes.Unimplemented, status.Code(err))
+	assert.Contains(t, err.Error(), "snapshot")
 }
 
 func TestDeleteVolume(t *testing.T) {
@@ -670,6 +751,72 @@ func TestControllerExpandVolume(t *testing.T) {
 	}
 }
 
+func TestCreateSnapshot(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	cs := getTestControllerServer(mockProvider)
+	now := time.Now().UTC()
+
+	mockProvider.On("CreateSnapshot", mock.Anything, "test-volume", "snap-1").Return(&opennebula.VolumeSnapshot{
+		SnapshotID:     "image-snapshot:10:1",
+		SourceVolumeID: "test-volume",
+		CreationTime:   now,
+		SizeBytes:      int64(1024 * 1024 * 1024),
+		ReadyToUse:     true,
+	}, nil)
+
+	resp, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{
+		Name:           "snap-1",
+		SourceVolumeId: "test-volume",
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, "image-snapshot:10:1", resp.GetSnapshot().GetSnapshotId())
+	assert.Equal(t, "test-volume", resp.GetSnapshot().GetSourceVolumeId())
+	mockProvider.AssertExpectations(t)
+}
+
+func TestDeleteSnapshot(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	cs := getTestControllerServer(mockProvider)
+
+	mockProvider.On("DeleteSnapshot", mock.Anything, "image-snapshot:10:1").Return(nil)
+
+	resp, err := cs.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{
+		SnapshotId: "image-snapshot:10:1",
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, &csi.DeleteSnapshotResponse{}, resp)
+	mockProvider.AssertExpectations(t)
+}
+
+func TestListSnapshots(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	cs := getTestControllerServer(mockProvider)
+	now := time.Now().UTC()
+
+	mockProvider.On("ListSnapshots", mock.Anything, "", "test-volume", int32(10), "").Return([]opennebula.VolumeSnapshot{
+		{
+			SnapshotID:     "image-snapshot:10:1",
+			SourceVolumeID: "test-volume",
+			CreationTime:   now,
+			SizeBytes:      int64(1024 * 1024 * 1024),
+			ReadyToUse:     true,
+		},
+	}, "", nil)
+
+	resp, err := cs.ListSnapshots(context.Background(), &csi.ListSnapshotsRequest{
+		SourceVolumeId: "test-volume",
+		MaxEntries:     10,
+	})
+
+	assert.NoError(t, err)
+	if assert.Len(t, resp.GetEntries(), 1) {
+		assert.Equal(t, "image-snapshot:10:1", resp.GetEntries()[0].GetSnapshot().GetSnapshotId())
+	}
+	mockProvider.AssertExpectations(t)
+}
+
 func TestControllerUnpublishVolume(t *testing.T) {
 	tcs := []struct {
 		name                             string
@@ -738,6 +885,14 @@ func (m *MockOpenNebulaVolumeProviderTestify) CreateVolume(ctx context.Context, 
 	return nil, args.Error(1)
 }
 
+func (m *MockOpenNebulaVolumeProviderTestify) CloneVolume(ctx context.Context, name string, sourceVolume string, selection opennebula.DatastoreSelectionConfig) (*opennebula.VolumeCreateResult, error) {
+	args := m.Called(ctx, name, sourceVolume, selection)
+	if result := args.Get(0); result != nil {
+		return result.(*opennebula.VolumeCreateResult), args.Error(1)
+	}
+	return nil, args.Error(1)
+}
+
 func (m *MockOpenNebulaVolumeProviderTestify) DeleteVolume(ctx context.Context, volume string) error {
 	args := m.Called(ctx, volume)
 	return args.Error(0)
@@ -771,6 +926,24 @@ func (m *MockOpenNebulaVolumeProviderTestify) GetCapacity(ctx context.Context, s
 func (m *MockOpenNebulaVolumeProviderTestify) VolumeExists(ctx context.Context, volume string) (int, int, error) {
 	args := m.Called(ctx, volume)
 	return args.Get(0).(int), args.Get(1).(int), args.Error(2)
+}
+
+func (m *MockOpenNebulaVolumeProviderTestify) CreateSnapshot(ctx context.Context, sourceVolume string, snapshotName string) (*opennebula.VolumeSnapshot, error) {
+	args := m.Called(ctx, sourceVolume, snapshotName)
+	if result := args.Get(0); result != nil {
+		return result.(*opennebula.VolumeSnapshot), args.Error(1)
+	}
+	return nil, args.Error(1)
+}
+
+func (m *MockOpenNebulaVolumeProviderTestify) DeleteSnapshot(ctx context.Context, snapshotID string) error {
+	args := m.Called(ctx, snapshotID)
+	return args.Error(0)
+}
+
+func (m *MockOpenNebulaVolumeProviderTestify) ListSnapshots(ctx context.Context, snapshotID string, sourceVolumeID string, maxEntries int32, startingToken string) ([]opennebula.VolumeSnapshot, string, error) {
+	args := m.Called(ctx, snapshotID, sourceVolumeID, maxEntries, startingToken)
+	return args.Get(0).([]opennebula.VolumeSnapshot), args.String(1), args.Error(2)
 }
 
 func (m *MockOpenNebulaVolumeProviderTestify) NodeExists(ctx context.Context, node string) (int, error) {

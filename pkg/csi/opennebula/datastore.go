@@ -43,6 +43,7 @@ type Datastore struct {
 
 type VolumeCreateResult struct {
 	Datastore             Datastore
+	CapacityBytes         int64
 	FallbackUsed          bool
 	AttemptedDatastoreIDs []int
 }

@@ -55,7 +55,20 @@ func (ns *NodeServer) handleSharedFilesystemStage(req *csi.NodeStageVolumeReques
 
 	notMountPoint, err := ns.mounter.Interface.IsLikelyNotMountPoint(stagingTargetPath)
 	if err == nil && !notMountPoint {
-		return &csi.NodeStageVolumeResponse{}, nil
+		if staleErr := detectStaleSharedFilesystemMount(stagingTargetPath); staleErr == nil {
+			return &csi.NodeStageVolumeResponse{}, nil
+		} else {
+			ns.Driver.metrics.RecordCephFSSubvolume("stale_mount_detected", "failure")
+			klog.Warningf("detected stale CephFS mount at %s: %v", stagingTargetPath, staleErr)
+			if !ns.Driver.featureGates.CephFSSelfHealing {
+				return nil, status.Errorf(codes.FailedPrecondition, "stale CephFS mount detected at %s: %v", stagingTargetPath, staleErr)
+			}
+			if err := mountCleanup(stagingTargetPath, ns); err != nil {
+				return nil, err
+			}
+			_ = os.RemoveAll(sharedCephFSKeyringDir(stagingTargetPath))
+			ns.Driver.metrics.RecordCephFSSubvolume("self_heal_remount", "attempted")
+		}
 	}
 
 	if err := os.MkdirAll(stagingTargetPath, 0775); err != nil {
@@ -108,11 +121,13 @@ func (ns *NodeServer) handleSharedFilesystemStage(req *csi.NodeStageVolumeReques
 
 	output, err := ns.mounter.Exec.Command("ceph-fuse", args...).CombinedOutput()
 	if err != nil {
+		ns.Driver.metrics.RecordCephFSSubvolume("mount", "failure")
 		_ = os.RemoveAll(keyringDir)
 		klog.V(0).ErrorS(err, "Failed to mount CephFS volume",
 			"method", "handleSharedFilesystemStage", "stagingTargetPath", stagingTargetPath, "output", string(output))
 		return nil, status.Errorf(codes.Internal, "failed to mount CephFS volume: %s", strings.TrimSpace(string(output)))
 	}
+	ns.Driver.metrics.RecordCephFSSubvolume("mount", "success")
 
 	return &csi.NodeStageVolumeResponse{}, nil
 }
@@ -200,4 +215,15 @@ func uniqueStrings(values []string) []string {
 
 func sharedCephFSKeyringDir(stagingTargetPath string) string {
 	return stagingTargetPath + sharedCephFSTempDirSuffix
+}
+
+func detectStaleSharedFilesystemMount(stagingTargetPath string) error {
+	entries, err := os.ReadDir(stagingTargetPath)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	return nil
 }

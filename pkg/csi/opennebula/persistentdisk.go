@@ -123,6 +123,7 @@ func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name st
 
 		return &VolumeCreateResult{
 			Datastore:             datastore,
+			CapacityBytes:         size,
 			FallbackUsed:          len(attemptedDatastores) > 1,
 			AttemptedDatastoreIDs: append([]int(nil), attemptedDatastores...),
 		}, nil
@@ -155,6 +156,194 @@ func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume 
 		return fmt.Errorf("failed to wait for volume deletion: %w", err)
 	}
 	return nil
+}
+
+func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name string, sourceVolume string, selection DatastoreSelectionConfig) (*VolumeCreateResult, error) {
+	if strings.TrimSpace(name) == "" {
+		return nil, fmt.Errorf("clone name cannot be empty")
+	}
+	if strings.TrimSpace(sourceVolume) == "" {
+		return nil, fmt.Errorf("source volume cannot be empty")
+	}
+
+	sourceVolumeID, _, err := p.VolumeExists(ctx, sourceVolume)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve source volume %q: %w", sourceVolume, err)
+	}
+	if sourceVolumeID == -1 {
+		return nil, fmt.Errorf("source volume %q was not found", sourceVolume)
+	}
+
+	sourceImage, err := p.ctrl.Image(sourceVolumeID).InfoContext(ctx, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect source volume %q: %w", sourceVolume, err)
+	}
+
+	candidates, err := p.resolveProvisioningDatastores(ctx, selection)
+	if err != nil {
+		return nil, err
+	}
+
+	sourceSizeBytes := int64(sourceImage.Size * sizeConversion)
+	attemptedDatastores := make([]int, 0, len(candidates))
+	insufficientCapacity := make([]string, 0)
+	for _, datastore := range candidates {
+		attemptedDatastores = append(attemptedDatastores, datastore.ID)
+		if datastore.FreeBytes < sourceSizeBytes {
+			recordDatastoreProvisioningResult(datastore.ID, false)
+			insufficientCapacity = append(insufficientCapacity, strconv.Itoa(datastore.ID))
+			continue
+		}
+
+		finishAttempt := beginDatastoreAttempt(datastore.ID)
+		cloneID, err := p.ctrl.Image(sourceVolumeID).CloneContext(ctx, name, datastore.ID)
+		finishAttempt()
+		if err != nil {
+			recordDatastoreProvisioningResult(datastore.ID, false)
+			if isInsufficientCapacityError(err) {
+				insufficientCapacity = append(insufficientCapacity, strconv.Itoa(datastore.ID))
+				continue
+			}
+			return nil, fmt.Errorf("failed to clone volume %q into datastore %d: %w", sourceVolume, datastore.ID, err)
+		}
+		recordDatastoreProvisioningResult(datastore.ID, true)
+
+		if err := p.waitForResourceStatus(cloneID, timeout, p.volumeReady); err != nil {
+			return nil, fmt.Errorf("failed waiting for clone %d to become ready: %w", cloneID, err)
+		}
+
+		return &VolumeCreateResult{
+			Datastore:             datastore,
+			CapacityBytes:         sourceSizeBytes,
+			FallbackUsed:          len(attemptedDatastores) > 1,
+			AttemptedDatastoreIDs: append([]int(nil), attemptedDatastores...),
+		}, nil
+	}
+
+	return nil, &datastoreCapacityError{
+		message: fmt.Sprintf("none of the configured datastores had enough free capacity to clone %q; attempted datastores: %s", sourceVolume, strings.Join(insufficientCapacity, ",")),
+	}
+}
+
+func (p *PersistentDiskVolumeProvider) CreateSnapshot(ctx context.Context, sourceVolume string, snapshotName string) (*VolumeSnapshot, error) {
+	if strings.TrimSpace(sourceVolume) == "" {
+		return nil, fmt.Errorf("source volume cannot be empty")
+	}
+
+	sourceVolumeID, sourceSize, err := p.VolumeExists(ctx, sourceVolume)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve source volume %q: %w", sourceVolume, err)
+	}
+	if sourceVolumeID == -1 {
+		return nil, fmt.Errorf("source volume %q was not found", sourceVolume)
+	}
+
+	if strings.TrimSpace(snapshotName) == "" {
+		snapshotName = fmt.Sprintf("%s-snapshot", sourceVolume)
+	}
+
+	response, err := p.ctrl.Client.CallContext(ctx, "one.image.snapshotcreate", sourceVolumeID, snapshotName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create snapshot for volume %q: %w", sourceVolume, err)
+	}
+
+	snapshotID := response.BodyInt()
+	imageInfo, err := p.ctrl.Image(sourceVolumeID).InfoContext(ctx, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect snapshot metadata for volume %q: %w", sourceVolume, err)
+	}
+
+	snapshot, err := imageSnapshotByID(imageInfo, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &VolumeSnapshot{
+		SnapshotID:     EncodeVolumeSnapshotID(sourceVolumeID, snapshotID),
+		SourceVolumeID: sourceVolume,
+		CreationTime:   time.Unix(int64(snapshot.Date), 0).UTC(),
+		SizeBytes:      int64(sourceSize),
+		ReadyToUse:     true,
+	}, nil
+}
+
+func (p *PersistentDiskVolumeProvider) DeleteSnapshot(ctx context.Context, snapshotID string) error {
+	imageID, imageSnapshotID, err := DecodeVolumeSnapshotID(snapshotID)
+	if err != nil {
+		return err
+	}
+
+	err = p.ctrl.Image(imageID).Snapshot(imageSnapshotID).DeleteContext(ctx)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "not found") {
+		return nil
+	}
+	return err
+}
+
+func (p *PersistentDiskVolumeProvider) ListSnapshots(ctx context.Context, snapshotID string, sourceVolumeID string, maxEntries int32, startingToken string) ([]VolumeSnapshot, string, error) {
+	snapshots := make([]VolumeSnapshot, 0)
+
+	switch {
+	case strings.TrimSpace(snapshotID) != "":
+		imageID, imageSnapshotID, err := DecodeVolumeSnapshotID(snapshotID)
+		if err != nil {
+			return nil, "", err
+		}
+
+		imageInfo, err := p.ctrl.Image(imageID).InfoContext(ctx, true)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to inspect image %d while listing snapshot %q: %w", imageID, snapshotID, err)
+		}
+		snapshot, err := imageSnapshotByID(imageInfo, imageSnapshotID)
+		if err != nil {
+			return nil, "", err
+		}
+		snapshots = append(snapshots, convertImageSnapshot(imageInfo, snapshot))
+	case strings.TrimSpace(sourceVolumeID) != "":
+		imageID, _, err := p.VolumeExists(ctx, sourceVolumeID)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to resolve source volume %q: %w", sourceVolumeID, err)
+		}
+		if imageID == -1 {
+			return nil, "", fmt.Errorf("source volume %q was not found", sourceVolumeID)
+		}
+
+		imageInfo, err := p.ctrl.Image(imageID).InfoContext(ctx, true)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to inspect source volume %q: %w", sourceVolumeID, err)
+		}
+		snapshots = append(snapshots, convertImageSnapshots(imageInfo)...)
+	default:
+		pool, err := p.ctrl.Images().InfoContext(ctx)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to list images while enumerating snapshots: %w", err)
+		}
+		for _, imageInfo := range pool.Images {
+			imageCopy := imageInfo
+			snapshots = append(snapshots, convertImageSnapshots(&imageCopy)...)
+		}
+	}
+
+	start := 0
+	if strings.TrimSpace(startingToken) != "" {
+		value, err := strconv.Atoi(startingToken)
+		if err != nil || value < 0 {
+			return nil, "", fmt.Errorf("invalid starting token %q", startingToken)
+		}
+		start = value
+	}
+	if start > len(snapshots) {
+		return nil, "", fmt.Errorf("starting token %q is out of range", startingToken)
+	}
+
+	end := len(snapshots)
+	nextToken := ""
+	if maxEntries > 0 && start+int(maxEntries) < len(snapshots) {
+		end = start + int(maxEntries)
+		nextToken = strconv.Itoa(end)
+	}
+
+	return append([]VolumeSnapshot(nil), snapshots[start:end]...), nextToken, nil
 }
 
 func (p *PersistentDiskVolumeProvider) ExpandVolume(ctx context.Context, volume string, size int64) (int64, error) {
@@ -721,4 +910,32 @@ func latestHistoryDatastoreID(vmInfo *vm.VM) (int, error) {
 	}
 
 	return latest.DSID, nil
+}
+
+func imageSnapshotByID(imageInfo *img.Image, snapshotID int) (shared.Snapshot, error) {
+	for _, snapshot := range imageInfo.Snapshots.Snapshots {
+		if snapshot.ID == snapshotID {
+			return snapshot, nil
+		}
+	}
+
+	return shared.Snapshot{}, fmt.Errorf("snapshot %d was not found in image %d", snapshotID, imageInfo.ID)
+}
+
+func convertImageSnapshots(imageInfo *img.Image) []VolumeSnapshot {
+	converted := make([]VolumeSnapshot, 0, len(imageInfo.Snapshots.Snapshots))
+	for _, snapshot := range imageInfo.Snapshots.Snapshots {
+		converted = append(converted, convertImageSnapshot(imageInfo, snapshot))
+	}
+	return converted
+}
+
+func convertImageSnapshot(imageInfo *img.Image, snapshot shared.Snapshot) VolumeSnapshot {
+	return VolumeSnapshot{
+		SnapshotID:     EncodeVolumeSnapshotID(imageInfo.ID, snapshot.ID),
+		SourceVolumeID: imageInfo.Name,
+		CreationTime:   time.Unix(int64(snapshot.Date), 0).UTC(),
+		SizeBytes:      int64(imageInfo.Size * sizeConversion),
+		ReadyToUse:     true,
+	}
 }

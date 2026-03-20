@@ -29,6 +29,7 @@ import (
 	"github.com/kubernetes-csi/csi-lib-utils/protosanitizer"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/klog/v2"
 )
 
@@ -39,6 +40,7 @@ var (
 		csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
 		csi.ControllerServiceCapability_RPC_GET_CAPACITY,
 		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
+		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
 	}
 
 	supportedAccessModes = []csi.VolumeCapability_AccessMode_Mode{
@@ -124,10 +126,15 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	params := filterProvisioningParams(rawParams)
 	fsType := getRequestedFSType(rawParams, volumeCapabilities[0])
 	immutableVolume := accessMode.Mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
+	contentSource := req.GetVolumeContentSource()
 
 	response.Volume.VolumeContext = params
 
 	if volumeAccessModel == opennebula.VolumeAccessModelSharedFS {
+		if contentSource != nil {
+			s.driver.metrics.RecordOperation("create_volume", "cephfs", "unimplemented", time.Since(started))
+			return nil, status.Error(codes.Unimplemented, "shared filesystem volumes do not yet support cloning or snapshot restore")
+		}
 		if s.sharedFilesystemProvider == nil {
 			s.driver.metrics.RecordOperation("create_volume", "cephfs", "failed_precondition", time.Since(started))
 			return nil, status.Error(codes.FailedPrecondition, "shared filesystem provider is not configured")
@@ -185,6 +192,52 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	}
 	backend = "disk"
 
+	if contentSource != nil {
+		switch source := contentSource.Type.(type) {
+		case *csi.VolumeContentSource_Volume:
+			result, err := s.volumeProvider.CloneVolume(ctx, name, source.Volume.GetVolumeId(), selection)
+			if err != nil {
+				switch {
+				case opennebula.IsDatastoreConfigError(err):
+					s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
+					return nil, status.Error(codes.InvalidArgument, err.Error())
+				case opennebula.IsDatastoreCapacityError(err):
+					s.driver.metrics.RecordOperation("create_volume", backend, "resource_exhausted", time.Since(started))
+					return nil, status.Error(codes.ResourceExhausted, err.Error())
+				}
+				s.driver.metrics.RecordOperation("create_volume", backend, "internal", time.Since(started))
+				return nil, status.Error(codes.Internal, "failed to clone volume")
+			}
+
+			if result.CapacityBytes > 0 {
+				response.Volume.CapacityBytes = result.CapacityBytes
+			}
+			s.driver.metrics.RecordOperation("create_volume", result.Datastore.Backend, "success", time.Since(started))
+			s.recordPVCEventFromParams(ctx, rawParams, eventReasonCloneCreated, fmt.Sprintf("cloned source volume %s into datastore %d", source.Volume.GetVolumeId(), result.Datastore.ID))
+			if result.FallbackUsed {
+				s.recordPVCEventFromParams(ctx, rawParams, eventReasonDatastoreFallback, fmt.Sprintf("fallback selected datastore %d after attempts %v", result.Datastore.ID, result.AttemptedDatastoreIDs))
+			}
+			s.recordPVCEventFromParams(ctx, rawParams, eventReasonDatastoreSelected, fmt.Sprintf("selected %s datastore %d (%s) with policy %s", result.Datastore.Backend, result.Datastore.ID, result.Datastore.Name, selection.Policy))
+			s.driver.metrics.RecordDatastoreSelection(string(selection.Policy), result.Datastore.Backend, result.Datastore.ID, "selected")
+			s.driver.metrics.SetDatastoreCapacity(result.Datastore.Backend, result.Datastore.ID, result.Datastore.FreeBytes, result.Datastore.TotalBytes)
+			s.annotatePlacementFromParams(ctx, rawParams, PlacementReport{
+				Backend:                     result.Datastore.Backend,
+				DatastoreID:                 result.Datastore.ID,
+				DatastoreName:               result.Datastore.Name,
+				SelectionPolicy:             string(selection.Policy),
+				FallbackUsed:                result.FallbackUsed,
+				CompatibilityAwareSelection: s.driver.featureGates.CompatibilityAwareSelection,
+			})
+			return response, nil
+		case *csi.VolumeContentSource_Snapshot:
+			s.driver.metrics.RecordOperation("create_volume", backend, "unimplemented", time.Since(started))
+			return nil, status.Error(codes.Unimplemented, "restoring a volume from an OpenNebula image snapshot is not supported by the current backend")
+		default:
+			s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
+			return nil, status.Error(codes.InvalidArgument, "unsupported volume content source")
+		}
+	}
+
 	volumeID, volumeSize, _ := s.volumeProvider.VolumeExists(ctx, name)
 	if volumeID != -1 {
 		if int64(volumeSize) == requiredBytes {
@@ -220,6 +273,9 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		return nil, status.Error(codes.Internal, "failed to create volume")
 	}
 	s.driver.metrics.RecordOperation("create_volume", result.Datastore.Backend, "success", time.Since(started))
+	if result.CapacityBytes > 0 {
+		response.Volume.CapacityBytes = result.CapacityBytes
+	}
 	s.driver.metrics.RecordDatastoreSelection(string(selection.Policy), result.Datastore.Backend, result.Datastore.ID, "selected")
 	s.driver.metrics.SetDatastoreCapacity(result.Datastore.Backend, result.Datastore.ID, result.Datastore.FreeBytes, result.Datastore.TotalBytes)
 	if result.FallbackUsed {
@@ -292,6 +348,89 @@ func (s *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 	s.driver.metrics.RecordOperation("delete_volume", "disk", "success", time.Since(started))
 	klog.V(1).InfoS("Volume deleted successfully", "method", "DeleteVolume", "volumeID", req.VolumeId)
 	return &csi.DeleteVolumeResponse{}, nil
+}
+
+func (s *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
+	started := time.Now()
+	klog.V(1).InfoS("CreateSnapshot called", "req", protosanitizer.StripSecrets(req))
+
+	if strings.TrimSpace(req.GetName()) == "" {
+		s.driver.metrics.RecordSnapshot("disk", "create", "invalid_argument")
+		return nil, status.Error(codes.InvalidArgument, "snapshot name is required")
+	}
+	if strings.TrimSpace(req.GetSourceVolumeId()) == "" {
+		s.driver.metrics.RecordSnapshot("disk", "create", "invalid_argument")
+		return nil, status.Error(codes.InvalidArgument, "source volume ID is required")
+	}
+	if opennebula.IsSharedFilesystemVolumeID(req.GetSourceVolumeId()) {
+		s.driver.metrics.RecordSnapshot("cephfs", "create", "unimplemented")
+		return nil, status.Error(codes.Unimplemented, "CephFS snapshots are disabled in v0.4.0")
+	}
+
+	snapshot, err := s.volumeProvider.CreateSnapshot(ctx, req.GetSourceVolumeId(), req.GetName())
+	if err != nil {
+		s.driver.metrics.RecordSnapshot("disk", "create", "internal")
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	s.driver.metrics.RecordSnapshot("disk", "create", "success")
+	s.driver.metrics.RecordOperation("create_snapshot", "disk", "success", time.Since(started))
+
+	return &csi.CreateSnapshotResponse{
+		Snapshot: &csi.Snapshot{
+			SizeBytes:      snapshot.SizeBytes,
+			SnapshotId:     snapshot.SnapshotID,
+			SourceVolumeId: snapshot.SourceVolumeID,
+			CreationTime:   timestamppb.New(snapshot.CreationTime),
+			ReadyToUse:     snapshot.ReadyToUse,
+		},
+	}, nil
+}
+
+func (s *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
+	started := time.Now()
+	klog.V(1).InfoS("DeleteSnapshot called", "req", protosanitizer.StripSecrets(req))
+
+	if strings.TrimSpace(req.GetSnapshotId()) == "" {
+		s.driver.metrics.RecordSnapshot("disk", "delete", "invalid_argument")
+		return nil, status.Error(codes.InvalidArgument, "snapshot ID is required")
+	}
+
+	if err := s.volumeProvider.DeleteSnapshot(ctx, req.GetSnapshotId()); err != nil {
+		s.driver.metrics.RecordSnapshot("disk", "delete", "internal")
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	s.driver.metrics.RecordSnapshot("disk", "delete", "success")
+	s.driver.metrics.RecordOperation("delete_snapshot", "disk", "success", time.Since(started))
+	return &csi.DeleteSnapshotResponse{}, nil
+}
+
+func (s *ControllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
+	klog.V(1).InfoS("ListSnapshots called", "req", protosanitizer.StripSecrets(req))
+
+	snapshots, nextToken, err := s.volumeProvider.ListSnapshots(ctx, req.GetSnapshotId(), req.GetSourceVolumeId(), req.GetMaxEntries(), req.GetStartingToken())
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	entries := make([]*csi.ListSnapshotsResponse_Entry, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		entries = append(entries, &csi.ListSnapshotsResponse_Entry{
+			Snapshot: &csi.Snapshot{
+				SizeBytes:      snapshot.SizeBytes,
+				SnapshotId:     snapshot.SnapshotID,
+				SourceVolumeId: snapshot.SourceVolumeID,
+				CreationTime:   timestamppb.New(snapshot.CreationTime),
+				ReadyToUse:     snapshot.ReadyToUse,
+			},
+		})
+	}
+
+	return &csi.ListSnapshotsResponse{
+		Entries:   entries,
+		NextToken: nextToken,
+	}, nil
 }
 
 // TODO: Process VolumeCapability, readonly
