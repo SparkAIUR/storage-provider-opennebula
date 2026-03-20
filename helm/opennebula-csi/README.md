@@ -27,7 +27,8 @@ Chart repo:
 - local, Ceph RBD, and SparkAI CephFS datastore backends
 - `ReadWriteOnce`, `ReadOnlyMany`, and CephFS-backed `ReadWriteMany`
 - CSI resize, metrics, preflight checks, snapshots, and clone workflows
-- gated alpha features for detached-disk expansion, CephFS expansion, CephFS snapshot/clone, CephFS self-healing, and topology accessibility
+- stable detached-disk expansion and dynamic CephFS expansion
+- gated alpha features for CephFS snapshot/clone, CephFS self-healing, and topology accessibility
 
 ## Prerequisites
 
@@ -183,8 +184,6 @@ For static CephFS RWX, `sharedFilesystemPath` must already exist in the filesyst
 
 ```yaml
 featureGates:
-  detachedDiskExpansion: true
-  cephfsExpansion: true
   cephfsSnapshots: true
   cephfsClones: true
   cephfsSelfHealing: true
@@ -237,8 +236,8 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
-| `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"ghcr.io/sparkaiur/opennebula-csi"` | No |
-| `image.tag` | Driver image tag. | `"v0.3.1"` | No |
+| `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
+| `image.tag` | Driver image tag. | `"v0.4.0"` | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
 
 ### Driver
@@ -259,8 +258,8 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `featureGates.compatibilityAwareSelection` | Enable compatibility-aware filtering for datastores such as `COMPATIBLE_SYS_DS`. | `true` | No |
-| `featureGates.detachedDiskExpansion` | Enable detached persistent-disk expansion through image-level resize. | `false` | No |
-| `featureGates.cephfsExpansion` | Enable CephFS dynamic subvolume expansion. | `false` | No |
+| `featureGates.detachedDiskExpansion` | Enable detached persistent-disk expansion through image-level resize. Stable and enabled by default in `v0.4.0`. | `true` | No |
+| `featureGates.cephfsExpansion` | Enable CephFS dynamic subvolume expansion. Stable and enabled by default in `v0.4.0`. | `true` | No |
 | `featureGates.cephfsSnapshots` | Enable CephFS snapshot RPC flows. | `false` | No |
 | `featureGates.cephfsClones` | Enable CephFS PVC clone and snapshot restore flows. | `false` | No |
 | `featureGates.cephfsSelfHealing` | Enable stale CephFS mount lazy-unmount/remount recovery in node stage. `NodeGetVolumeStats` still reports disconnected CephFS mounts as restage-needed errors because kubelet stats calls do not include remount credentials. | `false` | No |
@@ -379,8 +378,8 @@ Common `storageClasses[].parameters` used by this driver:
 | StorageClass-managed provisioning | `storageClasses[].name` plus `storageClasses[].parameters.datastoreIDs` or `driver.defaultDatastores` |
 | CephFS RWX | CephFS datastore IDs, StorageClass secret refs, Kubernetes Secrets with `adminID/adminKey` and `userID/userKey` |
 | Topology accessibility alpha | `featureGates.topologyAccessibility=true` plus node labels `topology.opennebula.sparkaiur.io/system-ds=<id>` |
-| Detached disk expansion alpha | `featureGates.detachedDiskExpansion=true` |
-| CephFS expansion alpha | `featureGates.cephfsExpansion=true` |
+| Detached disk expansion | Enabled by default |
+| CephFS expansion | Enabled by default |
 | CephFS snapshots alpha | `featureGates.cephfsSnapshots=true` |
 | CephFS clones alpha | `featureGates.cephfsClones=true` |
 

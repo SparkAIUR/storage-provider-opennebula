@@ -14,7 +14,7 @@ credentials:
 
 image:
   repository: "nudevco/opennebula-csi"
-  tag: "v0.3.1"
+  tag: "v0.4.0"
   pullPolicy: "IfNotPresent"
 
 imagePullSecrets: []
@@ -33,8 +33,8 @@ driver:
 
 featureGates:
   compatibilityAwareSelection: true
-  detachedDiskExpansion: false
-  cephfsExpansion: false
+  detachedDiskExpansion: true
+  cephfsExpansion: true
   cephfsSnapshots: false
   cephfsClones: false
   cephfsSelfHealing: false

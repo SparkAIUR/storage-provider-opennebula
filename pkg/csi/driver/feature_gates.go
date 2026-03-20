@@ -20,8 +20,8 @@ type FeatureGates struct {
 func defaultFeatureGates() FeatureGates {
 	return FeatureGates{
 		CompatibilityAwareSelection: true,
-		DetachedDiskExpansion:       false,
-		CephFSExpansion:             false,
+		DetachedDiskExpansion:       true,
+		CephFSExpansion:             true,
 		CephFSSnapshots:             false,
 		CephFSClones:                false,
 		CephFSSelfHealing:           false,

@@ -11,13 +11,40 @@ This fork is focused on Omni deployments on OpenNebula and removes the old requi
 - Support `least-used`, `ordered`, and `autopilot` datastore selection policies.
 - Support `Filesystem` and `Block` volume modes.
 - Support `ReadWriteOnce`, `ReadOnlyMany`, and CephFS-backed `ReadWriteMany` filesystem volumes.
-- Support CSI volume expansion for attached volumes, including node-side filesystem growth.
+- Support CSI volume expansion for attached volumes, detached persistent disks, and dynamic CephFS subvolumes.
 - Support `NodeGetVolumeStats`, driver-native Prometheus metrics, Kubernetes Events, and PV placement annotations.
 - Support preflight validation through the binary and an optional Helm Job.
 - Support CSI snapshots plus PVC-to-PVC clone for disk-backed OpenNebula volumes.
-- Support gated topology accessibility, detached-disk expansion, and CephFS expansion/snapshot/clone flows for staging validation.
+- Support gated topology accessibility plus CephFS snapshot/clone and self-healing flows for staging validation.
 - Support `local`, OpenNebula Ceph RBD, and SparkAI CephFS datastores.
 - Keep the internal selection/provider structure ready for future `nfs` support.
+
+## Validated v0.4.0 matrix
+
+The `v0.4.0` release was validated on a live Omni + Talos + OpenNebula staging cluster with:
+
+- local RWO volumes on an OpenNebula image datastore
+- Ceph RBD RWO volumes on a Ceph-backed image datastore with a Ceph system datastore
+- CephFS static and dynamic RWX volumes on a SparkAI CephFS `FILE` datastore
+- ROX clones on the disk-backed path
+
+Staging-validated stable features:
+
+- Local RWO create, mount, resize, detach, reattach, and delete cleanup
+- Ceph RBD RWO create, mount, resize, detach, reattach, and delete cleanup
+- CephFS static RWX create, publish across nodes, and retain-on-delete behavior
+- CephFS dynamic RWX create, publish across nodes, resize, snapshot create/delete, clone, snapshot restore, and delete cleanup
+- Disk-path CSI snapshots and PVC clones
+- `NodeGetVolumeStats`, driver metrics, PV placement annotations, and Kubernetes Events
+- `detachedDiskExpansion`
+- `cephfsExpansion`
+
+Features that remain gated in `v0.4.0`:
+
+- `cephfsSnapshots`
+- `cephfsClones`
+- `cephfsSelfHealing`
+- `topologyAccessibility`
 
 ## Release artifacts
 
@@ -113,7 +140,8 @@ Routing is inferred from the requested access mode:
 - Databases and other single-writer application data should still use the OpenNebula `IMAGE` datastore path
 - Shared caches, model stores, and other multi-node RWX workloads can now use the CephFS shared-filesystem path
 - `ReadOnlyMany` remains on the disk path in `v0.4.0`
-- CephFS expansion, snapshots, and clones are implemented behind feature gates and remain alpha-off by default in `v0.4.0`
+- CephFS expansion is stable in `v0.4.0`
+- CephFS snapshots and clones remain implemented behind feature gates and stay alpha-off by default in `v0.4.0`
 
 ## Ceph RBD support
 
@@ -224,7 +252,6 @@ Expected CephFS secret keys:
 
 ### CephFS alpha feature gates
 
-- `cephfsExpansion=true` enables `ControllerExpandVolume` for dynamic CephFS subvolumes through `ceph fs subvolume resize`
 - `cephfsSnapshots=true` enables `CreateSnapshot`, `DeleteSnapshot`, and snapshot listing for dynamic CephFS subvolumes
 - `cephfsClones=true` enables PVC clone from CephFS volumes and restore from CephFS snapshots
 - `cephfsSelfHealing=true` enables one lazy-unmount/remount recovery attempt when node stage detects a stale CephFS mount during staging
@@ -240,9 +267,9 @@ Current behavior:
 - Controller expansion is supported for OpenNebula volumes that are attached to a VM.
 - Filesystem expansion is supported on the node for mounted filesystem volumes.
 - Block volumes do not require node-side filesystem expansion.
-- CephFS shared-filesystem volumes support expansion for dynamic subvolumes when `cephfsExpansion=true`.
+- CephFS shared-filesystem volumes support expansion for dynamic subvolumes by default in `v0.4.0`.
 - Static CephFS paths created with `sharedFilesystemPath` are not expandable.
-- Detached-volume expansion is available behind `detachedDiskExpansion=true` and uses image-level resize via `one.image.update`.
+- Detached-volume expansion is enabled by default in `v0.4.0` and uses image-level resize via `one.image.update`.
 - Shrinking remains unsupported for disk and CephFS paths.
 
 ## Snapshots and clones
@@ -400,8 +427,8 @@ Stable features are enabled by default. Higher-risk features remain behind featu
 Current gates:
 
 - `compatibilityAwareSelection=true`
-- `detachedDiskExpansion=false`
-- `cephfsExpansion=false`
+- `detachedDiskExpansion=true`
+- `cephfsExpansion=true`
 - `cephfsSnapshots=false`
 - `cephfsClones=false`
 - `cephfsSelfHealing=false`
@@ -557,7 +584,7 @@ For CephFS-backed Omni deployments:
 
 ## Staging validation gate
 
-`v0.4.0` is intentionally blocked on a live CephFS staging validation pass. The repo now includes:
+`v0.4.0` was validated on a live Omni + Talos + OpenNebula staging cluster before release. The repo includes:
 
 - a local validation script: `hack/validate-staging-cephfs.sh`
 - a manual GitHub Actions workflow: `.github/workflows/staging-cephfs-validation.yaml`
@@ -578,7 +605,13 @@ Required staging secrets for the workflow:
 - `STAGING_CEPHFS_NODE_USER_ID`
 - `STAGING_CEPHFS_NODE_USER_KEY`
 
-For the SparkAI staging lab on `on.lab.sprkinfra.com`, use the dedicated example at `examples/omni-values-staging-ceph.yaml` and point `datastoreIDs` at the validated `one-csi` Ceph-backed datastore exposed by the staging OpenNebula frontend.
+Sanitized staging-derived operator notes:
+
+- local-style datastores should use `WaitForFirstConsumer` and be treated as placement-sensitive, not portable
+- Ceph RBD volumes require the target VM to run on a compatible Ceph system datastore; a local `TM_MAD=local` system datastore is not a valid Ceph RBD attach target
+- static CephFS paths must already exist before the claim is created
+- dynamic CephFS expansion requires the standard CSI controller-expand secret refs on the StorageClass
+- stale CephFS mounts surface as restage-needed errors in volume stats until the workload is restaged
 
 ## Local development
 
