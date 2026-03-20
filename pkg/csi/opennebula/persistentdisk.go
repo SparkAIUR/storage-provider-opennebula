@@ -93,14 +93,20 @@ func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name st
 	}
 
 	var insufficientCapacity []string
+	attemptedDatastores := make([]int, 0, len(candidates))
 	for _, datastore := range candidates {
+		attemptedDatastores = append(attemptedDatastores, datastore.ID)
 		if datastore.FreeBytes < size {
+			recordDatastoreProvisioningResult(datastore.ID, false)
 			insufficientCapacity = append(insufficientCapacity, fmt.Sprintf("%d", datastore.ID))
 			continue
 		}
 
+		finishAttempt := beginDatastoreAttempt(datastore.ID)
 		imageID, err := p.ctrl.Images().CreateContext(ctx, tpl.String(), uint(datastore.ID))
+		finishAttempt()
 		if err != nil {
+			recordDatastoreProvisioningResult(datastore.ID, false)
 			if isInsufficientCapacityError(err) {
 				insufficientCapacity = append(insufficientCapacity, fmt.Sprintf("%d", datastore.ID))
 				continue
@@ -108,13 +114,18 @@ func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name st
 
 			return nil, fmt.Errorf("failed to create volume on datastore %d: %w", datastore.ID, err)
 		}
+		recordDatastoreProvisioningResult(datastore.ID, true)
 
 		err = p.waitForResourceStatus(imageID, timeout, p.volumeReady)
 		if err != nil {
 			return nil, fmt.Errorf("failed to wait for volume readiness: %w", err)
 		}
 
-		return &VolumeCreateResult{Datastore: datastore}, nil
+		return &VolumeCreateResult{
+			Datastore:             datastore,
+			FallbackUsed:          len(attemptedDatastores) > 1,
+			AttemptedDatastoreIDs: append([]int(nil), attemptedDatastores...),
+		}, nil
 	}
 
 	return nil, &datastoreCapacityError{
@@ -279,14 +290,6 @@ func (p *PersistentDiskVolumeProvider) inspectAttachmentEnvironment(ctx context.
 		DeploymentMode: DeploymentModeUnknown,
 	}
 
-	if report.ImageDatastore.Type != datastoreTypeCeph {
-		return report, nil
-	}
-
-	if err := validateCephImageDatastore(imageDatastore); err != nil {
-		return nil, err
-	}
-
 	vmInfo, err := p.ctrl.VM(nodeID).Info(true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to inspect node %d before attach: %w", nodeID, err)
@@ -305,6 +308,18 @@ func (p *PersistentDiskVolumeProvider) inspectAttachmentEnvironment(ctx context.
 	normalizedSystemDatastore := datastoreFromSchema(systemDatastore)
 	report.SystemDatastore = &normalizedSystemDatastore
 	report.DeploymentMode = resolveDeploymentMode(systemDatastore)
+
+	if err := validateCompatibleSystemDatastore(imageDatastore, systemDatastoreID); err != nil {
+		return nil, err
+	}
+
+	if report.ImageDatastore.Type != datastoreTypeCeph {
+		return report, nil
+	}
+
+	if err := validateCephImageDatastore(imageDatastore); err != nil {
+		return nil, err
+	}
 
 	switch report.DeploymentMode {
 	case DeploymentModeCeph:

@@ -42,6 +42,19 @@ func TestGetDatastoreSelectionConfigFallsBackToDriverDefaults(t *testing.T) {
 	assert.Equal(t, []string{"local", "ceph", "cephfs"}, selection.AllowedTypes)
 }
 
+func TestGetDatastoreSelectionConfigSupportsAutopilotPolicy(t *testing.T) {
+	pluginConfig := config.LoadConfiguration()
+	pluginConfig.OverrideVal(config.DefaultDatastoresVar, "100,101")
+	pluginConfig.OverrideVal(config.DatastorePolicyVar, "autopilot")
+	pluginConfig.OverrideVal(config.AllowedDatastoreTypesVar, "local,ceph")
+
+	driver := &Driver{PluginConfig: pluginConfig}
+
+	selection, err := driver.GetDatastoreSelectionConfig(nil)
+	require.NoError(t, err)
+	assert.Equal(t, opennebula.DatastoreSelectionPolicyAutopilot, selection.Policy)
+}
+
 func TestFilterProvisioningParamsRemovesReservedKeys(t *testing.T) {
 	filtered := filterProvisioningParams(map[string]string{
 		storageClassParamDatastoreIDs:               "100",

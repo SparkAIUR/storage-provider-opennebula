@@ -49,8 +49,10 @@ func (p *CephFSVolumeProvider) CreateSharedVolume(ctx context.Context, req Share
 	staticPath := sharedFilesystemPath(req.Parameters)
 	overrideGroup := sharedFilesystemSubvolumeGroup(req.Parameters)
 	var insufficientCapacity []string
+	attemptedDatastores := make([]int, 0, len(candidates))
 
 	for _, datastore := range candidates {
+		attemptedDatastores = append(attemptedDatastores, datastore.ID)
 		if datastore.CephFS == nil {
 			return nil, &datastoreConfigError{message: fmt.Sprintf("datastore %d does not expose CephFS metadata", datastore.ID)}
 		}
@@ -78,14 +80,17 @@ func (p *CephFSVolumeProvider) CreateSharedVolume(ctx context.Context, req Share
 			}
 
 			return &SharedVolumeCreateResult{
-				VolumeID:      volumeID,
-				CapacityBytes: req.SizeBytes,
-				Datastore:     datastore,
-				Metadata:      metadata,
+				VolumeID:              volumeID,
+				CapacityBytes:         req.SizeBytes,
+				Datastore:             datastore,
+				Metadata:              metadata,
+				FallbackUsed:          len(attemptedDatastores) > 1,
+				AttemptedDatastoreIDs: append([]int(nil), attemptedDatastores...),
 			}, nil
 		}
 
 		if req.SizeBytes > 0 && datastore.FreeBytes > 0 && datastore.FreeBytes < req.SizeBytes {
+			recordDatastoreProvisioningResult(datastore.ID, false)
 			insufficientCapacity = append(insufficientCapacity, strconv.Itoa(datastore.ID))
 			continue
 		}
@@ -97,13 +102,18 @@ func (p *CephFSVolumeProvider) CreateSharedVolume(ctx context.Context, req Share
 		metadata.Mode = SharedVolumeModeDynamic
 		metadata.SubvolumeName = sanitizeSubvolumeName(req.Name)
 
+		finishAttempt := beginDatastoreAttempt(datastore.ID)
 		if err := p.ensureSubvolume(ctx, datastore, metadata, req.SizeBytes, req.Secrets); err != nil {
+			finishAttempt()
+			recordDatastoreProvisioningResult(datastore.ID, false)
 			if IsDatastoreCapacityError(err) {
 				insufficientCapacity = append(insufficientCapacity, strconv.Itoa(datastore.ID))
 				continue
 			}
 			return nil, err
 		}
+		finishAttempt()
+		recordDatastoreProvisioningResult(datastore.ID, true)
 
 		subpath, err := p.getSubvolumePath(ctx, datastore, metadata, req.Secrets)
 		if err != nil {
@@ -117,10 +127,12 @@ func (p *CephFSVolumeProvider) CreateSharedVolume(ctx context.Context, req Share
 		}
 
 		return &SharedVolumeCreateResult{
-			VolumeID:      volumeID,
-			CapacityBytes: req.SizeBytes,
-			Datastore:     datastore,
-			Metadata:      metadata,
+			VolumeID:              volumeID,
+			CapacityBytes:         req.SizeBytes,
+			Datastore:             datastore,
+			Metadata:              metadata,
+			FallbackUsed:          len(attemptedDatastores) > 1,
+			AttemptedDatastoreIDs: append([]int(nil), attemptedDatastores...),
 		}, nil
 	}
 

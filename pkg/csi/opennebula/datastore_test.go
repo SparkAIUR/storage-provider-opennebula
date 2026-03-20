@@ -337,6 +337,35 @@ func TestOrderDatastoresOrderedPreservesConfiguredOrder(t *testing.T) {
 	assert.Equal(t, []int{100, 101, 102}, []int{ordered[0].ID, ordered[1].ID, ordered[2].ID})
 }
 
+func TestOrderDatastoresAutopilotPrefersHealthierDatastore(t *testing.T) {
+	resetDatastoreSelectionRuntime()
+	recordDatastoreProvisioningResult(100, false)
+	recordDatastoreProvisioningResult(100, false)
+	finish := beginDatastoreAttempt(101)
+	defer finish()
+
+	ordered, err := OrderDatastores([]Datastore{
+		{ID: 100, FreeBytes: 90, TotalBytes: 100},
+		{ID: 101, FreeBytes: 80, TotalBytes: 100},
+		{ID: 102, FreeBytes: 70, TotalBytes: 100},
+	}, DatastoreSelectionPolicyAutopilot)
+	require.NoError(t, err)
+	assert.Equal(t, []int{102, 101, 100}, []int{ordered[0].ID, ordered[1].ID, ordered[2].ID})
+}
+
+func TestValidateCompatibleSystemDatastore(t *testing.T) {
+	imageDS := newTestDatastore(200, "fast-local", "fs", "local", map[string]string{
+		"COMPATIBLE_SYS_DS": "100,101",
+	})
+
+	require.NoError(t, validateCompatibleSystemDatastore(imageDS, 100))
+
+	err := validateCompatibleSystemDatastore(imageDS, 102)
+	require.Error(t, err)
+	assert.True(t, IsDatastoreConfigError(err))
+	assert.Contains(t, err.Error(), "COMPATIBLE_SYS_DS")
+}
+
 func TestSumDatastoreCapacityAggregatesConfiguredPool(t *testing.T) {
 	total := SumDatastoreCapacity([]Datastore{
 		{ID: 100, FreeBytes: 10},

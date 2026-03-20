@@ -163,13 +163,16 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		s.driver.metrics.RecordOperation("create_volume", backend, "success", time.Since(started))
 		s.driver.metrics.RecordDatastoreSelection(string(selection.Policy), result.Datastore.Backend, result.Datastore.ID, "selected")
 		s.driver.metrics.SetDatastoreCapacity(result.Datastore.Backend, result.Datastore.ID, result.Datastore.FreeBytes, result.Datastore.TotalBytes)
+		if result.FallbackUsed {
+			s.recordPVCEventFromParams(ctx, rawParams, eventReasonDatastoreFallback, fmt.Sprintf("fallback selected datastore %d after attempts %v", result.Datastore.ID, result.AttemptedDatastoreIDs))
+		}
 		s.recordPVCEventFromParams(ctx, rawParams, eventReasonDatastoreSelected, fmt.Sprintf("selected %s datastore %d (%s) with policy %s", result.Datastore.Backend, result.Datastore.ID, result.Datastore.Name, selection.Policy))
 		s.annotatePlacementFromParams(ctx, rawParams, PlacementReport{
 			Backend:                     result.Metadata.Backend,
 			DatastoreID:                 result.Datastore.ID,
 			DatastoreName:               result.Datastore.Name,
 			SelectionPolicy:             string(selection.Policy),
-			FallbackUsed:                false,
+			FallbackUsed:                result.FallbackUsed,
 			CompatibilityAwareSelection: s.driver.featureGates.CompatibilityAwareSelection,
 		})
 		klog.V(1).InfoS("Shared filesystem volume created successfully",
@@ -219,13 +222,16 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	s.driver.metrics.RecordOperation("create_volume", result.Datastore.Backend, "success", time.Since(started))
 	s.driver.metrics.RecordDatastoreSelection(string(selection.Policy), result.Datastore.Backend, result.Datastore.ID, "selected")
 	s.driver.metrics.SetDatastoreCapacity(result.Datastore.Backend, result.Datastore.ID, result.Datastore.FreeBytes, result.Datastore.TotalBytes)
+	if result.FallbackUsed {
+		s.recordPVCEventFromParams(ctx, rawParams, eventReasonDatastoreFallback, fmt.Sprintf("fallback selected datastore %d after attempts %v", result.Datastore.ID, result.AttemptedDatastoreIDs))
+	}
 	s.recordPVCEventFromParams(ctx, rawParams, eventReasonDatastoreSelected, fmt.Sprintf("selected %s datastore %d (%s) with policy %s", result.Datastore.Backend, result.Datastore.ID, result.Datastore.Name, selection.Policy))
 	s.annotatePlacementFromParams(ctx, rawParams, PlacementReport{
 		Backend:                     result.Datastore.Backend,
 		DatastoreID:                 result.Datastore.ID,
 		DatastoreName:               result.Datastore.Name,
 		SelectionPolicy:             string(selection.Policy),
-		FallbackUsed:                false,
+		FallbackUsed:                result.FallbackUsed,
 		CompatibilityAwareSelection: s.driver.featureGates.CompatibilityAwareSelection,
 	})
 

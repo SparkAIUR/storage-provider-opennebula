@@ -16,6 +16,7 @@ type DatastoreSelectionPolicy string
 const (
 	DatastoreSelectionPolicyLeastUsed DatastoreSelectionPolicy = "least-used"
 	DatastoreSelectionPolicyOrdered   DatastoreSelectionPolicy = "ordered"
+	DatastoreSelectionPolicyAutopilot DatastoreSelectionPolicy = "autopilot"
 )
 
 type DatastoreSelectionConfig struct {
@@ -41,7 +42,9 @@ type Datastore struct {
 }
 
 type VolumeCreateResult struct {
-	Datastore Datastore
+	Datastore             Datastore
+	FallbackUsed          bool
+	AttemptedDatastoreIDs []int
 }
 
 type DatastoreSelector interface {
@@ -88,6 +91,8 @@ func NormalizeDatastoreSelectionPolicy(policy string) DatastoreSelectionPolicy {
 		return DatastoreSelectionPolicyLeastUsed
 	case string(DatastoreSelectionPolicyOrdered):
 		return DatastoreSelectionPolicyOrdered
+	case string(DatastoreSelectionPolicyAutopilot):
+		return DatastoreSelectionPolicyAutopilot
 	default:
 		return DatastoreSelectionPolicy(strings.ToLower(strings.TrimSpace(policy)))
 	}
@@ -99,6 +104,8 @@ func NewDatastoreSelector(policy DatastoreSelectionPolicy) (DatastoreSelector, e
 		return leastUsedDatastoreSelector{}, nil
 	case DatastoreSelectionPolicyOrdered:
 		return orderedDatastoreSelector{}, nil
+	case DatastoreSelectionPolicyAutopilot:
+		return autopilotDatastoreSelector{}, nil
 	default:
 		return nil, &datastoreConfigError{message: fmt.Sprintf("unsupported datastore selection policy %q", policy)}
 	}

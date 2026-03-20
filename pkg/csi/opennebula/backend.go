@@ -2,6 +2,7 @@ package opennebula
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	datastoreSchema "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/datastore"
@@ -19,16 +20,17 @@ const (
 	datastoreTypeLocal = "local"
 	datastoreTypeCeph  = "ceph"
 
-	cephAttrPoolName   = "POOL_NAME"
-	cephAttrHost       = "CEPH_HOST"
-	cephAttrUser       = "CEPH_USER"
-	cephAttrSecret     = "CEPH_SECRET"
-	cephAttrConf       = "CEPH_CONF"
-	cephAttrKey        = "CEPH_KEY"
-	cephAttrBridgeList = "BRIDGE_LIST"
-	cephAttrRBDFormat  = "RBD_FORMAT"
-	cephAttrECPoolName = "EC_POOL_NAME"
-	cephAttrDiskType   = "DISK_TYPE"
+	cephAttrPoolName    = "POOL_NAME"
+	cephAttrHost        = "CEPH_HOST"
+	cephAttrUser        = "CEPH_USER"
+	cephAttrSecret      = "CEPH_SECRET"
+	cephAttrConf        = "CEPH_CONF"
+	cephAttrKey         = "CEPH_KEY"
+	cephAttrBridgeList  = "BRIDGE_LIST"
+	cephAttrRBDFormat   = "RBD_FORMAT"
+	cephAttrECPoolName  = "EC_POOL_NAME"
+	cephAttrDiskType    = "DISK_TYPE"
+	compatibleSysDSAttr = "COMPATIBLE_SYS_DS"
 
 	cephDiskTypeRBD = "RBD"
 )
@@ -282,6 +284,39 @@ func requireDatastoreAttributes(ds datastoreSchema.Datastore, keys ...string) er
 	}
 
 	return nil
+}
+
+func validateCompatibleSystemDatastore(imageDS datastoreSchema.Datastore, systemDatastoreID int) error {
+	raw := getDatastoreAttribute(imageDS, compatibleSysDSAttr)
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	allowed := make(map[int]struct{})
+	for _, part := range strings.Fields(strings.NewReplacer(",", " ", ";", " ").Replace(raw)) {
+		value := strings.TrimSpace(part)
+		if value == "" {
+			continue
+		}
+		id, err := strconv.Atoi(value)
+		if err != nil {
+			return &datastoreConfigError{
+				message: fmt.Sprintf("datastore %d has invalid %s value %q", imageDS.ID, compatibleSysDSAttr, value),
+			}
+		}
+		allowed[id] = struct{}{}
+	}
+
+	if len(allowed) == 0 {
+		return nil
+	}
+	if _, ok := allowed[systemDatastoreID]; ok {
+		return nil
+	}
+
+	return &datastoreConfigError{
+		message: fmt.Sprintf("datastore %d is not compatible with target system datastore %d according to %s=%s", imageDS.ID, systemDatastoreID, compatibleSysDSAttr, strings.TrimSpace(raw)),
+	}
 }
 
 func getDatastoreAttribute(ds datastoreSchema.Datastore, key string) string {

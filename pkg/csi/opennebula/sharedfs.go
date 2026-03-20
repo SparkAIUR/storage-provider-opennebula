@@ -71,11 +71,13 @@ type SharedVolumeRequest struct {
 }
 
 type SharedVolumeCreateResult struct {
-	VolumeID      string
-	CapacityBytes int64
-	Datastore     Datastore
-	VolumeContext map[string]string
-	Metadata      SharedVolumeMetadata
+	VolumeID              string
+	CapacityBytes         int64
+	Datastore             Datastore
+	VolumeContext         map[string]string
+	Metadata              SharedVolumeMetadata
+	FallbackUsed          bool
+	AttemptedDatastoreIDs []int
 }
 
 func IsSharedFilesystemVolumeID(volumeID string) bool {
