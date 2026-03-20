@@ -95,10 +95,19 @@ spec:
               mountPath: /dev
         - name: csi-node-driver-registrar
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.14.0
+          {{- if .Values.metrics.enabled }}
+          ports:
+            - containerPort: {{ .Values.metrics.ports.registrar }}
+              name: registrar-metrics
+              protocol: TCP
+          {{- end }}
           args:
             - "--v=5"
             - "--csi-address=$(ADDRESS)"
             - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
+            {{- if .Values.metrics.enabled }}
+            - "--http-endpoint=:{{ .Values.metrics.ports.registrar }}"
+            {{- end }}
           env:
             - name: ADDRESS
               value: /csi/csi.sock

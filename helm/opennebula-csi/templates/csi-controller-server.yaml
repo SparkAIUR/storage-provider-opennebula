@@ -78,10 +78,19 @@ spec:
         - name: csi-provisioner
           image: registry.k8s.io/sig-storage/csi-provisioner:v5.3.0
           imagePullPolicy: IfNotPresent
+          {{- if .Values.metrics.enabled }}
+          ports:
+            - containerPort: {{ .Values.metrics.ports.provisioner }}
+              name: provisioner-metrics
+              protocol: TCP
+          {{- end }}
           args:
             - "--v=5"
             - "--csi-address=$(ADDRESS)"
             - "--default-fstype=ext4"
+            {{- if .Values.metrics.enabled }}
+            - "--http-endpoint=:{{ .Values.metrics.ports.provisioner }}"
+            {{- end }}
           env:
             - name: ADDRESS
               value: /csi/csi.sock
@@ -91,10 +100,19 @@ spec:
         - name: csi-attacher
           image: registry.k8s.io/sig-storage/csi-attacher:v4.9.0
           imagePullPolicy: IfNotPresent
+          {{- if .Values.metrics.enabled }}
+          ports:
+            - containerPort: {{ .Values.metrics.ports.attacher }}
+              name: attacher-metrics
+              protocol: TCP
+          {{- end }}
           args:
             - "--v=5"
             - "--csi-address=$(ADDRESS)"
             - "--timeout=2m"
+            {{- if .Values.metrics.enabled }}
+            - "--http-endpoint=:{{ .Values.metrics.ports.attacher }}"
+            {{- end }}
           env:
             - name: ADDRESS
               value: /csi/csi.sock
@@ -104,10 +122,19 @@ spec:
         - name: csi-resizer
           image: registry.k8s.io/sig-storage/csi-resizer:v1.13.2
           imagePullPolicy: IfNotPresent
+          {{- if .Values.metrics.enabled }}
+          ports:
+            - containerPort: {{ .Values.metrics.ports.resizer }}
+              name: resizer-metrics
+              protocol: TCP
+          {{- end }}
           args:
             - "--v=5"
             - "--csi-address=$(ADDRESS)"
             - "--leader-election"
+            {{- if .Values.metrics.enabled }}
+            - "--http-endpoint=:{{ .Values.metrics.ports.resizer }}"
+            {{- end }}
           env:
             - name: ADDRESS
               value: /csi/csi.sock

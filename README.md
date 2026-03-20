@@ -205,6 +205,77 @@ Current behavior:
 - CephFS shared-filesystem volumes do not support expansion in `v0.4.0`.
 - Detached-volume expansion is not currently supported by the driver, because the OpenNebula API surface used by this fork only exposes a documented disk-resize path for attached VM disks.
 
+## Metrics and Prometheus
+
+The Helm chart can now expose Prometheus-scrapable CSI sidecar metrics for:
+
+- `csi-provisioner`
+- `csi-attacher`
+- `csi-resizer`
+- `csi-node-driver-registrar`
+
+These metrics cover CSI controller and node operations such as provisioning, attaching, resizing, request latency, and sidecar work-queue behavior.
+
+Important distinction:
+
+- PVC object metrics should come from `kube-state-metrics`
+- CSI operation metrics come from this chart
+
+Examples of PVC object metrics you should expect from `kube-state-metrics`:
+
+- `kube_persistentvolumeclaim_info`
+- `kube_persistentvolumeclaim_status_phase`
+- `kube_persistentvolumeclaim_resource_requests_storage_bytes`
+
+Chart metrics behavior:
+
+- metrics endpoints are enabled by default
+- the chart creates scrape `Service` objects for controller and node metrics
+- optional `ServiceMonitor` objects can be enabled for Prometheus Operator environments
+- standard Prometheus annotation-based scraping can also be used through `metrics.controller.service.annotations` and `metrics.node.service.annotations`
+
+Relevant Helm values:
+
+```yaml
+metrics:
+  enabled: true
+  path: /metrics
+  controller:
+    service:
+      annotations: {}
+      labels: {}
+    serviceMonitor:
+      enabled: false
+      namespace: ""
+      interval: 30s
+      scrapeTimeout: 10s
+      labels: {}
+      annotations: {}
+  node:
+    service:
+      annotations: {}
+      labels: {}
+    serviceMonitor:
+      enabled: false
+      namespace: ""
+      interval: 30s
+      scrapeTimeout: 10s
+      labels: {}
+      annotations: {}
+```
+
+If you are using Prometheus Operator, set:
+
+```yaml
+metrics:
+  controller:
+    serviceMonitor:
+      enabled: true
+  node:
+    serviceMonitor:
+      enabled: true
+```
+
 ## Helm installation
 
 Add the SparkAI chart repo:

@@ -51,4 +51,35 @@ node:
   extraArgs: []
   extraEnv: []
 
+metrics:
+  enabled: true
+  path: /metrics
+  controller:
+    service:
+      annotations: {}
+      labels: {}
+    serviceMonitor:
+      enabled: false
+      namespace: ""
+      interval: 30s
+      scrapeTimeout: 10s
+      labels: {}
+      annotations: {}
+  node:
+    service:
+      annotations: {}
+      labels: {}
+    serviceMonitor:
+      enabled: false
+      namespace: ""
+      interval: 30s
+      scrapeTimeout: 10s
+      labels: {}
+      annotations: {}
+  ports:
+    provisioner: 8685
+    attacher: 8686
+    resizer: 8687
+    registrar: 8688
+
 storageClasses: []
