@@ -27,6 +27,7 @@ driver:
   allowedDatastoreTypes:
     - "local"
     - "ceph"
+    - "cephfs"
   extraArgs: []
   env: []
 

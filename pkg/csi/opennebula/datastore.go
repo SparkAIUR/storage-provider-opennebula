@@ -36,6 +36,7 @@ type Datastore struct {
 	FreeBytes int64
 	Enabled   bool
 	Ceph      *CephDatastoreAttributes
+	CephFS    *CephFSDatastoreAttributes
 }
 
 type VolumeCreateResult struct {
@@ -242,6 +243,7 @@ func datastoreFromSchema(source datastoreSchema.Datastore) Datastore {
 		FreeBytes: int64(source.FreeMB) * mib,
 		Enabled:   enabled,
 		Ceph:      datastoreCephAttributes(source),
+		CephFS:    datastoreCephFSAttributes(source),
 	}
 }
 
@@ -255,6 +257,10 @@ func datastoreCephAttributes(source datastoreSchema.Datastore) *CephDatastoreAtt
 }
 
 func inferDatastoreType(source datastoreSchema.Datastore) string {
+	if strings.EqualFold(getDatastoreAttribute(source, sharedBackendAttr), sharedBackendCephFS) {
+		return datastoreTypeCephFS
+	}
+
 	values := []string{
 		strings.ToLower(strings.TrimSpace(source.TMMad)),
 		strings.ToLower(strings.TrimSpace(source.DSMad)),
@@ -263,7 +269,7 @@ func inferDatastoreType(source datastoreSchema.Datastore) string {
 
 	for _, value := range values {
 		switch value {
-		case "local", "ceph", "nfs", "nas", "fs_lvm", "fs_lvm_ssh":
+		case "local", "ceph", "nfs", "nas", "fs_lvm", "fs_lvm_ssh", datastoreTypeCephFS:
 			return value
 		case "fs":
 			if strings.EqualFold(source.TMMad, "local") {
@@ -302,6 +308,15 @@ func normalizeAllowedDatastoreType(value string) string {
 	default:
 		return normalized
 	}
+}
+
+func datastoreCephFSAttributes(source datastoreSchema.Datastore) *CephFSDatastoreAttributes {
+	if normalizeAllowedDatastoreType(inferDatastoreType(source)) != datastoreTypeCephFS {
+		return nil
+	}
+
+	attrs := extractCephFSDatastoreAttributes(source)
+	return &attrs
 }
 
 type leastUsedDatastoreSelector struct{}

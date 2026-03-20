@@ -86,6 +86,17 @@ type CephDatastoreAttributes struct {
 	ECPoolName string
 }
 
+func extractCephFSDatastoreAttributes(ds datastoreSchema.Datastore) CephFSDatastoreAttributes {
+	return CephFSDatastoreAttributes{
+		FSName:           getDatastoreAttribute(ds, cephFSAttrFSName),
+		RootPath:         cleanSharedPath(getDatastoreAttribute(ds, cephFSAttrRootPath)),
+		SubvolumeGroup:   getDatastoreAttribute(ds, cephFSAttrSubvolumeGroup),
+		Monitors:         normalizeMonitorList(getDatastoreAttribute(ds, cephAttrHost)),
+		MountOptions:     normalizeMountOptions(getDatastoreAttribute(ds, cephFSAttrMountOptions)),
+		OptionalCephConf: getDatastoreAttribute(ds, cephAttrConf),
+	}
+}
+
 func GetDatastoreBackendProfile(typ string) (DatastoreBackendProfile, error) {
 	switch normalizeAllowedDatastoreType(typ) {
 	case datastoreTypeLocal:
@@ -99,6 +110,12 @@ func GetDatastoreBackendProfile(typ string) (DatastoreBackendProfile, error) {
 			RequiredAttrs:     append([]string(nil), cephRequiredAttrs...),
 			AllowedImageModes: []DeploymentMode{DeploymentModeCeph, DeploymentModeSSH},
 			validate:          validateCephImageDatastore,
+		}, nil
+	case datastoreTypeCephFS:
+		return DatastoreBackendProfile{
+			Type:          datastoreTypeCephFS,
+			RequiredAttrs: []string{sharedBackendAttr, cephFSAttrFSName, cephFSAttrRootPath, cephFSAttrSubvolumeGroup, cephAttrHost},
+			validate:      validateCephFSDatastore,
 		}, nil
 	default:
 		return DatastoreBackendProfile{}, &datastoreConfigError{message: fmt.Sprintf("unsupported datastore backend %q", typ)}
@@ -117,6 +134,16 @@ func GetBackendCapabilityProfile(backend string) BackendCapabilityProfile {
 			SupportsBlockROX:      true,
 			SupportsBlockRWX:      false,
 		}
+	case datastoreTypeCephFS:
+		return BackendCapabilityProfile{
+			Backend:               datastoreTypeCephFS,
+			SupportsFilesystemRWO: true,
+			SupportsFilesystemROX: true,
+			SupportsFilesystemRWX: true,
+			SupportsBlockRWO:      false,
+			SupportsBlockROX:      false,
+			SupportsBlockRWX:      false,
+		}
 	default:
 		return BackendCapabilityProfile{
 			Backend:               datastoreTypeLocal,
@@ -128,6 +155,23 @@ func GetBackendCapabilityProfile(backend string) BackendCapabilityProfile {
 			SupportsBlockRWX:      false,
 		}
 	}
+}
+
+func validateCephFSDatastore(ds datastoreSchema.Datastore) error {
+	if !strings.EqualFold(strings.TrimSpace(getDatastoreAttribute(ds, sharedBackendAttr)), sharedBackendCephFS) {
+		return &datastoreConfigError{message: fmt.Sprintf("datastore %d must define %s=cephfs", ds.ID, sharedBackendAttr)}
+	}
+	if !strings.EqualFold(strings.TrimSpace(ds.Type), string(datastoreSchema.File)) {
+		return &datastoreConfigError{message: fmt.Sprintf("datastore %d must be an OpenNebula FILE datastore for CephFS RWX", ds.ID)}
+	}
+	if err := requireDatastoreAttributes(ds, cephFSAttrFSName, cephFSAttrRootPath, cephFSAttrSubvolumeGroup, cephAttrHost); err != nil {
+		return err
+	}
+	if len(normalizeMonitorList(getDatastoreAttribute(ds, cephAttrHost))) == 0 {
+		return &datastoreConfigError{message: fmt.Sprintf("datastore %d must define at least one Ceph monitor in %s", ds.ID, cephAttrHost)}
+	}
+
+	return nil
 }
 
 func extractCephDatastoreAttributes(ds datastoreSchema.Datastore) CephDatastoreAttributes {
@@ -262,4 +306,28 @@ func getDatastoreAttribute(ds datastoreSchema.Datastore, key string) string {
 
 func normalizeDiskType(ds datastoreSchema.Datastore) string {
 	return strings.ToUpper(getDatastoreAttribute(ds, cephAttrDiskType))
+}
+
+func normalizeMonitorList(value string) []string {
+	replacer := strings.NewReplacer(",", " ", ";", " ")
+	parts := strings.Fields(replacer.Replace(strings.TrimSpace(value)))
+	return parts
+}
+
+func normalizeMountOptions(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+
+	raw := strings.Split(value, ",")
+	options := make([]string, 0, len(raw))
+	for _, option := range raw {
+		trimmed := strings.TrimSpace(option)
+		if trimmed == "" {
+			continue
+		}
+		options = append(options, trimmed)
+	}
+
+	return options
 }

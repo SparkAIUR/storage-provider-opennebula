@@ -49,6 +49,13 @@ type OpenNebulaVolumeProvider interface {
 	VolumeReadyWithTimeout(volumeID int) (bool, error)
 }
 
+type SharedFilesystemProvider interface {
+	CreateSharedVolume(ctx context.Context, req SharedVolumeRequest) (*SharedVolumeCreateResult, error)
+	DeleteSharedVolume(ctx context.Context, volumeID string, secrets map[string]string) error
+	PublishSharedVolume(ctx context.Context, volumeID string, readonly bool) (map[string]string, error)
+	ValidateSharedVolume(ctx context.Context, volumeID string) (*SharedVolumeMetadata, error)
+}
+
 func NewClient(config OpenNebulaConfig) *OpenNebulaClient {
 	return &OpenNebulaClient{
 		Client: goca.NewDefaultClient(

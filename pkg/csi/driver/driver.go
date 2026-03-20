@@ -109,11 +109,22 @@ func (d *Driver) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to create PersistentDiskVolumeProvider: %v", err)
 	}
 
+	sharedFilesystemProvider, err := opennebula.NewCephFSVolumeProvider(
+		opennebula.NewClient(opennebula.OpenNebulaConfig{
+			Endpoint:    endpoint,
+			Credentials: credentials,
+		}),
+		d.mounter.Exec,
+	)
+	if err != nil || sharedFilesystemProvider == nil {
+		return fmt.Errorf("failed to create CephFSVolumeProvider: %v", err)
+	}
+
 	grpcServer.Start(
 		d.grpcServerEndpoint,
 		NewIdentityServer(d),
 		NewNodeServer(d, d.mounter),
-		NewControllerServer(d, volumeProvider),
+		NewControllerServer(d, volumeProvider, sharedFilesystemProvider),
 	)
 
 	go func() {

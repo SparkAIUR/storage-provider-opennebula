@@ -25,6 +25,7 @@ import (
 	"reflect"
 	"runtime"
 
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-lib-utils/protosanitizer"
 	"google.golang.org/grpc/codes"
@@ -86,6 +87,10 @@ func (ns *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 	volumeCapability := req.GetVolumeCapability()
 	if volumeCapability == nil {
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
+	}
+
+	if isSharedFilesystemRequest(volumeID, req.GetPublishContext()) {
+		return ns.handleSharedFilesystemStage(req)
 	}
 
 	accessType := volumeCapability.GetAccessType()
@@ -204,6 +209,10 @@ func (ns *NodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageV
 		return nil, status.Error(codes.InvalidArgument, "staging target path is required")
 	}
 
+	if opennebula.IsSharedFilesystemVolumeID(volumeID) {
+		return ns.handleSharedFilesystemUnstage(req)
+	}
+
 	klog.V(3).InfoS("Cleaning staging target path volume mount point",
 		"method", "NodeUnstageVolume", "volumeID", volumeID, "stagingTargetPath", stagingTargetPath)
 
@@ -243,6 +252,10 @@ func (ns *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 	volumeCapability := req.GetVolumeCapability()
 	if volumeCapability == nil {
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
+	}
+
+	if isSharedFilesystemRequest(volumeID, req.GetPublishContext()) {
+		return ns.handleSharedFilesystemPublish(req)
 	}
 
 	volumeContext := req.GetPublishContext()
@@ -454,6 +467,10 @@ func (ns *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 				CapacityBytes: capacityRange.GetRequiredBytes(),
 			}, nil
 		}
+	}
+
+	if opennebula.IsSharedFilesystemVolumeID(volumeID) {
+		return nil, status.Error(codes.Unimplemented, "CephFS shared filesystem expansion is not supported in v0.4.0")
 	}
 
 	// The node-side filesystem resizer is only available in the linux build of mount-utils.

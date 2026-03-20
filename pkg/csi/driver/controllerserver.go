@@ -48,15 +48,17 @@ var (
 )
 
 type ControllerServer struct {
-	driver         *Driver
-	volumeProvider opennebula.OpenNebulaVolumeProvider
+	driver                   *Driver
+	volumeProvider           opennebula.OpenNebulaVolumeProvider
+	sharedFilesystemProvider opennebula.SharedFilesystemProvider
 	csi.UnimplementedControllerServer
 }
 
-func NewControllerServer(d *Driver, vp opennebula.OpenNebulaVolumeProvider) *ControllerServer {
+func NewControllerServer(d *Driver, vp opennebula.OpenNebulaVolumeProvider, sharedProvider opennebula.SharedFilesystemProvider) *ControllerServer {
 	return &ControllerServer{
-		driver:         d,
-		volumeProvider: vp,
+		driver:                   d,
+		volumeProvider:           vp,
+		sharedFilesystemProvider: sharedProvider,
 	}
 }
 
@@ -97,11 +99,58 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		return nil, status.Error(codes.InvalidArgument, "missing access mode")
 	}
 
+	volumeAccessModel, err := resolveVolumeAccessModel(volumeCapabilities[0], selection.AllowedTypes)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
 	response := &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
 			VolumeId:      name,
 			CapacityBytes: requiredBytes,
 		},
+	}
+
+	params := filterProvisioningParams(rawParams)
+	fsType := getRequestedFSType(rawParams, volumeCapabilities[0])
+	immutableVolume := accessMode.Mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
+
+	response.Volume.VolumeContext = params
+
+	if volumeAccessModel == opennebula.VolumeAccessModelSharedFS {
+		if s.sharedFilesystemProvider == nil {
+			return nil, status.Error(codes.FailedPrecondition, "shared filesystem provider is not configured")
+		}
+
+		result, sharedErr := s.sharedFilesystemProvider.CreateSharedVolume(ctx, opennebula.SharedVolumeRequest{
+			Name:       name,
+			SizeBytes:  requiredBytes,
+			Selection:  selection,
+			Parameters: rawParams,
+			Secrets:    req.GetSecrets(),
+		})
+		if sharedErr != nil {
+			switch {
+			case opennebula.IsDatastoreConfigError(sharedErr):
+				return nil, status.Error(codes.InvalidArgument, sharedErr.Error())
+			case opennebula.IsDatastoreCapacityError(sharedErr):
+				return nil, status.Error(codes.ResourceExhausted, sharedErr.Error())
+			}
+			klog.V(0).ErrorS(sharedErr, "Failed to create shared filesystem volume",
+				"method", "CreateVolume", "volumeName", name, "requiredBytes", requiredBytes,
+				"policy", selection.Policy, "datastores", selection.Identifiers)
+			return nil, status.Error(codes.Internal, "failed to create volume")
+		}
+
+		response.Volume.VolumeId = result.VolumeID
+		response.Volume.CapacityBytes = result.CapacityBytes
+		klog.V(1).InfoS("Shared filesystem volume created successfully",
+			"method", "CreateVolume", "volumeName", name, "requiredBytes", requiredBytes,
+			"policy", selection.Policy, "datastores", selection.Identifiers,
+			"selectedDatastoreID", result.Datastore.ID, "selectedDatastoreName", result.Datastore.Name,
+			"backend", result.Metadata.Backend, "mode", result.Metadata.Mode)
+
+		return response, nil
 	}
 
 	volumeID, volumeSize, _ := s.volumeProvider.VolumeExists(ctx, name)
@@ -117,12 +166,6 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 			"volume with the same name already exists with different size")
 
 	}
-
-	params := filterProvisioningParams(rawParams)
-	fsType := getRequestedFSType(rawParams, volumeCapabilities[0])
-	immutableVolume := accessMode.Mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
-
-	response.Volume.VolumeContext = params
 
 	result, err := s.volumeProvider.CreateVolume(ctx, name, requiredBytes, DefaultDriverName, immutableVolume, fsType, params, selection)
 	if err != nil {
@@ -159,6 +202,27 @@ func (s *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 
 	klog.V(3).InfoS("Deleting volume", "method", "DeleteVolume", "volumeID", req.VolumeId)
 
+	if opennebula.IsSharedFilesystemVolumeID(req.VolumeId) {
+		if s.sharedFilesystemProvider == nil {
+			return nil, status.Error(codes.FailedPrecondition, "shared filesystem provider is not configured")
+		}
+
+		err := s.sharedFilesystemProvider.DeleteSharedVolume(ctx, req.VolumeId, req.GetSecrets())
+		if err != nil {
+			switch {
+			case opennebula.IsDatastoreConfigError(err):
+				return nil, status.Error(codes.FailedPrecondition, err.Error())
+			case opennebula.IsDatastoreCapacityError(err):
+				return nil, status.Error(codes.ResourceExhausted, err.Error())
+			}
+			klog.V(0).ErrorS(err, "Failed to delete shared filesystem volume", "method", "DeleteVolume", "volumeID", req.VolumeId)
+			return nil, status.Error(codes.FailedPrecondition, "failed to delete volume")
+		}
+
+		klog.V(1).InfoS("Shared filesystem volume deleted successfully", "method", "DeleteVolume", "volumeID", req.VolumeId)
+		return &csi.DeleteVolumeResponse{}, nil
+	}
+
 	err := s.volumeProvider.DeleteVolume(ctx, req.VolumeId)
 	if err != nil {
 		klog.V(0).ErrorS(err, "Failed to delete volume", "method", "DeleteVolume", "volumeID", req.VolumeId)
@@ -193,6 +257,34 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	}
 
 	immutableVolume := req.VolumeCapability.AccessMode.Mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
+
+	if opennebula.IsSharedFilesystemVolumeID(req.VolumeId) {
+		if s.sharedFilesystemProvider == nil {
+			return nil, status.Error(codes.FailedPrecondition, "shared filesystem provider is not configured")
+		}
+
+		nodeID, err := s.volumeProvider.NodeExists(ctx, req.NodeId)
+		if err != nil || nodeID == -1 {
+			klog.V(0).ErrorS(err, "Node does not exist", "method", "ControllerPublishVolume", "nodeID", req.NodeId)
+			return nil, status.Error(codes.NotFound, "node not found")
+		}
+
+		publishContext, err := s.sharedFilesystemProvider.PublishSharedVolume(ctx, req.VolumeId, req.GetReadonly() || immutableVolume)
+		if err != nil {
+			switch {
+			case opennebula.IsDatastoreConfigError(err):
+				return nil, status.Error(codes.FailedPrecondition, err.Error())
+			case opennebula.IsDatastoreCapacityError(err):
+				return nil, status.Error(codes.ResourceExhausted, err.Error())
+			}
+			klog.V(0).ErrorS(err, "Failed to publish shared filesystem volume",
+				"method", "ControllerPublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
+			return nil, status.Error(codes.Internal, "failed to publish volume")
+		}
+
+		_ = nodeID
+		return &csi.ControllerPublishVolumeResponse{PublishContext: publishContext}, nil
+	}
 
 	volumeID, _, err := s.volumeProvider.VolumeExists(ctx, req.VolumeId)
 	if err != nil || volumeID == -1 {
@@ -265,6 +357,10 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return nil, status.Error(codes.InvalidArgument, "missing node ID")
 	}
 
+	if opennebula.IsSharedFilesystemVolumeID(req.VolumeId) {
+		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
+
 	volumeID, _, err := s.volumeProvider.VolumeExists(ctx, req.VolumeId)
 	if err != nil || volumeID == -1 {
 		klog.V(1).InfoS("Volume not found, skipping volume unpublish",
@@ -325,11 +421,22 @@ func (s *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req *
 		return nil, status.Error(codes.InvalidArgument, "missing volume capabilities")
 	}
 
-	volumeID, _, err := s.volumeProvider.VolumeExists(ctx, req.VolumeId)
-	if err != nil || volumeID == -1 {
-		klog.V(0).ErrorS(err, "Volume not found",
-			"method", "ValidateVolumeCapabilities", "volumeID", req.VolumeId)
-		return nil, status.Error(codes.NotFound, "volume not found")
+	if opennebula.IsSharedFilesystemVolumeID(req.VolumeId) {
+		if s.sharedFilesystemProvider == nil {
+			return nil, status.Error(codes.FailedPrecondition, "shared filesystem provider is not configured")
+		}
+		if _, err := s.sharedFilesystemProvider.ValidateSharedVolume(ctx, req.VolumeId); err != nil {
+			klog.V(0).ErrorS(err, "Shared volume not found",
+				"method", "ValidateVolumeCapabilities", "volumeID", req.VolumeId)
+			return nil, status.Error(codes.NotFound, "volume not found")
+		}
+	} else {
+		volumeID, _, err := s.volumeProvider.VolumeExists(ctx, req.VolumeId)
+		if err != nil || volumeID == -1 {
+			klog.V(0).ErrorS(err, "Volume not found",
+				"method", "ValidateVolumeCapabilities", "volumeID", req.VolumeId)
+			return nil, status.Error(codes.NotFound, "volume not found")
+		}
 	}
 
 	if err := validateAccessMode(req.VolumeCapabilities, s.driver.getAllowedDatastoreTypes()); err != nil {
@@ -437,6 +544,10 @@ func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 		return nil, status.Error(codes.InvalidArgument, "missing required capacity range")
 	}
 
+	if opennebula.IsSharedFilesystemVolumeID(req.GetVolumeId()) {
+		return nil, status.Error(codes.Unimplemented, "CephFS shared filesystem expansion is not supported in v0.4.0")
+	}
+
 	newSize, err := s.volumeProvider.ExpandVolume(ctx, req.GetVolumeId(), capacityRange.GetRequiredBytes())
 	if err != nil {
 		switch {
@@ -501,50 +612,6 @@ func (s *ControllerServer) testConnectivity() {
 		"method", "testConnectivity", "endpoint", endpoint)
 }
 
-func validateAccessMode(volumeCapabilities []*csi.VolumeCapability, allowedBackends []string) error {
-	supportedModes := make(map[csi.VolumeCapability_AccessMode_Mode]bool)
-	for _, mode := range supportedAccessModes {
-		supportedModes[mode] = true
-	}
-
-	backendProfiles := backendCapabilityProfiles(allowedBackends)
-	for _, cap := range volumeCapabilities {
-		if cap.AccessMode == nil {
-			klog.V(0).ErrorS(nil, "Unsupported access mode", "method", "CreateVolume", "accessMode", "<nil>")
-			return fmt.Errorf("missing access mode")
-		}
-
-		mode := cap.AccessMode.Mode
-		if supportedModes[mode] {
-			continue
-		}
-
-		if isUnsupportedMultiNodeWriteMode(mode) {
-			err := unsupportedRWXError(mode, backendProfiles)
-			klog.V(0).ErrorS(nil, "Unsupported access mode",
-				"method", "CreateVolume", "accessMode", mode, "reason", err.Error())
-			return err
-		}
-
-		klog.V(0).ErrorS(nil, "Unsupported access mode",
-			"method", "CreateVolume", "accessMode", mode)
-		return fmt.Errorf("unsupported access mode %q; supported modes are %s",
-			mode.String(),
-			strings.Join(supportedAccessModeNames(), ", "))
-	}
-	return nil
-}
-
-func isUnsupportedMultiNodeWriteMode(mode csi.VolumeCapability_AccessMode_Mode) bool {
-	switch mode {
-	case csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
-		csi.VolumeCapability_AccessMode_MULTI_NODE_SINGLE_WRITER:
-		return true
-	default:
-		return false
-	}
-}
-
 func unsupportedRWXError(mode csi.VolumeCapability_AccessMode_Mode, profiles []opennebula.BackendCapabilityProfile) error {
 	backends := unsupportedFilesystemRWXBackends(profiles)
 	return fmt.Errorf(
@@ -556,7 +623,7 @@ func unsupportedRWXError(mode csi.VolumeCapability_AccessMode_Mode, profiles []o
 
 func backendCapabilityProfiles(backends []string) []opennebula.BackendCapabilityProfile {
 	if len(backends) == 0 {
-		backends = []string{"local", "ceph"}
+		backends = []string{"local", "ceph", "cephfs"}
 	}
 
 	profiles := make([]opennebula.BackendCapabilityProfile, 0, len(backends))

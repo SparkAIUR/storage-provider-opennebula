@@ -13,6 +13,8 @@ const (
 	storageClassParamDatastoreIDs             = "datastoreIDs"
 	storageClassParamDatastoreSelectionPolicy = "datastoreSelectionPolicy"
 	storageClassParamFSType                   = "fsType"
+	storageClassParamSharedFilesystemPath     = "sharedFilesystemPath"
+	storageClassParamSharedFilesystemGroup    = "sharedFilesystemSubvolumeGroup"
 )
 
 func (d *Driver) GetDatastoreSelectionConfig(params map[string]string) (opennebula.DatastoreSelectionConfig, error) {
@@ -41,9 +43,12 @@ func filterProvisioningParams(params map[string]string) map[string]string {
 	filtered := make(map[string]string, len(params))
 	for key, value := range params {
 		switch key {
-		case storageClassParamDatastoreIDs, storageClassParamDatastoreSelectionPolicy, storageClassParamFSType:
+		case storageClassParamDatastoreIDs, storageClassParamDatastoreSelectionPolicy, storageClassParamFSType, storageClassParamSharedFilesystemPath, storageClassParamSharedFilesystemGroup:
 			continue
 		default:
+			if strings.HasPrefix(key, "csi.storage.k8s.io/") {
+				continue
+			}
 			filtered[key] = value
 		}
 	}
@@ -85,7 +90,7 @@ func (d *Driver) getDefaultDatastorePolicy() string {
 func (d *Driver) getAllowedDatastoreTypes() []string {
 	values, ok := d.PluginConfig.GetStringSlice(config.AllowedDatastoreTypesVar)
 	if !ok {
-		return []string{"local", "ceph"}
+		return []string{"local", "ceph", "cephfs"}
 	}
 
 	return values
