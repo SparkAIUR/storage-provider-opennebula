@@ -76,6 +76,23 @@ Current rules:
 
 For OpenNebula local-style datastores, the driver treats `local`, `fs`, `fs_lvm`, and `fs_lvm_ssh` as local-compatible backends.
 
+### Local datastore placement guidance
+
+OpenNebula local-style image datastores are best treated as placement-sensitive, not portable.
+
+Recommended operator pattern for local-backed StorageClasses:
+
+- use `volumeBindingMode: WaitForFirstConsumer`
+- keep `compatibilityAwareSelection=true`
+- enable `topologyAccessibility` only if you can maintain correct node labels
+- use local-backed classes for node-sticky RWO workloads, not for workloads that must move freely between nodes
+
+Important limitation:
+
+- the driver does not perform CSI-side host-to-host data migration for local-backed PVCs
+- when a pod lands on a different node, Kubernetes waits for detach/attach, but the underlying storage must already be attachable by OpenNebula from the configured image datastore path
+- if OpenNebula cannot resolve the source image path during attach, the fix is in datastore layout or transfer-manager configuration, not in CSI-side file sync
+
 ## Access mode support
 
 Current access mode matrix:
@@ -184,12 +201,12 @@ CephFS StorageClass parameters:
 
 CephFS secret references:
 
-- dynamic provisioning uses standard CSI provisioner and controller-delete secret references
-- node-side mounts use standard CSI node-stage secret references
+- dynamic provisioning and deletion use the standard CSI provisioner secret reference
+- node-side mounts use the standard CSI node-stage secret reference
 
 Expected CephFS secret keys:
 
-- provisioner/controller-delete secrets: `adminID`, `adminKey`
+- provisioner secrets: `adminID`, `adminKey`
 - node-stage secrets: `userID`, `userKey`
 
 ### CephFS prerequisites
@@ -530,7 +547,7 @@ For CephFS-backed Omni deployments:
 
 1. Create a `FILE` datastore in OpenNebula and add the SparkAI CephFS attributes to its template.
 2. Set `driver.defaultDatastores` or StorageClass `datastoreIDs` to the CephFS datastore IDs.
-3. Add node-stage and provisioner/controller-delete secret refs to the StorageClass parameters.
+3. Add node-stage and provisioner secret refs to the StorageClass parameters.
 4. Use `ReadWriteMany` on the PVC to trigger the shared-filesystem path.
 5. Validate the resulting deployment with [examples/demo-busybox-cephfs-rwx.yaml](examples/demo-busybox-cephfs-rwx.yaml).
 

@@ -26,7 +26,5 @@ storageClasses:
       sharedFilesystemSubvolumeGroup: "csi"
       csi.storage.k8s.io/provisioner-secret-name: "cephfs-provisioner"
       csi.storage.k8s.io/provisioner-secret-namespace: "kube-system"
-      csi.storage.k8s.io/controller-delete-secret-name: "cephfs-provisioner"
-      csi.storage.k8s.io/controller-delete-secret-namespace: "kube-system"
       csi.storage.k8s.io/node-stage-secret-name: "cephfs-node-stage"
       csi.storage.k8s.io/node-stage-secret-namespace: "kube-system"

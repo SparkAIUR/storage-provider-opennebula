@@ -301,9 +301,22 @@ func inferDatastoreType(source datastoreSchema.Datastore) string {
 		return datastoreTypeCephFS
 	}
 
+	dsMad := strings.ToLower(strings.TrimSpace(source.DSMad))
+	tmMad := strings.ToLower(strings.TrimSpace(source.TMMad))
+	category := normalizeDatastoreCategory(source)
+
+	switch dsMad {
+	case "fs", "fs_lvm", "fs_lvm_ssh":
+		if category == string(datastoreSchema.Image) || category == string(datastoreSchema.File) || tmMad == "ssh" || tmMad == "shared" || tmMad == "local" {
+			return datastoreTypeLocal
+		}
+	case datastoreTypeCeph:
+		return datastoreTypeCeph
+	}
+
 	values := []string{
-		strings.ToLower(strings.TrimSpace(source.TMMad)),
-		strings.ToLower(strings.TrimSpace(source.DSMad)),
+		tmMad,
+		dsMad,
 		strings.ToLower(strings.TrimSpace(source.Type)),
 	}
 

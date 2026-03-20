@@ -13,7 +13,7 @@ credentials:
   inlineAuth: ""
 
 image:
-  repository: "ghcr.io/sparkaiur/opennebula-csi"
+  repository: "nudevco/opennebula-csi"
   tag: "v0.3.1"
   pullPolicy: "IfNotPresent"
 

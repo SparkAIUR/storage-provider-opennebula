@@ -11,6 +11,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -65,7 +66,7 @@ func NewKubeRuntime(component string) *KubeRuntime {
 
 	broadcaster := record.NewBroadcaster()
 	broadcaster.StartStructuredLogging(0)
-	broadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: client.CoreV1().Events(namespaceFromServiceAccount())})
+	broadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: client.CoreV1().Events("")})
 	recorder := broadcaster.NewRecorder(clientgoscheme.Scheme, corev1.EventSource{Component: component})
 
 	return &KubeRuntime{
@@ -84,7 +85,7 @@ func (r *KubeRuntime) EmitPVCEvent(ctx context.Context, namespace, name, reason,
 		klog.V(2).InfoS("Skipping PVC event emission", "namespace", namespace, "name", name, "reason", reason, "err", err)
 		return
 	}
-	r.recorder.Eventf(pvc, corev1.EventTypeNormal, reason, "%s", message)
+	r.emitNamespacedEvent(ctx, pvc.Namespace, pvc.Name, pvc.UID, "PersistentVolumeClaim", corev1.EventTypeNormal, reason, message)
 }
 
 func (r *KubeRuntime) EmitPVEvent(ctx context.Context, name, reason, message string) {
@@ -108,7 +109,7 @@ func (r *KubeRuntime) EmitWarningEventOnPVC(ctx context.Context, namespace, name
 		klog.V(2).InfoS("Skipping PVC warning emission", "namespace", namespace, "name", name, "reason", reason, "err", err)
 		return
 	}
-	r.recorder.Eventf(pvc, corev1.EventTypeWarning, reason, "%s", message)
+	r.emitNamespacedEvent(ctx, pvc.Namespace, pvc.Name, pvc.UID, "PersistentVolumeClaim", corev1.EventTypeWarning, reason, message)
 }
 
 func (r *KubeRuntime) AnnotatePVAsync(ctx context.Context, pvName string, report PlacementReport) {
@@ -117,7 +118,7 @@ func (r *KubeRuntime) AnnotatePVAsync(ctx context.Context, pvName string, report
 	}
 
 	go func() {
-		pollCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		pollCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
 		err := wait.PollUntilContextTimeout(pollCtx, time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
@@ -160,6 +161,42 @@ func (r *KubeRuntime) GetNodeLabel(ctx context.Context, nodeName, labelKey strin
 	}
 
 	return strings.TrimSpace(node.Labels[labelKey]), nil
+}
+
+func (r *KubeRuntime) emitNamespacedEvent(ctx context.Context, namespace, name string, uid types.UID, kind, eventType, reason, message string) {
+	if r == nil || !r.enabled || namespace == "" || name == "" {
+		return
+	}
+
+	now := metav1.Now()
+	event := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: fmt.Sprintf("%s-", strings.ToLower(name)),
+			Namespace:    namespace,
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:       kind,
+			Namespace:  namespace,
+			Name:       name,
+			UID:        uid,
+			APIVersion: "v1",
+		},
+		Reason:             reason,
+		Message:            message,
+		Source:             corev1.EventSource{Component: DefaultDriverName},
+		Type:               eventType,
+		FirstTimestamp:     now,
+		LastTimestamp:      now,
+		Count:              1,
+		ReportingController: DefaultDriverName,
+	}
+
+	if _, err := r.client.CoreV1().Events(namespace).Create(ctx, event, metav1.CreateOptions{}); err != nil {
+		if errors.IsAlreadyExists(err) {
+			return
+		}
+		klog.V(2).InfoS("Failed to emit namespaced event", "namespace", namespace, "name", name, "reason", reason, "err", err)
+	}
 }
 
 func buildPVAnnotationPatch(report PlacementReport) ([]byte, error) {

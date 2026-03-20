@@ -40,6 +40,7 @@ var (
 		csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
 		csi.ControllerServiceCapability_RPC_GET_CAPACITY,
 		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
+		csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
 	}
 
@@ -129,6 +130,9 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	contentSource := req.GetVolumeContentSource()
 
 	response.Volume.VolumeContext = params
+	if contentSource != nil {
+		response.Volume.ContentSource = contentSource
+	}
 
 	if volumeAccessModel == opennebula.VolumeAccessModelSharedFS {
 		if s.sharedFilesystemProvider == nil {

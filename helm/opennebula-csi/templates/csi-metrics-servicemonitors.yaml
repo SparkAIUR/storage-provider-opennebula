@@ -32,15 +32,15 @@ spec:
       interval: {{ .Values.metrics.controller.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.metrics.controller.serviceMonitor.scrapeTimeout }}
     {{- end }}
-    - port: provisioner-metrics
+    - port: prov-metrics
       path: {{ .Values.metrics.path }}
       interval: {{ .Values.metrics.controller.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.metrics.controller.serviceMonitor.scrapeTimeout }}
-    - port: attacher-metrics
+    - port: att-metrics
       path: {{ .Values.metrics.path }}
       interval: {{ .Values.metrics.controller.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.metrics.controller.serviceMonitor.scrapeTimeout }}
-    - port: resizer-metrics
+    - port: res-metrics
       path: {{ .Values.metrics.path }}
       interval: {{ .Values.metrics.controller.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.metrics.controller.serviceMonitor.scrapeTimeout }}
@@ -79,7 +79,7 @@ spec:
       interval: {{ .Values.metrics.node.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.metrics.node.serviceMonitor.scrapeTimeout }}
     {{- end }}
-    - port: registrar-metrics
+    - port: reg-metrics
       path: {{ .Values.metrics.path }}
       interval: {{ .Values.metrics.node.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.metrics.node.serviceMonitor.scrapeTimeout }}

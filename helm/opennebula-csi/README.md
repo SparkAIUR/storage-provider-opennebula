@@ -92,13 +92,15 @@ storageClasses:
   - name: opennebula-csi
     reclaimPolicy: Delete
     allowVolumeExpansion: true
-    volumeBindingMode: Immediate
+    volumeBindingMode: WaitForFirstConsumer
     parameters:
       datastoreIDs: "111"
       fsType: "xfs"
       cache: "none"
       driver: "raw"
 ```
+
+For local-style datastores (`local`, `fs`, `fs_lvm`, `fs_lvm_ssh`), prefer `WaitForFirstConsumer`. It lets Kubernetes choose a node first, which gives the driver and OpenNebula the best chance to select a compatible placement. Treat these classes as node-sensitive RWO storage, not portable storage.
 
 ### Multiple Datastores with Fallback
 
@@ -135,6 +137,36 @@ storageClasses:
       csi.storage.k8s.io/node-stage-secret-namespace: kube-system
 ```
 
+Recommended secret split for dynamic CephFS:
+
+- `cephfs-provisioner`
+  - used by the controller for `ceph fs subvolume create`, `rm`, `getpath`, and later resize/snapshot/clone flows
+  - should use a stronger Ceph identity with monitor, MDS, OSD, and `mgr` caps sufficient for CephFS subvolume lifecycle
+- `cephfs-node-stage`
+  - used by the node plugin for `ceph-fuse` mounts
+  - should use a narrower mount-oriented Ceph identity
+
+For the staging lab, the working split is:
+
+- provisioner user: `client.opennebula-csi`
+- node-stage user: `client.opennebula-csi-node`
+
+If dynamic CephFS fails with an error like:
+
+```text
+does your client key have mgr caps?
+```
+
+the provisioner secret is using a Ceph user without sufficient `mgr` privileges for subvolume lifecycle commands.
+
+The controller sidecar also needs a longer CSI RPC timeout than the default for CephFS create flows. The chart now renders:
+
+```text
+csi-provisioner --timeout=2m
+```
+
+Without that timeout increase, the driver may successfully create the CephFS subvolume but the external provisioner can still report `DeadlineExceeded` and leave the PVC pending.
+
 ### Alpha Feature Gates
 
 ```yaml
@@ -152,6 +184,13 @@ When `topologyAccessibility=true`, label nodes with:
 ```text
 topology.opennebula.sparkaiur.io/system-ds=<opennebula-system-datastore-id>
 ```
+
+For local-backed StorageClasses:
+
+- prefer `volumeBindingMode: WaitForFirstConsumer`
+- keep `featureGates.compatibilityAwareSelection=true`
+- do not assume the driver will live-migrate local PVC data between nodes
+- use Ceph RBD for portable RWO and CephFS for portable RWX
 
 ## Values Reference
 

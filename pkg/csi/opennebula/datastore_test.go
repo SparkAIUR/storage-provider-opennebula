@@ -72,6 +72,23 @@ func TestResolveDatastoresAcceptsNumericImageDatastoreCategoryFromOpenNebula(t *
 	assert.Equal(t, "local", resolved[0].Type)
 }
 
+func TestResolveDatastoresTreatsFSWithSSHTMModeAsLocal(t *testing.T) {
+	resolved, err := ResolveDatastores([]datastoreSchema.Datastore{
+		newTypedTestDatastore(100, "one-csi-local", "fs", "ssh", "0", map[string]string{
+			"TYPE":      "IMAGE_DS",
+			"DISK_TYPE": "FILE",
+		}),
+	}, DatastoreSelectionConfig{
+		Identifiers:  []string{"100"},
+		AllowedTypes: []string{"local"},
+	})
+	require.NoError(t, err)
+	require.Len(t, resolved, 1)
+	assert.Equal(t, "local", resolved[0].Type)
+	assert.Equal(t, "local", resolved[0].Backend)
+	assert.Equal(t, "IMAGE", resolved[0].Category)
+}
+
 func TestResolveDatastoresRejectsNumericSystemDatastoreCategoryFromOpenNebula(t *testing.T) {
 	_, err := ResolveDatastores([]datastoreSchema.Datastore{
 		newTypedTestDatastore(112, "lvm-local-system", "fs", "fs_lvm_ssh", "1", map[string]string{
@@ -141,6 +158,27 @@ func TestResolveDatastoresAcceptsValidCephImageDatastore(t *testing.T) {
 	assert.Equal(t, "RBD", resolved[0].DiskType)
 }
 
+func TestResolveDatastoresAcceptsCephImageDatastoreWithNumericSchemaDiskType(t *testing.T) {
+	ds := newTestDatastore(200, "ceph-a", "ceph", "ceph", map[string]string{
+		"DISK_TYPE":   "RBD",
+		"POOL_NAME":   "one",
+		"CEPH_HOST":   "mon1 mon2",
+		"CEPH_USER":   "libvirt",
+		"CEPH_SECRET": "secret-id",
+		"BRIDGE_LIST": "frontend",
+		"RBD_FORMAT":  "2",
+	})
+	ds.DiskType = "3"
+
+	resolved, err := ResolveDatastores([]datastoreSchema.Datastore{ds}, DatastoreSelectionConfig{
+		Identifiers:  []string{"200"},
+		AllowedTypes: []string{"ceph"},
+	})
+	require.NoError(t, err)
+	require.Len(t, resolved, 1)
+	assert.Equal(t, "RBD", resolved[0].DiskType)
+}
+
 func TestResolveDatastoresAcceptsValidCephFSFileDatastore(t *testing.T) {
 	resolved, err := ResolveDatastores([]datastoreSchema.Datastore{
 		newTypedTestDatastore(300, "cephfs-a", "fs", "shared", "FILE", map[string]string{
@@ -161,6 +199,26 @@ func TestResolveDatastoresAcceptsValidCephFSFileDatastore(t *testing.T) {
 	assert.Equal(t, "cephfs-prod", resolved[0].CephFS.FSName)
 	assert.Equal(t, "/kubernetes", resolved[0].CephFS.RootPath)
 	assert.Equal(t, []string{"mon1", "mon2"}, resolved[0].CephFS.Monitors)
+}
+
+func TestResolveDatastoresAcceptsNumericCephFSFileCategoryFromOpenNebula(t *testing.T) {
+	resolved, err := ResolveDatastores([]datastoreSchema.Datastore{
+		newTypedTestDatastore(300, "cephfs-a", "fs", "shared", "2", map[string]string{
+			"TYPE":                               "FILE_DS",
+			"SPARKAI_CSI_SHARE_BACKEND":          "cephfs",
+			"SPARKAI_CSI_CEPHFS_FS_NAME":         "cephfs-prod",
+			"SPARKAI_CSI_CEPHFS_ROOT_PATH":       "/kubernetes",
+			"SPARKAI_CSI_CEPHFS_SUBVOLUME_GROUP": "csi",
+			"CEPH_HOST":                          "mon1,mon2",
+		}),
+	}, DatastoreSelectionConfig{
+		Identifiers:  []string{"300"},
+		AllowedTypes: []string{"cephfs"},
+	})
+	require.NoError(t, err)
+	require.Len(t, resolved, 1)
+	assert.Equal(t, "FILE", resolved[0].Category)
+	assert.Equal(t, "cephfs", resolved[0].Type)
 }
 
 func TestResolveDatastoresRejectsCephFSWithoutFileCategory(t *testing.T) {

@@ -105,7 +105,7 @@ spec:
           {{- if .Values.metrics.enabled }}
           ports:
             - containerPort: {{ .Values.metrics.ports.registrar }}
-              name: registrar-metrics
+              name: reg-metrics
               protocol: TCP
           {{- end }}
           args:

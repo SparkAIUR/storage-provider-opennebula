@@ -29,18 +29,18 @@ spec:
       protocol: TCP
       targetPort: driver-metrics
     {{- end }}
-    - name: provisioner-metrics
+    - name: prov-metrics
       port: {{ .Values.metrics.ports.provisioner }}
       protocol: TCP
-      targetPort: provisioner-metrics
-    - name: attacher-metrics
+      targetPort: prov-metrics
+    - name: att-metrics
       port: {{ .Values.metrics.ports.attacher }}
       protocol: TCP
-      targetPort: attacher-metrics
-    - name: resizer-metrics
+      targetPort: att-metrics
+    - name: res-metrics
       port: {{ .Values.metrics.ports.resizer }}
       protocol: TCP
-      targetPort: resizer-metrics
+      targetPort: res-metrics
 ---
 apiVersion: v1
 kind: Service
@@ -71,8 +71,8 @@ spec:
       protocol: TCP
       targetPort: driver-metrics
     {{- end }}
-    - name: registrar-metrics
+    - name: reg-metrics
       port: {{ .Values.metrics.ports.registrar }}
       protocol: TCP
-      targetPort: registrar-metrics
+      targetPort: reg-metrics
 {{- end }}

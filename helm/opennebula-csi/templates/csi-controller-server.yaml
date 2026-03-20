@@ -88,12 +88,13 @@ spec:
           {{- if .Values.metrics.enabled }}
           ports:
             - containerPort: {{ .Values.metrics.ports.provisioner }}
-              name: provisioner-metrics
+              name: prov-metrics
               protocol: TCP
           {{- end }}
           args:
             - "--v=5"
             - "--csi-address=$(ADDRESS)"
+            - "--timeout=2m"
             - "--default-fstype=ext4"
             - "--extra-create-metadata"
             {{- if .Values.metrics.enabled }}
@@ -111,7 +112,7 @@ spec:
           {{- if .Values.metrics.enabled }}
           ports:
             - containerPort: {{ .Values.metrics.ports.attacher }}
-              name: attacher-metrics
+              name: att-metrics
               protocol: TCP
           {{- end }}
           args:
@@ -133,7 +134,7 @@ spec:
           {{- if .Values.metrics.enabled }}
           ports:
             - containerPort: {{ .Values.metrics.ports.resizer }}
-              name: resizer-metrics
+              name: res-metrics
               protocol: TCP
           {{- end }}
           args:

@@ -3,6 +3,7 @@ package opennebula
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -900,12 +901,33 @@ func (p *CephFSVolumeProvider) runCephCommand(_ context.Context, datastore Datas
 		return nil, fmt.Errorf("failed to secure temporary CephFS key file: %w", err)
 	}
 
-	commandArgs := []string{"-m", strings.Join(datastore.CephFS.Monitors, ","), "--id", adminID, "--keyfile", keyFilePath}
+	cephConfPath := strings.TrimSpace(datastore.CephFS.OptionalCephConf)
+	commandArgs := make([]string, 0, len(args)+8)
+	if cephConfPath == "" {
+		commandArgs = append(commandArgs, "-c", "/dev/null")
+	} else {
+		if _, err := os.Stat(cephConfPath); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				klog.V(2).InfoS("Configured Ceph config file is not present inside the controller container, falling back to an empty config", "datastoreID", datastore.ID, "path", cephConfPath)
+				commandArgs = append(commandArgs, "-c", "/dev/null")
+			} else {
+				return nil, fmt.Errorf("failed to stat configured Ceph config file %q: %w", cephConfPath, err)
+			}
+		} else {
+			commandArgs = append(commandArgs, "-c", cephConfPath)
+		}
+	}
+
+	commandArgs = append(commandArgs, "-m", strings.Join(datastore.CephFS.Monitors, ","), "--id", adminID, "--keyfile", keyFilePath)
 	commandArgs = append(commandArgs, args...)
 
 	cmd := p.exec.Command(cephFsCommandBin, commandArgs...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		trimmedOutput := strings.TrimSpace(string(output))
+		if trimmedOutput != "" {
+			return output, fmt.Errorf("ceph command failed: %w: %s", err, trimmedOutput)
+		}
 		return output, fmt.Errorf("ceph command failed: %w", err)
 	}
 

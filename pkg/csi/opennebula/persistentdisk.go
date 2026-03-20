@@ -369,7 +369,7 @@ func (p *PersistentDiskVolumeProvider) ExpandVolume(ctx context.Context, volume 
 		return int64(currentSize), nil
 	}
 
-	vmID, diskID, attached, err := p.findAttachedVolumeDisk(ctx, volumeID)
+	vmID, diskID, attached, attachedSizeBytes, err := p.findAttachedVolumeDisk(ctx, volumeID)
 	if err != nil {
 		return 0, err
 	}
@@ -380,8 +380,15 @@ func (p *PersistentDiskVolumeProvider) ExpandVolume(ctx context.Context, volume 
 	}
 
 	if attached {
+		if attachedSizeBytes >= size {
+			return attachedSizeBytes, nil
+		}
+
 		err = p.ctrl.VM(vmID).Disk(diskID).ResizeContext(ctx, strconv.FormatInt(sizeMB, 10))
 		if err != nil {
+			if attachedSizeBytes, sizeErr := p.attachedDiskSizeBytes(ctx, vmID, diskID, volumeID); sizeErr == nil && attachedSizeBytes >= size {
+				return attachedSizeBytes, nil
+			}
 			return 0, fmt.Errorf("failed to expand volume %s on vm %d disk %d: %w", volume, vmID, diskID, err)
 		}
 	} else {
@@ -398,19 +405,42 @@ func (p *PersistentDiskVolumeProvider) ExpandVolume(ctx context.Context, volume 
 		}
 	}
 
-	err = p.waitForResourceStatus(volumeID, volumeUsedTimeout, func(resourceID int) (bool, error) {
-		imageInfo, infoErr := p.ctrl.Image(resourceID).Info(true)
-		if infoErr != nil {
-			return false, fmt.Errorf("failed to get volume info after resize: %w", infoErr)
-		}
-
-		return int64(imageInfo.Size*sizeConversion) >= size, nil
-	})
+	var completedSizeBytes int64
+	if attached {
+		err = p.waitForResourceStatus(volumeID, volumeUsedTimeout, func(resourceID int) (bool, error) {
+			currentSizeBytes, sizeErr := p.attachedDiskSizeBytes(ctx, vmID, diskID, resourceID)
+			if sizeErr != nil {
+				return false, sizeErr
+			}
+			if currentSizeBytes >= size {
+				completedSizeBytes = currentSizeBytes
+				return true, nil
+			}
+			return false, nil
+		})
+	} else {
+		err = p.waitForResourceStatus(volumeID, volumeUsedTimeout, func(resourceID int) (bool, error) {
+			imageInfo, infoErr := p.ctrl.Image(resourceID).Info(true)
+			if infoErr != nil {
+				return false, fmt.Errorf("failed to get volume info after resize: %w", infoErr)
+			}
+			currentSizeBytes := int64(imageInfo.Size * sizeConversion)
+			if currentSizeBytes >= size {
+				completedSizeBytes = currentSizeBytes
+				return true, nil
+			}
+			return false, nil
+		})
+	}
 	if err != nil {
 		return 0, fmt.Errorf("failed waiting for volume resize to complete: %w", err)
 	}
 
-	return sizeMB * sizeConversion, nil
+	if completedSizeBytes == 0 {
+		completedSizeBytes = sizeMB * sizeConversion
+	}
+
+	return completedSizeBytes, nil
 }
 
 func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume string, node string, immutable bool, params map[string]string) error {
@@ -712,14 +742,15 @@ func (p *PersistentDiskVolumeProvider) resolveProvisioningDatastores(ctx context
 	return ordered, nil
 }
 
-func (p *PersistentDiskVolumeProvider) findAttachedVolumeDisk(ctx context.Context, volumeID int) (int, int, bool, error) {
+func (p *PersistentDiskVolumeProvider) findAttachedVolumeDisk(ctx context.Context, volumeID int) (int, int, bool, int64, error) {
 	vmPool, err := p.ctrl.VMs().InfoContext(ctx)
 	if err != nil {
-		return 0, 0, false, fmt.Errorf("failed to get vm info while locating attached volume %d: %w", volumeID, err)
+		return 0, 0, false, 0, fmt.Errorf("failed to get vm info while locating attached volume %d: %w", volumeID, err)
 	}
 
 	var attachedVMID int
 	var attachedDiskID int
+	var attachedSizeBytes int64
 	found := false
 	for _, vmInfo := range vmPool.VMs {
 		for _, disk := range vmInfo.Template.GetDisks() {
@@ -730,30 +761,67 @@ func (p *PersistentDiskVolumeProvider) findAttachedVolumeDisk(ctx context.Contex
 
 			diskIDStr, diskIDErr := disk.Get(shared.DiskID)
 			if diskIDErr != nil {
-				return 0, 0, false, fmt.Errorf("failed to determine disk ID for volume %d on vm %d: %w", volumeID, vmInfo.ID, diskIDErr)
+				return 0, 0, false, 0, fmt.Errorf("failed to determine disk ID for volume %d on vm %d: %w", volumeID, vmInfo.ID, diskIDErr)
 			}
 			diskID, convErr := strconv.Atoi(diskIDStr)
 			if convErr != nil {
-				return 0, 0, false, fmt.Errorf("invalid disk ID for volume %d on vm %d: %w", volumeID, vmInfo.ID, convErr)
+				return 0, 0, false, 0, fmt.Errorf("invalid disk ID for volume %d on vm %d: %w", volumeID, vmInfo.ID, convErr)
 			}
 
 			if found {
-				return 0, 0, false, &datastoreConfigError{
+				return 0, 0, false, 0, &datastoreConfigError{
 					message: fmt.Sprintf("volume %d is attached to multiple virtual machines; expansion currently requires a single attachment", volumeID),
 				}
 			}
 
+			diskSizeBytes, sizeErr := diskSizeBytesFromTemplate(disk)
+			if sizeErr != nil {
+				return 0, 0, false, 0, fmt.Errorf("failed to determine attached size for volume %d on vm %d disk %d: %w", volumeID, vmInfo.ID, diskID, sizeErr)
+			}
+
 			attachedVMID = vmInfo.ID
 			attachedDiskID = diskID
+			attachedSizeBytes = diskSizeBytes
 			found = true
 		}
 	}
 
 	if !found {
-		return 0, 0, false, nil
+		return 0, 0, false, 0, nil
 	}
 
-	return attachedVMID, attachedDiskID, true, nil
+	return attachedVMID, attachedDiskID, true, attachedSizeBytes, nil
+}
+
+func (p *PersistentDiskVolumeProvider) attachedDiskSizeBytes(ctx context.Context, vmID, diskID, volumeID int) (int64, error) {
+	vmInfo, err := p.ctrl.VM(vmID).InfoContext(ctx, true)
+	if err != nil {
+		return 0, fmt.Errorf("failed to inspect vm %d while checking attached volume %d size: %w", vmID, volumeID, err)
+	}
+
+	for _, disk := range vmInfo.Template.GetDisks() {
+		diskImageID, diskErr := disk.GetI(shared.ImageID)
+		if diskErr != nil || diskImageID != volumeID {
+			continue
+		}
+
+		currentDiskID, idErr := disk.GetI(shared.DiskID)
+		if idErr != nil || currentDiskID != diskID {
+			continue
+		}
+
+		return diskSizeBytesFromTemplate(disk)
+	}
+
+	return 0, fmt.Errorf("failed to locate attached disk %d for volume %d on vm %d", diskID, volumeID, vmID)
+}
+
+func diskSizeBytesFromTemplate(disk shared.Disk) (int64, error) {
+	sizeMB, err := disk.GetI(shared.Size)
+	if err != nil {
+		return 0, err
+	}
+	return int64(sizeMB) * sizeConversion, nil
 }
 
 func (p *PersistentDiskVolumeProvider) VolumeExists(ctx context.Context, volume string) (int, int, error) {
@@ -909,7 +977,7 @@ func latestHistoryDatastoreID(vmInfo *vm.VM) (int, error) {
 	var latest *vm.HistoryRecord
 	for idx := range vmInfo.HistoryRecords {
 		record := &vmInfo.HistoryRecords[idx]
-		if record.DSID <= 0 {
+		if record.DSID < 0 {
 			continue
 		}
 		if latest == nil || record.SEQ > latest.SEQ {

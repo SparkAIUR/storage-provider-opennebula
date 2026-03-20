@@ -163,7 +163,7 @@ func validateCephFSDatastore(ds datastoreSchema.Datastore) error {
 	if !strings.EqualFold(strings.TrimSpace(getDatastoreAttribute(ds, sharedBackendAttr)), sharedBackendCephFS) {
 		return &datastoreConfigError{message: fmt.Sprintf("datastore %d must define %s=cephfs", ds.ID, sharedBackendAttr)}
 	}
-	if !strings.EqualFold(strings.TrimSpace(ds.Type), string(datastoreSchema.File)) {
+	if !strings.EqualFold(normalizeDatastoreCategory(ds), string(datastoreSchema.File)) {
 		return &datastoreConfigError{message: fmt.Sprintf("datastore %d must be an OpenNebula FILE datastore for CephFS RWX", ds.ID)}
 	}
 	if err := requireDatastoreAttributes(ds, cephFSAttrFSName, cephFSAttrRootPath, cephFSAttrSubvolumeGroup, cephAttrHost); err != nil {
@@ -326,8 +326,9 @@ func getDatastoreAttribute(ds datastoreSchema.Datastore, key string) string {
 	case "TM_MAD":
 		return strings.TrimSpace(ds.TMMad)
 	case cephAttrDiskType:
-		if strings.TrimSpace(ds.DiskType) != "" {
-			return strings.TrimSpace(ds.DiskType)
+		raw := strings.TrimSpace(ds.DiskType)
+		if raw != "" && !isNumericDatastoreField(raw) {
+			return raw
 		}
 	}
 
@@ -341,6 +342,20 @@ func getDatastoreAttribute(ds datastoreSchema.Datastore, key string) string {
 
 func normalizeDiskType(ds datastoreSchema.Datastore) string {
 	return strings.ToUpper(getDatastoreAttribute(ds, cephAttrDiskType))
+}
+
+func isNumericDatastoreField(value string) bool {
+	if value == "" {
+		return false
+	}
+
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+
+	return true
 }
 
 func normalizeMonitorList(value string) []string {

@@ -235,6 +235,27 @@ func TestCreateVolumeCreatesSharedFilesystemVolumeForRWX(t *testing.T) {
 	sharedProvider.AssertExpectations(t)
 }
 
+func TestControllerGetCapabilitiesIncludesCloneVolume(t *testing.T) {
+	cs := getTestControllerServer(&MockOpenNebulaVolumeProviderTestify{})
+
+	resp, err := cs.ControllerGetCapabilities(context.Background(), &csi.ControllerGetCapabilitiesRequest{})
+	assert.NoError(t, err)
+
+	var cloneCap bool
+	for _, capability := range resp.GetCapabilities() {
+		rpc := capability.GetRpc()
+		if rpc == nil {
+			continue
+		}
+		if rpc.GetType() == csi.ControllerServiceCapability_RPC_CLONE_VOLUME {
+			cloneCap = true
+			break
+		}
+	}
+
+	assert.True(t, cloneCap, "controller must advertise CLONE_VOLUME capability")
+}
+
 func TestCreateVolumeIncludesAccessibleTopologyWhenEnabled(t *testing.T) {
 	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
 	sharedProvider := &MockSharedFilesystemProviderTestify{}
@@ -380,6 +401,9 @@ func TestCreateVolumeClonesFromSourceVolume(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "clone-volume", resp.GetVolume().GetVolumeId())
 	assert.Equal(t, int64(1024*1024*1024), resp.GetVolume().GetCapacityBytes())
+	if assert.NotNil(t, resp.GetVolume().GetContentSource()) {
+		assert.Equal(t, "source-volume", resp.GetVolume().GetContentSource().GetVolume().GetVolumeId())
+	}
 	mockProvider.AssertExpectations(t)
 }
 

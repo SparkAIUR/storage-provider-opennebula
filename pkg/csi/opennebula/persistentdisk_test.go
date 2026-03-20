@@ -135,6 +135,20 @@ func TestLatestHistoryDatastoreID(t *testing.T) {
 	assert.Equal(t, 150, dsID)
 }
 
+func TestLatestHistoryDatastoreIDAcceptsZeroSystemDatastore(t *testing.T) {
+	vmInfo := &vm.VM{
+		ID: 42,
+		HistoryRecords: []vm.HistoryRecord{
+			{SEQ: 0, DSID: -1},
+			{SEQ: 1, DSID: 0},
+		},
+	}
+
+	dsID, err := latestHistoryDatastoreID(vmInfo)
+	require.NoError(t, err)
+	assert.Equal(t, 0, dsID)
+}
+
 func TestLatestHistoryDatastoreIDRequiresSystemDatastoreHistory(t *testing.T) {
 	_, err := latestHistoryDatastoreID(&vm.VM{ID: 42})
 	require.Error(t, err)
