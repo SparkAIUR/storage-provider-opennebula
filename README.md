@@ -15,6 +15,7 @@ This fork is focused on Omni deployments on OpenNebula and removes the old requi
 - Support `NodeGetVolumeStats`, driver-native Prometheus metrics, Kubernetes Events, and PV placement annotations.
 - Support preflight validation through the binary and an optional Helm Job.
 - Support CSI snapshots plus PVC-to-PVC clone for disk-backed OpenNebula volumes.
+- Support gated topology accessibility, detached-disk expansion, and CephFS expansion/snapshot/clone flows for staging validation.
 - Support `local`, OpenNebula Ceph RBD, and SparkAI CephFS datastores.
 - Keep the internal selection/provider structure ready for future `nfs` support.
 
@@ -95,7 +96,7 @@ Routing is inferred from the requested access mode:
 - Databases and other single-writer application data should still use the OpenNebula `IMAGE` datastore path
 - Shared caches, model stores, and other multi-node RWX workloads can now use the CephFS shared-filesystem path
 - `ReadOnlyMany` remains on the disk path in `v0.4.0`
-- CephFS expansion, snapshots, and clones are not implemented in `v0.4.0`
+- CephFS expansion, snapshots, and clones are implemented behind feature gates and remain alpha-off by default in `v0.4.0`
 
 ## Ceph RBD support
 
@@ -199,6 +200,15 @@ Expected CephFS secret keys:
 - the runtime image now includes `ceph`, `ceph-fuse`, and related Ceph packages
 - CephFS node-stage auth is provided through Kubernetes Secret refs, not host-global Ceph config
 - dynamic CephFS provisioning requires a Ceph user with permission to create, getpath, and remove subvolumes in the configured filesystem and subvolume group
+- CephFS expansion, snapshot, and clone flows require the corresponding feature gates to be enabled before use
+
+### CephFS alpha feature gates
+
+- `cephfsExpansion=true` enables `ControllerExpandVolume` for dynamic CephFS subvolumes through `ceph fs subvolume resize`
+- `cephfsSnapshots=true` enables `CreateSnapshot`, `DeleteSnapshot`, and snapshot listing for dynamic CephFS subvolumes
+- `cephfsClones=true` enables PVC clone from CephFS volumes and restore from CephFS snapshots
+- `cephfsSelfHealing=true` enables one lazy-unmount/remount recovery attempt when node stage detects a stale CephFS mount
+- static CephFS paths created with `sharedFilesystemPath` still reject expansion
 
 ## Volume expansion
 
@@ -209,8 +219,10 @@ Current behavior:
 - Controller expansion is supported for OpenNebula volumes that are attached to a VM.
 - Filesystem expansion is supported on the node for mounted filesystem volumes.
 - Block volumes do not require node-side filesystem expansion.
-- CephFS shared-filesystem volumes do not support expansion in `v0.4.0`.
-- Detached-volume expansion is not currently supported by the driver, because the OpenNebula API surface used by this fork only exposes a documented disk-resize path for attached VM disks.
+- CephFS shared-filesystem volumes support expansion for dynamic subvolumes when `cephfsExpansion=true`.
+- Static CephFS paths created with `sharedFilesystemPath` are not expandable.
+- Detached-volume expansion is available behind `detachedDiskExpansion=true` and uses image-level resize via `one.image.update`.
+- Shrinking remains unsupported for disk and CephFS paths.
 
 ## Snapshots and clones
 
@@ -223,7 +235,25 @@ Stable disk-path data-management features in `v0.4.0`:
 Current limitations:
 
 - restoring a new PVC from an OpenNebula image snapshot is not supported by the current backend path
-- CephFS snapshots and clones remain alpha-off and are not exposed as stable features in `v0.4.0`
+- CephFS snapshots and clones remain alpha-off by default, but can be enabled with `cephfsSnapshots=true` and `cephfsClones=true`
+- CephFS clone restore requires a dynamic CephFS volume source or a CephFS snapshot source
+
+## Topology accessibility
+
+Topology accessibility remains alpha and is disabled by default.
+
+When `topologyAccessibility=true`:
+
+- the plugin advertises CSI `VOLUME_ACCESSIBILITY_CONSTRAINTS`
+- the node plugin reads the Kubernetes Node label `topology.opennebula.sparkaiur.io/system-ds`
+- `NodeGetInfo` reports that label as the node’s accessible topology segment
+- `CreateVolume` returns `accessible_topology` when the selected datastore exposes deterministic `COMPATIBLE_SYS_DS` values
+
+Operational requirements:
+
+- label Kubernetes nodes with `topology.opennebula.sparkaiur.io/system-ds=<opennebula-system-datastore-id>`
+- ensure the node DaemonSet service account can `get` `nodes`
+- if you need an override during testing, set `ONE_CSI_NODE_TOPOLOGY_SYSTEM_DS` through `driver.env`
 
 Example objects:
 
@@ -356,7 +386,14 @@ Current gates:
 - `cephfsSelfHealing=false`
 - `topologyAccessibility=false`
 
-The chart renders these into `ONE_CSI_FEATURE_GATES`. `cephfsSelfHealing` now controls stale CephFS remount attempts after a stale mount is detected during node stage.
+The chart renders these into `ONE_CSI_FEATURE_GATES`.
+
+- `detachedDiskExpansion` enables image-level resize for detached persistent disks
+- `cephfsExpansion` enables dynamic CephFS subvolume quota resize
+- `cephfsSnapshots` enables CephFS snapshot RPCs
+- `cephfsClones` enables CephFS PVC clone and snapshot restore flows
+- `cephfsSelfHealing` controls stale CephFS remount attempts after a stale mount is detected during node stage
+- `topologyAccessibility` enables node topology lookup and `accessible_topology` responses
 
 ## Helm installation
 
@@ -453,6 +490,7 @@ Each item under `storageClasses` supports:
 - Ceph RBD with SSH System Datastore mode: [examples/helm-values-ceph-ssh-mode.yaml](examples/helm-values-ceph-ssh-mode.yaml)
 - CephFS static RWX example: [examples/helm-values-cephfs-static.yaml](examples/helm-values-cephfs-static.yaml)
 - CephFS dynamic RWX example: [examples/helm-values-cephfs-dynamic.yaml](examples/helm-values-cephfs-dynamic.yaml)
+- Alpha feature-gate example: [examples/helm-values-feature-gates-alpha.yaml](examples/helm-values-feature-gates-alpha.yaml)
 - Snapshotter/clone example values: [examples/helm-values-snapshotter.yaml](examples/helm-values-snapshotter.yaml)
 - Preflight job example values: [examples/helm-values-preflight.yaml](examples/helm-values-preflight.yaml)
 - CephFS node-stage secret example: [examples/cephfs-node-stage-secret.yaml](examples/cephfs-node-stage-secret.yaml)
