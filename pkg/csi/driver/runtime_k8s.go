@@ -31,6 +31,8 @@ const (
 	annotationDatastoreName    = "storage-provider.opennebula.sparkaiur.io/datastore-name"
 	annotationSelectionPolicy  = "storage-provider.opennebula.sparkaiur.io/selection-policy"
 	annotationPlacementSummary = "storage-provider.opennebula.sparkaiur.io/placement-summary"
+
+	topologySystemDSLabel = "topology.opennebula.sparkaiur.io/system-ds"
 )
 
 type PlacementReport struct {
@@ -139,6 +141,25 @@ func (r *KubeRuntime) AnnotatePVAsync(ctx context.Context, pvName string, report
 			klog.V(2).InfoS("Failed to annotate PV", "pvName", pvName, "err", err)
 		}
 	}()
+}
+
+func (r *KubeRuntime) GetNodeLabel(ctx context.Context, nodeName, labelKey string) (string, error) {
+	if r == nil || !r.enabled {
+		return "", fmt.Errorf("kubernetes runtime is not enabled")
+	}
+	if strings.TrimSpace(nodeName) == "" {
+		return "", fmt.Errorf("node name is required")
+	}
+	if strings.TrimSpace(labelKey) == "" {
+		return "", fmt.Errorf("label key is required")
+	}
+
+	node, err := r.client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(node.Labels[labelKey]), nil
 }
 
 func buildPVAnnotationPatch(report PlacementReport) ([]byte, error) {

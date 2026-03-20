@@ -56,6 +56,10 @@ func getTestControllerServerWithAllowedTypes(mockProvider *MockOpenNebulaVolumeP
 	return NewControllerServer(driver, mockProvider, sharedProvider)
 }
 
+func getTestControllerServerWithDriver(mockProvider *MockOpenNebulaVolumeProviderTestify, sharedProvider *MockSharedFilesystemProviderTestify, driver *Driver) *ControllerServer {
+	return NewControllerServer(driver, mockProvider, sharedProvider)
+}
+
 func TestCreateVolume(t *testing.T) {
 	const volumeSize = int64(1024 * 1024 * 1024) // 1GiB
 
@@ -229,6 +233,77 @@ func TestCreateVolumeCreatesSharedFilesystemVolumeForRWX(t *testing.T) {
 	assert.Equal(t, "cephfs:eyJiYWNrZW5kIjoiY2VwaGZzIiwiZGF0YXN0b3JlSUQiOjEwMCwiZnNOYW1lIjoiY2VwaGZzIiwibW9kZSI6ImR5bmFtaWMiLCJzdWJ2b2x1bWVHcm91cCI6ImNzaSIsInN1YnBhdGgiOiIvdm9sdW1lcy9jc2ktcHZjIn0", resp.GetVolume().GetVolumeId())
 	mockProvider.AssertExpectations(t)
 	sharedProvider.AssertExpectations(t)
+}
+
+func TestCreateVolumeIncludesAccessibleTopologyWhenEnabled(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	sharedProvider := &MockSharedFilesystemProviderTestify{}
+	pluginConfig := config.LoadConfiguration()
+	pluginConfig.OverrideVal(config.DefaultDatastoresVar, "100")
+	pluginConfig.OverrideVal(config.AllowedDatastoreTypesVar, "local")
+
+	driver := &Driver{
+		name:               DefaultDriverName,
+		version:            driverVersion,
+		grpcServerEndpoint: DefaultGRPCServerEndpoint,
+		nodeID:             "test-controller-id",
+		PluginConfig:       pluginConfig,
+		featureGates: FeatureGates{
+			TopologyAccessibility: true,
+		},
+	}
+
+	mockProvider.On("VolumeExists", mock.Anything, "topology-volume").Return(-1, -1, nil)
+	mockProvider.On(
+		"CreateVolume",
+		mock.Anything,
+		"topology-volume",
+		int64(1024*1024*1024),
+		mock.Anything,
+		false,
+		"",
+		map[string]string{},
+		opennebula.DatastoreSelectionConfig{
+			Identifiers:  []string{"100"},
+			Policy:       opennebula.DatastoreSelectionPolicyLeastUsed,
+			AllowedTypes: []string{"local"},
+		},
+	).Return(&opennebula.VolumeCreateResult{
+		Datastore: opennebula.Datastore{
+			ID:                         100,
+			Name:                       "image-ds",
+			CompatibleSystemDatastores: []int{111, 112},
+		},
+		CapacityBytes: int64(1024 * 1024 * 1024),
+	}, nil)
+
+	cs := getTestControllerServerWithDriver(mockProvider, sharedProvider, driver)
+	resp, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name: "topology-volume",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: int64(1024 * 1024 * 1024),
+		},
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessType: &csi.VolumeCapability_Mount{
+					Mount: &csi.VolumeCapability_MountVolume{},
+				},
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+		},
+		Parameters: map[string]string{
+			storageClassParamDatastoreIDs: "100",
+		},
+	})
+
+	assert.NoError(t, err)
+	if assert.Len(t, resp.GetVolume().GetAccessibleTopology(), 2) {
+		assert.Equal(t, "111", resp.GetVolume().GetAccessibleTopology()[0].Segments[topologySystemDSLabel])
+		assert.Equal(t, "112", resp.GetVolume().GetAccessibleTopology()[1].Segments[topologySystemDSLabel])
+	}
+	mockProvider.AssertExpectations(t)
 }
 
 func TestCreateVolumeRejectsReadWriteManyBlockVolume(t *testing.T) {

@@ -32,6 +32,7 @@ const (
 	AllowedDatastoreTypesVar = "ONE_CSI_ALLOWED_DATASTORE_TYPES"
 	FeatureGatesVar          = "ONE_CSI_FEATURE_GATES"
 	MetricsEndpointVar       = "ONE_CSI_METRICS_ENDPOINT"
+	NodeTopologySystemDSVar  = "ONE_CSI_NODE_TOPOLOGY_SYSTEM_DS"
 
 	//Default values
 	defaultOpenNebulaRPCEndpoint = "http://localhost:2633/RPC2"

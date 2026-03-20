@@ -167,6 +167,9 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 
 		response.Volume.VolumeId = result.VolumeID
 		response.Volume.CapacityBytes = result.CapacityBytes
+		if s.driver.featureGates.TopologyAccessibility {
+			response.Volume.AccessibleTopology = accessibleTopologyForDatastore(result.Datastore)
+		}
 		s.driver.metrics.RecordOperation("create_volume", backend, "success", time.Since(started))
 		s.driver.metrics.RecordDatastoreSelection(string(selection.Policy), result.Datastore.Backend, result.Datastore.ID, "selected")
 		s.driver.metrics.SetDatastoreCapacity(result.Datastore.Backend, result.Datastore.ID, result.Datastore.FreeBytes, result.Datastore.TotalBytes)
@@ -211,6 +214,9 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 
 			if result.CapacityBytes > 0 {
 				response.Volume.CapacityBytes = result.CapacityBytes
+			}
+			if s.driver.featureGates.TopologyAccessibility {
+				response.Volume.AccessibleTopology = accessibleTopologyForDatastore(result.Datastore)
 			}
 			s.driver.metrics.RecordOperation("create_volume", result.Datastore.Backend, "success", time.Since(started))
 			s.recordPVCEventFromParams(ctx, rawParams, eventReasonCloneCreated, fmt.Sprintf("cloned source volume %s into datastore %d", source.Volume.GetVolumeId(), result.Datastore.ID))
@@ -275,6 +281,9 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	s.driver.metrics.RecordOperation("create_volume", result.Datastore.Backend, "success", time.Since(started))
 	if result.CapacityBytes > 0 {
 		response.Volume.CapacityBytes = result.CapacityBytes
+	}
+	if s.driver.featureGates.TopologyAccessibility {
+		response.Volume.AccessibleTopology = accessibleTopologyForDatastore(result.Datastore)
 	}
 	s.driver.metrics.RecordDatastoreSelection(string(selection.Policy), result.Datastore.Backend, result.Datastore.ID, "selected")
 	s.driver.metrics.SetDatastoreCapacity(result.Datastore.Backend, result.Datastore.ID, result.Datastore.FreeBytes, result.Datastore.TotalBytes)

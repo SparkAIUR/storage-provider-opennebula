@@ -233,6 +233,32 @@ func TestGetPluginCapabilities(t *testing.T) {
 		t.Error("missing online volume expansion capability")
 	}
 }
+
+func TestGetPluginCapabilitiesIncludesTopologyCapabilityWhenEnabled(t *testing.T) {
+	driver := &Driver{
+		name:         "test-driver",
+		version:      "1.0.0",
+		featureGates: FeatureGates{TopologyAccessibility: true},
+	}
+
+	is := NewIdentityServer(driver)
+	resp, err := is.GetPluginCapabilities(context.Background(), &csi.GetPluginCapabilitiesRequest{})
+
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	var sawTopology bool
+	for _, cap := range resp.Capabilities {
+		if service := cap.GetService(); service != nil && service.Type == csi.PluginCapability_Service_VOLUME_ACCESSIBILITY_CONSTRAINTS {
+			sawTopology = true
+		}
+	}
+
+	if !sawTopology {
+		t.Fatal("expected topology accessibility capability")
+	}
+}
 func TestProbe(t *testing.T) {
 	driver := &Driver{
 		name:    "test-driver",

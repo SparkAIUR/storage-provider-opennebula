@@ -5,6 +5,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"k8s.io/mount-utils"
@@ -17,12 +18,14 @@ const (
 )
 
 func getTestNodeServer(mountPoints []string) *NodeServer {
+	pluginConfig := config.LoadConfiguration()
 	driver := &Driver{
 		name:               DefaultDriverName,
 		version:            driverVersion,
 		grpcServerEndpoint: DefaultGRPCServerEndpoint,
 		nodeID:             "test-node-id",
 		maxVolumesPerNode:  30,
+		PluginConfig:       pluginConfig,
 	}
 	commandScriptArray := []testingexec.FakeCommandAction{}
 	//TODO: Simulate real commands
@@ -485,5 +488,18 @@ func TestNodeGetInfo(t *testing.T) {
 				assert.NotNil(t, response)
 			}
 		})
+	}
+}
+
+func TestNodeGetInfoIncludesAccessibleTopologyWhenEnabled(t *testing.T) {
+	tempDir := t.TempDir()
+	ns := getTestNodeServer([]string{tempDir})
+	ns.Driver.featureGates.TopologyAccessibility = true
+	ns.Driver.PluginConfig.OverrideVal(config.NodeTopologySystemDSVar, "111")
+
+	response, err := ns.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
+	assert.NoError(t, err)
+	if assert.NotNil(t, response.GetAccessibleTopology()) {
+		assert.Equal(t, "111", response.GetAccessibleTopology().Segments[topologySystemDSLabel])
 	}
 }

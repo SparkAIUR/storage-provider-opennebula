@@ -625,10 +625,15 @@ func (ns *NodeServer) NodeGetInfo(_ context.Context, req *csi.NodeGetInfoRequest
 	klog.V(3).InfoS("Returning node info",
 		"nodeId", nodeId, "maxVolumesPerNode", maxVolumesPerNode)
 
-	return &csi.NodeGetInfoResponse{
+	response := &csi.NodeGetInfoResponse{
 		NodeId:            nodeId,
 		MaxVolumesPerNode: maxVolumesPerNode,
-	}, nil
+	}
+	if accessibleTopology := ns.Driver.nodeAccessibleTopology(context.Background()); len(accessibleTopology) > 0 {
+		response.AccessibleTopology = accessibleTopology[0]
+	}
+
+	return response, nil
 }
 
 func (ns *NodeServer) getDeviceName(volumeName string) string {
