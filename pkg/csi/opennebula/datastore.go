@@ -25,18 +25,19 @@ type DatastoreSelectionConfig struct {
 }
 
 type Datastore struct {
-	ID        int
-	Name      string
-	Category  string
-	Type      string
-	Backend   string
-	DSMad     string
-	TMMad     string
-	DiskType  string
-	FreeBytes int64
-	Enabled   bool
-	Ceph      *CephDatastoreAttributes
-	CephFS    *CephFSDatastoreAttributes
+	ID         int
+	Name       string
+	Category   string
+	Type       string
+	Backend    string
+	DSMad      string
+	TMMad      string
+	DiskType   string
+	FreeBytes  int64
+	TotalBytes int64
+	Enabled    bool
+	Ceph       *CephDatastoreAttributes
+	CephFS     *CephFSDatastoreAttributes
 }
 
 type VolumeCreateResult struct {
@@ -232,18 +233,19 @@ func datastoreFromSchema(source datastoreSchema.Datastore) Datastore {
 	}
 
 	return Datastore{
-		ID:        source.ID,
-		Name:      source.Name,
-		Category:  normalizeDatastoreCategory(source),
-		Type:      normalizeAllowedDatastoreType(inferDatastoreType(source)),
-		Backend:   normalizeAllowedDatastoreType(inferDatastoreType(source)),
-		DSMad:     strings.ToLower(strings.TrimSpace(source.DSMad)),
-		TMMad:     strings.ToLower(strings.TrimSpace(source.TMMad)),
-		DiskType:  normalizeDiskType(source),
-		FreeBytes: int64(source.FreeMB) * mib,
-		Enabled:   enabled,
-		Ceph:      datastoreCephAttributes(source),
-		CephFS:    datastoreCephFSAttributes(source),
+		ID:         source.ID,
+		Name:       source.Name,
+		Category:   normalizeDatastoreCategory(source),
+		Type:       normalizeAllowedDatastoreType(inferDatastoreType(source)),
+		Backend:    normalizeAllowedDatastoreType(inferDatastoreType(source)),
+		DSMad:      strings.ToLower(strings.TrimSpace(source.DSMad)),
+		TMMad:      strings.ToLower(strings.TrimSpace(source.TMMad)),
+		DiskType:   normalizeDiskType(source),
+		FreeBytes:  int64(source.FreeMB) * mib,
+		TotalBytes: int64(source.TotalMB) * mib,
+		Enabled:    enabled,
+		Ceph:       datastoreCephAttributes(source),
+		CephFS:     datastoreCephFSAttributes(source),
 	}
 }
 

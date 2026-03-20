@@ -48,11 +48,18 @@ spec:
         - name: opennebula-csi
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          {{- if .Values.debugPort }}
+          {{- if or .Values.debugPort .Values.metrics.driver.enabled }}
           ports:
+            {{- if .Values.debugPort }}
             - containerPort: {{ .Values.debugPort }}
               name: debug
               protocol: TCP
+            {{- end }}
+            {{- if .Values.metrics.driver.enabled }}
+            - containerPort: {{ .Values.metrics.driver.port }}
+              name: driver-metrics
+              protocol: TCP
+            {{- end }}
           {{- end }}
           args:
             - "--endpoint=$(CSI_ENDPOINT)"

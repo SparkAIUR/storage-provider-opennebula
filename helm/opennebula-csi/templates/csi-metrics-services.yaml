@@ -23,6 +23,12 @@ spec:
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: controller
   ports:
+    {{- if .Values.metrics.driver.enabled }}
+    - name: driver-metrics
+      port: {{ .Values.metrics.driver.port }}
+      protocol: TCP
+      targetPort: driver-metrics
+    {{- end }}
     - name: provisioner-metrics
       port: {{ .Values.metrics.ports.provisioner }}
       protocol: TCP
@@ -59,6 +65,12 @@ spec:
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: node
   ports:
+    {{- if .Values.metrics.driver.enabled }}
+    - name: driver-metrics
+      port: {{ .Values.metrics.driver.port }}
+      protocol: TCP
+      targetPort: driver-metrics
+    {{- end }}
     - name: registrar-metrics
       port: {{ .Values.metrics.ports.registrar }}
       protocol: TCP

@@ -30,11 +30,15 @@ const (
 	DefaultDatastoresVar     = "ONE_CSI_DEFAULT_DATASTORES"
 	DatastorePolicyVar       = "ONE_CSI_DATASTORE_SELECTION_POLICY"
 	AllowedDatastoreTypesVar = "ONE_CSI_ALLOWED_DATASTORE_TYPES"
+	FeatureGatesVar          = "ONE_CSI_FEATURE_GATES"
+	MetricsEndpointVar       = "ONE_CSI_METRICS_ENDPOINT"
 
 	//Default values
 	defaultOpenNebulaRPCEndpoint = "http://localhost:2633/RPC2"
 	defaultDatastorePolicy       = "least-used"
 	defaultAllowedDatastoreTypes = "local,ceph,cephfs"
+	defaultFeatureGates          = "compatibilityAwareSelection=true,detachedDiskExpansion=false,cephfsExpansion=false,cephfsSnapshots=false,cephfsClones=false,cephfsSelfHealing=false,topologyAccessibility=false"
+	defaultMetricsEndpoint       = ":9810"
 )
 
 // CSIPluginConfig holds the configuration for the CSI plugin
@@ -70,6 +74,8 @@ func initViper() *viper.Viper {
 	viper.SetDefault(OpenNebulaRPCEndpointVar, defaultOpenNebulaRPCEndpoint)
 	viper.SetDefault(DatastorePolicyVar, defaultDatastorePolicy)
 	viper.SetDefault(AllowedDatastoreTypesVar, defaultAllowedDatastoreTypes)
+	viper.SetDefault(FeatureGatesVar, defaultFeatureGates)
+	viper.SetDefault(MetricsEndpointVar, defaultMetricsEndpoint)
 
 	viper.AutomaticEnv()
 	viper.SetTypeByDefaultValue(true)

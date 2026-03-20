@@ -36,7 +36,9 @@ const (
 )
 
 var (
-	driverVersion = "v0.0.1" //TODO: get from a repo metadata file or from a build flag
+	driverVersion   = "dev"
+	driverCommit    = "unknown"
+	driverBuildDate = "unknown"
 )
 
 // TODO: This should be a struct with a map of locks
@@ -49,6 +51,8 @@ type Driver struct {
 	grpcServerEndpoint string
 	nodeID             string
 	version            string
+	commit             string
+	buildDate          string
 
 	PluginConfig config.CSIPluginConfig
 
@@ -59,6 +63,10 @@ type Driver struct {
 	maxVolumesPerNode int64
 
 	mounter *mount.SafeFormatAndMount
+
+	featureGates FeatureGates
+	metrics      *DriverMetrics
+	kubeRuntime  *KubeRuntime
 }
 
 type DriverOptions struct {
@@ -74,11 +82,14 @@ func NewDriver(options *DriverOptions) *Driver {
 	return &Driver{
 		name:               options.DriverName,
 		version:            driverVersion,
+		commit:             driverCommit,
+		buildDate:          driverBuildDate,
 		nodeID:             options.NodeID,
 		grpcServerEndpoint: options.GRPCServerEndpoint,
 		PluginConfig:       options.PluginConfig,
 		maxVolumesPerNode:  options.MaxVolumesPerNode,
 		mounter:            options.Mounter,
+		featureGates:       loadFeatureGates(options.PluginConfig),
 	}
 
 	//TODO: Initialize volumeLocks
@@ -86,7 +97,16 @@ func NewDriver(options *DriverOptions) *Driver {
 }
 
 func (d *Driver) Run(ctx context.Context) error {
-	//TODO: Show driver metadata
+	klog.InfoS("Starting OpenNebula CSI driver",
+		"name", d.name,
+		"version", d.version,
+		"commit", d.commit,
+		"buildDate", d.buildDate,
+		"nodeID", d.nodeID,
+		"featureGates", d.featureGates)
+
+	d.metrics = NewDriverMetrics(d.version, d.commit)
+	d.kubeRuntime = NewKubeRuntime(d.name)
 
 	grpcServer := NewGRPCServer()
 
@@ -127,11 +147,15 @@ func (d *Driver) Run(ctx context.Context) error {
 		NewControllerServer(d, volumeProvider, sharedFilesystemProvider),
 	)
 
+	metricsServer := NewMetricsServer(d.PluginConfig, d.metrics)
+	metricsServer.Start()
+
 	go func() {
 		<-ctx.Done()
 		klog.Info("Received shutdown signal, stopping driver...")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), GracefulShutdownTimeout)
 		defer cancel()
+		metricsServer.Stop(shutdownCtx)
 		grpcServer.Stop(shutdownCtx)
 	}()
 

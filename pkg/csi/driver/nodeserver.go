@@ -24,10 +24,13 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
+	"strings"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-lib-utils/protosanitizer"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
@@ -440,9 +443,70 @@ func (ns *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubl
 }
 
 func (ns *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
-	//TODO: Implement
-	//A Node plugin MUST implement this RPC call if it has GET_VOLUME_STATS node capability or VOLUME_CONDITION node capability
-	return &csi.NodeGetVolumeStatsResponse{}, status.Error(codes.Unimplemented, "NodeGetVolumeStats is not implemented")
+	volumeID := req.GetVolumeId()
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
+	}
+
+	volumePath := req.GetVolumePath()
+	if volumePath == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume path is required")
+	}
+
+	info, err := os.Stat(volumePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, status.Errorf(codes.NotFound, "volume path %s was not found", volumePath)
+		}
+		return nil, status.Errorf(codes.Internal, "failed to stat volume path %s: %v", volumePath, err)
+	}
+
+	if info.IsDir() {
+		var fs unix.Statfs_t
+		if err := unix.Statfs(volumePath, &fs); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to collect filesystem stats for %s: %v", volumePath, err)
+		}
+
+		totalBytes := int64(fs.Blocks) * int64(fs.Bsize)
+		availableBytes := int64(fs.Bavail) * int64(fs.Bsize)
+		usedBytes := totalBytes - (int64(fs.Bfree) * int64(fs.Bsize))
+		totalInodes := int64(fs.Files)
+		availableInodes := int64(fs.Ffree)
+		usedInodes := totalInodes - availableInodes
+
+		return &csi.NodeGetVolumeStatsResponse{
+			Usage: []*csi.VolumeUsage{
+				{
+					Unit:      csi.VolumeUsage_BYTES,
+					Total:     totalBytes,
+					Available: availableBytes,
+					Used:      usedBytes,
+				},
+				{
+					Unit:      csi.VolumeUsage_INODES,
+					Total:     totalInodes,
+					Available: availableInodes,
+					Used:      usedInodes,
+				},
+			},
+		}, nil
+	}
+
+	sizeBytes, err := ns.getBlockVolumeSize(volumePath)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to collect block volume stats for %s: %v", volumePath, err)
+	}
+
+	return &csi.NodeGetVolumeStatsResponse{
+		Usage: []*csi.VolumeUsage{
+			{
+				Unit:      csi.VolumeUsage_BYTES,
+				Total:     sizeBytes,
+				Available: 0,
+				Used:      sizeBytes,
+			},
+		},
+	}, nil
 }
 
 func (ns *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
@@ -517,10 +581,39 @@ func (ns *NodeServer) NodeGetCapabilities(_ context.Context, req *csi.NodeGetCap
 				},
 			},
 		},
-		//TODO: implement and add NodeServiceCapability_RPC_GET_VOLUME_STATS capability
+		{
+			Type: &csi.NodeServiceCapability_Rpc{
+				Rpc: &csi.NodeServiceCapability_RPC{
+					Type: csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
+				},
+			},
+		},
 	}
 
 	return &csi.NodeGetCapabilitiesResponse{Capabilities: capabilities}, nil
+}
+
+func (ns *NodeServer) getBlockVolumeSize(volumePath string) (int64, error) {
+	info, err := os.Stat(volumePath)
+	if err != nil {
+		return 0, err
+	}
+
+	if info.Mode().IsRegular() {
+		return info.Size(), nil
+	}
+
+	output, err := ns.mounter.Exec.Command("blockdev", "--getsize64", volumePath).CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("blockdev failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+
+	sizeBytes, err := strconv.ParseInt(strings.TrimSpace(string(output)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid block size output %q: %w", strings.TrimSpace(string(output)), err)
+	}
+
+	return sizeBytes, nil
 }
 
 func (ns *NodeServer) NodeGetInfo(_ context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {

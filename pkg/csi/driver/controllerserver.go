@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
@@ -63,16 +64,20 @@ func NewControllerServer(d *Driver, vp opennebula.OpenNebulaVolumeProvider, shar
 }
 
 func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
+	started := time.Now()
+	backend := "unknown"
 	klog.V(1).InfoS("CreateVolume called", "req", protosanitizer.StripSecrets(req))
 
 	name := req.GetName()
 	if name == "" {
+		s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
 		klog.V(0).ErrorS(nil, "method", "CreateVolume", "CreateVolume called with empty volume name")
 		return nil, status.Error(codes.InvalidArgument, "missing volume name")
 	}
 
 	volumeCapabilities := req.GetVolumeCapabilities()
 	if len(volumeCapabilities) == 0 {
+		s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
 		klog.V(0).ErrorS(nil, "method", "CreateVolume", "CreateVolume called with empty or nil volume capabilities")
 		return nil, status.Error(codes.InvalidArgument, "missing volume capabilities")
 	}
@@ -85,22 +90,27 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	rawParams := req.GetParameters()
 	selection, err := s.driver.GetDatastoreSelectionConfig(rawParams)
 	if err != nil {
+		s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
+		s.recordPVCWarningFromParams(ctx, rawParams, eventReasonDatastoreRejected, err.Error())
 		klog.V(0).ErrorS(err, "Invalid datastore configuration", "method", "CreateVolume", "params", rawParams)
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
 	if err := validateAccessMode(volumeCapabilities, selection.AllowedTypes); err != nil {
+		s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
 	accessMode := volumeCapabilities[0].GetAccessMode()
 	if accessMode == nil {
+		s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
 		klog.V(0).ErrorS(nil, "method", "CreateVolume", "CreateVolume called with empty access mode")
 		return nil, status.Error(codes.InvalidArgument, "missing access mode")
 	}
 
 	volumeAccessModel, err := resolveVolumeAccessModel(volumeCapabilities[0], selection.AllowedTypes)
 	if err != nil {
+		s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
@@ -119,8 +129,10 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 
 	if volumeAccessModel == opennebula.VolumeAccessModelSharedFS {
 		if s.sharedFilesystemProvider == nil {
+			s.driver.metrics.RecordOperation("create_volume", "cephfs", "failed_precondition", time.Since(started))
 			return nil, status.Error(codes.FailedPrecondition, "shared filesystem provider is not configured")
 		}
+		backend = "cephfs"
 
 		result, sharedErr := s.sharedFilesystemProvider.CreateSharedVolume(ctx, opennebula.SharedVolumeRequest{
 			Name:       name,
@@ -132,10 +144,14 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		if sharedErr != nil {
 			switch {
 			case opennebula.IsDatastoreConfigError(sharedErr):
+				s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
+				s.recordPVCWarningFromParams(ctx, rawParams, eventReasonDatastoreRejected, sharedErr.Error())
 				return nil, status.Error(codes.InvalidArgument, sharedErr.Error())
 			case opennebula.IsDatastoreCapacityError(sharedErr):
+				s.driver.metrics.RecordOperation("create_volume", backend, "resource_exhausted", time.Since(started))
 				return nil, status.Error(codes.ResourceExhausted, sharedErr.Error())
 			}
+			s.driver.metrics.RecordOperation("create_volume", backend, "internal", time.Since(started))
 			klog.V(0).ErrorS(sharedErr, "Failed to create shared filesystem volume",
 				"method", "CreateVolume", "volumeName", name, "requiredBytes", requiredBytes,
 				"policy", selection.Policy, "datastores", selection.Identifiers)
@@ -144,6 +160,18 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 
 		response.Volume.VolumeId = result.VolumeID
 		response.Volume.CapacityBytes = result.CapacityBytes
+		s.driver.metrics.RecordOperation("create_volume", backend, "success", time.Since(started))
+		s.driver.metrics.RecordDatastoreSelection(string(selection.Policy), result.Datastore.Backend, result.Datastore.ID, "selected")
+		s.driver.metrics.SetDatastoreCapacity(result.Datastore.Backend, result.Datastore.ID, result.Datastore.FreeBytes, result.Datastore.TotalBytes)
+		s.recordPVCEventFromParams(ctx, rawParams, eventReasonDatastoreSelected, fmt.Sprintf("selected %s datastore %d (%s) with policy %s", result.Datastore.Backend, result.Datastore.ID, result.Datastore.Name, selection.Policy))
+		s.annotatePlacementFromParams(ctx, rawParams, PlacementReport{
+			Backend:                     result.Metadata.Backend,
+			DatastoreID:                 result.Datastore.ID,
+			DatastoreName:               result.Datastore.Name,
+			SelectionPolicy:             string(selection.Policy),
+			FallbackUsed:                false,
+			CompatibilityAwareSelection: s.driver.featureGates.CompatibilityAwareSelection,
+		})
 		klog.V(1).InfoS("Shared filesystem volume created successfully",
 			"method", "CreateVolume", "volumeName", name, "requiredBytes", requiredBytes,
 			"policy", selection.Policy, "datastores", selection.Identifiers,
@@ -152,14 +180,17 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 
 		return response, nil
 	}
+	backend = "disk"
 
 	volumeID, volumeSize, _ := s.volumeProvider.VolumeExists(ctx, name)
 	if volumeID != -1 {
 		if int64(volumeSize) == requiredBytes {
+			s.driver.metrics.RecordOperation("create_volume", backend, "success", time.Since(started))
 			klog.V(3).InfoS("Volume already exists with the same size",
 				"method", "CreateVolume", "volumeID", volumeID, "requiredSize", requiredBytes)
 			return response, nil
 		}
+		s.driver.metrics.RecordOperation("create_volume", backend, "already_exists", time.Since(started))
 		klog.V(0).ErrorS(nil, "Volume with the same name already exists with different size",
 			"method", "CreateVolume", "volumeID", volumeID, "existingSize", volumeSize, "requiredSize", requiredBytes)
 		return nil, status.Error(codes.AlreadyExists,
@@ -171,16 +202,32 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	if err != nil {
 		switch {
 		case opennebula.IsDatastoreConfigError(err):
+			s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
+			s.recordPVCWarningFromParams(ctx, rawParams, eventReasonDatastoreRejected, err.Error())
 			return nil, status.Error(codes.InvalidArgument, err.Error())
 		case opennebula.IsDatastoreCapacityError(err):
+			s.driver.metrics.RecordOperation("create_volume", backend, "resource_exhausted", time.Since(started))
 			return nil, status.Error(codes.ResourceExhausted, err.Error())
 		}
+		s.driver.metrics.RecordOperation("create_volume", backend, "internal", time.Since(started))
 		klog.V(0).ErrorS(err, "Failed to create volume",
 			"method", "CreateVolume", "volumeName", name, "requiredBytes", requiredBytes,
 			"defaultDriverName", DefaultDriverName, "immutableVolume", immutableVolume,
 			"policy", selection.Policy, "datastores", selection.Identifiers, "params", params)
 		return nil, status.Error(codes.Internal, "failed to create volume")
 	}
+	s.driver.metrics.RecordOperation("create_volume", result.Datastore.Backend, "success", time.Since(started))
+	s.driver.metrics.RecordDatastoreSelection(string(selection.Policy), result.Datastore.Backend, result.Datastore.ID, "selected")
+	s.driver.metrics.SetDatastoreCapacity(result.Datastore.Backend, result.Datastore.ID, result.Datastore.FreeBytes, result.Datastore.TotalBytes)
+	s.recordPVCEventFromParams(ctx, rawParams, eventReasonDatastoreSelected, fmt.Sprintf("selected %s datastore %d (%s) with policy %s", result.Datastore.Backend, result.Datastore.ID, result.Datastore.Name, selection.Policy))
+	s.annotatePlacementFromParams(ctx, rawParams, PlacementReport{
+		Backend:                     result.Datastore.Backend,
+		DatastoreID:                 result.Datastore.ID,
+		DatastoreName:               result.Datastore.Name,
+		SelectionPolicy:             string(selection.Policy),
+		FallbackUsed:                false,
+		CompatibilityAwareSelection: s.driver.featureGates.CompatibilityAwareSelection,
+	})
 
 	klog.V(1).InfoS("Volume created successfully",
 		"method", "CreateVolume", "volumeName", name, "requiredBytes",
@@ -193,9 +240,11 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 }
 
 func (s *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
+	started := time.Now()
 	klog.V(1).InfoS("DeleteVolume called", "req", protosanitizer.StripSecrets(req))
 
 	if req.VolumeId == "" {
+		s.driver.metrics.RecordOperation("delete_volume", "unknown", "invalid_argument", time.Since(started))
 		klog.V(0).ErrorS(nil, "method", "DeleteVolume", "DeleteVolume called with empty volume ID")
 		return nil, status.Error(codes.InvalidArgument, "missing volume ID")
 	}
@@ -211,47 +260,58 @@ func (s *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 		if err != nil {
 			switch {
 			case opennebula.IsDatastoreConfigError(err):
+				s.driver.metrics.RecordOperation("delete_volume", "cephfs", "failed_precondition", time.Since(started))
 				return nil, status.Error(codes.FailedPrecondition, err.Error())
 			case opennebula.IsDatastoreCapacityError(err):
+				s.driver.metrics.RecordOperation("delete_volume", "cephfs", "resource_exhausted", time.Since(started))
 				return nil, status.Error(codes.ResourceExhausted, err.Error())
 			}
+			s.driver.metrics.RecordOperation("delete_volume", "cephfs", "failed_precondition", time.Since(started))
 			klog.V(0).ErrorS(err, "Failed to delete shared filesystem volume", "method", "DeleteVolume", "volumeID", req.VolumeId)
 			return nil, status.Error(codes.FailedPrecondition, "failed to delete volume")
 		}
 
+		s.driver.metrics.RecordOperation("delete_volume", "cephfs", "success", time.Since(started))
 		klog.V(1).InfoS("Shared filesystem volume deleted successfully", "method", "DeleteVolume", "volumeID", req.VolumeId)
 		return &csi.DeleteVolumeResponse{}, nil
 	}
 
 	err := s.volumeProvider.DeleteVolume(ctx, req.VolumeId)
 	if err != nil {
+		s.driver.metrics.RecordOperation("delete_volume", "disk", "failed_precondition", time.Since(started))
 		klog.V(0).ErrorS(err, "Failed to delete volume", "method", "DeleteVolume", "volumeID", req.VolumeId)
 		return nil, status.Error(codes.FailedPrecondition, "failed to delete volume")
 	}
 
+	s.driver.metrics.RecordOperation("delete_volume", "disk", "success", time.Since(started))
 	klog.V(1).InfoS("Volume deleted successfully", "method", "DeleteVolume", "volumeID", req.VolumeId)
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
 // TODO: Process VolumeCapability, readonly
 func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
+	started := time.Now()
 	klog.V(1).InfoS("ControllerPublishVolume called", "req", protosanitizer.StripSecrets(req))
 	if req.VolumeId == "" {
+		s.driver.metrics.RecordOperation("controller_publish_volume", "unknown", "invalid_argument", time.Since(started))
 		klog.V(0).ErrorS(nil, "method", "ControllerPublishVolume", "ControllerPublishVolume called with empty volume ID")
 		return nil, status.Error(codes.InvalidArgument, "missing volume ID")
 	}
 
 	if req.NodeId == "" {
+		s.driver.metrics.RecordOperation("controller_publish_volume", "unknown", "invalid_argument", time.Since(started))
 		klog.V(0).ErrorS(nil, "method", "ControllerPublishVolume", "ControllerPublishVolume called with empty node ID")
 		return nil, status.Error(codes.InvalidArgument, "missing node ID")
 	}
 
 	if req.VolumeCapability == nil {
+		s.driver.metrics.RecordOperation("controller_publish_volume", "unknown", "invalid_argument", time.Since(started))
 		klog.V(0).ErrorS(nil, "method", "ControllerPublishVolume", "ControllerPublishVolume called with empty volume capability")
 		return nil, status.Error(codes.InvalidArgument, "missing volume capability")
 	}
 
 	if req.VolumeCapability.AccessMode == nil {
+		s.driver.metrics.RecordOperation("controller_publish_volume", "unknown", "invalid_argument", time.Since(started))
 		klog.V(0).ErrorS(nil, "method", "ControllerPublishVolume", "ControllerPublishVolume called with empty access mode")
 		return nil, status.Error(codes.InvalidArgument, "missing access mode")
 	}
@@ -265,6 +325,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 		nodeID, err := s.volumeProvider.NodeExists(ctx, req.NodeId)
 		if err != nil || nodeID == -1 {
+			s.driver.metrics.RecordOperation("controller_publish_volume", "cephfs", "not_found", time.Since(started))
 			klog.V(0).ErrorS(err, "Node does not exist", "method", "ControllerPublishVolume", "nodeID", req.NodeId)
 			return nil, status.Error(codes.NotFound, "node not found")
 		}
@@ -273,33 +334,40 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		if err != nil {
 			switch {
 			case opennebula.IsDatastoreConfigError(err):
+				s.driver.metrics.RecordOperation("controller_publish_volume", "cephfs", "failed_precondition", time.Since(started))
 				return nil, status.Error(codes.FailedPrecondition, err.Error())
 			case opennebula.IsDatastoreCapacityError(err):
+				s.driver.metrics.RecordOperation("controller_publish_volume", "cephfs", "resource_exhausted", time.Since(started))
 				return nil, status.Error(codes.ResourceExhausted, err.Error())
 			}
+			s.driver.metrics.RecordOperation("controller_publish_volume", "cephfs", "internal", time.Since(started))
 			klog.V(0).ErrorS(err, "Failed to publish shared filesystem volume",
 				"method", "ControllerPublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
 			return nil, status.Error(codes.Internal, "failed to publish volume")
 		}
 
+		s.driver.metrics.RecordOperation("controller_publish_volume", "cephfs", "success", time.Since(started))
 		_ = nodeID
 		return &csi.ControllerPublishVolumeResponse{PublishContext: publishContext}, nil
 	}
 
 	volumeID, _, err := s.volumeProvider.VolumeExists(ctx, req.VolumeId)
 	if err != nil || volumeID == -1 {
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "not_found", time.Since(started))
 		klog.V(0).ErrorS(err, "Volume does not exist", "method", "ControllerPublishVolume", "volumeID", req.VolumeId)
 		return nil, status.Error(codes.NotFound, "volume not found")
 	}
 
 	nodeID, err := s.volumeProvider.NodeExists(ctx, req.NodeId)
 	if err != nil || nodeID == -1 {
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "not_found", time.Since(started))
 		klog.V(0).ErrorS(err, "Node does not exist", "method", "ControllerPublishVolume", "nodeID", req.NodeId)
 		return nil, status.Error(codes.NotFound, "node not found")
 	}
 
 	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err == nil {
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
 		klog.V(1).InfoS("Volume already attached to node",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
 		return &csi.ControllerPublishVolumeResponse{
@@ -318,10 +386,13 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	if err != nil {
 		switch {
 		case opennebula.IsDatastoreConfigError(err):
+			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "failed_precondition", time.Since(started))
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
 		case opennebula.IsDatastoreCapacityError(err):
+			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "resource_exhausted", time.Since(started))
 			return nil, status.Error(codes.ResourceExhausted, err.Error())
 		}
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "internal", time.Since(started))
 		klog.V(0).ErrorS(err, "Failed to attach volume",
 			"method", "ControllerPublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
 		return nil, status.Error(codes.Internal, "failed to attach volume")
@@ -331,11 +402,15 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID)
 	target, err = s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err != nil {
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "internal", time.Since(started))
 		klog.V(0).ErrorS(err, "Failed to get volume in node",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID)
 		return nil, status.Error(codes.Internal, "failed to get volume in node")
 	}
 
+	s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
+	s.driver.metrics.RecordAttachValidation("disk", "attach", "success")
+	s.recordPVCEventFromParams(ctx, req.GetVolumeContext(), eventReasonAttachValidated, fmt.Sprintf("validated and attached volume %s to node %s", req.GetVolumeId(), req.GetNodeId()))
 	klog.V(1).InfoS("Volume attached successfully",
 		"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
 
@@ -505,10 +580,12 @@ func (s *ControllerServer) ListVolumes(ctx context.Context, req *csi.ListVolumes
 }
 
 func (s *ControllerServer) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
+	started := time.Now()
 	klog.V(1).InfoS("GetCapacity called", "req", protosanitizer.StripSecrets(req))
 
 	selection, err := s.driver.GetDatastoreSelectionConfig(req.GetParameters())
 	if err != nil {
+		s.driver.metrics.RecordOperation("get_capacity", "unknown", "invalid_argument", time.Since(started))
 		klog.V(0).ErrorS(err, "Invalid datastore configuration", "method", "GetCapacity")
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -517,14 +594,18 @@ func (s *ControllerServer) GetCapacity(ctx context.Context, req *csi.GetCapacity
 	if err != nil {
 		switch {
 		case opennebula.IsDatastoreConfigError(err):
+			s.driver.metrics.RecordOperation("get_capacity", "disk", "invalid_argument", time.Since(started))
 			return nil, status.Error(codes.InvalidArgument, err.Error())
 		case opennebula.IsDatastoreCapacityError(err):
+			s.driver.metrics.RecordOperation("get_capacity", "disk", "resource_exhausted", time.Since(started))
 			return nil, status.Error(codes.ResourceExhausted, err.Error())
 		}
+		s.driver.metrics.RecordOperation("get_capacity", "disk", "internal", time.Since(started))
 		klog.V(0).ErrorS(err, "Failed to get available capacity", "method", "GetCapacity")
 		return nil, status.Error(codes.Internal, "failed to get capacity")
 	}
 
+	s.driver.metrics.RecordOperation("get_capacity", "disk", "success", time.Since(started))
 	klog.V(1).InfoS("Available capacity retrieved successfully",
 		"method", "GetCapacity", "availableCapacity", availableCapacity)
 	return &csi.GetCapacityResponse{
@@ -533,18 +614,22 @@ func (s *ControllerServer) GetCapacity(ctx context.Context, req *csi.GetCapacity
 }
 
 func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
+	started := time.Now()
 	klog.V(1).InfoS("ControllerExpandVolume called", "req", protosanitizer.StripSecrets(req))
 
 	if req.GetVolumeId() == "" {
+		s.driver.metrics.RecordOperation("controller_expand_volume", "unknown", "invalid_argument", time.Since(started))
 		return nil, status.Error(codes.InvalidArgument, "missing volume ID")
 	}
 
 	capacityRange := req.GetCapacityRange()
 	if capacityRange == nil || capacityRange.GetRequiredBytes() <= 0 {
+		s.driver.metrics.RecordOperation("controller_expand_volume", "unknown", "invalid_argument", time.Since(started))
 		return nil, status.Error(codes.InvalidArgument, "missing required capacity range")
 	}
 
 	if opennebula.IsSharedFilesystemVolumeID(req.GetVolumeId()) {
+		s.driver.metrics.RecordOperation("controller_expand_volume", "cephfs", "unimplemented", time.Since(started))
 		return nil, status.Error(codes.Unimplemented, "CephFS shared filesystem expansion is not supported in v0.4.0")
 	}
 
@@ -552,11 +637,14 @@ func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 	if err != nil {
 		switch {
 		case opennebula.IsDatastoreConfigError(err):
+			s.driver.metrics.RecordOperation("controller_expand_volume", "disk", "failed_precondition", time.Since(started))
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
 		case opennebula.IsDatastoreCapacityError(err):
+			s.driver.metrics.RecordOperation("controller_expand_volume", "disk", "resource_exhausted", time.Since(started))
 			return nil, status.Error(codes.ResourceExhausted, err.Error())
 		}
 
+		s.driver.metrics.RecordOperation("controller_expand_volume", "disk", "internal", time.Since(started))
 		klog.V(0).ErrorS(err, "Failed to expand volume", "method", "ControllerExpandVolume", "volumeID", req.GetVolumeId())
 		return nil, status.Error(codes.Internal, "failed to expand volume")
 	}
@@ -661,4 +749,25 @@ func supportedAccessModeNames() []string {
 	}
 
 	return names
+}
+
+func (s *ControllerServer) recordPVCEventFromParams(ctx context.Context, params map[string]string, reason, message string) {
+	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil {
+		return
+	}
+	s.driver.kubeRuntime.EmitPVCEvent(ctx, params[paramPVCNamespace], params[paramPVCName], reason, message)
+}
+
+func (s *ControllerServer) recordPVCWarningFromParams(ctx context.Context, params map[string]string, reason, message string) {
+	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil {
+		return
+	}
+	s.driver.kubeRuntime.EmitWarningEventOnPVC(ctx, params[paramPVCNamespace], params[paramPVCName], reason, message)
+}
+
+func (s *ControllerServer) annotatePlacementFromParams(ctx context.Context, params map[string]string, report PlacementReport) {
+	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil {
+		return
+	}
+	s.driver.kubeRuntime.AnnotatePVAsync(ctx, params[paramPVName], report)
 }

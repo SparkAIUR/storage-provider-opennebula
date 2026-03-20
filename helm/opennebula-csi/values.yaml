@@ -31,6 +31,15 @@ driver:
   extraArgs: []
   env: []
 
+featureGates:
+  compatibilityAwareSelection: true
+  detachedDiskExpansion: false
+  cephfsExpansion: false
+  cephfsSnapshots: false
+  cephfsClones: false
+  cephfsSelfHealing: false
+  topologyAccessibility: false
+
 controller:
   replicaCount: 1
   podAnnotations: {}
@@ -54,6 +63,9 @@ node:
 metrics:
   enabled: true
   path: /metrics
+  driver:
+    enabled: true
+    port: 9810
   controller:
     service:
       annotations: {}

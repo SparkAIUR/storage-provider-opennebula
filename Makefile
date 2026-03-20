@@ -28,6 +28,10 @@ HELM := $(SYSTEM_HELM)
 endif
 
 CLOSEST_TAG ?= $(shell git -C $(SELF) describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)
+BUILD_VERSION ?= $(shell git -C $(SELF) describe --tags --always --dirty 2>/dev/null || echo dev)
+GIT_COMMIT ?= $(shell git -C $(SELF) rev-parse --short HEAD 2>/dev/null || echo unknown)
+BUILD_DATE ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
+GO_LDFLAGS := -X github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/driver.driverVersion=$(BUILD_VERSION) -X github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/driver.driverCommit=$(GIT_COMMIT) -X github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/driver.driverBuildDate=$(BUILD_DATE)
 
 # Local registry and tag used for building/pushing image targets
 LOCAL_TAG ?= latest
@@ -87,12 +91,16 @@ test:
 build: fmt vet $(addprefix build-,$(BUILD_BINS))
 
 build-%:
-	go build -o $(SELF)/bin/$* ./cmd/$*/main.go
+	go build -ldflags "$(GO_LDFLAGS)" -o $(SELF)/bin/$* ./cmd/$*/main.go
 
 docker-build: $(addprefix docker-build-,$(IMAGE_NAMES))
 
 docker-build-%:
-	$(CONTAINER_TOOL) build -t $(LOCAL_REGISTRY)/$*:$(LOCAL_TAG) .
+	$(CONTAINER_TOOL) build \
+		--build-arg VERSION=$(BUILD_VERSION) \
+		--build-arg COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_DATE=$(BUILD_DATE) \
+		-t $(LOCAL_REGISTRY)/$*:$(LOCAL_TAG) .
 
 docker-push: $(addprefix docker-push-,$(IMAGE_NAMES))
 
@@ -112,6 +120,9 @@ docker-release-%:
 	-$(CONTAINER_TOOL) buildx create --name $*-builder
 	$(CONTAINER_TOOL) buildx use $*-builder
 	$(CONTAINER_TOOL) buildx build --push --platform=$(_PLATFORMS) \
+		--build-arg VERSION=$(CLOSEST_TAG) \
+		--build-arg COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_DATE=$(BUILD_DATE) \
 		-t $(REMOTE_REGISTRY)/$*:$(CLOSEST_TAG) \
 		-t $(REMOTE_REGISTRY)/$*:latest \
 		-t $(DOCKERHUB_REGISTRY)/$*:$(CLOSEST_TAG) \

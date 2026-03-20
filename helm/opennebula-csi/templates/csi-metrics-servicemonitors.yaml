@@ -26,6 +26,12 @@ spec:
       app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/component: controller
   endpoints:
+    {{- if .Values.metrics.driver.enabled }}
+    - port: driver-metrics
+      path: {{ .Values.metrics.path }}
+      interval: {{ .Values.metrics.controller.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.metrics.controller.serviceMonitor.scrapeTimeout }}
+    {{- end }}
     - port: provisioner-metrics
       path: {{ .Values.metrics.path }}
       interval: {{ .Values.metrics.controller.serviceMonitor.interval }}
@@ -67,6 +73,12 @@ spec:
       app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/component: node
   endpoints:
+    {{- if .Values.metrics.driver.enabled }}
+    - port: driver-metrics
+      path: {{ .Values.metrics.path }}
+      interval: {{ .Values.metrics.node.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.metrics.node.serviceMonitor.scrapeTimeout }}
+    {{- end }}
     - port: registrar-metrics
       path: {{ .Values.metrics.path }}
       interval: {{ .Values.metrics.node.serviceMonitor.interval }}

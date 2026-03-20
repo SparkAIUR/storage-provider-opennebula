@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -295,39 +296,54 @@ func TestUnpublishVolume(t *testing.T) {
 }
 
 func TestNodeGetVolumeStats(t *testing.T) {
-	tempDir := t.TempDir()
-	tcs := []struct {
-		name           string
-		request        *csi.NodeGetVolumeStatsRequest
-		expectResponse *csi.NodeGetVolumeStatsResponse
-		expectError    bool
-	}{
-		{
-			name: "[ERROR] Test unimplemented",
-			request: &csi.NodeGetVolumeStatsRequest{
-				VolumeId: "test-volume-id",
-			},
-			expectResponse: &csi.NodeGetVolumeStatsResponse{},
-			expectError:    true,
-		},
-	}
+	t.Run("returns filesystem stats for mounted directory", func(t *testing.T) {
+		tempDir := t.TempDir()
+		ns := getTestNodeServer([]string{tempDir})
 
-	for _, tc := range tcs {
-		t.Run(tc.name, func(t *testing.T) {
-			ns := getTestNodeServer([]string{tempDir})
-			response, err := ns.NodeGetVolumeStats(context.Background(), tc.request)
-			if tc.expectError {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-			}
-			if tc.expectResponse != nil {
-				assert.Equal(t, tc.expectResponse, response)
-			} else {
-				assert.NotNil(t, response)
-			}
+		response, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+			VolumeId:   "test-volume-id",
+			VolumePath: tempDir,
 		})
-	}
+
+		assert.NoError(t, err)
+		if assert.Len(t, response.GetUsage(), 2) {
+			assert.Equal(t, csi.VolumeUsage_BYTES, response.GetUsage()[0].GetUnit())
+			assert.Greater(t, response.GetUsage()[0].GetTotal(), int64(0))
+			assert.Equal(t, csi.VolumeUsage_INODES, response.GetUsage()[1].GetUnit())
+			assert.Greater(t, response.GetUsage()[1].GetTotal(), int64(0))
+		}
+	})
+
+	t.Run("returns byte stats for block-like file", func(t *testing.T) {
+		tempDir := t.TempDir()
+		filePath := tempDir + "/volume.img"
+		payload := make([]byte, 4096)
+		err := os.WriteFile(filePath, payload, 0o644)
+		assert.NoError(t, err)
+
+		ns := getTestNodeServer([]string{tempDir})
+		response, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+			VolumeId:   "test-volume-id",
+			VolumePath: filePath,
+		})
+
+		assert.NoError(t, err)
+		if assert.Len(t, response.GetUsage(), 1) {
+			assert.Equal(t, csi.VolumeUsage_BYTES, response.GetUsage()[0].GetUnit())
+			assert.Equal(t, int64(len(payload)), response.GetUsage()[0].GetTotal())
+			assert.Equal(t, int64(len(payload)), response.GetUsage()[0].GetUsed())
+		}
+	})
+
+	t.Run("rejects empty volume path", func(t *testing.T) {
+		ns := getTestNodeServer(nil)
+		response, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+			VolumeId: "test-volume-id",
+		})
+
+		assert.Error(t, err)
+		assert.Nil(t, response)
+	})
 }
 
 func TestNodeExpandVolume(t *testing.T) {
@@ -401,6 +417,13 @@ func TestNodeGetCapabilities(t *testing.T) {
 						Type: &csi.NodeServiceCapability_Rpc{
 							Rpc: &csi.NodeServiceCapability_RPC{
 								Type: csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
+							},
+						},
+					},
+					{
+						Type: &csi.NodeServiceCapability_Rpc{
+							Rpc: &csi.NodeServiceCapability_RPC{
+								Type: csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
 							},
 						},
 					},
