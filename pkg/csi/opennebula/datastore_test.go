@@ -55,6 +55,40 @@ func TestResolveDatastoresRejectsSystemDatastoreForProvisioning(t *testing.T) {
 	assert.Contains(t, err.Error(), "IMAGE or FILE datastore")
 }
 
+func TestResolveDatastoresAcceptsNumericImageDatastoreCategoryFromOpenNebula(t *testing.T) {
+	resolved, err := ResolveDatastores([]datastoreSchema.Datastore{
+		newTypedTestDatastore(111, "lvm-local-image", "fs", "fs_lvm_ssh", "0", map[string]string{
+			"TYPE":      "IMAGE_DS",
+			"DISK_TYPE": "BLOCK",
+			"DRIVER":    "raw",
+		}),
+	}, DatastoreSelectionConfig{
+		Identifiers:  []string{"111"},
+		AllowedTypes: []string{"local"},
+	})
+	require.NoError(t, err)
+	require.Len(t, resolved, 1)
+	assert.Equal(t, "IMAGE", resolved[0].Category)
+	assert.Equal(t, "local", resolved[0].Type)
+}
+
+func TestResolveDatastoresRejectsNumericSystemDatastoreCategoryFromOpenNebula(t *testing.T) {
+	_, err := ResolveDatastores([]datastoreSchema.Datastore{
+		newTypedTestDatastore(112, "lvm-local-system", "fs", "fs_lvm_ssh", "1", map[string]string{
+			"TYPE":      "SYSTEM_DS",
+			"DISK_TYPE": "BLOCK",
+			"DRIVER":    "raw",
+		}),
+	}, DatastoreSelectionConfig{
+		Identifiers:  []string{"112"},
+		AllowedTypes: []string{"local"},
+	})
+	require.Error(t, err)
+	assert.True(t, IsDatastoreConfigError(err))
+	assert.Contains(t, err.Error(), `OpenNebula type "1"`)
+	assert.Contains(t, err.Error(), `template TYPE="SYSTEM_DS"`)
+}
+
 func TestResolveDatastoresRejectsUnknownIdentifier(t *testing.T) {
 	_, err := ResolveDatastores([]datastoreSchema.Datastore{
 		{ID: 100, Name: "fast-local", DSMad: "fs", TMMad: "local", StateRaw: 0},

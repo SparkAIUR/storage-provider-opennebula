@@ -234,7 +234,7 @@ func datastoreFromSchema(source datastoreSchema.Datastore) Datastore {
 	return Datastore{
 		ID:        source.ID,
 		Name:      source.Name,
-		Category:  strings.ToUpper(strings.TrimSpace(source.Type)),
+		Category:  normalizeDatastoreCategory(source),
 		Type:      normalizeAllowedDatastoreType(inferDatastoreType(source)),
 		Backend:   normalizeAllowedDatastoreType(inferDatastoreType(source)),
 		DSMad:     strings.ToLower(strings.TrimSpace(source.DSMad)),
@@ -288,14 +288,37 @@ func inferDatastoreType(source datastoreSchema.Datastore) string {
 }
 
 func validateProvisioningDatastoreCategory(source datastoreSchema.Datastore) error {
-	switch strings.ToUpper(strings.TrimSpace(source.Type)) {
+	switch normalizeDatastoreCategory(source) {
 	case "", string(datastoreSchema.Image), string(datastoreSchema.File):
 		return nil
 	default:
+		templateType := strings.TrimSpace(getDatastoreAttribute(source, "TYPE"))
 		return &datastoreConfigError{
-			message: fmt.Sprintf("datastore %d has OpenNebula type %q and cannot be used for CSI provisioning; select an IMAGE or FILE datastore", source.ID, source.Type),
+			message: fmt.Sprintf("datastore %d has OpenNebula type %q (template TYPE=%q) and cannot be used for CSI provisioning; select an IMAGE or FILE datastore", source.ID, source.Type, templateType),
 		}
 	}
+}
+
+func normalizeDatastoreCategory(source datastoreSchema.Datastore) string {
+	candidates := []string{
+		strings.TrimSpace(source.Type),
+		getDatastoreAttribute(source, "TYPE"),
+	}
+
+	for _, candidate := range candidates {
+		switch strings.ToUpper(strings.TrimSpace(candidate)) {
+		case "", "-":
+			continue
+		case string(datastoreSchema.Image), "IMAGE_DS", "IMG", "0":
+			return string(datastoreSchema.Image)
+		case string(datastoreSchema.System), "SYSTEM_DS", "SYS", "1":
+			return string(datastoreSchema.System)
+		case string(datastoreSchema.File), "FILE_DS", "FILES", "FIL", "2":
+			return string(datastoreSchema.File)
+		}
+	}
+
+	return strings.ToUpper(strings.TrimSpace(source.Type))
 }
 
 func normalizeAllowedDatastoreType(value string) string {
