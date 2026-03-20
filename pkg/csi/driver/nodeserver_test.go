@@ -2,12 +2,16 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
+	"golang.org/x/sys/unix"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/mount-utils"
 	"k8s.io/utils/exec"
 	testingexec "k8s.io/utils/exec/testing"
@@ -346,6 +350,35 @@ func TestNodeGetVolumeStats(t *testing.T) {
 
 		assert.Error(t, err)
 		assert.Nil(t, response)
+	})
+
+	t.Run("maps disconnected cephfs statfs to failed precondition", func(t *testing.T) {
+		tempDir := t.TempDir()
+		ns := getTestNodeServer([]string{tempDir})
+
+		originalStat := nodeVolumePathStat
+		originalStatfs := nodeVolumePathFS
+		t.Cleanup(func() {
+			nodeVolumePathStat = originalStat
+			nodeVolumePathFS = originalStatfs
+		})
+
+		nodeVolumePathStat = func(name string) (os.FileInfo, error) {
+			return originalStat(name)
+		}
+		nodeVolumePathFS = func(path string, buf *unix.Statfs_t) error {
+			return errors.New("transport endpoint is not connected")
+		}
+
+		response, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+			VolumeId:   "cephfs:test-volume-id",
+			VolumePath: tempDir,
+		})
+
+		assert.Nil(t, response)
+		assert.Error(t, err)
+		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+		assert.Contains(t, err.Error(), "stale CephFS mount detected")
 	})
 }
 

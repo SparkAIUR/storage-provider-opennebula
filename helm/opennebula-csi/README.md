@@ -133,6 +133,8 @@ storageClasses:
       datastoreIDs: "300"
       csi.storage.k8s.io/provisioner-secret-name: cephfs-provisioner
       csi.storage.k8s.io/provisioner-secret-namespace: kube-system
+      csi.storage.k8s.io/controller-expand-secret-name: cephfs-provisioner
+      csi.storage.k8s.io/controller-expand-secret-namespace: kube-system
       csi.storage.k8s.io/node-stage-secret-name: cephfs-node-stage
       csi.storage.k8s.io/node-stage-secret-namespace: kube-system
 ```
@@ -166,6 +168,16 @@ csi-provisioner --timeout=2m
 ```
 
 Without that timeout increase, the driver may successfully create the CephFS subvolume but the external provisioner can still report `DeadlineExceeded` and leave the PVC pending.
+
+For CephFS expansion, add the standard CSI controller-expand secret refs to the StorageClass. In practice this is usually the same secret as the provisioner path:
+
+```yaml
+parameters:
+  csi.storage.k8s.io/controller-expand-secret-name: cephfs-provisioner
+  csi.storage.k8s.io/controller-expand-secret-namespace: kube-system
+```
+
+For static CephFS RWX, `sharedFilesystemPath` must already exist in the filesystem. The driver will mount that path, but it does not create the directory for you.
 
 ### Alpha Feature Gates
 
@@ -251,7 +263,7 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | `featureGates.cephfsExpansion` | Enable CephFS dynamic subvolume expansion. | `false` | No |
 | `featureGates.cephfsSnapshots` | Enable CephFS snapshot RPC flows. | `false` | No |
 | `featureGates.cephfsClones` | Enable CephFS PVC clone and snapshot restore flows. | `false` | No |
-| `featureGates.cephfsSelfHealing` | Enable stale CephFS mount lazy-unmount/remount recovery in node stage. | `false` | No |
+| `featureGates.cephfsSelfHealing` | Enable stale CephFS mount lazy-unmount/remount recovery in node stage. `NodeGetVolumeStats` still reports disconnected CephFS mounts as restage-needed errors because kubelet stats calls do not include remount credentials. | `false` | No |
 | `featureGates.topologyAccessibility` | Enable topology capability advertisement and `accessible_topology` handling. | `false` | No |
 
 ### Controller

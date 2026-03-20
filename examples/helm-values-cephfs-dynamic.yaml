@@ -17,7 +17,7 @@ driver:
 storageClasses:
   - name: opennebula-cephfs-dynamic
     reclaimPolicy: Delete
-    allowVolumeExpansion: false
+    allowVolumeExpansion: true
     volumeBindingMode: Immediate
     mountOptions: []
     parameters:
@@ -26,5 +26,7 @@ storageClasses:
       sharedFilesystemSubvolumeGroup: "csi"
       csi.storage.k8s.io/provisioner-secret-name: "cephfs-provisioner"
       csi.storage.k8s.io/provisioner-secret-namespace: "kube-system"
+      csi.storage.k8s.io/controller-expand-secret-name: "cephfs-provisioner"
+      csi.storage.k8s.io/controller-expand-secret-namespace: "kube-system"
       csi.storage.k8s.io/node-stage-secret-name: "cephfs-node-stage"
       csi.storage.k8s.io/node-stage-secret-namespace: "kube-system"

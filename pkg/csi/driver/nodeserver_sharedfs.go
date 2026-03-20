@@ -227,3 +227,10 @@ func detectStaleSharedFilesystemMount(stagingTargetPath string) error {
 	}
 	return nil
 }
+
+func isDisconnectedSharedFilesystemError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "transport endpoint is not connected")
+}

@@ -37,6 +37,11 @@ import (
 	mount "k8s.io/mount-utils"
 )
 
+var (
+	nodeVolumePathStat = os.Stat
+	nodeVolumePathFS   = unix.Statfs
+)
+
 const (
 	defaultFSType   = "ext4"  // Default filesystem type for volumes
 	defaultDiskPath = "/dev/" // Path to disk devices (probably we should include in volumecontext)
@@ -453,17 +458,25 @@ func (ns *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolu
 		return nil, status.Error(codes.InvalidArgument, "volume path is required")
 	}
 
-	info, err := os.Stat(volumePath)
+	info, err := nodeVolumePathStat(volumePath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, status.Errorf(codes.NotFound, "volume path %s was not found", volumePath)
+		}
+		if opennebula.IsSharedFilesystemVolumeID(volumeID) && isDisconnectedSharedFilesystemError(err) {
+			ns.Driver.metrics.RecordCephFSSubvolume("stale_mount_detected", "failure")
+			return nil, status.Errorf(codes.FailedPrecondition, "stale CephFS mount detected at %s: %v; restage the volume to recover", volumePath, err)
 		}
 		return nil, status.Errorf(codes.Internal, "failed to stat volume path %s: %v", volumePath, err)
 	}
 
 	if info.IsDir() {
 		var fs unix.Statfs_t
-		if err := unix.Statfs(volumePath, &fs); err != nil {
+		if err := nodeVolumePathFS(volumePath, &fs); err != nil {
+			if opennebula.IsSharedFilesystemVolumeID(volumeID) && isDisconnectedSharedFilesystemError(err) {
+				ns.Driver.metrics.RecordCephFSSubvolume("stale_mount_detected", "failure")
+				return nil, status.Errorf(codes.FailedPrecondition, "stale CephFS mount detected at %s: %v; restage the volume to recover", volumePath, err)
+			}
 			return nil, status.Errorf(codes.Internal, "failed to collect filesystem stats for %s: %v", volumePath, err)
 		}
 

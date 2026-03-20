@@ -202,6 +202,7 @@ CephFS StorageClass parameters:
 CephFS secret references:
 
 - dynamic provisioning and deletion use the standard CSI provisioner secret reference
+- CephFS expansion uses the standard CSI controller-expand secret reference
 - node-side mounts use the standard CSI node-stage secret reference
 
 Expected CephFS secret keys:
@@ -216,7 +217,9 @@ Expected CephFS secret keys:
 - Ceph monitor endpoints in `CEPH_HOST` must be reachable from the controller and node plugin pods
 - the runtime image now includes `ceph`, `ceph-fuse`, and related Ceph packages
 - CephFS node-stage auth is provided through Kubernetes Secret refs, not host-global Ceph config
+- static CephFS paths configured through `sharedFilesystemPath` must already exist; the driver does not create them
 - dynamic CephFS provisioning requires a Ceph user with permission to create, getpath, and remove subvolumes in the configured filesystem and subvolume group
+- dynamic CephFS expansion also requires `csi.storage.k8s.io/controller-expand-secret-name` and `csi.storage.k8s.io/controller-expand-secret-namespace` on the StorageClass, typically pointing at the same secret used for the provisioner path
 - CephFS expansion, snapshot, and clone flows require the corresponding feature gates to be enabled before use
 
 ### CephFS alpha feature gates
@@ -224,7 +227,8 @@ Expected CephFS secret keys:
 - `cephfsExpansion=true` enables `ControllerExpandVolume` for dynamic CephFS subvolumes through `ceph fs subvolume resize`
 - `cephfsSnapshots=true` enables `CreateSnapshot`, `DeleteSnapshot`, and snapshot listing for dynamic CephFS subvolumes
 - `cephfsClones=true` enables PVC clone from CephFS volumes and restore from CephFS snapshots
-- `cephfsSelfHealing=true` enables one lazy-unmount/remount recovery attempt when node stage detects a stale CephFS mount
+- `cephfsSelfHealing=true` enables one lazy-unmount/remount recovery attempt when node stage detects a stale CephFS mount during staging
+- `NodeGetVolumeStats` reports stale or disconnected CephFS mounts as `FailedPrecondition` so kubelet surfaces a precise restage-needed error instead of a generic internal stat failure
 - static CephFS paths created with `sharedFilesystemPath` still reject expansion
 
 ## Volume expansion
