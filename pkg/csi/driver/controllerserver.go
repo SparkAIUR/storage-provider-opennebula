@@ -131,15 +131,89 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	response.Volume.VolumeContext = params
 
 	if volumeAccessModel == opennebula.VolumeAccessModelSharedFS {
-		if contentSource != nil {
-			s.driver.metrics.RecordOperation("create_volume", "cephfs", "unimplemented", time.Since(started))
-			return nil, status.Error(codes.Unimplemented, "shared filesystem volumes do not yet support cloning or snapshot restore")
-		}
 		if s.sharedFilesystemProvider == nil {
 			s.driver.metrics.RecordOperation("create_volume", "cephfs", "failed_precondition", time.Since(started))
 			return nil, status.Error(codes.FailedPrecondition, "shared filesystem provider is not configured")
 		}
 		backend = "cephfs"
+
+		if contentSource != nil {
+			var (
+				result   *opennebula.SharedVolumeCreateResult
+				cloneErr error
+			)
+			switch source := contentSource.Type.(type) {
+			case *csi.VolumeContentSource_Volume:
+				if !s.driver.featureGates.CephFSClones {
+					s.driver.metrics.RecordOperation("create_volume", backend, "unimplemented", time.Since(started))
+					return nil, status.Error(codes.Unimplemented, "CephFS volume cloning is disabled by feature gate")
+				}
+				result, cloneErr = s.sharedFilesystemProvider.CloneSharedVolume(ctx, opennebula.SharedVolumeCloneRequest{
+					Name:           name,
+					SizeBytes:      requiredBytes,
+					Selection:      selection,
+					Parameters:     rawParams,
+					Secrets:        req.GetSecrets(),
+					SourceVolumeID: source.Volume.GetVolumeId(),
+				})
+			case *csi.VolumeContentSource_Snapshot:
+				if !opennebula.IsSharedFilesystemSnapshotID(source.Snapshot.GetSnapshotId()) {
+					s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
+					return nil, status.Error(codes.InvalidArgument, "shared filesystem restore requires a CephFS snapshot source")
+				}
+				if !s.driver.featureGates.CephFSSnapshots || !s.driver.featureGates.CephFSClones {
+					s.driver.metrics.RecordOperation("create_volume", backend, "unimplemented", time.Since(started))
+					return nil, status.Error(codes.Unimplemented, "CephFS snapshot restore is disabled by feature gate")
+				}
+				result, cloneErr = s.sharedFilesystemProvider.CloneSharedVolume(ctx, opennebula.SharedVolumeCloneRequest{
+					Name:             name,
+					SizeBytes:        requiredBytes,
+					Selection:        selection,
+					Parameters:       rawParams,
+					Secrets:          req.GetSecrets(),
+					SourceSnapshotID: source.Snapshot.GetSnapshotId(),
+				})
+			default:
+				s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
+				return nil, status.Error(codes.InvalidArgument, "unsupported shared filesystem content source")
+			}
+
+			if cloneErr != nil {
+				switch {
+				case opennebula.IsDatastoreConfigError(cloneErr):
+					s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
+					return nil, status.Error(codes.InvalidArgument, cloneErr.Error())
+				case opennebula.IsDatastoreCapacityError(cloneErr):
+					s.driver.metrics.RecordOperation("create_volume", backend, "resource_exhausted", time.Since(started))
+					return nil, status.Error(codes.ResourceExhausted, cloneErr.Error())
+				}
+				s.driver.metrics.RecordOperation("create_volume", backend, "internal", time.Since(started))
+				return nil, status.Error(codes.Internal, "failed to clone shared filesystem volume")
+			}
+
+			response.Volume.VolumeId = result.VolumeID
+			response.Volume.CapacityBytes = result.CapacityBytes
+			if s.driver.featureGates.TopologyAccessibility {
+				response.Volume.AccessibleTopology = accessibleTopologyForDatastore(result.Datastore)
+			}
+			s.driver.metrics.RecordOperation("create_volume", backend, "success", time.Since(started))
+			s.driver.metrics.RecordDatastoreSelection(string(selection.Policy), result.Datastore.Backend, result.Datastore.ID, "selected")
+			s.driver.metrics.SetDatastoreCapacity(result.Datastore.Backend, result.Datastore.ID, result.Datastore.FreeBytes, result.Datastore.TotalBytes)
+			s.recordPVCEventFromParams(ctx, rawParams, eventReasonCloneCreated, fmt.Sprintf("created CephFS clone in datastore %d from content source", result.Datastore.ID))
+			if result.FallbackUsed {
+				s.recordPVCEventFromParams(ctx, rawParams, eventReasonDatastoreFallback, fmt.Sprintf("fallback selected datastore %d after attempts %v", result.Datastore.ID, result.AttemptedDatastoreIDs))
+			}
+			s.recordPVCEventFromParams(ctx, rawParams, eventReasonDatastoreSelected, fmt.Sprintf("selected %s datastore %d (%s) with policy %s", result.Datastore.Backend, result.Datastore.ID, result.Datastore.Name, selection.Policy))
+			s.annotatePlacementFromParams(ctx, rawParams, PlacementReport{
+				Backend:                     result.Metadata.Backend,
+				DatastoreID:                 result.Datastore.ID,
+				DatastoreName:               result.Datastore.Name,
+				SelectionPolicy:             string(selection.Policy),
+				FallbackUsed:                result.FallbackUsed,
+				CompatibilityAwareSelection: s.driver.featureGates.CompatibilityAwareSelection,
+			})
+			return response, nil
+		}
 
 		result, sharedErr := s.sharedFilesystemProvider.CreateSharedVolume(ctx, opennebula.SharedVolumeRequest{
 			Name:       name,
@@ -372,8 +446,31 @@ func (s *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 		return nil, status.Error(codes.InvalidArgument, "source volume ID is required")
 	}
 	if opennebula.IsSharedFilesystemVolumeID(req.GetSourceVolumeId()) {
-		s.driver.metrics.RecordSnapshot("cephfs", "create", "unimplemented")
-		return nil, status.Error(codes.Unimplemented, "CephFS snapshots are disabled in v0.4.0")
+		if s.sharedFilesystemProvider == nil {
+			return nil, status.Error(codes.FailedPrecondition, "shared filesystem provider is not configured")
+		}
+		if !s.driver.featureGates.CephFSSnapshots {
+			s.driver.metrics.RecordSnapshot("cephfs", "create", "unimplemented")
+			return nil, status.Error(codes.Unimplemented, "CephFS snapshots are disabled by feature gate")
+		}
+
+		snapshot, err := s.sharedFilesystemProvider.CreateSharedSnapshot(ctx, req.GetSourceVolumeId(), req.GetName(), req.GetSecrets())
+		if err != nil {
+			s.driver.metrics.RecordSnapshot("cephfs", "create", "internal")
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+
+		s.driver.metrics.RecordSnapshot("cephfs", "create", "success")
+		s.driver.metrics.RecordOperation("create_snapshot", "cephfs", "success", time.Since(started))
+		return &csi.CreateSnapshotResponse{
+			Snapshot: &csi.Snapshot{
+				SizeBytes:      snapshot.SizeBytes,
+				SnapshotId:     snapshot.SnapshotID,
+				SourceVolumeId: snapshot.SourceVolumeID,
+				CreationTime:   timestamppb.New(snapshot.CreationTime),
+				ReadyToUse:     snapshot.ReadyToUse,
+			},
+		}, nil
 	}
 
 	snapshot, err := s.volumeProvider.CreateSnapshot(ctx, req.GetSourceVolumeId(), req.GetName())
@@ -404,6 +501,22 @@ func (s *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSn
 		s.driver.metrics.RecordSnapshot("disk", "delete", "invalid_argument")
 		return nil, status.Error(codes.InvalidArgument, "snapshot ID is required")
 	}
+	if opennebula.IsSharedFilesystemSnapshotID(req.GetSnapshotId()) {
+		if s.sharedFilesystemProvider == nil {
+			return nil, status.Error(codes.FailedPrecondition, "shared filesystem provider is not configured")
+		}
+		if !s.driver.featureGates.CephFSSnapshots {
+			s.driver.metrics.RecordSnapshot("cephfs", "delete", "unimplemented")
+			return nil, status.Error(codes.Unimplemented, "CephFS snapshots are disabled by feature gate")
+		}
+		if err := s.sharedFilesystemProvider.DeleteSharedSnapshot(ctx, req.GetSnapshotId(), req.GetSecrets()); err != nil {
+			s.driver.metrics.RecordSnapshot("cephfs", "delete", "internal")
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		s.driver.metrics.RecordSnapshot("cephfs", "delete", "success")
+		s.driver.metrics.RecordOperation("delete_snapshot", "cephfs", "success", time.Since(started))
+		return &csi.DeleteSnapshotResponse{}, nil
+	}
 
 	if err := s.volumeProvider.DeleteSnapshot(ctx, req.GetSnapshotId()); err != nil {
 		s.driver.metrics.RecordSnapshot("disk", "delete", "internal")
@@ -417,6 +530,38 @@ func (s *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSn
 
 func (s *ControllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
 	klog.V(1).InfoS("ListSnapshots called", "req", protosanitizer.StripSecrets(req))
+
+	if opennebula.IsSharedFilesystemSnapshotID(req.GetSnapshotId()) || opennebula.IsSharedFilesystemVolumeID(req.GetSourceVolumeId()) {
+		if s.sharedFilesystemProvider == nil {
+			return nil, status.Error(codes.FailedPrecondition, "shared filesystem provider is not configured")
+		}
+		if !s.driver.featureGates.CephFSSnapshots {
+			return nil, status.Error(codes.Unimplemented, "CephFS snapshots are disabled by feature gate")
+		}
+
+		snapshots, nextToken, err := s.sharedFilesystemProvider.ListSharedSnapshots(ctx, req.GetSnapshotId(), req.GetSourceVolumeId(), req.GetMaxEntries(), req.GetStartingToken(), nil)
+		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+
+		entries := make([]*csi.ListSnapshotsResponse_Entry, 0, len(snapshots))
+		for _, snapshot := range snapshots {
+			entries = append(entries, &csi.ListSnapshotsResponse_Entry{
+				Snapshot: &csi.Snapshot{
+					SizeBytes:      snapshot.SizeBytes,
+					SnapshotId:     snapshot.SnapshotID,
+					SourceVolumeId: snapshot.SourceVolumeID,
+					CreationTime:   timestamppb.New(snapshot.CreationTime),
+					ReadyToUse:     snapshot.ReadyToUse,
+				},
+			})
+		}
+
+		return &csi.ListSnapshotsResponse{
+			Entries:   entries,
+			NextToken: nextToken,
+		}, nil
+	}
 
 	snapshots, nextToken, err := s.volumeProvider.ListSnapshots(ctx, req.GetSnapshotId(), req.GetSourceVolumeId(), req.GetMaxEntries(), req.GetStartingToken())
 	if err != nil {
@@ -783,11 +928,36 @@ func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 	}
 
 	if opennebula.IsSharedFilesystemVolumeID(req.GetVolumeId()) {
-		s.driver.metrics.RecordOperation("controller_expand_volume", "cephfs", "unimplemented", time.Since(started))
-		return nil, status.Error(codes.Unimplemented, "CephFS shared filesystem expansion is not supported in v0.4.0")
+		if s.sharedFilesystemProvider == nil {
+			return nil, status.Error(codes.FailedPrecondition, "shared filesystem provider is not configured")
+		}
+		if !s.driver.featureGates.CephFSExpansion {
+			s.driver.metrics.RecordOperation("controller_expand_volume", "cephfs", "unimplemented", time.Since(started))
+			return nil, status.Error(codes.Unimplemented, "CephFS shared filesystem expansion is disabled by feature gate")
+		}
+
+		newSize, err := s.sharedFilesystemProvider.ExpandSharedVolume(ctx, req.GetVolumeId(), capacityRange.GetRequiredBytes(), req.GetSecrets())
+		if err != nil {
+			switch {
+			case opennebula.IsDatastoreConfigError(err):
+				s.driver.metrics.RecordOperation("controller_expand_volume", "cephfs", "failed_precondition", time.Since(started))
+				return nil, status.Error(codes.FailedPrecondition, err.Error())
+			case opennebula.IsDatastoreCapacityError(err):
+				s.driver.metrics.RecordOperation("controller_expand_volume", "cephfs", "resource_exhausted", time.Since(started))
+				return nil, status.Error(codes.ResourceExhausted, err.Error())
+			}
+
+			s.driver.metrics.RecordOperation("controller_expand_volume", "cephfs", "internal", time.Since(started))
+			return nil, status.Error(codes.Internal, "failed to expand CephFS volume")
+		}
+
+		return &csi.ControllerExpandVolumeResponse{
+			CapacityBytes:         newSize,
+			NodeExpansionRequired: false,
+		}, nil
 	}
 
-	newSize, err := s.volumeProvider.ExpandVolume(ctx, req.GetVolumeId(), capacityRange.GetRequiredBytes())
+	newSize, err := s.volumeProvider.ExpandVolume(ctx, req.GetVolumeId(), capacityRange.GetRequiredBytes(), s.driver.featureGates.DetachedDiskExpansion)
 	if err != nil {
 		switch {
 		case opennebula.IsDatastoreConfigError(err):

@@ -779,7 +779,7 @@ func TestControllerExpandVolume(t *testing.T) {
 				},
 			},
 			setupMock: func(m *MockOpenNebulaVolumeProviderTestify) {
-				m.On("ExpandVolume", mock.Anything, "test-volume", expandedSize).Return(expandedSize, nil)
+				m.On("ExpandVolume", mock.Anything, "test-volume", expandedSize, false).Return(expandedSize, nil)
 			},
 			expectNodeExpand: true,
 		},
@@ -797,7 +797,7 @@ func TestControllerExpandVolume(t *testing.T) {
 				},
 			},
 			setupMock: func(m *MockOpenNebulaVolumeProviderTestify) {
-				m.On("ExpandVolume", mock.Anything, "test-volume", expandedSize).Return(expandedSize, nil)
+				m.On("ExpandVolume", mock.Anything, "test-volume", expandedSize, false).Return(expandedSize, nil)
 			},
 			expectNodeExpand: false,
 		},
@@ -850,6 +850,38 @@ func TestCreateSnapshot(t *testing.T) {
 	mockProvider.AssertExpectations(t)
 }
 
+func TestCreateSnapshotCreatesSharedFilesystemSnapshotWhenEnabled(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	sharedProvider := &MockSharedFilesystemProviderTestify{}
+	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local,cephfs")
+	cs.driver.featureGates.CephFSSnapshots = true
+	now := time.Now().UTC()
+
+	sharedProvider.On("CreateSharedSnapshot", mock.Anything, "cephfs:source", "snap-1", map[string]string{
+		"adminID":  "csi-admin",
+		"adminKey": "super-secret",
+	}).Return(&opennebula.VolumeSnapshot{
+		SnapshotID:     "cephfs-snapshot:test",
+		SourceVolumeID: "cephfs:source",
+		CreationTime:   now,
+		SizeBytes:      int64(1024 * 1024 * 1024),
+		ReadyToUse:     true,
+	}, nil)
+
+	resp, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{
+		Name:           "snap-1",
+		SourceVolumeId: "cephfs:source",
+		Secrets: map[string]string{
+			"adminID":  "csi-admin",
+			"adminKey": "super-secret",
+		},
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, "cephfs-snapshot:test", resp.GetSnapshot().GetSnapshotId())
+	sharedProvider.AssertExpectations(t)
+}
+
 func TestDeleteSnapshot(t *testing.T) {
 	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
 	cs := getTestControllerServer(mockProvider)
@@ -863,6 +895,23 @@ func TestDeleteSnapshot(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, &csi.DeleteSnapshotResponse{}, resp)
 	mockProvider.AssertExpectations(t)
+}
+
+func TestDeleteSnapshotDeletesSharedFilesystemSnapshotWhenEnabled(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	sharedProvider := &MockSharedFilesystemProviderTestify{}
+	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local,cephfs")
+	cs.driver.featureGates.CephFSSnapshots = true
+
+	sharedProvider.On("DeleteSharedSnapshot", mock.Anything, "cephfs-snapshot:test", mock.Anything).Return(nil)
+
+	resp, err := cs.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{
+		SnapshotId: "cephfs-snapshot:test",
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, &csi.DeleteSnapshotResponse{}, resp)
+	sharedProvider.AssertExpectations(t)
 }
 
 func TestListSnapshots(t *testing.T) {
@@ -889,6 +938,183 @@ func TestListSnapshots(t *testing.T) {
 	if assert.Len(t, resp.GetEntries(), 1) {
 		assert.Equal(t, "image-snapshot:10:1", resp.GetEntries()[0].GetSnapshot().GetSnapshotId())
 	}
+	mockProvider.AssertExpectations(t)
+}
+
+func TestCreateVolumeClonesSharedFilesystemVolumeWhenEnabled(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	sharedProvider := &MockSharedFilesystemProviderTestify{}
+	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local,cephfs")
+	cs.driver.featureGates.CephFSClones = true
+
+	sharedProvider.On("CloneSharedVolume", mock.Anything, opennebula.SharedVolumeCloneRequest{
+		Name:      "rwx-clone",
+		SizeBytes: int64(1024 * 1024 * 1024),
+		Selection: opennebula.DatastoreSelectionConfig{
+			Identifiers:  []string{"100"},
+			Policy:       opennebula.DatastoreSelectionPolicyLeastUsed,
+			AllowedTypes: []string{"local", "cephfs"},
+		},
+		Parameters: map[string]string{
+			storageClassParamDatastoreIDs: "100",
+		},
+		Secrets: map[string]string{
+			"adminID":  "csi-admin",
+			"adminKey": "super-secret",
+		},
+		SourceVolumeID: "cephfs:source",
+	}).Return(&opennebula.SharedVolumeCreateResult{
+		VolumeID:      "cephfs:clone",
+		CapacityBytes: int64(1024 * 1024 * 1024),
+		Datastore:     opennebula.Datastore{ID: 100, Name: "cephfs-file"},
+		Metadata:      opennebula.SharedVolumeMetadata{Backend: "cephfs", Mode: opennebula.SharedVolumeModeDynamic},
+	}, nil)
+
+	resp, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name: "rwx-clone",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: int64(1024 * 1024 * 1024),
+		},
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessType: &csi.VolumeCapability_Mount{
+					Mount: &csi.VolumeCapability_MountVolume{FsType: "xfs"},
+				},
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
+				},
+			},
+		},
+		Parameters: map[string]string{
+			storageClassParamDatastoreIDs: "100",
+		},
+		Secrets: map[string]string{
+			"adminID":  "csi-admin",
+			"adminKey": "super-secret",
+		},
+		VolumeContentSource: &csi.VolumeContentSource{
+			Type: &csi.VolumeContentSource_Volume{
+				Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "cephfs:source"},
+			},
+		},
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, "cephfs:clone", resp.GetVolume().GetVolumeId())
+	sharedProvider.AssertExpectations(t)
+}
+
+func TestCreateVolumeRestoresSharedFilesystemSnapshotWhenEnabled(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	sharedProvider := &MockSharedFilesystemProviderTestify{}
+	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local,cephfs")
+	cs.driver.featureGates.CephFSClones = true
+	cs.driver.featureGates.CephFSSnapshots = true
+
+	sharedProvider.On("CloneSharedVolume", mock.Anything, opennebula.SharedVolumeCloneRequest{
+		Name:      "rwx-restore",
+		SizeBytes: int64(1024 * 1024 * 1024),
+		Selection: opennebula.DatastoreSelectionConfig{
+			Identifiers:  []string{"100"},
+			Policy:       opennebula.DatastoreSelectionPolicyLeastUsed,
+			AllowedTypes: []string{"local", "cephfs"},
+		},
+		Parameters: map[string]string{
+			storageClassParamDatastoreIDs: "100",
+		},
+		Secrets: map[string]string{
+			"adminID":  "csi-admin",
+			"adminKey": "super-secret",
+		},
+		SourceSnapshotID: "cephfs-snapshot:test",
+	}).Return(&opennebula.SharedVolumeCreateResult{
+		VolumeID:      "cephfs:restore",
+		CapacityBytes: int64(1024 * 1024 * 1024),
+		Datastore:     opennebula.Datastore{ID: 100, Name: "cephfs-file"},
+		Metadata:      opennebula.SharedVolumeMetadata{Backend: "cephfs", Mode: opennebula.SharedVolumeModeDynamic},
+	}, nil)
+
+	resp, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name: "rwx-restore",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: int64(1024 * 1024 * 1024),
+		},
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessType: &csi.VolumeCapability_Mount{
+					Mount: &csi.VolumeCapability_MountVolume{FsType: "xfs"},
+				},
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
+				},
+			},
+		},
+		Parameters: map[string]string{
+			storageClassParamDatastoreIDs: "100",
+		},
+		Secrets: map[string]string{
+			"adminID":  "csi-admin",
+			"adminKey": "super-secret",
+		},
+		VolumeContentSource: &csi.VolumeContentSource{
+			Type: &csi.VolumeContentSource_Snapshot{
+				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "cephfs-snapshot:test"},
+			},
+		},
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, "cephfs:restore", resp.GetVolume().GetVolumeId())
+	sharedProvider.AssertExpectations(t)
+}
+
+func TestControllerExpandVolumeExpandsSharedFilesystemWhenEnabled(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	sharedProvider := &MockSharedFilesystemProviderTestify{}
+	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local,cephfs")
+	cs.driver.featureGates.CephFSExpansion = true
+
+	sharedProvider.On("ExpandSharedVolume", mock.Anything, "cephfs:volume", int64(2*1024*1024*1024), mock.Anything).Return(int64(2*1024*1024*1024), nil)
+
+	resp, err := cs.ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{
+		VolumeId: "cephfs:volume",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: int64(2 * 1024 * 1024 * 1024),
+		},
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{FsType: "xfs"},
+			},
+		},
+	})
+
+	assert.NoError(t, err)
+	assert.False(t, resp.GetNodeExpansionRequired())
+	assert.Equal(t, int64(2*1024*1024*1024), resp.GetCapacityBytes())
+	sharedProvider.AssertExpectations(t)
+}
+
+func TestControllerExpandVolumePassesDetachedExpansionGate(t *testing.T) {
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	cs := getTestControllerServer(mockProvider)
+	cs.driver.featureGates.DetachedDiskExpansion = true
+
+	mockProvider.On("ExpandVolume", mock.Anything, "test-volume", int64(2*1024*1024*1024), true).Return(int64(2*1024*1024*1024), nil)
+
+	resp, err := cs.ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{
+		VolumeId: "test-volume",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: int64(2 * 1024 * 1024 * 1024),
+		},
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{FsType: "ext4"},
+			},
+		},
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, int64(2*1024*1024*1024), resp.GetCapacityBytes())
 	mockProvider.AssertExpectations(t)
 }
 
@@ -973,8 +1199,8 @@ func (m *MockOpenNebulaVolumeProviderTestify) DeleteVolume(ctx context.Context, 
 	return args.Error(0)
 }
 
-func (m *MockOpenNebulaVolumeProviderTestify) ExpandVolume(ctx context.Context, volume string, size int64) (int64, error) {
-	args := m.Called(ctx, volume, size)
+func (m *MockOpenNebulaVolumeProviderTestify) ExpandVolume(ctx context.Context, volume string, size int64, allowDetached bool) (int64, error) {
+	args := m.Called(ctx, volume, size, allowDetached)
 	return args.Get(0).(int64), args.Error(1)
 }
 
@@ -1044,9 +1270,40 @@ func (m *MockSharedFilesystemProviderTestify) CreateSharedVolume(ctx context.Con
 	return nil, args.Error(1)
 }
 
+func (m *MockSharedFilesystemProviderTestify) CloneSharedVolume(ctx context.Context, req opennebula.SharedVolumeCloneRequest) (*opennebula.SharedVolumeCreateResult, error) {
+	args := m.Called(ctx, req)
+	if result := args.Get(0); result != nil {
+		return result.(*opennebula.SharedVolumeCreateResult), args.Error(1)
+	}
+	return nil, args.Error(1)
+}
+
 func (m *MockSharedFilesystemProviderTestify) DeleteSharedVolume(ctx context.Context, volumeID string, secrets map[string]string) error {
 	args := m.Called(ctx, volumeID, secrets)
 	return args.Error(0)
+}
+
+func (m *MockSharedFilesystemProviderTestify) ExpandSharedVolume(ctx context.Context, volumeID string, sizeBytes int64, secrets map[string]string) (int64, error) {
+	args := m.Called(ctx, volumeID, sizeBytes, secrets)
+	return args.Get(0).(int64), args.Error(1)
+}
+
+func (m *MockSharedFilesystemProviderTestify) CreateSharedSnapshot(ctx context.Context, sourceVolumeID string, snapshotName string, secrets map[string]string) (*opennebula.VolumeSnapshot, error) {
+	args := m.Called(ctx, sourceVolumeID, snapshotName, secrets)
+	if result := args.Get(0); result != nil {
+		return result.(*opennebula.VolumeSnapshot), args.Error(1)
+	}
+	return nil, args.Error(1)
+}
+
+func (m *MockSharedFilesystemProviderTestify) DeleteSharedSnapshot(ctx context.Context, snapshotID string, secrets map[string]string) error {
+	args := m.Called(ctx, snapshotID, secrets)
+	return args.Error(0)
+}
+
+func (m *MockSharedFilesystemProviderTestify) ListSharedSnapshots(ctx context.Context, snapshotID string, sourceVolumeID string, maxEntries int32, startingToken string, secrets map[string]string) ([]opennebula.VolumeSnapshot, string, error) {
+	args := m.Called(ctx, snapshotID, sourceVolumeID, maxEntries, startingToken, secrets)
+	return args.Get(0).([]opennebula.VolumeSnapshot), args.String(1), args.Error(2)
 }
 
 func (m *MockSharedFilesystemProviderTestify) PublishSharedVolume(ctx context.Context, volumeID string, readonly bool) (map[string]string, error) {

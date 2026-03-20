@@ -70,6 +70,16 @@ type SharedVolumeRequest struct {
 	Secrets    map[string]string
 }
 
+type SharedVolumeCloneRequest struct {
+	Name             string
+	SizeBytes        int64
+	Selection        DatastoreSelectionConfig
+	Parameters       map[string]string
+	Secrets          map[string]string
+	SourceVolumeID   string
+	SourceSnapshotID string
+}
+
 type SharedVolumeCreateResult struct {
 	VolumeID              string
 	CapacityBytes         int64

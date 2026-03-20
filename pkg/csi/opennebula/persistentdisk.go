@@ -346,7 +346,7 @@ func (p *PersistentDiskVolumeProvider) ListSnapshots(ctx context.Context, snapsh
 	return append([]VolumeSnapshot(nil), snapshots[start:end]...), nextToken, nil
 }
 
-func (p *PersistentDiskVolumeProvider) ExpandVolume(ctx context.Context, volume string, size int64) (int64, error) {
+func (p *PersistentDiskVolumeProvider) ExpandVolume(ctx context.Context, volume string, size int64, allowDetached bool) (int64, error) {
 	if size <= 0 {
 		return 0, fmt.Errorf("invalid requested volume size: must be greater than 0")
 	}
@@ -369,7 +369,7 @@ func (p *PersistentDiskVolumeProvider) ExpandVolume(ctx context.Context, volume 
 		return int64(currentSize), nil
 	}
 
-	vmID, diskID, err := p.findAttachedVolumeDisk(ctx, volumeID)
+	vmID, diskID, attached, err := p.findAttachedVolumeDisk(ctx, volumeID)
 	if err != nil {
 		return 0, err
 	}
@@ -379,9 +379,23 @@ func (p *PersistentDiskVolumeProvider) ExpandVolume(ctx context.Context, volume 
 		sizeMB++
 	}
 
-	err = p.ctrl.VM(vmID).Disk(diskID).ResizeContext(ctx, strconv.FormatInt(sizeMB, 10))
-	if err != nil {
-		return 0, fmt.Errorf("failed to expand volume %s on vm %d disk %d: %w", volume, vmID, diskID, err)
+	if attached {
+		err = p.ctrl.VM(vmID).Disk(diskID).ResizeContext(ctx, strconv.FormatInt(sizeMB, 10))
+		if err != nil {
+			return 0, fmt.Errorf("failed to expand volume %s on vm %d disk %d: %w", volume, vmID, diskID, err)
+		}
+	} else {
+		if !allowDetached {
+			return 0, &datastoreConfigError{
+				message: "expanding detached OpenNebula persistent disks is disabled; attach the volume or enable the detachedDiskExpansion feature gate and retry expansion",
+			}
+		}
+
+		tpl := img.NewTemplate()
+		tpl.Add(imk.Size, int(sizeMB))
+		if err := p.ctrl.Image(volumeID).UpdateContext(ctx, tpl.String(), parameters.Merge); err != nil {
+			return 0, fmt.Errorf("failed to expand detached volume %s via image update: %w", volume, err)
+		}
 	}
 
 	err = p.waitForResourceStatus(volumeID, volumeUsedTimeout, func(resourceID int) (bool, error) {
@@ -698,10 +712,10 @@ func (p *PersistentDiskVolumeProvider) resolveProvisioningDatastores(ctx context
 	return ordered, nil
 }
 
-func (p *PersistentDiskVolumeProvider) findAttachedVolumeDisk(ctx context.Context, volumeID int) (int, int, error) {
+func (p *PersistentDiskVolumeProvider) findAttachedVolumeDisk(ctx context.Context, volumeID int) (int, int, bool, error) {
 	vmPool, err := p.ctrl.VMs().InfoContext(ctx)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get vm info while locating attached volume %d: %w", volumeID, err)
+		return 0, 0, false, fmt.Errorf("failed to get vm info while locating attached volume %d: %w", volumeID, err)
 	}
 
 	var attachedVMID int
@@ -716,15 +730,15 @@ func (p *PersistentDiskVolumeProvider) findAttachedVolumeDisk(ctx context.Contex
 
 			diskIDStr, diskIDErr := disk.Get(shared.DiskID)
 			if diskIDErr != nil {
-				return 0, 0, fmt.Errorf("failed to determine disk ID for volume %d on vm %d: %w", volumeID, vmInfo.ID, diskIDErr)
+				return 0, 0, false, fmt.Errorf("failed to determine disk ID for volume %d on vm %d: %w", volumeID, vmInfo.ID, diskIDErr)
 			}
 			diskID, convErr := strconv.Atoi(diskIDStr)
 			if convErr != nil {
-				return 0, 0, fmt.Errorf("invalid disk ID for volume %d on vm %d: %w", volumeID, vmInfo.ID, convErr)
+				return 0, 0, false, fmt.Errorf("invalid disk ID for volume %d on vm %d: %w", volumeID, vmInfo.ID, convErr)
 			}
 
 			if found {
-				return 0, 0, &datastoreConfigError{
+				return 0, 0, false, &datastoreConfigError{
 					message: fmt.Sprintf("volume %d is attached to multiple virtual machines; expansion currently requires a single attachment", volumeID),
 				}
 			}
@@ -736,12 +750,10 @@ func (p *PersistentDiskVolumeProvider) findAttachedVolumeDisk(ctx context.Contex
 	}
 
 	if !found {
-		return 0, 0, &datastoreConfigError{
-			message: "expanding detached OpenNebula persistent disks is not supported by the current driver implementation; attach the volume and retry expansion",
-		}
+		return 0, 0, false, nil
 	}
 
-	return attachedVMID, attachedDiskID, nil
+	return attachedVMID, attachedDiskID, true, nil
 }
 
 func (p *PersistentDiskVolumeProvider) VolumeExists(ctx context.Context, volume string) (int, int, error) {
