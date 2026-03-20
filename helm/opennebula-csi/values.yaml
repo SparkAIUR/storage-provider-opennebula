@@ -94,4 +94,19 @@ metrics:
     resizer: 8687
     registrar: 8688
 
+preflight:
+  enabled: false
+  failReleaseOnError: true
+  image:
+    repository: ""
+    tag: ""
+  datastores: []
+  nodeStageSecretRefs: []
+  provisionerSecretRefs: []
+
+snapshotter:
+  enabled: true
+  image: registry.k8s.io/sig-storage/csi-snapshotter:v8.2.1
+  extraArgs: []
+
 storageClasses: []

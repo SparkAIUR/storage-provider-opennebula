@@ -21,6 +21,7 @@ import (
 	"flag"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
@@ -31,10 +32,17 @@ import (
 )
 
 var (
-	driverName        = flag.String("drivername", driver.DefaultDriverName, "CSI driver name")
-	pluginEndpoint    = flag.String("endpoint", driver.DefaultGRPCServerEndpoint, "CSI plugin endpoint")
-	nodeID            = flag.String("nodeid", "", "Node ID")
-	maxVolumesPerNode = flag.Uint64("maxVolumesPerNode", 255, "Maximum number of volumes that can be attached to a node")
+	driverName                  = flag.String("drivername", driver.DefaultDriverName, "CSI driver name")
+	pluginEndpoint              = flag.String("endpoint", driver.DefaultGRPCServerEndpoint, "CSI plugin endpoint")
+	nodeID                      = flag.String("nodeid", "", "Node ID")
+	maxVolumesPerNode           = flag.Uint64("maxVolumesPerNode", 255, "Maximum number of volumes that can be attached to a node")
+	mode                        = flag.String("mode", "driver", "Execution mode: driver or preflight")
+	output                      = flag.String("output", "text", "Output format for preflight mode: text or json")
+	preflightDatastores         = flag.String("preflight-datastores", "", "Comma-separated datastore identifiers to validate during preflight")
+	preflightNodeStageSecrets   = flag.String("preflight-node-stage-secrets", "", "Comma-separated namespace/name secret references for CephFS node-stage validation")
+	preflightProvisionerSecrets = flag.String("preflight-provisioner-secrets", "", "Comma-separated namespace/name secret references for CephFS provisioner validation")
+	requireSnapshotCRDs         = flag.Bool("require-snapshot-crds", false, "Require snapshot.storage.k8s.io CRDs during preflight")
+	requireServiceMonitorCRDs   = flag.Bool("require-servicemonitor-crds", false, "Require monitoring.coreos.com ServiceMonitor CRD during preflight")
 )
 
 func main() {
@@ -48,23 +56,15 @@ func main() {
 
 	config := config.LoadConfiguration()
 
-	handle(config)
-	os.Exit(0)
+	exitCode := handle(config)
+	os.Exit(exitCode)
 }
 
-func handle(cfg config.CSIPluginConfig) {
+func handle(cfg config.CSIPluginConfig) int {
 	mounter := mount.NewSafeFormatAndMount(
 		mount.New(""), // using default linux mounter implementation
 		exec.New(),
 	)
-	driverOptions := &driver.DriverOptions{
-		NodeID:             *nodeID,
-		DriverName:         *driverName,
-		GRPCServerEndpoint: *pluginEndpoint,
-		PluginConfig:       cfg,
-		Mounter:            mounter,
-	}
-	driver := driver.NewDriver(driverOptions)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -76,8 +76,64 @@ func handle(cfg config.CSIPluginConfig) {
 		cancel()
 	}()
 
-	err := driver.Run(ctx)
-	if err != nil {
-		klog.Fatalf("Failed to run driver: %v", err)
+	switch *mode {
+	case "driver":
+		driverOptions := &driver.DriverOptions{
+			NodeID:             *nodeID,
+			DriverName:         *driverName,
+			GRPCServerEndpoint: *pluginEndpoint,
+			PluginConfig:       cfg,
+			Mounter:            mounter,
+		}
+		driver := driver.NewDriver(driverOptions)
+		if err := driver.Run(ctx); err != nil {
+			klog.Errorf("Failed to run driver: %v", err)
+			return 1
+		}
+		return 0
+	case "preflight":
+		nodeStageRefs, err := driver.ParseSecretRefsCSV(*preflightNodeStageSecrets)
+		if err != nil {
+			klog.Errorf("Invalid node stage secret references: %v", err)
+			return 1
+		}
+		provisionerRefs, err := driver.ParseSecretRefsCSV(*preflightProvisionerSecrets)
+		if err != nil {
+			klog.Errorf("Invalid provisioner secret references: %v", err)
+			return 1
+		}
+		opts := driver.PreflightOptions{
+			Datastores:               splitCSV(*preflightDatastores),
+			NodeStageSecretRefs:      nodeStageRefs,
+			ProvisionerSecretRefs:    provisionerRefs,
+			RequireSnapshotCRDs:      *requireSnapshotCRDs,
+			RequireServiceMonitorCRD: *requireServiceMonitorCRDs,
+		}
+		if err := driver.RunPreflightCommand(ctx, cfg, exec.New(), opts, *output, os.Stdout); err != nil {
+			klog.Errorf("Preflight failed: %v", err)
+			return 1
+		}
+		return 0
+	default:
+		klog.Errorf("Unsupported mode %q", *mode)
+		return 1
 	}
+}
+
+func splitCSV(value string) []string {
+	if value == "" {
+		return nil
+	}
+
+	parts := strings.Split(value, ",")
+	normalized := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		normalized = append(normalized, trimmed)
+	}
+
+	return normalized
 }

@@ -1,0 +1,409 @@
+package driver
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/OpenNebula/one/src/oca/go/src/goca"
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
+	utilexec "k8s.io/utils/exec"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+)
+
+type SecretRef struct {
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+}
+
+type PreflightOptions struct {
+	Datastores               []string
+	NodeStageSecretRefs      []SecretRef
+	ProvisionerSecretRefs    []SecretRef
+	RequireSnapshotCRDs      bool
+	RequireServiceMonitorCRD bool
+}
+
+type PreflightCheckResult struct {
+	Check   string `json:"check"`
+	Outcome string `json:"outcome"`
+	Message string `json:"message"`
+}
+
+type PreflightReport struct {
+	Passed  bool                   `json:"passed"`
+	Results []PreflightCheckResult `json:"results"`
+}
+
+type PreflightRunner struct {
+	Config  config.CSIPluginConfig
+	Exec    utilexec.Interface
+	Options PreflightOptions
+}
+
+func NewPreflightRunner(cfg config.CSIPluginConfig, exec utilexec.Interface, opts PreflightOptions) *PreflightRunner {
+	if exec == nil {
+		exec = utilexec.New()
+	}
+
+	return &PreflightRunner{
+		Config:  cfg,
+		Exec:    exec,
+		Options: opts,
+	}
+}
+
+func (r *PreflightRunner) Run(ctx context.Context) PreflightReport {
+	results := make([]PreflightCheckResult, 0, 8)
+	failed := false
+
+	appendResult := func(check, outcome, message string) {
+		results = append(results, PreflightCheckResult{
+			Check:   check,
+			Outcome: outcome,
+			Message: message,
+		})
+		if outcome == "fail" {
+			failed = true
+		}
+	}
+
+	endpoint, _ := r.Config.GetString(config.OpenNebulaRPCEndpointVar)
+	credentials, _ := r.Config.GetString(config.OpenNebulaCredentialsVar)
+	if strings.TrimSpace(endpoint) == "" || strings.TrimSpace(credentials) == "" {
+		appendResult("opennebula_auth", "fail", "ONE_XMLRPC and ONE_AUTH must both be configured")
+		return PreflightReport{Passed: false, Results: results}
+	}
+
+	client := opennebula.NewClient(opennebula.OpenNebulaConfig{
+		Endpoint:    endpoint,
+		Credentials: credentials,
+	})
+	if err := client.Probe(ctx); err != nil {
+		appendResult("opennebula_auth", "fail", fmt.Sprintf("failed to reach OpenNebula API: %v", err))
+		return PreflightReport{Passed: false, Results: results}
+	}
+	appendResult("opennebula_auth", "pass", fmt.Sprintf("connected to OpenNebula API at %s", endpoint))
+
+	ctrl := goca.NewController(client.Client)
+	datastorePool, err := ctrl.Datastores().InfoContext(ctx)
+	if err != nil {
+		appendResult("datastore_resolution", "fail", fmt.Sprintf("failed to list OpenNebula datastores: %v", err))
+		return PreflightReport{Passed: false, Results: results}
+	}
+
+	selection, hasDatastores, err := r.selectionConfig()
+	if err != nil {
+		appendResult("datastore_resolution", "fail", err.Error())
+		return PreflightReport{Passed: false, Results: results}
+	}
+
+	resolvedDatastores := []opennebula.Datastore{}
+	if !hasDatastores {
+		appendResult("datastore_resolution", "skip", "no preflight datastores were configured; skipping datastore validation")
+	} else {
+		resolvedDatastores, err = opennebula.ResolveDatastores(datastorePool.Datastores, selection)
+		if err != nil {
+			appendResult("datastore_resolution", "fail", err.Error())
+			return PreflightReport{Passed: false, Results: results}
+		}
+		names := make([]string, 0, len(resolvedDatastores))
+		for _, ds := range resolvedDatastores {
+			names = append(names, fmt.Sprintf("%d(%s:%s)", ds.ID, ds.Category, ds.Backend))
+		}
+		appendResult("datastore_resolution", "pass", fmt.Sprintf("validated datastores: %s", strings.Join(names, ", ")))
+	}
+
+	if err := r.requireBinary("ceph"); err != nil {
+		appendResult("ceph_binary", "fail", err.Error())
+	} else {
+		appendResult("ceph_binary", "pass", "found ceph in PATH")
+	}
+
+	if err := r.requireBinary("ceph-fuse"); err != nil {
+		appendResult("ceph_fuse_binary", "fail", err.Error())
+	} else {
+		appendResult("ceph_fuse_binary", "pass", "found ceph-fuse in PATH")
+	}
+
+	monitorErr := r.checkMonitorReachability(ctx, resolvedDatastores)
+	switch {
+	case monitorErr == nil && len(resolvedDatastores) > 0:
+		appendResult("ceph_monitor_reachability", "pass", "successfully reached all discovered Ceph/CephFS monitors")
+	case monitorErr == nil:
+		appendResult("ceph_monitor_reachability", "skip", "no Ceph or CephFS datastores selected; skipping monitor reachability checks")
+	default:
+		appendResult("ceph_monitor_reachability", "fail", monitorErr.Error())
+	}
+
+	kubeClient, discoClient, kubeErr := preflightKubeClients()
+	if kubeErr != nil {
+		if len(r.Options.NodeStageSecretRefs) > 0 || len(r.Options.ProvisionerSecretRefs) > 0 || r.Options.RequireSnapshotCRDs || r.Options.RequireServiceMonitorCRD {
+			appendResult("kubernetes_api", "fail", fmt.Sprintf("failed to initialize Kubernetes client for preflight: %v", kubeErr))
+		} else {
+			appendResult("kubernetes_api", "skip", "Kubernetes client not available; skipping cluster-scoped preflight checks")
+		}
+	} else {
+		appendResult("kubernetes_api", "pass", "connected to Kubernetes API for cluster-scoped preflight checks")
+
+		if err := checkSecretRefs(ctx, kubeClient, append(r.Options.NodeStageSecretRefs, r.Options.ProvisionerSecretRefs...)...); err != nil {
+			appendResult("secret_refs", "fail", err.Error())
+		} else if len(r.Options.NodeStageSecretRefs)+len(r.Options.ProvisionerSecretRefs) > 0 {
+			appendResult("secret_refs", "pass", "validated referenced Kubernetes secrets")
+		} else {
+			appendResult("secret_refs", "skip", "no secret references were configured for preflight validation")
+		}
+
+		if r.Options.RequireSnapshotCRDs {
+			if err := requireAPIResource(discoClient, "snapshot.storage.k8s.io/v1", "volumesnapshots", "volumesnapshotcontents"); err != nil {
+				appendResult("snapshot_crds", "fail", err.Error())
+			} else {
+				appendResult("snapshot_crds", "pass", "snapshot.storage.k8s.io CRDs are available")
+			}
+		} else {
+			appendResult("snapshot_crds", "skip", "snapshot CRD validation was not requested")
+		}
+
+		if r.Options.RequireServiceMonitorCRD {
+			if err := requireAPIResource(discoClient, "monitoring.coreos.com/v1", "servicemonitors"); err != nil {
+				appendResult("servicemonitor_crd", "fail", err.Error())
+			} else {
+				appendResult("servicemonitor_crd", "pass", "monitoring.coreos.com ServiceMonitor CRD is available")
+			}
+		} else {
+			appendResult("servicemonitor_crd", "skip", "ServiceMonitor CRD validation was not requested")
+		}
+	}
+
+	return PreflightReport{
+		Passed:  !failed,
+		Results: results,
+	}
+}
+
+func RunPreflightCommand(ctx context.Context, cfg config.CSIPluginConfig, exec utilexec.Interface, opts PreflightOptions, output string, w io.Writer) error {
+	report := NewPreflightRunner(cfg, exec, opts).Run(ctx)
+
+	switch strings.ToLower(strings.TrimSpace(output)) {
+	case "", "text":
+		for _, result := range report.Results {
+			fmt.Fprintf(w, "[%s] %s: %s\n", strings.ToUpper(result.Outcome), result.Check, result.Message)
+		}
+	case "json":
+		encoder := json.NewEncoder(w)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(report); err != nil {
+			return fmt.Errorf("failed to encode preflight report: %w", err)
+		}
+	default:
+		return fmt.Errorf("unsupported preflight output format %q", output)
+	}
+
+	if !report.Passed {
+		return fmt.Errorf("preflight checks failed")
+	}
+
+	return nil
+}
+
+func ParseSecretRefsCSV(raw string) ([]SecretRef, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+
+	refs := make([]SecretRef, 0)
+	for _, part := range strings.Split(raw, ",") {
+		value := strings.TrimSpace(part)
+		if value == "" {
+			continue
+		}
+
+		namespace, name, ok := strings.Cut(value, "/")
+		if !ok || strings.TrimSpace(namespace) == "" || strings.TrimSpace(name) == "" {
+			return nil, fmt.Errorf("invalid secret reference %q; expected namespace/name", value)
+		}
+
+		refs = append(refs, SecretRef{
+			Namespace: strings.TrimSpace(namespace),
+			Name:      strings.TrimSpace(name),
+		})
+	}
+
+	return refs, nil
+}
+
+func (r *PreflightRunner) selectionConfig() (opennebula.DatastoreSelectionConfig, bool, error) {
+	cfg := r.Config
+	if len(r.Options.Datastores) > 0 {
+		cfg.OverrideVal(config.DefaultDatastoresVar, strings.Join(r.Options.Datastores, ","))
+	}
+
+	driver := &Driver{PluginConfig: cfg}
+	selection, err := driver.GetDatastoreSelectionConfig(nil)
+	if err != nil {
+		if len(r.Options.Datastores) == 0 {
+			if defaults, ok := cfg.GetStringSlice(config.DefaultDatastoresVar); !ok || len(defaults) == 0 {
+				return opennebula.DatastoreSelectionConfig{}, false, nil
+			}
+		}
+		return opennebula.DatastoreSelectionConfig{}, false, err
+	}
+
+	return selection, true, nil
+}
+
+func (r *PreflightRunner) requireBinary(name string) error {
+	if r.Exec == nil {
+		return fmt.Errorf("exec interface is not configured")
+	}
+	if _, err := r.Exec.LookPath(name); err != nil {
+		return fmt.Errorf("required binary %q was not found in PATH", name)
+	}
+	return nil
+}
+
+func (r *PreflightRunner) checkMonitorReachability(ctx context.Context, datastores []opennebula.Datastore) error {
+	uniqueTargets := make(map[string]struct{})
+	for _, datastore := range datastores {
+		switch datastore.Backend {
+		case "ceph":
+			if datastore.Ceph == nil {
+				continue
+			}
+			for _, target := range expandMonitorTargets(datastore.Ceph.CephHost) {
+				uniqueTargets[target] = struct{}{}
+			}
+		case "cephfs":
+			if datastore.CephFS == nil {
+				continue
+			}
+			for _, target := range expandMonitorTargets(strings.Join(datastore.CephFS.Monitors, ",")) {
+				uniqueTargets[target] = struct{}{}
+			}
+		}
+	}
+
+	if len(uniqueTargets) == 0 {
+		return nil
+	}
+
+	for target := range uniqueTargets {
+		conn, err := (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "tcp", target)
+		if err != nil {
+			return fmt.Errorf("failed to reach Ceph monitor %s: %w", target, err)
+		}
+		_ = conn.Close()
+	}
+
+	return nil
+}
+
+func expandMonitorTargets(raw string) []string {
+	replacer := strings.NewReplacer(",", " ", ";", " ")
+	parts := strings.Fields(replacer.Replace(strings.TrimSpace(raw)))
+	targets := make([]string, 0, len(parts)*2)
+	seen := make(map[string]struct{})
+
+	appendTarget := func(value string) {
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		targets = append(targets, value)
+	}
+
+	for _, part := range parts {
+		if _, _, err := net.SplitHostPort(part); err == nil {
+			appendTarget(part)
+			continue
+		}
+
+		host := strings.Trim(part, "[]")
+		appendTarget(net.JoinHostPort(host, "3300"))
+		appendTarget(net.JoinHostPort(host, "6789"))
+	}
+
+	return targets
+}
+
+func checkSecretRefs(ctx context.Context, client kubernetes.Interface, refs ...SecretRef) error {
+	for _, ref := range refs {
+		if strings.TrimSpace(ref.Namespace) == "" || strings.TrimSpace(ref.Name) == "" {
+			return fmt.Errorf("secret reference must include namespace and name")
+		}
+
+		_, err := client.CoreV1().Secrets(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+		if err == nil {
+			continue
+		}
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("secret %s/%s was not found", ref.Namespace, ref.Name)
+		}
+		return fmt.Errorf("failed to read secret %s/%s: %w", ref.Namespace, ref.Name, err)
+	}
+
+	return nil
+}
+
+func requireAPIResource(discoveryClient discovery.DiscoveryInterface, groupVersion string, resources ...string) error {
+	resourceList, err := discoveryClient.ServerResourcesForGroupVersion(groupVersion)
+	if err != nil {
+		return fmt.Errorf("required API group %s is not available: %w", groupVersion, err)
+	}
+
+	available := make(map[string]struct{}, len(resourceList.APIResources))
+	for _, resource := range resourceList.APIResources {
+		available[resource.Name] = struct{}{}
+	}
+
+	for _, resource := range resources {
+		if _, ok := available[resource]; !ok {
+			return fmt.Errorf("required resource %s in API group %s is not available", resource, groupVersion)
+		}
+	}
+
+	return nil
+}
+
+func preflightKubeClients() (kubernetes.Interface, discovery.DiscoveryInterface, error) {
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+		if kubeconfig := strings.TrimSpace(os.Getenv("KUBECONFIG")); kubeconfig != "" {
+			loadingRules.ExplicitPath = kubeconfig
+		} else if home, homeErr := os.UserHomeDir(); homeErr == nil {
+			loadingRules.ExplicitPath = filepath.Join(home, ".kube", "config")
+		}
+
+		cfg, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			loadingRules,
+			&clientcmd.ConfigOverrides{},
+		).ClientConfig()
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	client, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return client, client.Discovery(), nil
+}

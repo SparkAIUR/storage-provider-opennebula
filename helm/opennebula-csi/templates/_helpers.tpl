@@ -53,6 +53,14 @@ Create chart name and version as used by the chart label.
 {{- default "credentials" .Values.credentials.existingSecret.key -}}
 {{- end }}
 
+{{- define "opennebula-csi.preflightImageRepository" -}}
+{{- default .Values.image.repository .Values.preflight.image.repository -}}
+{{- end }}
+
+{{- define "opennebula-csi.preflightImageTag" -}}
+{{- default .Values.image.tag .Values.preflight.image.tag -}}
+{{- end }}
+
 {{- define "opennebula-csi.driverCommonEnv" -}}
 - name: ONE_XMLRPC
   value: {{ .Values.oneApiEndpoint | quote }}
