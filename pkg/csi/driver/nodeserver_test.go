@@ -101,6 +101,38 @@ func TestStageVolume(t *testing.T) {
 	}
 }
 
+func TestStageSharedFilesystemVolume(t *testing.T) {
+	tempDir := t.TempDir()
+	ns := getTestNodeServer([]string{})
+
+	resp, err := ns.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "cephfs:eyJiYWNrZW5kIjoiY2VwaGZzIiwiZGF0YXN0b3JlSUQiOjMwMCwiZnNOYW1lIjoiY2VwaGZzLXByb2QiLCJtb2RlIjoic3RhdGljIiwic3VicGF0aCI6Ii9rdWJlcm5ldGVzL3N0YXRpYy9tb2RlbC1jYWNoZSJ9",
+		StagingTargetPath: tempDir,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{FsType: "xfs"},
+			},
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
+			},
+		},
+		PublishContext: map[string]string{
+			"shareBackend":   "cephfs",
+			"cephfsMonitors": "mon1,mon2",
+			"cephfsFSName":   "cephfs-prod",
+			"cephfsSubpath":  "/kubernetes/static/model-cache",
+			"cephfsReadonly": "false",
+		},
+		Secrets: map[string]string{
+			"userID":  "csi-node",
+			"userKey": "super-secret",
+		},
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, &csi.NodeStageVolumeResponse{}, resp)
+}
+
 func TestUnstageVolume(t *testing.T) {
 	tempDir := t.TempDir()
 	tcs := []struct {
@@ -194,6 +226,35 @@ func TestPublishVolume(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPublishSharedFilesystemVolume(t *testing.T) {
+	tempDir := t.TempDir()
+	ns := getTestNodeServer([]string{tempDir})
+
+	resp, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:          "cephfs:eyJiYWNrZW5kIjoiY2VwaGZzIiwiZGF0YXN0b3JlSUQiOjMwMCwiZnNOYW1lIjoiY2VwaGZzLXByb2QiLCJtb2RlIjoiZHluYW1pYyIsInN1YnBhdGgiOiIva3ViZXJuZXRlcy9keW5hbWljL29uZS1jc2ktZGVtbyJ9",
+		StagingTargetPath: tempDir,
+		TargetPath:        targetPath,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{FsType: "xfs"},
+			},
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
+			},
+		},
+		PublishContext: map[string]string{
+			"shareBackend":   "cephfs",
+			"cephfsMonitors": "mon1,mon2",
+			"cephfsFSName":   "cephfs-prod",
+			"cephfsSubpath":  "/kubernetes/dynamic/one-csi-demo",
+			"cephfsReadonly": "false",
+		},
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, &csi.NodePublishVolumeResponse{}, resp)
 }
 
 func TestUnpublishVolume(t *testing.T) {

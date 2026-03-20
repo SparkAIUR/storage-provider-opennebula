@@ -31,7 +31,7 @@ func TestGetDatastoreSelectionConfigFallsBackToDriverDefaults(t *testing.T) {
 	pluginConfig := config.LoadConfiguration()
 	pluginConfig.OverrideVal(config.DefaultDatastoresVar, "100,101")
 	pluginConfig.OverrideVal(config.DatastorePolicyVar, "ordered")
-	pluginConfig.OverrideVal(config.AllowedDatastoreTypesVar, "local,ceph")
+	pluginConfig.OverrideVal(config.AllowedDatastoreTypesVar, "local,ceph,cephfs")
 
 	driver := &Driver{PluginConfig: pluginConfig}
 
@@ -39,16 +39,19 @@ func TestGetDatastoreSelectionConfigFallsBackToDriverDefaults(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"100", "101"}, selection.Identifiers)
 	assert.Equal(t, opennebula.DatastoreSelectionPolicyOrdered, selection.Policy)
-	assert.Equal(t, []string{"local", "ceph"}, selection.AllowedTypes)
+	assert.Equal(t, []string{"local", "ceph", "cephfs"}, selection.AllowedTypes)
 }
 
 func TestFilterProvisioningParamsRemovesReservedKeys(t *testing.T) {
 	filtered := filterProvisioningParams(map[string]string{
-		storageClassParamDatastoreIDs:             "100",
-		storageClassParamDatastoreSelectionPolicy: "least-used",
-		storageClassParamFSType:                   "xfs",
-		"driver":                                  "raw",
-		"cache":                                   "none",
+		storageClassParamDatastoreIDs:               "100",
+		storageClassParamDatastoreSelectionPolicy:   "least-used",
+		storageClassParamFSType:                     "xfs",
+		storageClassParamSharedFilesystemPath:       "/static/path",
+		storageClassParamSharedFilesystemGroup:      "csi",
+		"csi.storage.k8s.io/node-stage-secret-name": "cephfs-node",
+		"driver": "raw",
+		"cache":  "none",
 	})
 
 	assert.Equal(t, map[string]string{
@@ -62,5 +65,5 @@ func TestGetAllowedDatastoreTypesUsesCephEnabledDefault(t *testing.T) {
 
 	driver := &Driver{PluginConfig: pluginConfig}
 
-	assert.Equal(t, []string{"local", "ceph"}, driver.getAllowedDatastoreTypes())
+	assert.Equal(t, []string{"local", "ceph", "cephfs"}, driver.getAllowedDatastoreTypes())
 }

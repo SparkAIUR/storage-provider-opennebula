@@ -107,6 +107,46 @@ func TestResolveDatastoresAcceptsValidCephImageDatastore(t *testing.T) {
 	assert.Equal(t, "RBD", resolved[0].DiskType)
 }
 
+func TestResolveDatastoresAcceptsValidCephFSFileDatastore(t *testing.T) {
+	resolved, err := ResolveDatastores([]datastoreSchema.Datastore{
+		newTypedTestDatastore(300, "cephfs-a", "fs", "shared", "FILE", map[string]string{
+			"SPARKAI_CSI_SHARE_BACKEND":          "cephfs",
+			"SPARKAI_CSI_CEPHFS_FS_NAME":         "cephfs-prod",
+			"SPARKAI_CSI_CEPHFS_ROOT_PATH":       "/kubernetes",
+			"SPARKAI_CSI_CEPHFS_SUBVOLUME_GROUP": "csi",
+			"CEPH_HOST":                          "mon1,mon2",
+		}),
+	}, DatastoreSelectionConfig{
+		Identifiers:  []string{"300"},
+		AllowedTypes: []string{"cephfs"},
+	})
+	require.NoError(t, err)
+	require.Len(t, resolved, 1)
+	assert.Equal(t, "cephfs", resolved[0].Type)
+	require.NotNil(t, resolved[0].CephFS)
+	assert.Equal(t, "cephfs-prod", resolved[0].CephFS.FSName)
+	assert.Equal(t, "/kubernetes", resolved[0].CephFS.RootPath)
+	assert.Equal(t, []string{"mon1", "mon2"}, resolved[0].CephFS.Monitors)
+}
+
+func TestResolveDatastoresRejectsCephFSWithoutFileCategory(t *testing.T) {
+	_, err := ResolveDatastores([]datastoreSchema.Datastore{
+		newTypedTestDatastore(300, "cephfs-a", "fs", "shared", "IMAGE", map[string]string{
+			"SPARKAI_CSI_SHARE_BACKEND":          "cephfs",
+			"SPARKAI_CSI_CEPHFS_FS_NAME":         "cephfs-prod",
+			"SPARKAI_CSI_CEPHFS_ROOT_PATH":       "/kubernetes",
+			"SPARKAI_CSI_CEPHFS_SUBVOLUME_GROUP": "csi",
+			"CEPH_HOST":                          "mon1 mon2",
+		}),
+	}, DatastoreSelectionConfig{
+		Identifiers:  []string{"300"},
+		AllowedTypes: []string{"cephfs"},
+	})
+	require.Error(t, err)
+	assert.True(t, IsDatastoreConfigError(err))
+	assert.Contains(t, err.Error(), "FILE datastore")
+}
+
 func TestResolveDatastoresRejectsCephDatastoreMissingRequiredAttr(t *testing.T) {
 	_, err := ResolveDatastores([]datastoreSchema.Datastore{
 		newTestDatastore(200, "ceph-a", "ceph", "ceph", map[string]string{
@@ -196,6 +236,7 @@ func TestResolveDeploymentMode(t *testing.T) {
 func TestGetBackendCapabilityProfileReportsNoFilesystemRWXForCurrentBackends(t *testing.T) {
 	localProfile := GetBackendCapabilityProfile("local")
 	cephProfile := GetBackendCapabilityProfile("ceph")
+	cephFSProfile := GetBackendCapabilityProfile("cephfs")
 
 	assert.Equal(t, "local", localProfile.Backend)
 	assert.True(t, localProfile.SupportsFilesystemRWO)
@@ -212,6 +253,34 @@ func TestGetBackendCapabilityProfileReportsNoFilesystemRWXForCurrentBackends(t *
 	assert.True(t, cephProfile.SupportsBlockRWO)
 	assert.True(t, cephProfile.SupportsBlockROX)
 	assert.False(t, cephProfile.SupportsBlockRWX)
+
+	assert.Equal(t, "cephfs", cephFSProfile.Backend)
+	assert.True(t, cephFSProfile.SupportsFilesystemRWO)
+	assert.True(t, cephFSProfile.SupportsFilesystemROX)
+	assert.True(t, cephFSProfile.SupportsFilesystemRWX)
+	assert.False(t, cephFSProfile.SupportsBlockRWO)
+	assert.False(t, cephFSProfile.SupportsBlockROX)
+	assert.False(t, cephFSProfile.SupportsBlockRWX)
+}
+
+func TestSharedVolumeIDRoundTrip(t *testing.T) {
+	encoded, err := EncodeSharedVolumeID(SharedVolumeMetadata{
+		DatastoreID:    300,
+		Mode:           SharedVolumeModeDynamic,
+		FSName:         "cephfs-prod",
+		SubvolumeGroup: "csi",
+		Subpath:        "/volumes/csi/test",
+		Backend:        "cephfs",
+		SubvolumeName:  "one-csi-test",
+	})
+	require.NoError(t, err)
+
+	decoded, err := DecodeSharedVolumeID(encoded)
+	require.NoError(t, err)
+	assert.Equal(t, 300, decoded.DatastoreID)
+	assert.Equal(t, SharedVolumeModeDynamic, decoded.Mode)
+	assert.Equal(t, "/volumes/csi/test", decoded.Subpath)
+	assert.Equal(t, "one-csi-test", decoded.SubvolumeName)
 }
 
 func TestOrderDatastoresLeastUsedSortsByFreeCapacity(t *testing.T) {
@@ -245,6 +314,10 @@ func TestSumDatastoreCapacityAggregatesConfiguredPool(t *testing.T) {
 }
 
 func newTestDatastore(id int, name, dsMad, tmMad string, attrs map[string]string) datastoreSchema.Datastore {
+	return newTypedTestDatastore(id, name, dsMad, tmMad, "", attrs)
+}
+
+func newTypedTestDatastore(id int, name, dsMad, tmMad, datastoreType string, attrs map[string]string) datastoreSchema.Datastore {
 	tpl := datastoreSchema.NewTemplate()
 	for key, value := range attrs {
 		tpl.AddPair(key, value)
@@ -255,6 +328,7 @@ func newTestDatastore(id int, name, dsMad, tmMad string, attrs map[string]string
 		Name:     name,
 		DSMad:    dsMad,
 		TMMad:    tmMad,
+		Type:     datastoreType,
 		StateRaw: 0,
 		Template: *tpl,
 	}
