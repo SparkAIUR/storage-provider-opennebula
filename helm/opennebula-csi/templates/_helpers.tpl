@@ -113,6 +113,10 @@ Create chart name and version as used by the chart label.
   value: {{ .Values.driver.vmHotplugTimeoutMaxSeconds | quote }}
 - name: ONE_CSI_VM_HOTPLUG_STUCK_VM_COOLDOWN_SECONDS
   value: {{ .Values.driver.vmHotplugStuckVmCooldownSeconds | quote }}
+- name: ONE_CSI_NODE_DEVICE_DISCOVERY_TIMEOUT_SECONDS
+  value: {{ .Values.driver.nodeDeviceDiscoveryTimeoutSeconds | quote }}
+- name: ONE_CSI_PREFLIGHT_LOCAL_IMMEDIATE_BINDING_POLICY
+  value: {{ .Values.preflight.localImmediateBindingPolicy | quote }}
 - name: ONE_CSI_INVENTORY_CONTROLLER_ENABLED
   value: {{ $inventoryEnabled | quote }}
 - name: ONE_CSI_INVENTORY_DATASTORE_AUTHORITY_MODE

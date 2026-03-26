@@ -12,10 +12,12 @@ import (
 	"time"
 
 	"github.com/OpenNebula/one/src/oca/go/src/goca"
+	datastoreSchema "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/datastore"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	utilexec "k8s.io/utils/exec"
 
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/discovery"
@@ -186,6 +188,9 @@ func (r *PreflightRunner) Run(ctx context.Context) PreflightReport {
 		} else {
 			appendResult("servicemonitor_crd", "skip", "ServiceMonitor CRD validation was not requested")
 		}
+
+		outcome, message := r.checkLocalImmediateBinding(ctx, kubeClient, datastorePool.Datastores)
+		appendResult("local_immediate_binding", outcome, message)
 	}
 
 	return PreflightReport{
@@ -406,4 +411,75 @@ func preflightKubeClients() (kubernetes.Interface, discovery.DiscoveryInterface,
 	}
 
 	return client, client.Discovery(), nil
+}
+
+func (r *PreflightRunner) checkLocalImmediateBinding(ctx context.Context, client kubernetes.Interface, pool []datastoreSchema.Datastore) (string, string) {
+	policy := normalizeLocalImmediateBindingPolicy(r.Config)
+	storageClasses, err := client.StorageV1().StorageClasses().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return "fail", fmt.Sprintf("failed to list storage classes for local binding validation: %v", err)
+	}
+
+	warnings := make([]string, 0)
+	for _, storageClass := range storageClasses.Items {
+		if storageClass.Provisioner != DefaultDriverName {
+			continue
+		}
+		if !storageClassUsesLocalBackend(r.Config, pool, storageClass) {
+			continue
+		}
+		if volumeBindingMode(storageClass) != storagev1.VolumeBindingWaitForFirstConsumer {
+			warnings = append(warnings, fmt.Sprintf("%s uses Immediate binding for local-backed provisioning", storageClass.Name))
+		}
+	}
+
+	if len(warnings) == 0 {
+		return "pass", "no local-backed StorageClasses use Immediate binding"
+	}
+	if policy == "fail" {
+		return "fail", strings.Join(warnings, "; ")
+	}
+	return "warn", strings.Join(warnings, "; ")
+}
+
+func normalizeLocalImmediateBindingPolicy(cfg config.CSIPluginConfig) string {
+	value, ok := cfg.GetString(config.PreflightLocalImmediateBindingPolicyVar)
+	if !ok {
+		return "warn"
+	}
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "fail":
+		return "fail"
+	default:
+		return "warn"
+	}
+}
+
+func storageClassUsesLocalBackend(cfg config.CSIPluginConfig, pool []datastoreSchema.Datastore, storageClass storagev1.StorageClass) bool {
+	driver := &Driver{PluginConfig: cfg}
+	selection, err := driver.GetDatastoreSelectionConfig(storageClass.Parameters)
+	if err != nil {
+		return false
+	}
+
+	datastores, err := opennebula.ResolveDatastores(pool, selection)
+	if err != nil {
+		return false
+	}
+
+	for _, datastore := range datastores {
+		if datastore.Backend == "local" {
+			return true
+		}
+	}
+
+	return false
+}
+
+func volumeBindingMode(storageClass storagev1.StorageClass) storagev1.VolumeBindingMode {
+	if storageClass.VolumeBindingMode == nil {
+		return storagev1.VolumeBindingImmediate
+	}
+	return *storageClass.VolumeBindingMode
 }

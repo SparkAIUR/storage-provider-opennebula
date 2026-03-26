@@ -143,10 +143,11 @@ func TestResolveDevicePath(t *testing.T) {
 		assert.NoError(t, err)
 
 		ns := getTestNodeServer(nil)
-		devicePath, resolveErr := ns.resolveDevicePath("sde", time.Second)
+		devicePath, resolution, resolveErr := ns.resolveDevicePath("sde", time.Second)
 
 		assert.NoError(t, resolveErr)
 		assert.Equal(t, filepath.Join(diskPath, "sde"), devicePath)
+		assert.Equal(t, "exact", resolution.ResolvedBy)
 	})
 
 	t.Run("falls back to virtio alias when present", func(t *testing.T) {
@@ -155,18 +156,19 @@ func TestResolveDevicePath(t *testing.T) {
 		assert.NoError(t, err)
 
 		ns := getTestNodeServer(nil)
-		devicePath, resolveErr := ns.resolveDevicePath("sde", time.Second)
+		devicePath, resolution, resolveErr := ns.resolveDevicePath("sde", time.Second)
 
 		assert.NoError(t, resolveErr)
 		assert.Equal(t, filepath.Join(diskPath, "vde"), devicePath)
+		assert.Equal(t, "alias", resolution.ResolvedBy)
 	})
 
 	t.Run("times out when no candidate device appears", func(t *testing.T) {
 		withTestDiskPath(t)
 		ns := getTestNodeServer(nil)
-		ns.Driver.PluginConfig.OverrideVal(config.VMHotplugTimeoutBaseVar, 1)
+		ns.Driver.PluginConfig.OverrideVal(config.NodeDeviceDiscoveryTimeoutVar, 1)
 
-		devicePath, resolveErr := ns.resolveDevicePath("sdf", ns.deviceDiscoveryTimeout(nil))
+		devicePath, _, resolveErr := ns.resolveDevicePath("sdf", ns.deviceDiscoveryTimeout(nil))
 
 		assert.Empty(t, devicePath)
 		assert.Error(t, resolveErr)
@@ -174,15 +176,25 @@ func TestResolveDevicePath(t *testing.T) {
 		assert.Contains(t, resolveErr.Error(), "sdf")
 	})
 
-	t.Run("uses publish context timeout override when present", func(t *testing.T) {
+	t.Run("uses dedicated publish context timeout override when present", func(t *testing.T) {
 		ns := getTestNodeServer(nil)
-		ns.Driver.PluginConfig.OverrideVal(config.VMHotplugTimeoutBaseVar, 120)
+		ns.Driver.PluginConfig.OverrideVal(config.NodeDeviceDiscoveryTimeoutVar, 30)
 
 		timeout := ns.deviceDiscoveryTimeout(map[string]string{
-			publishContextHotplugTimeoutSeconds: "300",
+			publishContextDeviceDiscoveryTimeoutSeconds: "30",
+			publishContextHotplugTimeoutSeconds:         "300",
 		})
 
-		assert.Equal(t, 300*time.Second, timeout)
+		assert.Equal(t, 30*time.Second, timeout)
+	})
+
+	t.Run("falls back to configured device discovery timeout", func(t *testing.T) {
+		ns := getTestNodeServer(nil)
+		ns.Driver.PluginConfig.OverrideVal(config.NodeDeviceDiscoveryTimeoutVar, 45)
+
+		timeout := ns.deviceDiscoveryTimeout(nil)
+
+		assert.Equal(t, 45*time.Second, timeout)
 	})
 }
 

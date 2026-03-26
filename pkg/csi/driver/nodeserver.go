@@ -84,6 +84,7 @@ func NewNodeServer(d *Driver, mounter *mount.SafeFormatAndMount) *NodeServer {
 // performs the necessary operations to prepare the volume for use, like formatting and mounting
 // the volume at the staging target path.
 func (ns *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+	started := time.Now()
 
 	klog.V(1).InfoS("NodeStageVolume called", "req", protosanitizer.StripSecrets(req).String())
 
@@ -118,12 +119,22 @@ func (ns *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 	if len(volName) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "[volumeName] entry is required in volume context")
 	}
-	devicePath, err := ns.resolveDevicePath(volName, ns.deviceDiscoveryTimeout(volumeContext))
+	deviceTimeout := ns.deviceDiscoveryTimeout(volumeContext)
+	devicePath, resolution, err := ns.resolveDevicePath(volName, deviceTimeout)
 	if err != nil {
+		ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "timeout", time.Since(started))
+		ns.recordPVCWarningFromPublishContext(context.Background(), volumeContext, eventReasonDeviceDiscoveryTimeout, err.Error())
 		klog.V(0).ErrorS(err, "Failed to resolve device path",
-			"method", "NodeStageVolume", "volumeID", volumeID, "volumeName", volName)
+			"method", "NodeStageVolume", "volumeID", volumeID, "volumeName", volName, "deviceDiscoveryTimeout", deviceTimeout)
 		return nil, status.Error(codes.DeadlineExceeded, err.Error())
 	}
+	ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "success", resolution.Latency)
+	if resolution.Latency > 10*time.Second {
+		ns.recordPVCWarningFromPublishContext(context.Background(), volumeContext, eventReasonDeviceDiscoverySlow, fmt.Sprintf("device discovery for volume %s took %s", volumeID, resolution.Latency))
+	}
+	klog.V(2).InfoS("Resolved staged device path",
+		"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath, "deviceDiscoveryTimeout", deviceTimeout,
+		"resolvedBy", resolution.ResolvedBy, "resolutionLatency", resolution.Latency)
 
 	volMount := volumeCapability.GetMount()
 	mountFlags := volMount.GetMountFlags()
@@ -201,6 +212,7 @@ func (ns *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 		return nil, status.Errorf(codes.Internal, "failed to format and mount volume: %s", err)
 	}
 
+	ns.Driver.metrics.RecordNodeStageDuration("disk", "success", time.Since(started))
 	klog.V(1).InfoS("Volume staged successfully",
 		"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath,
 		"stagingTargetPath", stagingTargetPath, "fsType", fsType)
@@ -309,12 +321,19 @@ func (ns *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 	var resp *csi.NodePublishVolumeResponse
 	switch accessType.(type) {
 	case *csi.VolumeCapability_Block:
-		devicePath, resolveErr := ns.resolveDevicePath(volName, ns.deviceDiscoveryTimeout(volumeContext))
+		deviceTimeout := ns.deviceDiscoveryTimeout(volumeContext)
+		devicePath, resolution, resolveErr := ns.resolveDevicePath(volName, deviceTimeout)
 		if resolveErr != nil {
+			ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "timeout", deviceTimeout)
+			ns.recordPVCWarningFromPublishContext(context.Background(), volumeContext, eventReasonDeviceDiscoveryTimeout, resolveErr.Error())
 			klog.V(0).ErrorS(resolveErr, "Failed to resolve device path for block volume publish",
-				"method", "NodePublishVolume", "volumeID", volumeID, "volumeName", volName)
+				"method", "NodePublishVolume", "volumeID", volumeID, "volumeName", volName, "deviceDiscoveryTimeout", deviceTimeout)
 			return nil, status.Error(codes.DeadlineExceeded, resolveErr.Error())
 		}
+		ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "success", resolution.Latency)
+		klog.V(2).InfoS("Resolved block device path",
+			"method", "NodePublishVolume", "volumeID", volumeID, "devicePath", devicePath, "deviceDiscoveryTimeout", deviceTimeout,
+			"resolvedBy", resolution.ResolvedBy, "resolutionLatency", resolution.Latency)
 		resp, err = ns.handleBlockVolumePublish(devicePath, targetPath, volumeCapability, options)
 	case *csi.VolumeCapability_Mount:
 		resp, err = ns.handleMountVolumePublish(stagingTargetPath, targetPath, volumeCapability, options)
@@ -663,19 +682,31 @@ func (ns *NodeServer) getDeviceName(volumeName string) string {
 	return path.Join(defaultDiskPath, volumeName)
 }
 
-func (ns *NodeServer) resolveDevicePath(volumeName string, timeout time.Duration) (string, error) {
+type deviceResolutionResult struct {
+	ResolvedBy string
+	Latency    time.Duration
+}
+
+func (ns *NodeServer) resolveDevicePath(volumeName string, timeout time.Duration) (string, deviceResolutionResult, error) {
+	started := time.Now()
 	candidates := ns.deviceCandidates(volumeName)
 	deadline := time.Now().Add(timeout)
 	var lastErr error
+	expected := ns.getDeviceName(volumeName)
 
 	for {
 		for _, candidate := range candidates {
 			if _, err := nodeVolumePathStat(candidate); err == nil {
-				if candidate != ns.getDeviceName(volumeName) {
+				result := deviceResolutionResult{
+					ResolvedBy: "exact",
+					Latency:    time.Since(started),
+				}
+				if candidate != expected {
+					result.ResolvedBy = "alias"
 					klog.V(2).InfoS("Resolved device path via alias",
 						"method", "resolveDevicePath", "volumeName", volumeName, "devicePath", candidate)
 				}
-				return candidate, nil
+				return candidate, result, nil
 			} else if !os.IsNotExist(err) {
 				lastErr = err
 			}
@@ -689,13 +720,13 @@ func (ns *NodeServer) resolveDevicePath(volumeName string, timeout time.Duration
 	}
 
 	if lastErr != nil {
-		return "", fmt.Errorf(
+		return "", deviceResolutionResult{}, fmt.Errorf(
 			"timed out after %s waiting for device path for volume %q (checked %s, last error: %v)",
 			timeout, volumeName, strings.Join(candidates, ", "), lastErr,
 		)
 	}
 
-	return "", fmt.Errorf(
+	return "", deviceResolutionResult{}, fmt.Errorf(
 		"timed out after %s waiting for device path for volume %q (checked %s)",
 		timeout, volumeName, strings.Join(candidates, ", "),
 	)
@@ -703,6 +734,12 @@ func (ns *NodeServer) resolveDevicePath(volumeName string, timeout time.Duration
 
 func (ns *NodeServer) deviceDiscoveryTimeout(publishContext map[string]string) time.Duration {
 	if publishContext != nil {
+		if raw, ok := publishContext[publishContextDeviceDiscoveryTimeoutSeconds]; ok && raw != "" {
+			timeoutSeconds, err := strconv.Atoi(raw)
+			if err == nil && timeoutSeconds > 0 {
+				return time.Duration(timeoutSeconds) * time.Second
+			}
+		}
 		if raw, ok := publishContext[publishContextHotplugTimeoutSeconds]; ok && raw != "" {
 			timeoutSeconds, err := strconv.Atoi(raw)
 			if err == nil && timeoutSeconds > 0 {
@@ -711,15 +748,24 @@ func (ns *NodeServer) deviceDiscoveryTimeout(publishContext map[string]string) t
 		}
 	}
 
-	timeoutSeconds, ok := ns.Driver.PluginConfig.GetInt(config.VMHotplugTimeoutBaseVar)
+	timeoutSeconds, ok := ns.Driver.PluginConfig.GetInt(config.NodeDeviceDiscoveryTimeoutVar)
 	if !ok || timeoutSeconds <= 0 {
-		timeoutSeconds, ok = ns.Driver.PluginConfig.GetInt(config.VMHotplugTimeoutVar)
-	}
-	if !ok || timeoutSeconds <= 0 {
-		timeoutSeconds = 120
+		timeoutSeconds = 30
 	}
 
 	return time.Duration(timeoutSeconds) * time.Second
+}
+
+func (ns *NodeServer) recordPVCWarningFromPublishContext(ctx context.Context, publishContext map[string]string, reason, message string) {
+	if ns == nil || ns.Driver == nil || ns.Driver.kubeRuntime == nil || publishContext == nil {
+		return
+	}
+	namespace := strings.TrimSpace(publishContext[paramPVCNamespace])
+	name := strings.TrimSpace(publishContext[paramPVCName])
+	if namespace == "" || name == "" {
+		return
+	}
+	ns.Driver.kubeRuntime.EmitWarningEventOnPVC(ctx, namespace, name, reason, message)
 }
 
 func (ns *NodeServer) deviceCandidates(volumeName string) []string {

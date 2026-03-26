@@ -16,7 +16,7 @@ storageClasses:
   - name: opennebula-local-balanced
     reclaimPolicy: Delete
     allowVolumeExpansion: true
-    volumeBindingMode: Immediate
+    volumeBindingMode: WaitForFirstConsumer
     mountOptions: []
     parameters:
       datastoreIDs: "100,101,102"

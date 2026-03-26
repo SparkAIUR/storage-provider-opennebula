@@ -20,18 +20,22 @@ const (
 type DriverMetrics struct {
 	registry *prometheus.Registry
 
-	operationTotal          *prometheus.CounterVec
-	operationDuration       *prometheus.HistogramVec
-	datastoreSelectionTotal *prometheus.CounterVec
-	attachValidationTotal   *prometheus.CounterVec
-	cephFSSubvolumeTotal    *prometheus.CounterVec
-	snapshotTotal           *prometheus.CounterVec
-	preflightTotal          *prometheus.CounterVec
-	hotplugGuardTotal       *prometheus.CounterVec
-	hotplugTimeoutTotal     *prometheus.CounterVec
-	datastoreFreeBytes      *prometheus.GaugeVec
-	datastoreTotalBytes     *prometheus.GaugeVec
-	buildInfo               *prometheus.GaugeVec
+	operationTotal               *prometheus.CounterVec
+	operationDuration            *prometheus.HistogramVec
+	datastoreSelectionTotal      *prometheus.CounterVec
+	attachValidationTotal        *prometheus.CounterVec
+	cephFSSubvolumeTotal         *prometheus.CounterVec
+	snapshotTotal                *prometheus.CounterVec
+	preflightTotal               *prometheus.CounterVec
+	hotplugGuardTotal            *prometheus.CounterVec
+	hotplugTimeoutTotal          *prometheus.CounterVec
+	controllerPublishDuration    *prometheus.HistogramVec
+	nodeStageDuration            *prometheus.HistogramVec
+	nodeDeviceResolutionDuration *prometheus.HistogramVec
+	hotplugRecoveryTotal         *prometheus.CounterVec
+	datastoreFreeBytes           *prometheus.GaugeVec
+	datastoreTotalBytes          *prometheus.GaugeVec
+	buildInfo                    *prometheus.GaugeVec
 }
 
 func NewDriverMetrics(version, commit string) *DriverMetrics {
@@ -80,6 +84,25 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 			Name: "opennebula_csi_hotplug_timeout_total",
 			Help: "Total number of block hotplug timeout outcomes by operation, backend, and outcome.",
 		}, []string{"operation", "backend", "outcome"}),
+		controllerPublishDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "opennebula_csi_controller_publish_duration_seconds",
+			Help:    "Duration of ControllerPublishVolume operations by backend and outcome.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"backend", "outcome"}),
+		nodeStageDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "opennebula_csi_node_stage_duration_seconds",
+			Help:    "Duration of NodeStageVolume operations by backend and outcome.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"backend", "outcome"}),
+		nodeDeviceResolutionDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "opennebula_csi_node_device_resolution_duration_seconds",
+			Help:    "Duration of node device path resolution by backend and outcome.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"backend", "outcome"}),
+		hotplugRecoveryTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_hotplug_recovery_total",
+			Help: "Total number of hotplug recovery path decisions by operation, reason, and outcome.",
+		}, []string{"operation", "reason", "outcome"}),
 		datastoreFreeBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "opennebula_csi_datastore_free_bytes",
 			Help: "Latest observed free capacity for a datastore by backend and datastore ID.",
@@ -104,6 +127,10 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 		metrics.preflightTotal,
 		metrics.hotplugGuardTotal,
 		metrics.hotplugTimeoutTotal,
+		metrics.controllerPublishDuration,
+		metrics.nodeStageDuration,
+		metrics.nodeDeviceResolutionDuration,
+		metrics.hotplugRecoveryTotal,
 		metrics.datastoreFreeBytes,
 		metrics.datastoreTotalBytes,
 		metrics.buildInfo,
@@ -169,6 +196,34 @@ func (m *DriverMetrics) RecordHotplugTimeout(operation, backend, outcome string)
 		return
 	}
 	m.hotplugTimeoutTotal.WithLabelValues(operation, backend, outcome).Inc()
+}
+
+func (m *DriverMetrics) RecordControllerPublishDuration(backend, outcome string, duration time.Duration) {
+	if m == nil {
+		return
+	}
+	m.controllerPublishDuration.WithLabelValues(backend, outcome).Observe(duration.Seconds())
+}
+
+func (m *DriverMetrics) RecordNodeStageDuration(backend, outcome string, duration time.Duration) {
+	if m == nil {
+		return
+	}
+	m.nodeStageDuration.WithLabelValues(backend, outcome).Observe(duration.Seconds())
+}
+
+func (m *DriverMetrics) RecordNodeDeviceResolutionDuration(backend, outcome string, duration time.Duration) {
+	if m == nil {
+		return
+	}
+	m.nodeDeviceResolutionDuration.WithLabelValues(backend, outcome).Observe(duration.Seconds())
+}
+
+func (m *DriverMetrics) RecordHotplugRecovery(operation, reason, outcome string) {
+	if m == nil {
+		return
+	}
+	m.hotplugRecoveryTotal.WithLabelValues(operation, reason, outcome).Inc()
 }
 
 func (m *DriverMetrics) SetDatastoreCapacity(backend string, datastoreID int, freeBytes, totalBytes int64) {

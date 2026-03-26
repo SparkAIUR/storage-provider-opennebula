@@ -53,6 +53,7 @@ var (
 )
 
 const publishContextHotplugTimeoutSeconds = "hotplugTimeoutSeconds"
+const publishContextDeviceDiscoveryTimeoutSeconds = "deviceDiscoveryTimeoutSeconds"
 
 type ControllerServer struct {
 	driver                   *Driver
@@ -676,8 +677,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err == nil {
-		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target)
+		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext())
 		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
 		klog.V(1).InfoS("Volume already attached to node",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
 		return &csi.ControllerPublishVolumeResponse{
@@ -687,6 +689,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 	if cooldown, ok := s.hotplugCooldownState(ctx, req.NodeId); ok {
 		s.driver.metrics.RecordHotplugGuard("attach", "vm_cooldown", "rejected")
+		s.driver.metrics.RecordHotplugRecovery("attach", "vm_cooldown", "rejected")
 		message := fmt.Sprintf(
 			"node %s is in hotplug recovery cooldown until %s after timed out %s (last observed attached=%t ready=%t)",
 			req.NodeId,
@@ -702,6 +705,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	nodeRelease, ok := s.driver.operationLocks.TryAcquire(controllerNodeLockKey(req.NodeId))
 	if !ok {
 		s.driver.metrics.RecordHotplugGuard("attach", "node_busy", "rejected")
+		s.driver.metrics.RecordHotplugRecovery("attach", "node_busy", "rejected")
 		message := fmt.Sprintf("another hotplug operation is already in progress for node %s; retry later", req.NodeId)
 		s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonHotplugNodeBusy, message)
 		return nil, status.Error(codes.Aborted, message)
@@ -713,8 +717,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 	target, err = s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err == nil {
-		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target)
+		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext())
 		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
 		klog.V(1).InfoS("Volume already attached to node",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
 		return &csi.ControllerPublishVolumeResponse{
@@ -733,9 +738,10 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.Internal, "failed to resolve volume size")
 	}
 	hotplugTimeout := s.volumeProvider.ComputeHotplugTimeout(sizeBytes)
+	deviceDiscoveryTimeout := s.nodeDeviceDiscoveryTimeout(hotplugTimeout)
 	s.recordPVCEventFromParams(ctx, params, eventReasonHotplugTimeoutScaled, fmt.Sprintf("computed hotplug timeout %s for volume size %d bytes", hotplugTimeout, sizeBytes))
 	klog.V(3).InfoS("Attaching volume to node",
-		"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "sizeBytes", sizeBytes, "hotplugTimeout", hotplugTimeout)
+		"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "sizeBytes", sizeBytes, "hotplugTimeout", hotplugTimeout, "deviceDiscoveryTimeout", deviceDiscoveryTimeout)
 	err = s.volumeProvider.AttachVolume(ctx, req.VolumeId, req.NodeId, immutableVolume, params)
 	if err != nil {
 		s.handleHotplugTimeout(ctx, req.NodeId, req.VolumeId, params, "attach", "disk", err)
@@ -748,6 +754,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			return nil, status.Error(codes.ResourceExhausted, err.Error())
 		}
 		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "internal", time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", "internal", time.Since(started))
 		klog.V(0).ErrorS(err, "Failed to attach volume",
 			"method", "ControllerPublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
 		return nil, status.Error(codes.Internal, "failed to attach volume")
@@ -758,22 +765,21 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	target, err = s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err != nil {
 		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "internal", time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", "internal", time.Since(started))
 		klog.V(0).ErrorS(err, "Failed to get volume in node",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID)
 		return nil, status.Error(codes.Internal, "failed to get volume in node")
 	}
 
 	s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
+	s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
 	s.driver.metrics.RecordAttachValidation("disk", "attach", "success")
 	s.recordPVCEventFromParams(ctx, req.GetVolumeContext(), eventReasonAttachValidated, fmt.Sprintf("validated and attached volume %s to node %s", req.GetVolumeId(), req.GetNodeId()))
 	klog.V(1).InfoS("Volume attached successfully",
 		"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
 
 	return &csi.ControllerPublishVolumeResponse{
-		PublishContext: map[string]string{
-			"volumeName":                        target,
-			publishContextHotplugTimeoutSeconds: strconv.Itoa(int(hotplugTimeout.Seconds())),
-		},
+		PublishContext: s.publishContextForVolume(ctx, req.VolumeId, target, deviceDiscoveryTimeout, req.GetVolumeContext()),
 	}, nil
 }
 
@@ -1099,9 +1105,14 @@ func (s *ControllerServer) hotplugCooldownState(ctx context.Context, node string
 	return cooldown, true
 }
 
-func (s *ControllerServer) publishContextForVolume(ctx context.Context, volumeID, target string) map[string]string {
+func (s *ControllerServer) publishContextForVolume(ctx context.Context, volumeID, target string, deviceDiscoveryTimeout time.Duration, sourceContext map[string]string) map[string]string {
 	publishContext := map[string]string{
 		"volumeName": target,
+	}
+	for _, key := range []string{paramPVCName, paramPVCNamespace, paramPVName} {
+		if value := strings.TrimSpace(sourceContext[key]); value != "" {
+			publishContext[key] = value
+		}
 	}
 
 	sizeBytes, err := s.volumeProvider.ResolveVolumeSizeBytes(ctx, volumeID)
@@ -1113,7 +1124,24 @@ func (s *ControllerServer) publishContextForVolume(ctx context.Context, volumeID
 
 	hotplugTimeout := s.volumeProvider.ComputeHotplugTimeout(sizeBytes)
 	publishContext[publishContextHotplugTimeoutSeconds] = strconv.Itoa(int(hotplugTimeout.Seconds()))
+	if deviceDiscoveryTimeout <= 0 {
+		deviceDiscoveryTimeout = s.nodeDeviceDiscoveryTimeout(hotplugTimeout)
+	}
+	publishContext[publishContextDeviceDiscoveryTimeoutSeconds] = strconv.Itoa(int(deviceDiscoveryTimeout.Seconds()))
 	return publishContext
+}
+
+func (s *ControllerServer) nodeDeviceDiscoveryTimeout(hotplugTimeout time.Duration) time.Duration {
+	timeoutSeconds, ok := s.driver.PluginConfig.GetInt(config.NodeDeviceDiscoveryTimeoutVar)
+	if !ok || timeoutSeconds <= 0 {
+		timeoutSeconds = 30
+	}
+
+	timeout := time.Duration(timeoutSeconds) * time.Second
+	if hotplugTimeout > 0 && hotplugTimeout < timeout {
+		return hotplugTimeout
+	}
+	return timeout
 }
 
 func (s *ControllerServer) handleHotplugTimeout(ctx context.Context, node, volume string, params map[string]string, operation, backend string, err error) {
@@ -1123,12 +1151,14 @@ func (s *ControllerServer) handleHotplugTimeout(ctx context.Context, node, volum
 	}
 
 	s.driver.metrics.RecordHotplugTimeout(operation, backend, "timeout_exhausted")
+	s.driver.metrics.RecordHotplugRecovery(operation, "timeout_exhausted", "observed")
 	if timeoutErr.LastObservedReady {
 		return
 	}
 
 	s.driver.hotplugGuard.MarkCooldown(node, operation, volume, timeoutErr.Timeout, timeoutErr.LastObservedAttached, timeoutErr.LastObservedReady)
 	s.driver.metrics.RecordHotplugGuard(operation, "timeout_exhausted", "cooldown")
+	s.driver.metrics.RecordHotplugRecovery(operation, "timeout_exhausted", "cooldown")
 	message := fmt.Sprintf(
 		"node %s entered hotplug cooldown after %s timeout %s (attached=%t ready=%t)",
 		node,

@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VALUES_FILE="${VALUES_FILE:-examples/helm-values-single-datastore.yaml}"
+NAMESPACE="${NAMESPACE:-kube-system}"
+RELEASE_NAME="${RELEASE_NAME:-opennebula-csi}"
+CSI_IMAGE_REPOSITORY="${CSI_IMAGE_REPOSITORY:-}"
+CSI_IMAGE_TAG="${CSI_IMAGE_TAG:-}"
+LAB_KUBECONFIG="${LAB_KUBECONFIG:-${KUBECONFIG:-${ROOT_DIR}/refs/kubeconfig.yaml}}"
+VALIDATION_NAMESPACE="${VALIDATION_NAMESPACE:-opennebula-csi-release-validation}"
+SC_NAME="${SC_NAME:-opennebula-default-rwo}"
+LOCAL_NODE="${LOCAL_NODE:-hplcsiw01}"
+CNPG_TIMEOUT_SECONDS="${CNPG_TIMEOUT_SECONDS:-600}"
+
+require() {
+  local var_name="$1"
+  if [[ -z "${!var_name:-}" ]]; then
+    echo "missing required environment variable: ${var_name}" >&2
+    exit 1
+  fi
+}
+
+cleanup() {
+  kubectl --kubeconfig "${LAB_KUBECONFIG}" delete namespace "${VALIDATION_NAMESPACE}" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+require ONE_XMLRPC
+require ONE_AUTH
+
+cd "${ROOT_DIR}"
+
+export KUBECONFIG="${LAB_KUBECONFIG}"
+
+go test ./...
+helm lint helm/opennebula-csi --values "${VALUES_FILE}"
+helm template "${RELEASE_NAME}" helm/opennebula-csi \
+  --values "${VALUES_FILE}" \
+  --set "oneApiEndpoint=${ONE_XMLRPC}" \
+  --set "inventoryController.enabled=true" >/tmp/opennebula-csi-release-validation-render.yaml
+
+kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1 || kubectl create namespace "${NAMESPACE}"
+kubectl create namespace "${VALIDATION_NAMESPACE}" >/dev/null 2>&1 || true
+
+kubectl -n "${NAMESPACE}" create secret generic opennebula-csi-auth \
+  --from-literal=credentials="${ONE_AUTH}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+helm_args=(
+  upgrade --install "${RELEASE_NAME}" helm/opennebula-csi
+  --namespace "${NAMESPACE}"
+  --create-namespace
+  --set "oneApiEndpoint=${ONE_XMLRPC}"
+  --set "inventoryController.enabled=true"
+  --values "${VALUES_FILE}"
+)
+
+if [[ -n "${CSI_IMAGE_REPOSITORY}" ]]; then
+  helm_args+=(--set "image.repository=${CSI_IMAGE_REPOSITORY}")
+fi
+if [[ -n "${CSI_IMAGE_TAG}" ]]; then
+  helm_args+=(--set "image.tag=${CSI_IMAGE_TAG}")
+fi
+
+helm "${helm_args[@]}"
+
+kubectl -n "${NAMESPACE}" rollout status statefulset/"${RELEASE_NAME}"-opennebula-csi-controller --timeout=10m
+kubectl -n "${NAMESPACE}" rollout status daemonset/"${RELEASE_NAME}"-opennebula-csi-node --timeout=10m
+kubectl -n "${NAMESPACE}" rollout status deployment/"${RELEASE_NAME}"-opennebula-csi-inventory-controller --timeout=10m
+
+kubectl wait --for=condition=Established --timeout=2m crd/opennebuladatastores.storageprovider.opennebula.sparkaiur.io
+kubectl wait --for=condition=Established --timeout=2m crd/opennebulanodes.storageprovider.opennebula.sparkaiur.io
+kubectl get opennebuladatastores
+kubectl get opennebulanodes
+test -n "$(kubectl get opennebuladatastores -o jsonpath='{.items[0].metadata.name}')"
+test -n "$(kubectl get opennebulanodes -o jsonpath='{.items[0].metadata.name}')"
+
+kubectl apply -n "${VALIDATION_NAMESPACE}" -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: release-local-a
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: ${SC_NAME}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: release-local-b
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: ${SC_NAME}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: release-local-smoke
+spec:
+  nodeName: ${LOCAL_NODE}
+  restartPolicy: Never
+  containers:
+    - name: busybox
+      image: busybox:1.36
+      command: ["sh", "-c", "echo alpha >/data-a/check && echo beta >/data-b/check && sleep 300"]
+      volumeMounts:
+        - name: data-a
+          mountPath: /data-a
+        - name: data-b
+          mountPath: /data-b
+  volumes:
+    - name: data-a
+      persistentVolumeClaim:
+        claimName: release-local-a
+    - name: data-b
+      persistentVolumeClaim:
+        claimName: release-local-b
+EOF
+
+kubectl -n "${VALIDATION_NAMESPACE}" wait --for=condition=Ready pod/release-local-smoke --timeout=10m
+kubectl -n "${VALIDATION_NAMESPACE}" exec release-local-smoke -- sh -c 'test "$(cat /data-a/check)" = "alpha" && test "$(cat /data-b/check)" = "beta"'
+
+kubectl -n "${VALIDATION_NAMESPACE}" patch pvc release-local-a --type merge -p '{"spec":{"resources":{"requests":{"storage":"2Gi"}}}}'
+kubectl -n "${VALIDATION_NAMESPACE}" wait --for=jsonpath='{.status.capacity.storage}'=2Gi pvc/release-local-a --timeout=10m || true
+kubectl -n "${VALIDATION_NAMESPACE}" delete pod release-local-smoke --wait=true
+kubectl -n "${VALIDATION_NAMESPACE}" apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: release-local-smoke
+spec:
+  nodeName: ${LOCAL_NODE}
+  restartPolicy: Never
+  containers:
+    - name: busybox
+      image: busybox:1.36
+      command: ["sh", "-c", "df -B1 /data-a | tail -1 | awk '{print \$2}' >/tmp/size && cat /tmp/size && sleep 300"]
+      volumeMounts:
+        - name: data-a
+          mountPath: /data-a
+        - name: data-b
+          mountPath: /data-b
+  volumes:
+    - name: data-a
+      persistentVolumeClaim:
+        claimName: release-local-a
+    - name: data-b
+      persistentVolumeClaim:
+        claimName: release-local-b
+EOF
+kubectl -n "${VALIDATION_NAMESPACE}" wait --for=condition=Ready pod/release-local-smoke --timeout=10m
+size_bytes="$(kubectl -n "${VALIDATION_NAMESPACE}" exec release-local-smoke -- cat /tmp/size)"
+if [[ "${size_bytes}" -lt 1800000000 ]]; then
+  echo "expanded filesystem size too small: ${size_bytes}" >&2
+  exit 1
+fi
+
+start_epoch="$(date +%s)"
+kubectl apply -n "${VALIDATION_NAMESPACE}" -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cnpg-bootstrap-pvc
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: ${SC_NAME}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cnpg-bootstrap-smoke
+spec:
+  serviceName: cnpg-bootstrap-smoke
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cnpg-bootstrap-smoke
+  template:
+    metadata:
+      labels:
+        app: cnpg-bootstrap-smoke
+    spec:
+      nodeName: ${LOCAL_NODE}
+      initContainers:
+        - name: bootstrap
+          image: busybox:1.36
+          command: ["sh", "-c", "date >/var/lib/postgresql/data/bootstrap.txt"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      containers:
+        - name: postgres
+          image: busybox:1.36
+          command: ["sh", "-c", "test -s /var/lib/postgresql/data/bootstrap.txt && echo ready >/tmp/ready && sleep 300"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: cnpg-bootstrap-pvc
+EOF
+kubectl -n "${VALIDATION_NAMESPACE}" rollout status statefulset/cnpg-bootstrap-smoke --timeout="${CNPG_TIMEOUT_SECONDS}s"
+ready_epoch="$(date +%s)"
+echo "cnpg_bootstrap_seconds=$((ready_epoch-start_epoch))"
+kubectl -n "${VALIDATION_NAMESPACE}" exec statefulset/cnpg-bootstrap-smoke -- test -s /var/lib/postgresql/data/bootstrap.txt
+
+echo "release lab validation passed"

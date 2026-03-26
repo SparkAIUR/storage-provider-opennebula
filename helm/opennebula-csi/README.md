@@ -241,7 +241,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
-| `image.tag` | Driver image tag. | `"v0.4.3"` | No |
+| `image.tag` | Driver image tag. | `"v0.4.4rc0"` | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
 
 ### Driver
@@ -256,6 +256,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.vmHotplugTimeoutPer100GiSeconds` | Additional timeout added for each 100 GiB bucket of actual disk size. | `60` | No |
 | `driver.vmHotplugTimeoutMaxSeconds` | Maximum timeout cap for a single VM hotplug operation. | `900` | No |
 | `driver.vmHotplugStuckVmCooldownSeconds` | Cooldown period applied after a VM stays stuck in hotplug through the full timeout. | `300` | No |
+| `driver.nodeDeviceDiscoveryTimeoutSeconds` | Dedicated node-side device discovery timeout. This stays shorter than the controller hotplug budget so healthy fast-path retries happen quickly. | `30` | No |
 | `driver.allowedDatastoreTypes` | Allowed backend types for provisioning. | `["local","ceph","cephfs"]` | No |
 | `driver.extraArgs` | Extra CLI args appended to both controller and node driver containers. | `[]` | No |
 | `driver.env` | Additional environment variables appended to both controller and node driver containers. Useful for advanced overrides such as `ONE_CSI_NODE_TOPOLOGY_SYSTEM_DS`. | `[]` | No |
@@ -338,10 +339,12 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | `preflight.image.repository` | Override image repository for the preflight Job. Empty falls back to `image.repository`. | `""` | No |
 | `preflight.image.tag` | Override image tag for the preflight Job. Empty falls back to `image.tag`. | `""` | No |
 | `preflight.datastores` | Datastore identifiers checked by preflight. | `[]` | No |
+| `preflight.localImmediateBindingPolicy` | Policy for local-backed StorageClasses using `Immediate` binding during preflight. Supported values: `warn`, `fail`. | `"warn"` | No |
 | `preflight.nodeStageSecretRefs` | `namespace/name` secret refs validated for CephFS node stage. | `[]` | Conditional |
 | `preflight.provisionerSecretRefs` | `namespace/name` secret refs validated for CephFS provisioning. | `[]` | Conditional |
 
 `preflight.nodeStageSecretRefs` and `preflight.provisionerSecretRefs` are only needed when validating CephFS secret wiring.
+For local-backed classes, preflight now checks `volumeBindingMode` and warns by default if `Immediate` is used instead of `WaitForFirstConsumer`.
 
 ### Snapshotter
 

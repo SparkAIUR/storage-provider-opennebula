@@ -38,6 +38,8 @@ const (
 	VMHotplugTimeoutPer100GiVar               = "ONE_CSI_VM_HOTPLUG_TIMEOUT_PER_100GI_SECONDS"
 	VMHotplugTimeoutMaxVar                    = "ONE_CSI_VM_HOTPLUG_TIMEOUT_MAX_SECONDS"
 	VMHotplugStuckCooldownSecondsVar          = "ONE_CSI_VM_HOTPLUG_STUCK_VM_COOLDOWN_SECONDS"
+	NodeDeviceDiscoveryTimeoutVar             = "ONE_CSI_NODE_DEVICE_DISCOVERY_TIMEOUT_SECONDS"
+	PreflightLocalImmediateBindingPolicyVar   = "ONE_CSI_PREFLIGHT_LOCAL_IMMEDIATE_BINDING_POLICY"
 	ControllerLeaderElectionEnabledVar        = "ONE_CSI_CONTROLLER_LEADER_ELECTION_ENABLED"
 	ControllerLeaderElectionLeaseNameVar      = "ONE_CSI_CONTROLLER_LEADER_ELECTION_LEASE_NAME"
 	ControllerLeaderElectionLeaseNamespaceVar = "ONE_CSI_CONTROLLER_LEADER_ELECTION_LEASE_NAMESPACE"
@@ -64,6 +66,8 @@ const (
 	defaultVMHotplugTimeoutStep                  = 60
 	defaultVMHotplugTimeoutMax                   = 900
 	defaultVMHotplugCooldown                     = 300
+	defaultNodeDeviceDiscoveryTimeout            = 30
+	defaultPreflightLocalImmediateBindingPolicy  = "warn"
 	defaultControllerLeaderElectionEnabled       = false
 	defaultControllerLeaderElectionLeaseDuration = 45
 	defaultControllerLeaderElectionRenewDeadline = 30
@@ -118,6 +122,8 @@ func initViper() *viper.Viper {
 	viper.SetDefault(VMHotplugTimeoutPer100GiVar, defaultVMHotplugTimeoutStep)
 	viper.SetDefault(VMHotplugTimeoutMaxVar, defaultVMHotplugTimeoutMax)
 	viper.SetDefault(VMHotplugStuckCooldownSecondsVar, defaultVMHotplugCooldown)
+	viper.SetDefault(NodeDeviceDiscoveryTimeoutVar, defaultNodeDeviceDiscoveryTimeout)
+	viper.SetDefault(PreflightLocalImmediateBindingPolicyVar, defaultPreflightLocalImmediateBindingPolicy)
 	viper.SetDefault(ControllerLeaderElectionEnabledVar, defaultControllerLeaderElectionEnabled)
 	viper.SetDefault(ControllerLeaderElectionLeaseDurationVar, defaultControllerLeaderElectionLeaseDuration)
 	viper.SetDefault(ControllerLeaderElectionRenewDeadlineVar, defaultControllerLeaderElectionRenewDeadline)

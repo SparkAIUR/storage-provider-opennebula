@@ -213,6 +213,34 @@ func TestCreateVolume(t *testing.T) {
 	}
 }
 
+func TestPublishContextForVolumeIncludesDedicatedDeviceDiscoveryTimeout(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	cs := getTestControllerServer(mockProvider)
+
+	publishContext := cs.publishContextForVolume(context.Background(), "pvc-1", "sdd", 30*time.Second, map[string]string{
+		paramPVCName:      "data-pvc",
+		paramPVCNamespace: "default",
+		paramPVName:       "pv-data-pvc",
+	})
+
+	assert.Equal(t, "sdd", publishContext["volumeName"])
+	assert.Equal(t, "180", publishContext[publishContextHotplugTimeoutSeconds])
+	assert.Equal(t, "30", publishContext[publishContextDeviceDiscoveryTimeoutSeconds])
+	assert.Equal(t, "data-pvc", publishContext[paramPVCName])
+	assert.Equal(t, "default", publishContext[paramPVCNamespace])
+	assert.Equal(t, "pv-data-pvc", publishContext[paramPVName])
+}
+
+func TestNodeDeviceDiscoveryTimeoutCapsToHotplugTimeout(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	cs := getTestControllerServer(mockProvider)
+	cs.driver.PluginConfig.OverrideVal(config.NodeDeviceDiscoveryTimeoutVar, 30)
+
+	timeout := cs.nodeDeviceDiscoveryTimeout(15 * time.Second)
+
+	assert.Equal(t, 15*time.Second, timeout)
+}
+
 func TestCreateVolumeCreatesSharedFilesystemVolumeForRWX(t *testing.T) {
 	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
 	sharedProvider := &MockSharedFilesystemProviderTestify{}
@@ -572,8 +600,9 @@ func TestControllerPublishVolume(t *testing.T) {
 			},
 			expectResponse: &csi.ControllerPublishVolumeResponse{
 				PublishContext: map[string]string{
-					"volumeName":                        "attached-volume",
-					publishContextHotplugTimeoutSeconds: "180",
+					"volumeName":                                "attached-volume",
+					publishContextHotplugTimeoutSeconds:         "180",
+					publishContextDeviceDiscoveryTimeoutSeconds: "30",
 				},
 			},
 			expectError: false,

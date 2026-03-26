@@ -125,7 +125,8 @@ Important limitation:
 - when a pod lands on a different node, Kubernetes waits for detach/attach, but the underlying storage must already be attachable by OpenNebula from the configured image datastore path
 - if OpenNebula cannot resolve the source image path during attach, the fix is in datastore layout or transfer-manager configuration, not in CSI-side file sync
 - the controller serializes attach/detach/expand operations per volume, allows only one active VM hotplug per node at a time, and returns retryable `Aborted` for later same-node requests instead of letting them time out in-line
-- hotplug attach, detach, and node-side device discovery now use a size-aware timeout budget derived from the actual OpenNebula disk size
+- hotplug attach and detach use a size-aware timeout budget derived from the actual OpenNebula disk size
+- node-side device discovery now uses a smaller dedicated timeout budget so healthy fast-path mounts fail and retry quickly instead of waiting through the full hotplug recovery budget
 - if a VM stays non-ready through the full hotplug timeout, the controller places that VM into a temporary recovery cooldown and rejects new hotplug work with retryable `Unavailable`
 - recreating a MinIO tenant with local-backed PVCs should still be treated as node-sticky; if the workload must move freely across nodes after recreation, use Ceph RBD or CephFS instead
 
@@ -411,6 +412,7 @@ Example values enabling driver metrics and ServiceMonitors:
 ## Preflight validation
 
 The binary now supports a preflight mode that validates OpenNebula connectivity, datastore configuration, Ceph tooling, monitor reachability, referenced Kubernetes secrets, and optional CRD dependencies.
+For local-backed StorageClasses, preflight also warns by default when `volumeBindingMode: Immediate` is used instead of `WaitForFirstConsumer`. Set `ONE_CSI_PREFLIGHT_LOCAL_IMMEDIATE_BINDING_POLICY=fail` to make that a hard release-blocking error.
 
 CLI example:
 
@@ -667,7 +669,8 @@ At minimum, release validation should include:
 
 - `go test ./...`
 - `helm template opennebula-csi ./helm/opennebula-csi ...`
-- a live lab validation for the feature or hotfix being released
+- `bash hack/validate-release-lab.sh`
+- a live lab validation for the feature or hotfix being released, including local attach/mount, local expansion, inventory CRDs, and the CNPG-style bootstrap/init smoke path when touching fast-path mount behavior
 
 Push a semantic tag such as `v0.1.0` only after that validation to trigger the release workflow.
 

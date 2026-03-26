@@ -42,7 +42,7 @@ storageClasses:
       storageclass.kubernetes.io/is-default-class: "false"
     reclaimPolicy: Delete
     allowVolumeExpansion: true
-    volumeBindingMode: Immediate
+    volumeBindingMode: WaitForFirstConsumer
     mountOptions: []
     parameters:
       datastoreIDs: "100,101,102"
