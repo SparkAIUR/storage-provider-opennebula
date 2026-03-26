@@ -52,6 +52,7 @@ const (
 	annotationDatastoreID                              = "storage-provider.opennebula.sparkaiur.io/datastore-id"
 	topologySystemDSLabel                              = "topology.opennebula.sparkaiur.io/system-ds"
 	hotplugStateConfigMapName                          = "opennebula-csi-hotplug-state"
+	sharedBackendAttr                                  = "SPARKAI_CSI_SHARE_BACKEND"
 	defaultValidationImagePullPolicy corev1.PullPolicy = corev1.PullIfNotPresent
 )
 
@@ -375,6 +376,14 @@ func (s *Syncer) ensureDatastoreObject(ctx context.Context, ds datastoreSchema.D
 	current := &inventoryv1alpha1.OpenNebulaDatastore{}
 	err := s.client.Get(ctx, types.NamespacedName{Name: name}, current)
 	if err == nil {
+		desiredBackend := normalizeDatastoreBackend(ds)
+		if current.Spec.Discovery.ExpectedBackend != desiredBackend {
+			updated := current.DeepCopy()
+			updated.Spec.Discovery.ExpectedBackend = desiredBackend
+			if err := s.client.Update(ctx, updated); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {
@@ -895,6 +904,14 @@ func normalizeDatastore(ds datastoreSchema.Datastore) opennebula.Datastore {
 }
 
 func normalizeDatastoreBackend(ds datastoreSchema.Datastore) string {
+	if backend, err := ds.Template.GetStr(sharedBackendAttr); err == nil {
+		switch strings.ToLower(strings.TrimSpace(backend)) {
+		case "ceph", "rbd", "ceph-rbd":
+			return "ceph-rbd"
+		case "cephfs":
+			return "cephfs"
+		}
+	}
 	normalized := strings.ToLower(strings.TrimSpace(ds.TMMad))
 	switch normalized {
 	case "ceph":
@@ -908,6 +925,14 @@ func normalizeDatastoreBackend(ds datastoreSchema.Datastore) string {
 
 func normalizeDatastoreType(ds datastoreSchema.Datastore) string {
 	trimmed := strings.ToUpper(strings.TrimSpace(ds.Type))
+	switch trimmed {
+	case "0":
+		return string(datastoreSchema.Image)
+	case "1":
+		return string(datastoreSchema.System)
+	case "2":
+		return string(datastoreSchema.File)
+	}
 	if trimmed == "" {
 		return "UNKNOWN"
 	}

@@ -167,6 +167,44 @@ func TestBuildDatastoreStatusStorageClassDetails(t *testing.T) {
 	}
 }
 
+func TestNormalizeDatastoreTypeAndBackend(t *testing.T) {
+	ds := datastoreSchema.Datastore{
+		ID:      104,
+		Name:    "one-csi-cephfs",
+		Type:    "2",
+		TMMad:   "ssh",
+		DSMad:   "fs",
+		TotalMB: 1024,
+		FreeMB:  512,
+	}
+	ds.Template.AddPair(sharedBackendAttr, "cephfs")
+
+	status := (&Syncer{}).buildDatastoreStatus(
+		inventoryv1alpha1.OpenNebulaDatastore{
+			ObjectMeta: metav1.ObjectMeta{Name: "ds-104", Generation: 1},
+			Spec: inventoryv1alpha1.OpenNebulaDatastoreSpec{
+				Enabled: true,
+				Discovery: inventoryv1alpha1.OpenNebulaDatastoreDiscoverySpec{
+					OpenNebulaDatastoreID: 104,
+					ExpectedBackend:       "cephfs",
+					Allowed:               true,
+				},
+			},
+		},
+		ds,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+	if status.Type != string(datastoreSchema.File) {
+		t.Fatalf("expected datastore type %q, got %q", datastoreSchema.File, status.Type)
+	}
+	if status.Backend != "cephfs" {
+		t.Fatalf("expected datastore backend cephfs, got %q", status.Backend)
+	}
+}
+
 func TestValidationMetricsDisplayAndCapacityFallback(t *testing.T) {
 	read := int64(12000)
 	write := int64(8000)
