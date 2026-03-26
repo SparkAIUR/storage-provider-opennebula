@@ -19,6 +19,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -51,6 +52,7 @@ func getTestControllerServerWithAllowedTypes(mockProvider *MockOpenNebulaVolumeP
 		grpcServerEndpoint: DefaultGRPCServerEndpoint,
 		nodeID:             "test-controller-id",
 		PluginConfig:       pluginConfig,
+		operationLocks:     NewOperationLocks(),
 	}
 
 	return NewControllerServer(driver, mockProvider, sharedProvider)
@@ -58,6 +60,37 @@ func getTestControllerServerWithAllowedTypes(mockProvider *MockOpenNebulaVolumeP
 
 func getTestControllerServerWithDriver(mockProvider *MockOpenNebulaVolumeProviderTestify, sharedProvider *MockSharedFilesystemProviderTestify, driver *Driver) *ControllerServer {
 	return NewControllerServer(driver, mockProvider, sharedProvider)
+}
+
+func newTestDriver() *Driver {
+	pluginConfig := config.LoadConfiguration()
+	pluginConfig.OverrideVal(config.DefaultDatastoresVar, "100,101")
+	pluginConfig.OverrideVal(config.AllowedDatastoreTypesVar, "local")
+
+	return &Driver{
+		name:               DefaultDriverName,
+		version:            driverVersion,
+		grpcServerEndpoint: DefaultGRPCServerEndpoint,
+		nodeID:             "test-controller-id",
+		PluginConfig:       pluginConfig,
+		featureGates:       FeatureGates{DetachedDiskExpansion: true},
+		operationLocks:     NewOperationLocks(),
+	}
+}
+
+func newPublishReq(volumeID, nodeID string) *csi.ControllerPublishVolumeRequest {
+	return &csi.ControllerPublishVolumeRequest{
+		VolumeId: volumeID,
+		NodeId:   nodeID,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{FsType: "xfs"},
+			},
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+			},
+		},
+	}
 }
 
 func TestCreateVolume(t *testing.T) {
@@ -1194,8 +1227,119 @@ func TestControllerUnpublishVolume(t *testing.T) {
 	}
 }
 
+func TestControllerPublishVolumeSerializesSameNodeHotplug(t *testing.T) {
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	provider := &serializingVolumeProvider{MockOpenNebulaVolumeProviderTestify: mockProvider}
+	provider.attachGate = make(chan struct{})
+	provider.attachStarted = make(chan struct{}, 2)
+	provider.attachFinished = make(chan struct{}, 2)
+
+	cs := NewControllerServer(newTestDriver(), provider, &MockSharedFilesystemProviderTestify{})
+
+	mockProvider.On("VolumeExists", mock.Anything, "vol-1").Return(1, 1, nil)
+	mockProvider.On("VolumeExists", mock.Anything, "vol-2").Return(2, 1, nil)
+	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", errors.New("not attached")).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 2, 41).Return("", errors.New("not attached")).Once()
+	mockProvider.On("AttachVolume", mock.Anything, "vol-1", "node-1", false, mock.Anything).Return(nil).Once()
+	mockProvider.On("AttachVolume", mock.Anything, "vol-2", "node-1", false, mock.Anything).Return(nil).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("sdb", nil).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 2, 41).Return("sdc", nil).Once()
+
+	errs := make(chan error, 2)
+	go func() {
+		_, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-1", "node-1"))
+		errs <- err
+	}()
+	<-provider.attachStarted
+
+	go func() {
+		_, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-2", "node-1"))
+		errs <- err
+	}()
+
+	select {
+	case <-provider.attachStarted:
+		t.Fatal("expected same-node publish to serialize attach operations")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(provider.attachGate)
+	<-provider.attachFinished
+	<-provider.attachFinished
+
+	assert.NoError(t, <-errs)
+	assert.NoError(t, <-errs)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&provider.maxConcurrentAttach))
+	mockProvider.AssertExpectations(t)
+}
+
+func TestControllerExpandVolumeSerializesWithPublishOnSameVolume(t *testing.T) {
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	provider := &serializingVolumeProvider{MockOpenNebulaVolumeProviderTestify: mockProvider}
+	provider.attachGate = make(chan struct{})
+	provider.attachStarted = make(chan struct{}, 1)
+	provider.attachFinished = make(chan struct{}, 1)
+	provider.expandGate = make(chan struct{})
+	provider.expandStarted = make(chan struct{}, 1)
+	provider.expandFinished = make(chan struct{}, 1)
+
+	cs := NewControllerServer(newTestDriver(), provider, &MockSharedFilesystemProviderTestify{})
+
+	mockProvider.On("ExpandVolume", mock.Anything, "vol-1", int64(2*1024*1024*1024), true).Return(int64(2 * 1024 * 1024 * 1024), nil).Once()
+	mockProvider.On("VolumeExists", mock.Anything, "vol-1").Return(1, 1, nil)
+	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", errors.New("not attached")).Once()
+	mockProvider.On("AttachVolume", mock.Anything, "vol-1", "node-1", false, mock.Anything).Return(nil).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("sdb", nil).Once()
+
+	errs := make(chan error, 2)
+	go func() {
+		_, err := cs.ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{
+			VolumeId: "vol-1",
+			CapacityRange: &csi.CapacityRange{
+				RequiredBytes: int64(2 * 1024 * 1024 * 1024),
+			},
+		})
+		errs <- err
+	}()
+	<-provider.expandStarted
+
+	go func() {
+		_, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-1", "node-1"))
+		errs <- err
+	}()
+
+	select {
+	case <-provider.attachStarted:
+		t.Fatal("expected expand to hold the volume lock until completion")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(provider.expandGate)
+	<-provider.expandFinished
+	close(provider.attachGate)
+	<-provider.attachFinished
+
+	assert.NoError(t, <-errs)
+	assert.NoError(t, <-errs)
+	mockProvider.AssertExpectations(t)
+}
+
 type MockOpenNebulaVolumeProviderTestify struct {
 	mock.Mock
+}
+
+type serializingVolumeProvider struct {
+	*MockOpenNebulaVolumeProviderTestify
+	attachGate          chan struct{}
+	attachStarted       chan struct{}
+	attachFinished      chan struct{}
+	expandGate          chan struct{}
+	expandStarted       chan struct{}
+	expandFinished      chan struct{}
+	concurrentAttach    int32
+	maxConcurrentAttach int32
 }
 
 type MockSharedFilesystemProviderTestify struct {
@@ -1231,6 +1375,27 @@ func (m *MockOpenNebulaVolumeProviderTestify) ExpandVolume(ctx context.Context, 
 func (m *MockOpenNebulaVolumeProviderTestify) AttachVolume(ctx context.Context, volume string, node string, immutable bool, params map[string]string) error {
 	args := m.Called(ctx, volume, node, immutable, params)
 	return args.Error(0)
+}
+
+func (p *serializingVolumeProvider) AttachVolume(ctx context.Context, volume string, node string, immutable bool, params map[string]string) error {
+	current := atomic.AddInt32(&p.concurrentAttach, 1)
+	for {
+		max := atomic.LoadInt32(&p.maxConcurrentAttach)
+		if current <= max || atomic.CompareAndSwapInt32(&p.maxConcurrentAttach, max, current) {
+			break
+		}
+	}
+	if p.attachStarted != nil {
+		p.attachStarted <- struct{}{}
+	}
+	if p.attachGate != nil {
+		<-p.attachGate
+	}
+	if p.attachFinished != nil {
+		p.attachFinished <- struct{}{}
+	}
+	atomic.AddInt32(&p.concurrentAttach, -1)
+	return p.MockOpenNebulaVolumeProviderTestify.AttachVolume(ctx, volume, node, immutable, params)
 }
 
 func (m *MockOpenNebulaVolumeProviderTestify) DetachVolume(ctx context.Context, volume string, node string) error {
@@ -1284,6 +1449,19 @@ func (m *MockOpenNebulaVolumeProviderTestify) GetVolumeInNode(ctx context.Contex
 func (m *MockOpenNebulaVolumeProviderTestify) VolumeReadyWithTimeout(volumeID int) (bool, error) {
 	args := m.Called(volumeID)
 	return args.Bool(0), args.Error(1)
+}
+
+func (p *serializingVolumeProvider) ExpandVolume(ctx context.Context, volume string, size int64, allowDetached bool) (int64, error) {
+	if p.expandStarted != nil {
+		p.expandStarted <- struct{}{}
+	}
+	if p.expandGate != nil {
+		<-p.expandGate
+	}
+	if p.expandFinished != nil {
+		p.expandFinished <- struct{}{}
+	}
+	return p.MockOpenNebulaVolumeProviderTestify.ExpandVolume(ctx, volume, size, allowDetached)
 }
 
 func (m *MockSharedFilesystemProviderTestify) CreateSharedVolume(ctx context.Context, req opennebula.SharedVolumeRequest) (*opennebula.SharedVolumeCreateResult, error) {

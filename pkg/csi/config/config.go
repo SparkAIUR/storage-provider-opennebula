@@ -33,6 +33,7 @@ const (
 	FeatureGatesVar          = "ONE_CSI_FEATURE_GATES"
 	MetricsEndpointVar       = "ONE_CSI_METRICS_ENDPOINT"
 	NodeTopologySystemDSVar  = "ONE_CSI_NODE_TOPOLOGY_SYSTEM_DS"
+	VMHotplugTimeoutVar      = "ONE_CSI_VM_HOTPLUG_TIMEOUT_SECONDS"
 
 	//Default values
 	defaultOpenNebulaRPCEndpoint = "http://localhost:2633/RPC2"
@@ -40,6 +41,7 @@ const (
 	defaultAllowedDatastoreTypes = "local,ceph,cephfs"
 	defaultFeatureGates          = "compatibilityAwareSelection=true,detachedDiskExpansion=false,cephfsExpansion=false,cephfsSnapshots=false,cephfsClones=false,cephfsSelfHealing=false,topologyAccessibility=false"
 	defaultMetricsEndpoint       = ":9810"
+	defaultVMHotplugTimeout      = 60
 )
 
 // CSIPluginConfig holds the configuration for the CSI plugin
@@ -77,6 +79,7 @@ func initViper() *viper.Viper {
 	viper.SetDefault(AllowedDatastoreTypesVar, defaultAllowedDatastoreTypes)
 	viper.SetDefault(FeatureGatesVar, defaultFeatureGates)
 	viper.SetDefault(MetricsEndpointVar, defaultMetricsEndpoint)
+	viper.SetDefault(VMHotplugTimeoutVar, defaultVMHotplugTimeout)
 
 	viper.AutomaticEnv()
 	viper.SetTypeByDefaultValue(true)

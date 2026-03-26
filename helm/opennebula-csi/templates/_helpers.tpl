@@ -85,6 +85,8 @@ Create chart name and version as used by the chart label.
 - name: ONE_CSI_METRICS_ENDPOINT
   value: {{ printf ":%v" .Values.metrics.driver.port | quote }}
 {{- end }}
+- name: ONE_CSI_VM_HOTPLUG_TIMEOUT_SECONDS
+  value: {{ .Values.driver.vmHotplugTimeoutSeconds | quote }}
 - name: ONE_CSI_FEATURE_GATES
   value: "compatibilityAwareSelection={{ .Values.featureGates.compatibilityAwareSelection }},detachedDiskExpansion={{ .Values.featureGates.detachedDiskExpansion }},cephfsExpansion={{ .Values.featureGates.cephfsExpansion }},cephfsSnapshots={{ .Values.featureGates.cephfsSnapshots }},cephfsClones={{ .Values.featureGates.cephfsClones }},cephfsSelfHealing={{ .Values.featureGates.cephfsSelfHealing }},topologyAccessibility={{ .Values.featureGates.topologyAccessibility }}"
 {{- with .Values.driver.env }}

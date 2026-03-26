@@ -201,6 +201,8 @@ For local-backed StorageClasses:
 - prefer `volumeBindingMode: WaitForFirstConsumer`
 - keep `featureGates.compatibilityAwareSelection=true`
 - do not assume the driver will live-migrate local PVC data between nodes
+- the controller serializes VM hotplug operations and waits up to `driver.vmHotplugTimeoutSeconds` for attach/detach stabilization to reduce transient OpenNebula `wrong state HOTPLUG` failures
+- recreating MinIO tenants with local-backed PVCs should still be treated as node-sticky; use Ceph RBD or CephFS if the workload must remain portable across nodes
 - use Ceph RBD for portable RWO and CephFS for portable RWX
 
 ## Values Reference
@@ -237,7 +239,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
-| `image.tag` | Driver image tag. | `"v0.4.0"` | No |
+| `image.tag` | Driver image tag. | `"v0.4.1"` | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
 
 ### Driver
@@ -247,6 +249,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.logLevel` | Kubernetes `-v` log level passed to the driver binary. | `5` | No |
 | `driver.defaultDatastores` | Default list of OpenNebula datastore IDs or aliases used when StorageClasses do not override `datastoreIDs`. | `[]` | Conditional |
 | `driver.datastoreSelectionPolicy` | Default datastore selection policy. Supported values: `least-used`, `ordered`, `autopilot`. | `"least-used"` | No |
+| `driver.vmHotplugTimeoutSeconds` | Bounded wait for VM disk hotplug stabilization after attach/detach before the driver returns an error. | `60` | No |
 | `driver.allowedDatastoreTypes` | Allowed backend types for provisioning. | `["local","ceph","cephfs"]` | No |
 | `driver.extraArgs` | Extra CLI args appended to both controller and node driver containers. | `[]` | No |
 | `driver.env` | Additional environment variables appended to both controller and node driver containers. Useful for advanced overrides such as `ONE_CSI_NODE_TOPOLOGY_SYSTEM_DS`. | `[]` | No |
@@ -258,8 +261,8 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `featureGates.compatibilityAwareSelection` | Enable compatibility-aware filtering for datastores such as `COMPATIBLE_SYS_DS`. | `true` | No |
-| `featureGates.detachedDiskExpansion` | Enable detached persistent-disk expansion through image-level resize. Stable and enabled by default in `v0.4.0`. | `true` | No |
-| `featureGates.cephfsExpansion` | Enable CephFS dynamic subvolume expansion. Stable and enabled by default in `v0.4.0`. | `true` | No |
+| `featureGates.detachedDiskExpansion` | Enable detached persistent-disk expansion through image-level resize. Stable and enabled by default in `v0.4.1`. | `true` | No |
+| `featureGates.cephfsExpansion` | Enable CephFS dynamic subvolume expansion. Stable and enabled by default in `v0.4.1`. | `true` | No |
 | `featureGates.cephfsSnapshots` | Enable CephFS snapshot RPC flows. | `false` | No |
 | `featureGates.cephfsClones` | Enable CephFS PVC clone and snapshot restore flows. | `false` | No |
 | `featureGates.cephfsSelfHealing` | Enable stale CephFS mount lazy-unmount/remount recovery in node stage. `NodeGetVolumeStats` still reports disconnected CephFS mounts as restage-needed errors because kubelet stats calls do not include remount credentials. | `false` | No |

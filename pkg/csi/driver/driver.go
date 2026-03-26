@@ -18,7 +18,6 @@ package driver
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
@@ -41,11 +40,6 @@ var (
 	driverBuildDate = "unknown"
 )
 
-// TODO: This should be a struct with a map of locks
-// to avoid locking the entire driver
-// and allow concurrent access to different volumes
-type VolumeLocks sync.Mutex
-
 type Driver struct {
 	name               string
 	grpcServerEndpoint string
@@ -58,7 +52,7 @@ type Driver struct {
 
 	controllerServerCapabilities []*csi.ControllerServiceCapability
 
-	volumeLocks *VolumeLocks
+	operationLocks *OperationLocks
 
 	maxVolumesPerNode int64
 
@@ -90,10 +84,8 @@ func NewDriver(options *DriverOptions) *Driver {
 		maxVolumesPerNode:  options.MaxVolumesPerNode,
 		mounter:            options.Mounter,
 		featureGates:       loadFeatureGates(options.PluginConfig),
+		operationLocks:     NewOperationLocks(),
 	}
-
-	//TODO: Initialize volumeLocks
-
 }
 
 func (d *Driver) Run(ctx context.Context) error {
@@ -119,12 +111,18 @@ func (d *Driver) Run(ctx context.Context) error {
 	if !ok {
 		return fmt.Errorf("failed to get %s credentials from config", config.OpenNebulaCredentialsVar)
 	}
+	hotplugTimeoutSeconds, ok := d.PluginConfig.GetInt(config.VMHotplugTimeoutVar)
+	if !ok || hotplugTimeoutSeconds <= 0 {
+		hotplugTimeoutSeconds = 60
+	}
 
 	volumeProvider, err := opennebula.NewPersistentDiskVolumeProvider(
 		opennebula.NewClient(opennebula.OpenNebulaConfig{
 			Endpoint:    endpoint,
 			Credentials: credentials,
-		}))
+		}),
+		time.Duration(hotplugTimeoutSeconds)*time.Second,
+	)
 	if err != nil || volumeProvider == nil {
 		return fmt.Errorf("failed to create PersistentDiskVolumeProvider: %v", err)
 	}

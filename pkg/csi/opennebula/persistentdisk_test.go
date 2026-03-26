@@ -59,7 +59,7 @@ func TestPersistentDiskLifecycle(t *testing.T) {
 		t.Fatal("failed to create OpenNebula client")
 	}
 
-	volumeProvider, err := NewPersistentDiskVolumeProvider(client)
+	volumeProvider, err := NewPersistentDiskVolumeProvider(client, 60*time.Second)
 	if err != nil {
 		t.Fatalf("failed to create PersistentDiskVolumeProvider: %v", err)
 	}
@@ -154,4 +154,59 @@ func TestLatestHistoryDatastoreIDRequiresSystemDatastoreHistory(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, IsDatastoreConfigError(err))
 	assert.Contains(t, err.Error(), "system datastore history")
+}
+
+func TestIsHotplugStateError(t *testing.T) {
+	require.True(t, isHotplugStateError(fmt.Errorf("OpenNebula error: wrong state HOTPLUG")))
+	require.True(t, isHotplugStateError(fmt.Errorf("wrong state hotplug")))
+	require.False(t, isHotplugStateError(fmt.Errorf("wrong state running")))
+	require.False(t, isHotplugStateError(nil))
+}
+
+func TestWaitForHotplugStateAttachSucceedsAfterSeveralPolls(t *testing.T) {
+	provider := &PersistentDiskVolumeProvider{}
+	attempts := 0
+
+	err := provider.waitForHotplugState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+		attempts++
+		switch attempts {
+		case 1, 2:
+			return false, false, nil
+		default:
+			return true, true, nil
+		}
+	}, "attach", "vol-a", "node-a")
+
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, attempts, 3)
+}
+
+func TestWaitForHotplugStateDetachSucceedsAfterSeveralPolls(t *testing.T) {
+	provider := &PersistentDiskVolumeProvider{}
+	attempts := 0
+
+	err := provider.waitForHotplugState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+		attempts++
+		switch attempts {
+		case 1, 2:
+			return true, false, nil
+		default:
+			return false, true, nil
+		}
+	}, "detach", "vol-a", "node-a")
+
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, attempts, 3)
+}
+
+func TestWaitForHotplugStateTimesOutWhenAttachNeverStabilizes(t *testing.T) {
+	provider := &PersistentDiskVolumeProvider{}
+
+	err := provider.waitForHotplugState(context.Background(), 5*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+		return false, false, nil
+	}, "attach", "vol-a", "node-a")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timed out")
+	assert.Contains(t, err.Error(), "attached=false")
 }

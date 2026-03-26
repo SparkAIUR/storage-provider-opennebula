@@ -59,6 +59,9 @@ type ControllerServer struct {
 }
 
 func NewControllerServer(d *Driver, vp opennebula.OpenNebulaVolumeProvider, sharedProvider opennebula.SharedFilesystemProvider) *ControllerServer {
+	if d.operationLocks == nil {
+		d.operationLocks = NewOperationLocks()
+	}
 	return &ControllerServer{
 		driver:                   d,
 		volumeProvider:           vp,
@@ -668,6 +671,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.NotFound, "node not found")
 	}
 
+	release := s.driver.operationLocks.Acquire(controllerNodeLockKey(req.NodeId), controllerVolumeLockKey(req.VolumeId))
+	defer release()
+
 	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err == nil {
 		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
@@ -745,6 +751,9 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId)
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
+
+	release := s.driver.operationLocks.Acquire(controllerNodeLockKey(req.NodeId), controllerVolumeLockKey(req.VolumeId))
+	defer release()
 
 	nodeID, err := s.volumeProvider.NodeExists(ctx, req.NodeId)
 	if err != nil || nodeID == -1 {
@@ -961,6 +970,9 @@ func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 		}, nil
 	}
 
+	release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.GetVolumeId()))
+	defer release()
+
 	newSize, err := s.volumeProvider.ExpandVolume(ctx, req.GetVolumeId(), capacityRange.GetRequiredBytes(), s.driver.featureGates.DetachedDiskExpansion)
 	if err != nil {
 		switch {
@@ -988,6 +1000,14 @@ func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 		CapacityBytes:         newSize,
 		NodeExpansionRequired: nodeExpansionRequired,
 	}, nil
+}
+
+func controllerNodeLockKey(nodeID string) string {
+	return "node:" + nodeID
+}
+
+func controllerVolumeLockKey(volumeID string) string {
+	return "volume:" + volumeID
 }
 
 // TODO: Implement methods specified in https://github.com/container-storage-interface/spec/blob/98819c45a37a67e0cd466bd02b813faf91af4e45/spec.md#controller-service-rpc

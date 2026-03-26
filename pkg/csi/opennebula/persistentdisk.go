@@ -37,21 +37,28 @@ import (
 const (
 	ownerTag          = "OWNER"
 	sizeConversion    = 1024 * 1024
-	timeout           = 5 * time.Second
 	fsTypeTag         = "FS"
 	volumeUsedTimeout = 30 * time.Second
+	hotplugPollInterval = time.Second
 )
 
 type PersistentDiskVolumeProvider struct {
-	ctrl *goca.Controller
+	ctrl            *goca.Controller
+	hotplugTimeout  time.Duration
+	hotplugPollWait time.Duration
 }
 
-func NewPersistentDiskVolumeProvider(client *OpenNebulaClient) (*PersistentDiskVolumeProvider, error) {
+func NewPersistentDiskVolumeProvider(client *OpenNebulaClient, hotplugTimeout time.Duration) (*PersistentDiskVolumeProvider, error) {
 	if client == nil {
 		return nil, fmt.Errorf("client reference is nil")
 	}
+	if hotplugTimeout <= 0 {
+		hotplugTimeout = 60 * time.Second
+	}
 	return &PersistentDiskVolumeProvider{
-		ctrl: goca.NewController(client.Client),
+		ctrl:            goca.NewController(client.Client),
+		hotplugTimeout:  hotplugTimeout,
+		hotplugPollWait: hotplugPollInterval,
 	}, nil
 }
 
@@ -116,7 +123,7 @@ func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name st
 		}
 		recordDatastoreProvisioningResult(datastore.ID, true)
 
-		err = p.waitForResourceStatus(imageID, timeout, p.volumeReady)
+		err = p.waitForResourceStatus(imageID, p.hotplugTimeout, p.volumeReady)
 		if err != nil {
 			return nil, fmt.Errorf("failed to wait for volume readiness: %w", err)
 		}
@@ -151,7 +158,7 @@ func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume 
 
 	// Force delete
 	p.ctrl.Client.CallContext(ctx, "one.image.delete", volumeID, true)
-	err = p.waitForResourceStatus(volumeID, timeout, p.volumeDeleted)
+	err = p.waitForResourceStatus(volumeID, p.hotplugTimeout, p.volumeDeleted)
 	if err != nil {
 		return fmt.Errorf("failed to wait for volume deletion: %w", err)
 	}
@@ -208,7 +215,7 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 		}
 		recordDatastoreProvisioningResult(datastore.ID, true)
 
-		if err := p.waitForResourceStatus(cloneID, timeout, p.volumeReady); err != nil {
+		if err := p.waitForResourceStatus(cloneID, p.hotplugTimeout, p.volumeReady); err != nil {
 			return nil, fmt.Errorf("failed waiting for clone %d to become ready: %w", cloneID, err)
 		}
 
@@ -486,14 +493,27 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		disk.Add("READONLY", "YES")
 	}
 
-	err = p.ctrl.VM(nodeID).DiskAttach(disk.String())
-	if err != nil {
+	attachErr := p.ctrl.VM(nodeID).DiskAttach(disk.String())
+	if attachErr != nil && !isHotplugStateError(attachErr) {
 		return fmt.Errorf("failed to attach volume %s to node %s: %w",
-			volume, node, err)
+			volume, node, attachErr)
 	}
-	err = p.waitForResourceStatus(nodeID, timeout, p.nodeReady)
-	if err != nil {
-		return fmt.Errorf("failed to wait for node readiness: %w", err)
+
+	if err := p.waitForHotplugState(ctx, p.hotplugTimeout, p.hotplugPollWait, func() (bool, bool, error) {
+		attached := false
+		if _, infoErr := p.GetVolumeInNode(ctx, volumeID, nodeID); infoErr == nil {
+			attached = true
+		}
+		ready, readyErr := p.nodeReady(nodeID)
+		if readyErr != nil {
+			return attached, false, readyErr
+		}
+		return attached, ready, nil
+	}, "attach", volume, node); err != nil {
+		if attachErr != nil {
+			return fmt.Errorf("%w (initial attach error: %v)", err, attachErr)
+		}
+		return err
 	}
 	return nil
 }
@@ -663,14 +683,26 @@ func (p *PersistentDiskVolumeProvider) DetachVolume(ctx context.Context, volume,
 			if err != nil {
 				return fmt.Errorf("invalid disk ID format: %w", err)
 			}
-			err = vmController.Disk(diskIDInt).Detach()
-			if err != nil {
+			detachErr := vmController.Disk(diskIDInt).Detach()
+			if detachErr != nil && !isHotplugStateError(detachErr) {
 				return fmt.Errorf("failed to detach volume %s from node %s: %w",
-					diskID, node, err)
+					diskID, node, detachErr)
 			}
-			err = p.waitForResourceStatus(nodeID, timeout, p.nodeReady)
-			if err != nil {
-				return fmt.Errorf("failed to wait for node readiness: %w", err)
+			if err := p.waitForHotplugState(ctx, p.hotplugTimeout, p.hotplugPollWait, func() (bool, bool, error) {
+				attached := false
+				if _, infoErr := p.GetVolumeInNode(ctx, volumeID, nodeID); infoErr == nil {
+					attached = true
+				}
+				ready, readyErr := p.nodeReady(nodeID)
+				if readyErr != nil {
+					return attached, false, readyErr
+				}
+				return attached, ready, nil
+			}, "detach", volume, node); err != nil {
+				if detachErr != nil {
+					return fmt.Errorf("%w (initial detach error: %v)", err, detachErr)
+				}
+				return err
 			}
 			return nil
 		}
@@ -860,6 +892,13 @@ func isInsufficientCapacityError(err error) bool {
 	return false
 }
 
+func isHotplugStateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "wrong state hotplug")
+}
+
 func (p *PersistentDiskVolumeProvider) VolumeReadyWithTimeout(volumeID int) (bool, error) {
 	err := p.waitForResourceStatus(volumeID, volumeUsedTimeout, p.volumeReady)
 	if err != nil {
@@ -910,6 +949,52 @@ func (p *PersistentDiskVolumeProvider) nodeReady(nodeID int) (bool, error) {
 	}
 
 	return vmLCMState == vm.Running, nil
+}
+
+func (p *PersistentDiskVolumeProvider) waitForHotplugState(ctx context.Context, timeout, pollInterval time.Duration, observe func() (bool, bool, error), operation, volume, node string) error {
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	if pollInterval <= 0 {
+		pollInterval = time.Second
+	}
+
+	deadlineCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	lastAttached := false
+	lastReady := false
+	desiredAttached := operation == "attach"
+
+	for {
+		attached, ready, err := observe()
+		if err != nil {
+			return fmt.Errorf("failed while waiting for %s of volume %s on node %s: %w", operation, volume, node, err)
+		}
+
+		lastAttached = attached
+		lastReady = ready
+		if attached == desiredAttached && ready {
+			return nil
+		}
+
+		select {
+		case <-deadlineCtx.Done():
+			return fmt.Errorf(
+				"timed out after %s waiting for %s of volume %s on node %s (attached=%t ready=%t)",
+				timeout,
+				operation,
+				volume,
+				node,
+				lastAttached,
+				lastReady,
+			)
+		case <-ticker.C:
+		}
+	}
 }
 
 func (p *PersistentDiskVolumeProvider) waitForResourceStatus(volumeID int, timeout time.Duration, checkFunc func(int) (bool, error)) error {

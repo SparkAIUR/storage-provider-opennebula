@@ -547,7 +547,7 @@ func (ns *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 	}
 
 	if opennebula.IsSharedFilesystemVolumeID(volumeID) {
-		return nil, status.Error(codes.Unimplemented, "CephFS shared filesystem expansion is not supported in v0.4.0")
+		return nil, status.Error(codes.Unimplemented, "CephFS shared filesystem expansion is not supported in v0.4.1")
 	}
 
 	// The node-side filesystem resizer is only available in the linux build of mount-utils.

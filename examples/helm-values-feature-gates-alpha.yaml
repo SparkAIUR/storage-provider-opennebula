@@ -1,4 +1,4 @@
-# Example values for staging the alpha feature gates added in v0.4.0.
+# Example values for staging the alpha feature gates added in v0.4.1.
 #
 # Topology accessibility expects Kubernetes nodes to carry:
 #   topology.opennebula.sparkaiur.io/system-ds=<opennebula-system-datastore-id>
