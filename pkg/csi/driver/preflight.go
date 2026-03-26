@@ -45,9 +45,19 @@ type PreflightCheckResult struct {
 	Message string `json:"message"`
 }
 
+type PreflightStorageClassSummary struct {
+	Name                 string   `json:"name"`
+	Backend              string   `json:"backend"`
+	VolumeBindingMode    string   `json:"volumeBindingMode"`
+	AllowVolumeExpansion bool     `json:"allowVolumeExpansion"`
+	ValidationSupport    string   `json:"validationSupport"`
+	Warnings             []string `json:"warnings,omitempty"`
+}
+
 type PreflightReport struct {
-	Passed  bool                   `json:"passed"`
-	Results []PreflightCheckResult `json:"results"`
+	Passed         bool                           `json:"passed"`
+	Results        []PreflightCheckResult         `json:"results"`
+	StorageClasses []PreflightStorageClassSummary `json:"storageClasses,omitempty"`
 }
 
 type PreflightRunner struct {
@@ -189,13 +199,25 @@ func (r *PreflightRunner) Run(ctx context.Context) PreflightReport {
 			appendResult("servicemonitor_crd", "skip", "ServiceMonitor CRD validation was not requested")
 		}
 
+		storageClassSummaries := r.inspectStorageClasses(ctx, kubeClient, datastorePool.Datastores)
 		outcome, message := r.checkLocalImmediateBinding(ctx, kubeClient, datastorePool.Datastores)
 		appendResult("local_immediate_binding", outcome, message)
+		results = append(results, PreflightCheckResult{
+			Check:   "storageclass_audit",
+			Outcome: "pass",
+			Message: fmt.Sprintf("inspected %d CSI StorageClasses", len(storageClassSummaries)),
+		})
+		return PreflightReport{
+			Passed:         !failed,
+			Results:        results,
+			StorageClasses: storageClassSummaries,
+		}
 	}
 
 	return PreflightReport{
-		Passed:  !failed,
-		Results: results,
+		Passed:         !failed,
+		Results:        results,
+		StorageClasses: nil,
 	}
 }
 
@@ -206,6 +228,17 @@ func RunPreflightCommand(ctx context.Context, cfg config.CSIPluginConfig, exec u
 	case "", "text":
 		for _, result := range report.Results {
 			fmt.Fprintf(w, "[%s] %s: %s\n", strings.ToUpper(result.Outcome), result.Check, result.Message)
+		}
+		if len(report.StorageClasses) > 0 {
+			fmt.Fprintln(w, "StorageClasses:")
+			for _, summary := range report.StorageClasses {
+				warnings := "-"
+				if len(summary.Warnings) > 0 {
+					warnings = strings.Join(summary.Warnings, "; ")
+				}
+				fmt.Fprintf(w, "- %s backend=%s binding=%s expansion=%t validation=%s warnings=%s\n",
+					summary.Name, summary.Backend, summary.VolumeBindingMode, summary.AllowVolumeExpansion, summary.ValidationSupport, warnings)
+			}
 		}
 	case "json":
 		encoder := json.NewEncoder(w)
@@ -440,6 +473,67 @@ func (r *PreflightRunner) checkLocalImmediateBinding(ctx context.Context, client
 		return "fail", strings.Join(warnings, "; ")
 	}
 	return "warn", strings.Join(warnings, "; ")
+}
+
+func (r *PreflightRunner) inspectStorageClasses(ctx context.Context, client kubernetes.Interface, pool []datastoreSchema.Datastore) []PreflightStorageClassSummary {
+	storageClasses, err := client.StorageV1().StorageClasses().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil
+	}
+	summaries := make([]PreflightStorageClassSummary, 0)
+	for _, storageClass := range storageClasses.Items {
+		if storageClass.Provisioner != DefaultDriverName {
+			continue
+		}
+		backend := storageClassBackendSummary(r.Config, pool, storageClass)
+		mode := string(volumeBindingMode(storageClass))
+		allowExpansion := false
+		if storageClass.AllowVolumeExpansion != nil {
+			allowExpansion = *storageClass.AllowVolumeExpansion
+		}
+		summary := PreflightStorageClassSummary{
+			Name:                 storageClass.Name,
+			Backend:              backend,
+			VolumeBindingMode:    mode,
+			AllowVolumeExpansion: allowExpansion,
+			ValidationSupport:    validationSupportForBackend(backend),
+		}
+		if backend == "local" && volumeBindingMode(storageClass) != storagev1.VolumeBindingWaitForFirstConsumer {
+			summary.Warnings = append(summary.Warnings, "local datastore should use WaitForFirstConsumer")
+		}
+		if !allowExpansion {
+			summary.Warnings = append(summary.Warnings, "volume expansion disabled")
+		}
+		if backend == "cephfs" && (strings.TrimSpace(storageClass.Parameters["provisionerSecretName"]) == "" || strings.TrimSpace(storageClass.Parameters["provisionerSecretNamespace"]) == "") {
+			summary.Warnings = append(summary.Warnings, "cephfs provisioner secret refs incomplete")
+		}
+		summaries = append(summaries, summary)
+	}
+	return summaries
+}
+
+func validationSupportForBackend(backend string) string {
+	if backend == "cephfs" {
+		return "manual-disabled"
+	}
+	return "manual"
+}
+
+func storageClassBackendSummary(cfg config.CSIPluginConfig, pool []datastoreSchema.Datastore, storageClass storagev1.StorageClass) string {
+	if storageClassUsesLocalBackend(cfg, pool, storageClass) {
+		return "local"
+	}
+	driver := strings.ToLower(strings.TrimSpace(storageClass.Parameters["driver"]))
+	switch driver {
+	case "cephfs":
+		return "cephfs"
+	case "ceph", "rbd":
+		return "ceph-rbd"
+	}
+	if strings.Contains(strings.ToLower(storageClass.Provisioner), "cephfs") {
+		return "cephfs"
+	}
+	return "unknown"
 }
 
 func normalizeLocalImmediateBindingPolicy(cfg config.CSIPluginConfig) string {

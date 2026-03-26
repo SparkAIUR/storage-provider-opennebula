@@ -18,6 +18,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -1100,6 +1101,7 @@ func (s *ControllerServer) hotplugCooldownState(ctx context.Context, node string
 	ready, err := s.volumeProvider.NodeReady(ctx, node)
 	if err == nil && ready {
 		s.driver.hotplugGuard.Clear(node)
+		s.clearHotplugStateSnapshot(ctx, node)
 		return opennebula.HotplugCooldownState{}, false
 	}
 	return cooldown, true
@@ -1156,7 +1158,8 @@ func (s *ControllerServer) handleHotplugTimeout(ctx context.Context, node, volum
 		return
 	}
 
-	s.driver.hotplugGuard.MarkCooldown(node, operation, volume, timeoutErr.Timeout, timeoutErr.LastObservedAttached, timeoutErr.LastObservedReady)
+	state := s.driver.hotplugGuard.MarkCooldown(node, operation, volume, timeoutErr.Timeout, timeoutErr.LastObservedAttached, timeoutErr.LastObservedReady)
+	s.persistHotplugStateSnapshot(ctx, state)
 	s.driver.metrics.RecordHotplugGuard(operation, "timeout_exhausted", "cooldown")
 	s.driver.metrics.RecordHotplugRecovery(operation, "timeout_exhausted", "cooldown")
 	message := fmt.Sprintf(
@@ -1168,6 +1171,31 @@ func (s *ControllerServer) handleHotplugTimeout(ctx context.Context, node, volum
 		timeoutErr.LastObservedReady,
 	)
 	s.recordPVCWarningFromParams(ctx, params, eventReasonHotplugCooldown, message)
+}
+
+func (s *ControllerServer) persistHotplugStateSnapshot(ctx context.Context, state opennebula.HotplugCooldownState) {
+	if s.driver == nil || s.driver.kubeRuntime == nil {
+		return
+	}
+	payload, err := json.Marshal(state)
+	if err != nil {
+		klog.V(2).InfoS("Failed to marshal hotplug cooldown snapshot", "node", state.Node, "err", err)
+		return
+	}
+	if err := s.driver.kubeRuntime.UpsertConfigMapData(ctx, namespaceFromServiceAccount(), hotplugStateConfigMapName, map[string]string{
+		state.Node: string(payload),
+	}); err != nil {
+		klog.V(2).InfoS("Failed to persist hotplug cooldown snapshot", "node", state.Node, "err", err)
+	}
+}
+
+func (s *ControllerServer) clearHotplugStateSnapshot(ctx context.Context, node string) {
+	if s.driver == nil || s.driver.kubeRuntime == nil {
+		return
+	}
+	if err := s.driver.kubeRuntime.DeleteConfigMapKey(ctx, namespaceFromServiceAccount(), hotplugStateConfigMapName, node); err != nil {
+		klog.V(2).InfoS("Failed to clear hotplug cooldown snapshot", "node", node, "err", err)
+	}
 }
 
 // TODO: Implement methods specified in https://github.com/container-storage-interface/spec/blob/98819c45a37a67e0cd466bd02b813faf91af4e45/spec.md#controller-service-rpc

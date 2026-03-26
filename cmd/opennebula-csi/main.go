@@ -44,16 +44,16 @@ var (
 	preflightProvisionerSecrets = flag.String("preflight-provisioner-secrets", "", "Comma-separated namespace/name secret references for CephFS provisioner validation")
 	requireSnapshotCRDs         = flag.Bool("require-snapshot-crds", false, "Require snapshot.storage.k8s.io CRDs during preflight")
 	requireServiceMonitorCRDs   = flag.Bool("require-servicemonitor-crds", false, "Require monitoring.coreos.com ServiceMonitor CRD during preflight")
+	inventoryValidateDatastore  = flag.Int("datastore-id", 0, "OpenNebula datastore ID for inventory-validate mode")
+	inventoryValidateSC         = flag.String("storage-class", "", "StorageClass to use for inventory-validate mode")
+	inventoryValidateSize       = flag.String("size", "", "Validation PVC size for inventory-validate mode")
+	inventoryValidateFioArgs    = flag.String("fio-args", "", "Comma-separated fio args for inventory-validate mode")
 )
 
 func main() {
 	klog.InitFlags(nil)
 	_ = flag.Set("logtostderr", "true")
 	flag.Parse()
-
-	if *nodeID == "" {
-		klog.Warning("nodeid is empty")
-	}
 
 	config := config.LoadConfiguration()
 
@@ -125,6 +125,23 @@ func handle(cfg config.CSIPluginConfig) int {
 			DefaultImage:      defaultImage,
 		}); err != nil {
 			klog.Errorf("Inventory controller failed: %v", err)
+			return 1
+		}
+		return 0
+	case "inventory-validate":
+		if err := driver.RunInventoryValidateCommand(ctx, cfg, driver.InventoryValidateOptions{
+			DatastoreID:  *inventoryValidateDatastore,
+			StorageClass: *inventoryValidateSC,
+			Size:         *inventoryValidateSize,
+			FioArgs:      splitCSV(*inventoryValidateFioArgs),
+		}, os.Stdout); err != nil {
+			klog.Errorf("Inventory validation failed: %v", err)
+			return 1
+		}
+		return 0
+	case "support-bundle":
+		if err := driver.RunSupportBundleCommand(ctx, cfg, os.Stdout); err != nil {
+			klog.Errorf("Support bundle failed: %v", err)
 			return 1
 		}
 		return 0

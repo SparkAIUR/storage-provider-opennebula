@@ -9,10 +9,16 @@ const (
 	DatastoreValidationModeDisabled = "Disabled"
 	DatastoreValidationModeManual   = "Manual"
 
-	DatastorePhaseReady    = "Ready"
-	DatastorePhaseDegraded = "Degraded"
-	DatastorePhaseDisabled = "Disabled"
-	DatastorePhaseNotFound = "NotFound"
+	DatastorePhaseEnabled     = "Enabled"
+	DatastorePhaseAvailable   = "Available"
+	DatastorePhaseDisabled    = "Disabled"
+	DatastorePhaseUnavailable = "Unavailable"
+
+	DatastoreHealthHealthy         = "Healthy"
+	DatastoreHealthBackendMismatch = "BackendMismatch"
+	DatastoreHealthNotFound        = "NotFound"
+	DatastoreHealthLookupFailed    = "LookupFailed"
+	DatastoreHealthInvalid         = "Invalid"
 
 	NodePhaseReady    = "Ready"
 	NodePhaseDegraded = "Degraded"
@@ -56,11 +62,13 @@ type OpenNebulaDatastoreDiscoverySpec struct {
 }
 
 type OpenNebulaDatastoreSpec struct {
-	DisplayName string                            `json:"displayName,omitempty"`
-	Enabled     bool                              `json:"enabled,omitempty"`
-	Validation  OpenNebulaDatastoreValidationSpec `json:"validation,omitempty"`
-	Discovery   OpenNebulaDatastoreDiscoverySpec  `json:"discovery"`
-	Notes       string                            `json:"notes,omitempty"`
+	DisplayName        string                            `json:"displayName,omitempty"`
+	Enabled            bool                              `json:"enabled,omitempty"`
+	MaintenanceMode    bool                              `json:"maintenanceMode,omitempty"`
+	MaintenanceMessage string                            `json:"maintenanceMessage,omitempty"`
+	Validation         OpenNebulaDatastoreValidationSpec `json:"validation,omitempty"`
+	Discovery          OpenNebulaDatastoreDiscoverySpec  `json:"discovery"`
+	Notes              string                            `json:"notes,omitempty"`
 }
 
 type OpenNebulaDatastoreOpenNebulaStatus struct {
@@ -90,6 +98,14 @@ type OpenNebulaDatastoreUsageStatus struct {
 	BoundClaims           []ObjectRefSummary `json:"boundClaims,omitempty"`
 }
 
+type StorageClassDetail struct {
+	Name                 string   `json:"name,omitempty"`
+	VolumeBindingMode    string   `json:"volumeBindingMode,omitempty"`
+	AllowVolumeExpansion bool     `json:"allowVolumeExpansion,omitempty"`
+	BackendCompatible    bool     `json:"backendCompatible,omitempty"`
+	Warnings             []string `json:"warnings,omitempty"`
+}
+
 type ValidationResult struct {
 	ReadIops         *int64 `json:"readIops,omitempty"`
 	WriteIops        *int64 `json:"writeIops,omitempty"`
@@ -110,14 +126,29 @@ type OpenNebulaDatastoreValidationStatus struct {
 }
 
 type OpenNebulaDatastoreStatus struct {
-	ObservedGeneration int64                               `json:"observedGeneration,omitempty"`
-	Phase              string                              `json:"phase,omitempty"`
-	Backend            string                              `json:"backend,omitempty"`
-	OpenNebula         OpenNebulaDatastoreOpenNebulaStatus `json:"opennebula,omitempty"`
-	Capacity           OpenNebulaDatastoreCapacityStatus   `json:"capacity,omitempty"`
-	Usage              OpenNebulaDatastoreUsageStatus      `json:"usage,omitempty"`
-	Validation         OpenNebulaDatastoreValidationStatus `json:"validation,omitempty"`
-	Conditions         []metav1.Condition                  `json:"conditions,omitempty"`
+	ObservedGeneration       int64                               `json:"observedGeneration,omitempty"`
+	Phase                    string                              `json:"phase,omitempty"`
+	Health                   string                              `json:"health,omitempty"`
+	ID                       int                                 `json:"id,omitempty"`
+	Name                     string                              `json:"name,omitempty"`
+	Type                     string                              `json:"type,omitempty"`
+	Backend                  string                              `json:"backend,omitempty"`
+	CapacityDisplay          string                              `json:"capacityDisplay,omitempty"`
+	StorageClassesDisplay    string                              `json:"storageClassesDisplay,omitempty"`
+	MetricsDisplay           string                              `json:"metricsDisplay,omitempty"`
+	ReferencedByStorageClass bool                                `json:"referencedByStorageClass,omitempty"`
+	ReferenceCount           int32                               `json:"referenceCount,omitempty"`
+	ValidationEligible       bool                                `json:"validationEligible,omitempty"`
+	ValidationLastOutcome    string                              `json:"validationLastOutcome,omitempty"`
+	LastValidationAge        string                              `json:"lastValidationAge,omitempty"`
+	LastValidationPhase      string                              `json:"lastValidationPhase,omitempty"`
+	LastValidationSummary    string                              `json:"lastValidationSummary,omitempty"`
+	OpenNebula               OpenNebulaDatastoreOpenNebulaStatus `json:"opennebula,omitempty"`
+	Capacity                 OpenNebulaDatastoreCapacityStatus   `json:"capacity,omitempty"`
+	Usage                    OpenNebulaDatastoreUsageStatus      `json:"usage,omitempty"`
+	StorageClassDetails      []StorageClassDetail                `json:"storageClassDetails,omitempty"`
+	Validation               OpenNebulaDatastoreValidationStatus `json:"validation,omitempty"`
+	Conditions               []metav1.Condition                  `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -200,13 +231,17 @@ type OpenNebulaNodeHotplugStatus struct {
 }
 
 type OpenNebulaNodeStatus struct {
-	ObservedGeneration int64                          `json:"observedGeneration,omitempty"`
-	Phase              string                         `json:"phase,omitempty"`
-	Kubernetes         OpenNebulaNodeKubernetesStatus `json:"kubernetes,omitempty"`
-	OpenNebula         OpenNebulaNodeOpenNebulaStatus `json:"opennebula,omitempty"`
-	Storage            OpenNebulaNodeStorageStatus    `json:"storage,omitempty"`
-	Hotplug            OpenNebulaNodeHotplugStatus    `json:"hotplug,omitempty"`
-	Conditions         []metav1.Condition             `json:"conditions,omitempty"`
+	ObservedGeneration           int64                          `json:"observedGeneration,omitempty"`
+	Phase                        string                         `json:"phase,omitempty"`
+	DisplayState                 string                         `json:"displayState,omitempty"`
+	ActiveHotplugPressure        int32                          `json:"activeHotplugPressure,omitempty"`
+	SystemDatastoreDisplay       string                         `json:"systemDatastoreDisplay,omitempty"`
+	AttachedVolumeHandlesDisplay string                         `json:"attachedVolumeHandlesDisplay,omitempty"`
+	Kubernetes                   OpenNebulaNodeKubernetesStatus `json:"kubernetes,omitempty"`
+	OpenNebula                   OpenNebulaNodeOpenNebulaStatus `json:"opennebula,omitempty"`
+	Storage                      OpenNebulaNodeStorageStatus    `json:"storage,omitempty"`
+	Hotplug                      OpenNebulaNodeHotplugStatus    `json:"hotplug,omitempty"`
+	Conditions                   []metav1.Condition             `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true

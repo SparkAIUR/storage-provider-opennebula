@@ -66,57 +66,72 @@ Create chart name and version as used by the chart label.
 {{- end }}
 
 {{- define "opennebula-csi.driverCommonEnv" -}}
-{{- $inventory := (get .Values "inventoryController") | default dict -}}
+{{- $root := . -}}
+{{- $inventoryEnabledOverrideSet := false -}}
+{{- $inventoryEnabledOverride := false -}}
+{{- if kindIs "map" . -}}
+  {{- if hasKey . "context" -}}
+    {{- $root = get . "context" -}}
+  {{- end -}}
+  {{- if hasKey . "inventoryEnabledOverride" -}}
+    {{- $inventoryEnabledOverrideSet = true -}}
+    {{- $inventoryEnabledOverride = (get . "inventoryEnabledOverride") -}}
+  {{- end -}}
+{{- end -}}
+{{- $inventory := (get $root.Values "inventoryController") | default dict -}}
 {{- $inventoryResync := (get $inventory "resyncSeconds") | default dict -}}
 {{- $inventoryValidation := (get $inventory "validation") | default dict -}}
 - name: ONE_XMLRPC
-  value: {{ .Values.oneApiEndpoint | quote }}
+  value: {{ $root.Values.oneApiEndpoint | quote }}
 - name: ONE_AUTH
   valueFrom:
     secretKeyRef:
-      name: {{ include "opennebula-csi.authSecretName" . }}
-      key: {{ include "opennebula-csi.authSecretKey" . }}
+      name: {{ include "opennebula-csi.authSecretName" $root }}
+      key: {{ include "opennebula-csi.authSecretKey" $root }}
 {{- $inventoryEnabled := (get $inventory "enabled") | default false -}}
+{{- if $inventoryEnabledOverrideSet -}}
+{{- $inventoryEnabled = $inventoryEnabledOverride -}}
+{{- end -}}
 {{- $inventoryAuthorityMode := (get $inventory "authorityMode") | default "strict" -}}
 {{- $inventoryResyncDatastores := (get $inventoryResync "datastores") | default 60 -}}
 {{- $inventoryResyncNodes := (get $inventoryResync "nodes") | default 30 -}}
 {{- $inventoryLeaderElectionID := (get $inventory "leaderElectionID") | default "opennebula-csi-inventory-controller" -}}
 {{- $inventoryNamespace := (get $inventory "namespace") | default "" -}}
 {{- if eq (trim (printf "%v" $inventoryNamespace)) "" -}}
-{{- $inventoryNamespace = include "opennebula-csi.namespace" . -}}
+{{- $inventoryNamespace = include "opennebula-csi.namespace" $root -}}
 {{- end }}
 {{- $inventoryValidationEnabled := (get $inventoryValidation "enabled") | default true -}}
 {{- $inventoryValidationDefaultImage := (get $inventoryValidation "defaultImage") | default "ghcr.io/axboe/fio:latest" -}}
-{{- if .Values.driver.defaultDatastores }}
+{{- if $root.Values.driver.defaultDatastores }}
 - name: ONE_CSI_DEFAULT_DATASTORES
-  value: {{ join "," .Values.driver.defaultDatastores | quote }}
+  value: {{ join "," $root.Values.driver.defaultDatastores | quote }}
 {{- end }}
-{{- if .Values.driver.datastoreSelectionPolicy }}
+{{- if $root.Values.driver.datastoreSelectionPolicy }}
 - name: ONE_CSI_DATASTORE_SELECTION_POLICY
-  value: {{ .Values.driver.datastoreSelectionPolicy | quote }}
+  value: {{ $root.Values.driver.datastoreSelectionPolicy | quote }}
 {{- end }}
-{{- if .Values.driver.allowedDatastoreTypes }}
+{{- if $root.Values.driver.allowedDatastoreTypes }}
 - name: ONE_CSI_ALLOWED_DATASTORE_TYPES
-  value: {{ join "," .Values.driver.allowedDatastoreTypes | quote }}
+  value: {{ join "," $root.Values.driver.allowedDatastoreTypes | quote }}
 {{- end }}
-{{- if .Values.metrics.driver.enabled }}
+{{- if $root.Values.metrics.driver.enabled }}
 - name: ONE_CSI_METRICS_ENDPOINT
-  value: {{ printf ":%v" .Values.metrics.driver.port | quote }}
+  value: {{ printf ":%v" $root.Values.metrics.driver.port | quote }}
 {{- end }}
 - name: ONE_CSI_VM_HOTPLUG_TIMEOUT_SECONDS
-  value: {{ .Values.driver.vmHotplugTimeoutSeconds | quote }}
+  value: {{ $root.Values.driver.vmHotplugTimeoutSeconds | quote }}
 - name: ONE_CSI_VM_HOTPLUG_TIMEOUT_BASE_SECONDS
-  value: {{ .Values.driver.vmHotplugTimeoutBaseSeconds | quote }}
+  value: {{ $root.Values.driver.vmHotplugTimeoutBaseSeconds | quote }}
 - name: ONE_CSI_VM_HOTPLUG_TIMEOUT_PER_100GI_SECONDS
-  value: {{ .Values.driver.vmHotplugTimeoutPer100GiSeconds | quote }}
+  value: {{ $root.Values.driver.vmHotplugTimeoutPer100GiSeconds | quote }}
 - name: ONE_CSI_VM_HOTPLUG_TIMEOUT_MAX_SECONDS
-  value: {{ .Values.driver.vmHotplugTimeoutMaxSeconds | quote }}
+  value: {{ $root.Values.driver.vmHotplugTimeoutMaxSeconds | quote }}
 - name: ONE_CSI_VM_HOTPLUG_STUCK_VM_COOLDOWN_SECONDS
-  value: {{ .Values.driver.vmHotplugStuckVmCooldownSeconds | quote }}
+  value: {{ $root.Values.driver.vmHotplugStuckVmCooldownSeconds | quote }}
 - name: ONE_CSI_NODE_DEVICE_DISCOVERY_TIMEOUT_SECONDS
-  value: {{ .Values.driver.nodeDeviceDiscoveryTimeoutSeconds | quote }}
+  value: {{ $root.Values.driver.nodeDeviceDiscoveryTimeoutSeconds | quote }}
 - name: ONE_CSI_PREFLIGHT_LOCAL_IMMEDIATE_BINDING_POLICY
-  value: {{ .Values.preflight.localImmediateBindingPolicy | quote }}
+  value: {{ $root.Values.preflight.localImmediateBindingPolicy | quote }}
 - name: ONE_CSI_INVENTORY_CONTROLLER_ENABLED
   value: {{ $inventoryEnabled | quote }}
 - name: ONE_CSI_INVENTORY_DATASTORE_AUTHORITY_MODE
@@ -134,8 +149,8 @@ Create chart name and version as used by the chart label.
 - name: ONE_CSI_INVENTORY_VALIDATION_DEFAULT_IMAGE
   value: {{ $inventoryValidationDefaultImage | quote }}
 - name: ONE_CSI_FEATURE_GATES
-  value: "compatibilityAwareSelection={{ .Values.featureGates.compatibilityAwareSelection }},detachedDiskExpansion={{ .Values.featureGates.detachedDiskExpansion }},cephfsExpansion={{ .Values.featureGates.cephfsExpansion }},cephfsSnapshots={{ .Values.featureGates.cephfsSnapshots }},cephfsClones={{ .Values.featureGates.cephfsClones }},cephfsSelfHealing={{ .Values.featureGates.cephfsSelfHealing }},topologyAccessibility={{ .Values.featureGates.topologyAccessibility }}"
-{{- with .Values.driver.env }}
+  value: "compatibilityAwareSelection={{ $root.Values.featureGates.compatibilityAwareSelection }},detachedDiskExpansion={{ $root.Values.featureGates.detachedDiskExpansion }},cephfsExpansion={{ $root.Values.featureGates.cephfsExpansion }},cephfsSnapshots={{ $root.Values.featureGates.cephfsSnapshots }},cephfsClones={{ $root.Values.featureGates.cephfsClones }},cephfsSelfHealing={{ $root.Values.featureGates.cephfsSelfHealing }},topologyAccessibility={{ $root.Values.featureGates.topologyAccessibility }}"
+{{- with $root.Values.driver.env }}
 {{ toYaml . }}
 {{- end }}
 {{- end }}

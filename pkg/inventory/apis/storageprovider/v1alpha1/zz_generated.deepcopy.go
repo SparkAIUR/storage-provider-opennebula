@@ -90,6 +90,22 @@ func (in *OpenNebulaDatastoreUsageStatus) DeepCopyInto(out *OpenNebulaDatastoreU
 	}
 }
 
+func (in *StorageClassDetail) DeepCopyInto(out *StorageClassDetail) {
+	*out = *in
+	if in.Warnings != nil {
+		out.Warnings = append([]string(nil), in.Warnings...)
+	}
+}
+
+func (in *StorageClassDetail) DeepCopy() *StorageClassDetail {
+	if in == nil {
+		return nil
+	}
+	out := new(StorageClassDetail)
+	in.DeepCopyInto(out)
+	return out
+}
+
 func (in *ValidationResult) DeepCopyInto(out *ValidationResult) {
 	*out = *in
 	if in.ReadIops != nil {
@@ -136,6 +152,12 @@ func (in *OpenNebulaDatastoreStatus) DeepCopyInto(out *OpenNebulaDatastoreStatus
 	in.OpenNebula.DeepCopyInto(&out.OpenNebula)
 	in.Capacity.DeepCopyInto(&out.Capacity)
 	in.Usage.DeepCopyInto(&out.Usage)
+	if in.StorageClassDetails != nil {
+		out.StorageClassDetails = make([]StorageClassDetail, len(in.StorageClassDetails))
+		for i := range in.StorageClassDetails {
+			in.StorageClassDetails[i].DeepCopyInto(&out.StorageClassDetails[i])
+		}
+	}
 	in.Validation.DeepCopyInto(&out.Validation)
 	if in.Conditions != nil {
 		out.Conditions = make([]metav1.Condition, len(in.Conditions))

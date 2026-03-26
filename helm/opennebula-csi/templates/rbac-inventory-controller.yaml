@@ -13,7 +13,7 @@ metadata:
   name: {{ printf "%s-inventory-role" (include "opennebula-csi.fullname" .) }}
 rules:
   - apiGroups: [""]
-    resources: ["nodes", "persistentvolumes", "persistentvolumeclaims", "pods", "pods/log", "events"]
+    resources: ["nodes", "persistentvolumes", "persistentvolumeclaims", "pods", "pods/log", "events", "configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses", "volumeattachments"]

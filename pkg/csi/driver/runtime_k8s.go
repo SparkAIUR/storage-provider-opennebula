@@ -10,8 +10,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -50,6 +50,8 @@ type KubeRuntime struct {
 	recorder record.EventRecorder
 	enabled  bool
 }
+
+const hotplugStateConfigMapName = "opennebula-csi-hotplug-state"
 
 func NewKubeRuntime(component string) *KubeRuntime {
 	cfg, err := rest.InClusterConfig()
@@ -163,6 +165,71 @@ func (r *KubeRuntime) GetNodeLabel(ctx context.Context, nodeName, labelKey strin
 	return strings.TrimSpace(node.Labels[labelKey]), nil
 }
 
+func (r *KubeRuntime) UpsertConfigMapData(ctx context.Context, namespace, name string, data map[string]string) error {
+	if r == nil || !r.enabled {
+		return fmt.Errorf("kubernetes runtime is not enabled")
+	}
+	if namespace == "" {
+		namespace = namespaceFromServiceAccount()
+	}
+	cmClient := r.client.CoreV1().ConfigMaps(namespace)
+	current, err := cmClient.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			return err
+		}
+		_, err = cmClient.Create(ctx, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Data:       data,
+		}, metav1.CreateOptions{})
+		return err
+	}
+	if current.Data == nil {
+		current.Data = map[string]string{}
+	}
+	for key, value := range data {
+		current.Data[key] = value
+	}
+	_, err = cmClient.Update(ctx, current, metav1.UpdateOptions{})
+	return err
+}
+
+func (r *KubeRuntime) DeleteConfigMapKey(ctx context.Context, namespace, name, key string) error {
+	if r == nil || !r.enabled {
+		return fmt.Errorf("kubernetes runtime is not enabled")
+	}
+	if namespace == "" {
+		namespace = namespaceFromServiceAccount()
+	}
+	cmClient := r.client.CoreV1().ConfigMaps(namespace)
+	current, err := cmClient.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if current.Data == nil {
+		return nil
+	}
+	if _, ok := current.Data[key]; !ok {
+		return nil
+	}
+	delete(current.Data, key)
+	_, err = cmClient.Update(ctx, current, metav1.UpdateOptions{})
+	return err
+}
+
+func (r *KubeRuntime) GetConfigMap(ctx context.Context, namespace, name string) (*corev1.ConfigMap, error) {
+	if r == nil || !r.enabled {
+		return nil, fmt.Errorf("kubernetes runtime is not enabled")
+	}
+	if namespace == "" {
+		namespace = namespaceFromServiceAccount()
+	}
+	return r.client.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
+}
+
 func (r *KubeRuntime) emitNamespacedEvent(ctx context.Context, namespace, name string, uid types.UID, kind, eventType, reason, message string) {
 	if r == nil || !r.enabled || namespace == "" || name == "" {
 		return
@@ -181,13 +248,13 @@ func (r *KubeRuntime) emitNamespacedEvent(ctx context.Context, namespace, name s
 			UID:        uid,
 			APIVersion: "v1",
 		},
-		Reason:             reason,
-		Message:            message,
-		Source:             corev1.EventSource{Component: DefaultDriverName},
-		Type:               eventType,
-		FirstTimestamp:     now,
-		LastTimestamp:      now,
-		Count:              1,
+		Reason:              reason,
+		Message:             message,
+		Source:              corev1.EventSource{Component: DefaultDriverName},
+		Type:                eventType,
+		FirstTimestamp:      now,
+		LastTimestamp:       now,
+		Count:               1,
 		ReportingController: DefaultDriverName,
 	}
 

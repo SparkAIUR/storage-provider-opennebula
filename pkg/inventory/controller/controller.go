@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,6 +50,7 @@ const (
 	eventReasonInventoryNodeNotFound                   = "NodeNotFound"
 	annotationDatastoreID                              = "storage-provider.opennebula.sparkaiur.io/datastore-id"
 	topologySystemDSLabel                              = "topology.opennebula.sparkaiur.io/system-ds"
+	hotplugStateConfigMapName                          = "opennebula-csi-hotplug-state"
 	defaultValidationImagePullPolicy corev1.PullPolicy = corev1.PullIfNotPresent
 )
 
@@ -219,9 +221,20 @@ func (s *Syncer) syncDatastores(ctx context.Context) error {
 		status := item.DeepCopy()
 		if !ok {
 			status.Status = inventoryv1alpha1.OpenNebulaDatastoreStatus{
-				ObservedGeneration: item.Generation,
-				Phase:              inventoryv1alpha1.DatastorePhaseNotFound,
-				Backend:            item.Spec.Discovery.ExpectedBackend,
+				ObservedGeneration:    item.Generation,
+				Phase:                 inventoryv1alpha1.DatastorePhaseUnavailable,
+				Health:                inventoryv1alpha1.DatastoreHealthNotFound,
+				ID:                    item.Spec.Discovery.OpenNebulaDatastoreID,
+				Name:                  datastoreDisplayName(item, item.Status.OpenNebula),
+				Backend:               item.Spec.Discovery.ExpectedBackend,
+				CapacityDisplay:       unknownCapacityDisplay,
+				StorageClassesDisplay: "-",
+				MetricsDisplay:        validationMetricsDisplay(item.Status.Validation),
+				ValidationLastOutcome: validationLastOutcome(item.Status.Validation),
+				LastValidationAge:     validationAgeDisplay(item.Status.Validation),
+				LastValidationPhase:   validationPhaseDisplay(item.Status.Validation),
+				LastValidationSummary: validationSummaryDisplay(item.Status.Validation),
+				Validation:            item.Status.Validation,
 				Conditions: []metav1.Condition{
 					newCondition("Discovered", metav1.ConditionFalse, "DatastoreMissing", "Datastore was not found in OpenNebula"),
 				},
@@ -280,6 +293,7 @@ func (s *Syncer) syncNodes(ctx context.Context) error {
 	for _, ds := range datastores.Datastores {
 		dsNames[ds.ID] = ds.Name
 	}
+	hotplugStates, _ := s.loadHotplugStateMap(ctx)
 
 	nodeByName := make(map[string]corev1.Node, len(nodes.Items))
 	for _, node := range nodes.Items {
@@ -293,6 +307,7 @@ func (s *Syncer) syncNodes(ctx context.Context) error {
 			status.Status = inventoryv1alpha1.OpenNebulaNodeStatus{
 				ObservedGeneration: item.Generation,
 				Phase:              inventoryv1alpha1.NodePhaseNotFound,
+				DisplayState:       "NodeMissing",
 				Conditions: []metav1.Condition{
 					newCondition("KubernetesNodeFound", metav1.ConditionFalse, "NodeMissing", "Kubernetes node was not found"),
 				},
@@ -302,7 +317,7 @@ func (s *Syncer) syncNodes(ctx context.Context) error {
 			}
 			continue
 		}
-		nextStatus := s.buildNodeStatus(ctx, item, node, vas.Items, pvByName, dsNames)
+		nextStatus := s.buildNodeStatus(ctx, item, node, vas.Items, pvByName, dsNames, hotplugStates)
 		status.Status = nextStatus
 		if err := s.client.Status().Update(ctx, status); err != nil {
 			return err
@@ -373,6 +388,9 @@ func (s *Syncer) buildDatastoreStatus(item inventoryv1alpha1.OpenNebulaDatastore
 	normalized := normalizeDatastore(ds)
 	status := inventoryv1alpha1.OpenNebulaDatastoreStatus{
 		ObservedGeneration: item.Generation,
+		ID:                 normalized.ID,
+		Name:               datastoreDisplayName(item, inventoryv1alpha1.OpenNebulaDatastoreOpenNebulaStatus{ID: normalized.ID, Name: normalized.Name, Type: normalized.Type}),
+		Type:               normalized.Type,
 		Backend:            normalized.Backend,
 		OpenNebula: inventoryv1alpha1.OpenNebulaDatastoreOpenNebulaStatus{
 			ID:                         normalized.ID,
@@ -427,32 +445,33 @@ func (s *Syncer) buildDatastoreStatus(item inventoryv1alpha1.OpenNebulaDatastore
 			}
 		}
 	}
+	referencedByStorageClass := false
 	for _, sc := range scs {
 		if storageClassUsesDatastore(sc, normalized.ID) {
 			storageClasses[sc.Name] = struct{}{}
+			referencedByStorageClass = true
 		}
 	}
 	status.Usage.StorageClasses = sortedKeys(storageClasses)
-
-	phase := inventoryv1alpha1.DatastorePhaseReady
-	if !item.Spec.Enabled || !item.Spec.Discovery.Allowed {
-		phase = inventoryv1alpha1.DatastorePhaseDisabled
-	}
-	if item.Spec.Discovery.ExpectedBackend != "" && item.Spec.Discovery.ExpectedBackend != "unknown" && item.Spec.Discovery.ExpectedBackend != normalized.Backend {
-		phase = inventoryv1alpha1.DatastorePhaseDegraded
-	}
-	status.Phase = phase
+	status.ReferencedByStorageClass = referencedByStorageClass
+	status.ReferenceCount = int32(len(status.Usage.StorageClasses))
 	status.Validation = item.Status.Validation
-	status.Conditions = []metav1.Condition{
-		newCondition("Discovered", metav1.ConditionTrue, "DatastoreFound", "Datastore was discovered in OpenNebula"),
-		newCondition("ProvisioningEnabled", boolCondition(item.Spec.Enabled && item.Spec.Discovery.Allowed), "ProvisioningEvaluated", "Datastore provisioning eligibility evaluated"),
-		newCondition("BackendMatch", boolCondition(item.Spec.Discovery.ExpectedBackend == "" || item.Spec.Discovery.ExpectedBackend == "unknown" || item.Spec.Discovery.ExpectedBackend == normalized.Backend), "BackendEvaluated", "Datastore backend compatibility evaluated"),
-		newCondition("CapacityReported", metav1.ConditionTrue, "CapacityObserved", "Datastore capacity reported from OpenNebula"),
-	}
+	status.StorageClassesDisplay = storageClassesDisplay(status.Usage.StorageClasses)
+	status.CapacityDisplay = formatCapacityDisplay(status.Capacity.FreeBytes, status.Capacity.TotalBytes)
+	status.MetricsDisplay = validationMetricsDisplay(status.Validation)
+	status.Health = datastoreHealthForDisplay(status.Capacity.TotalBytes, item.Spec.Discovery.ExpectedBackend, normalized.Backend)
+	status.Phase = datastorePhaseForDisplay(status.Health, item.Spec.Enabled, item.Spec.Discovery.Allowed, item.Spec.MaintenanceMode, referencedByStorageClass)
+	status.ValidationEligible = validationEligible(item, normalized.Backend)
+	status.ValidationLastOutcome = validationLastOutcome(status.Validation)
+	status.LastValidationAge = validationAgeDisplay(status.Validation)
+	status.LastValidationPhase = validationPhaseDisplay(status.Validation)
+	status.LastValidationSummary = validationSummaryDisplay(status.Validation)
+	status.StorageClassDetails = buildStorageClassDetails(scs, normalized)
+	status.Conditions = datastoreConditions(item, normalized, status)
 	return status
 }
 
-func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.OpenNebulaNode, node corev1.Node, vas []storagev1.VolumeAttachment, pvByName map[string]corev1.PersistentVolume, datastoreNames map[int]string) inventoryv1alpha1.OpenNebulaNodeStatus {
+func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.OpenNebulaNode, node corev1.Node, vas []storagev1.VolumeAttachment, pvByName map[string]corev1.PersistentVolume, datastoreNames map[int]string, hotplugStates map[string]opennebula.HotplugCooldownState) inventoryv1alpha1.OpenNebulaNodeStatus {
 	status := inventoryv1alpha1.OpenNebulaNodeStatus{
 		ObservedGeneration: item.Generation,
 		Kubernetes: inventoryv1alpha1.OpenNebulaNodeKubernetesStatus{
@@ -476,6 +495,7 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 	vmID, err := s.ctrl.VMs().ByName(vmName)
 	if err != nil {
 		status.Phase = inventoryv1alpha1.NodePhaseNotFound
+		status.DisplayState = "VMNotFound"
 		status.Conditions = []metav1.Condition{
 			newCondition("KubernetesNodeFound", metav1.ConditionTrue, "NodeFound", "Kubernetes node was found"),
 			newCondition("OpenNebulaVMFound", metav1.ConditionFalse, "VMNotFound", "OpenNebula VM was not found"),
@@ -485,6 +505,7 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 	vmInfo, err := s.ctrl.VM(vmID).InfoContext(ctx, true)
 	if err != nil {
 		status.Phase = inventoryv1alpha1.NodePhaseDegraded
+		status.DisplayState = "VMNotReady"
 		status.Conditions = []metav1.Condition{
 			newCondition("KubernetesNodeFound", metav1.ConditionTrue, "NodeFound", "Kubernetes node was found"),
 			newCondition("OpenNebulaVMFound", metav1.ConditionFalse, "VMLookupFailed", "OpenNebula VM lookup failed"),
@@ -512,11 +533,26 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 	}
 	status.Hotplug.Ready = vmLCM == vmSchema.Running
 	status.Hotplug.InCooldown = false
+	if systemDSID != 0 || status.OpenNebula.SystemDatastoreName != "" {
+		status.SystemDatastoreDisplay = fmt.Sprintf("%d:%s", systemDSID, status.OpenNebula.SystemDatastoreName)
+	}
+	if state, ok := hotplugStates[node.Name]; ok {
+		status.Hotplug.InCooldown = true
+		expires := metav1.NewTime(state.ExpiresAt)
+		status.Hotplug.CooldownExpiresAt = &expires
+		status.Hotplug.LastCooldownOperation = state.Operation
+		status.Hotplug.LastCooldownVolume = state.Volume
+		attached := state.LastObservedAttached
+		ready := state.LastObservedReady
+		status.Hotplug.LastObservedAttached = &attached
+		status.Hotplug.LastObservedReady = &ready
+	}
 
 	for _, va := range vas {
 		if va.Spec.NodeName != node.Name || va.Spec.Source.PersistentVolumeName == nil {
 			continue
 		}
+		status.ActiveHotplugPressure++
 		pv, ok := pvByName[*va.Spec.Source.PersistentVolumeName]
 		if !ok || pv.Spec.CSI == nil {
 			continue
@@ -534,6 +570,8 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 		}
 		status.Storage.AttachedPersistentDisks = append(status.Storage.AttachedPersistentDisks, summary)
 	}
+	sort.Strings(status.Storage.AttachedVolumeIDs)
+	status.AttachedVolumeHandlesDisplay = attachedVolumeHandlesDisplay(status.Storage.AttachedVolumeIDs)
 
 	phase := inventoryv1alpha1.NodePhaseReady
 	if !item.Spec.Enabled {
@@ -542,11 +580,13 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 		phase = inventoryv1alpha1.NodePhaseDegraded
 	}
 	status.Phase = phase
+	status.DisplayState = nodeDisplayState(item.Spec.Enabled, status.Hotplug.InCooldown, status.Hotplug.Ready)
 	status.Conditions = []metav1.Condition{
 		newCondition("KubernetesNodeFound", metav1.ConditionTrue, "NodeFound", "Kubernetes node was found"),
 		newCondition("OpenNebulaVMFound", metav1.ConditionTrue, "VMFound", "OpenNebula VM was found"),
 		newCondition("VMReady", boolCondition(status.Hotplug.Ready), "VMReadinessEvaluated", "OpenNebula VM readiness evaluated"),
 		newCondition("TopologyResolved", boolCondition(status.Storage.TopologySystemDatastore != ""), "TopologyEvaluated", "Topology label evaluated"),
+		newCondition("HotplugCooldown", boolCondition(status.Hotplug.InCooldown), boolReason(status.Hotplug.InCooldown, "CooldownActive", "CooldownClear"), "Controller hotplug cooldown state evaluated"),
 	}
 	return status
 }
@@ -790,7 +830,7 @@ func normalizeDatastore(ds datastoreSchema.Datastore) opennebula.Datastore {
 	return opennebula.Datastore{
 		ID:                         ds.ID,
 		Name:                       ds.Name,
-		Type:                       normalizeDatastoreBackend(ds),
+		Type:                       normalizeDatastoreType(ds),
 		Backend:                    normalizeDatastoreBackend(ds),
 		DSMad:                      strings.ToLower(strings.TrimSpace(ds.DSMad)),
 		TMMad:                      strings.ToLower(strings.TrimSpace(ds.TMMad)),
@@ -804,11 +844,197 @@ func normalizeDatastoreBackend(ds datastoreSchema.Datastore) string {
 	normalized := strings.ToLower(strings.TrimSpace(ds.TMMad))
 	switch normalized {
 	case "ceph":
-		return "ceph"
+		return "ceph-rbd"
 	case "cephfs":
 		return "cephfs"
 	default:
 		return "local"
+	}
+}
+
+func normalizeDatastoreType(ds datastoreSchema.Datastore) string {
+	trimmed := strings.ToUpper(strings.TrimSpace(ds.Type))
+	if trimmed == "" {
+		return "UNKNOWN"
+	}
+	return trimmed
+}
+
+const unknownCapacityDisplay = "Unknown / Unknown (-)"
+
+func datastoreDisplayName(item inventoryv1alpha1.OpenNebulaDatastore, ds inventoryv1alpha1.OpenNebulaDatastoreOpenNebulaStatus) string {
+	if strings.TrimSpace(ds.Name) != "" {
+		return ds.Name
+	}
+	if strings.TrimSpace(item.Spec.DisplayName) != "" {
+		return item.Spec.DisplayName
+	}
+	if ds.ID != 0 {
+		return datastoreObjectName(ds.ID)
+	}
+	return item.Name
+}
+
+func expectedBackendMismatch(expected, actual string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(expected))
+	return trimmed != "" && trimmed != "unknown" && trimmed != strings.ToLower(strings.TrimSpace(actual))
+}
+
+func datastoreHealthForDisplay(totalBytes int64, expectedBackend, actualBackend string) string {
+	if totalBytes <= 0 {
+		return inventoryv1alpha1.DatastoreHealthInvalid
+	}
+	if expectedBackendMismatch(expectedBackend, actualBackend) {
+		return inventoryv1alpha1.DatastoreHealthBackendMismatch
+	}
+	return inventoryv1alpha1.DatastoreHealthHealthy
+}
+
+func datastorePhaseForDisplay(health string, enabled bool, allowed bool, maintenanceMode bool, referencedByStorageClass bool) string {
+	if health != inventoryv1alpha1.DatastoreHealthHealthy {
+		return inventoryv1alpha1.DatastorePhaseUnavailable
+	}
+	if maintenanceMode || !enabled || !allowed {
+		return inventoryv1alpha1.DatastorePhaseDisabled
+	}
+	if referencedByStorageClass {
+		return inventoryv1alpha1.DatastorePhaseEnabled
+	}
+	return inventoryv1alpha1.DatastorePhaseAvailable
+}
+
+func storageClassesDisplay(values []string) string {
+	if len(values) == 0 {
+		return "-"
+	}
+	return strings.Join(values, ",")
+}
+
+func formatCapacityDisplay(freeBytes, totalBytes int64) string {
+	if totalBytes <= 0 {
+		return unknownCapacityDisplay
+	}
+	usedBytes := maxInt64(totalBytes-freeBytes, 0)
+	usedPercent := int(math.Round((float64(usedBytes) / float64(totalBytes)) * 100))
+	return fmt.Sprintf("%s / %s (%d%%)", humanizeBytes(freeBytes), humanizeBytes(totalBytes), usedPercent)
+}
+
+func humanizeBytes(value int64) string {
+	if value <= 0 {
+		return "0 KB"
+	}
+	units := []string{"KB", "MB", "GB", "TB", "PB"}
+	scaled := float64(value) / 1024.0
+	unitIdx := 0
+	for scaled >= 1024.0 && unitIdx < len(units)-1 {
+		scaled /= 1024.0
+		unitIdx++
+	}
+	return fmt.Sprintf("%d %s", int(math.Round(scaled)), units[unitIdx])
+}
+
+func validationMetricsDisplay(status inventoryv1alpha1.OpenNebulaDatastoreValidationStatus) string {
+	if status.Phase != inventoryv1alpha1.ValidationPhaseSucceeded || (status.Result.ReadIops == nil && status.Result.WriteIops == nil && status.Result.LatencyP99Micros == nil) {
+		return "-"
+	}
+	return fmt.Sprintf("R:%s W:%s p99:%s", compactIOPS(status.Result.ReadIops), compactIOPS(status.Result.WriteIops), humanizeLatency(status.Result.LatencyP99Micros))
+}
+
+func validationEligible(ds inventoryv1alpha1.OpenNebulaDatastore, backend string) bool {
+	return ds.Spec.Validation.Mode == inventoryv1alpha1.DatastoreValidationModeManual && backend != "cephfs"
+}
+
+func validationLastOutcome(status inventoryv1alpha1.OpenNebulaDatastoreValidationStatus) string {
+	switch status.Phase {
+	case inventoryv1alpha1.ValidationPhaseSucceeded:
+		return "Succeeded"
+	case inventoryv1alpha1.ValidationPhaseFailed:
+		return "Failed"
+	case inventoryv1alpha1.ValidationPhaseRunning:
+		return "Running"
+	default:
+		return "Unknown"
+	}
+}
+
+func validationPhaseDisplay(status inventoryv1alpha1.OpenNebulaDatastoreValidationStatus) string {
+	if strings.TrimSpace(status.Phase) == "" {
+		return inventoryv1alpha1.ValidationPhaseIdle
+	}
+	return status.Phase
+}
+
+func validationAgeDisplay(status inventoryv1alpha1.OpenNebulaDatastoreValidationStatus) string {
+	if status.LastCompletedTime != nil {
+		return humanizeDurationSince(status.LastCompletedTime.Time)
+	}
+	if status.LastRunTime != nil {
+		return humanizeDurationSince(status.LastRunTime.Time)
+	}
+	return "-"
+}
+
+func validationSummaryDisplay(status inventoryv1alpha1.OpenNebulaDatastoreValidationStatus) string {
+	metrics := validationMetricsDisplay(status)
+	if metrics != "-" {
+		return metrics
+	}
+	switch status.Phase {
+	case inventoryv1alpha1.ValidationPhaseRunning:
+		return "Running"
+	case inventoryv1alpha1.ValidationPhaseFailed:
+		if strings.TrimSpace(status.Message) != "" {
+			return status.Message
+		}
+		return "Failed"
+	default:
+		return "-"
+	}
+}
+
+func humanizeDurationSince(ts time.Time) string {
+	if ts.IsZero() {
+		return "-"
+	}
+	d := time.Since(ts)
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Round(time.Second).Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Round(time.Minute).Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Round(time.Hour).Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Round(24*time.Hour).Hours()/24))
+	}
+}
+
+func compactIOPS(value *int64) string {
+	if value == nil {
+		return "-"
+	}
+	v := float64(*value)
+	switch {
+	case v >= 1_000_000:
+		return fmt.Sprintf("%dM", int(math.Round(v/1_000_000)))
+	case v >= 1_000:
+		return fmt.Sprintf("%dk", int(math.Round(v/1_000)))
+	default:
+		return fmt.Sprintf("%d", *value)
+	}
+}
+
+func humanizeLatency(micros *int64) string {
+	if micros == nil {
+		return "-"
+	}
+	switch {
+	case *micros < 1_000:
+		return fmt.Sprintf("%dµs", *micros)
+	case *micros < 1_000_000:
+		return fmt.Sprintf("%dms", int(math.Round(float64(*micros)/1_000.0)))
+	default:
+		return fmt.Sprintf("%ds", int(math.Round(float64(*micros)/1_000_000.0)))
 	}
 }
 
@@ -860,6 +1086,149 @@ func storageClassUsesDatastore(sc storagev1.StorageClass, datastoreID int) bool 
 	return false
 }
 
+func datastoreConditions(item inventoryv1alpha1.OpenNebulaDatastore, normalized opennebula.Datastore, status inventoryv1alpha1.OpenNebulaDatastoreStatus) []metav1.Condition {
+	provisioningAllowed := item.Spec.Enabled && item.Spec.Discovery.Allowed && !item.Spec.MaintenanceMode
+	provisioningReason := "ProvisioningEnabled"
+	provisioningMessage := "Datastore accepts new provisioning requests"
+	switch {
+	case item.Spec.MaintenanceMode:
+		provisioningReason = "ProvisioningDisabled"
+		provisioningMessage = maintenanceMessage(item.Spec.MaintenanceMessage)
+	case !item.Spec.Enabled:
+		provisioningReason = "ProvisioningDisabled"
+		provisioningMessage = "Datastore provisioning is disabled"
+	case !item.Spec.Discovery.Allowed:
+		provisioningReason = "DiscoveryDisallowed"
+		provisioningMessage = "Datastore is excluded from CSI provisioning"
+	}
+
+	backendMatch := !expectedBackendMismatch(item.Spec.Discovery.ExpectedBackend, normalized.Backend)
+	backendReason := boolReason(backendMatch, "DatastoreFound", "BackendMismatch")
+	backendMessage := "Datastore backend matches expected backend"
+	if !backendMatch {
+		backendMessage = fmt.Sprintf("Expected backend %q, found %q", item.Spec.Discovery.ExpectedBackend, normalized.Backend)
+	}
+
+	capacityValid := status.Capacity.TotalBytes > 0
+	validationHealthy := status.Validation.Phase != inventoryv1alpha1.ValidationPhaseFailed
+	validationReason := "ValidationPending"
+	validationMessage := "No successful validation result recorded"
+	switch status.Validation.Phase {
+	case inventoryv1alpha1.ValidationPhaseSucceeded:
+		validationReason = "ValidationSucceeded"
+		validationMessage = "Validation completed successfully"
+	case inventoryv1alpha1.ValidationPhaseFailed:
+		validationReason = "ValidationFailed"
+		validationMessage = strings.TrimSpace(status.Validation.Message)
+		if validationMessage == "" {
+			validationMessage = "Validation failed"
+		}
+	case inventoryv1alpha1.ValidationPhaseRunning:
+		validationReason = "ValidationPending"
+		validationMessage = "Validation job is running"
+	}
+
+	referenceReason := "NoStorageClassReference"
+	referenceMessage := "No StorageClass references this datastore"
+	if status.ReferencedByStorageClass {
+		referenceReason = "StorageClassReferenced"
+		referenceMessage = fmt.Sprintf("%d StorageClass reference(s) found", status.ReferenceCount)
+	}
+
+	return []metav1.Condition{
+		newCondition("Discovered", metav1.ConditionTrue, "DatastoreFound", "Datastore was discovered in OpenNebula"),
+		newCondition("ProvisioningEnabled", boolCondition(provisioningAllowed), provisioningReason, provisioningMessage),
+		newCondition("BackendMatch", boolCondition(backendMatch), backendReason, backendMessage),
+		newCondition("CapacityReported", boolCondition(capacityValid), boolReason(capacityValid, "CapacityObserved", "CapacityInvalid"), boolMessage(capacityValid, "Datastore capacity reported from OpenNebula", "Datastore capacity is invalid or unavailable")),
+		newCondition("ValidationHealthy", boolCondition(validationHealthy), validationReason, validationMessage),
+		newCondition("ReferencedByStorageClass", boolCondition(status.ReferencedByStorageClass), referenceReason, referenceMessage),
+	}
+}
+
+func maintenanceMessage(message string) string {
+	if trimmed := strings.TrimSpace(message); trimmed != "" {
+		return trimmed
+	}
+	return "Datastore is in maintenance mode"
+}
+
+func buildStorageClassDetails(scs []storagev1.StorageClass, ds opennebula.Datastore) []inventoryv1alpha1.StorageClassDetail {
+	details := make([]inventoryv1alpha1.StorageClassDetail, 0)
+	for _, sc := range scs {
+		if !storageClassUsesDatastore(sc, ds.ID) {
+			continue
+		}
+		mode := string(storagev1.VolumeBindingImmediate)
+		if sc.VolumeBindingMode != nil {
+			mode = string(*sc.VolumeBindingMode)
+		}
+		allowExpansion := false
+		if sc.AllowVolumeExpansion != nil {
+			allowExpansion = *sc.AllowVolumeExpansion
+		}
+		detail := inventoryv1alpha1.StorageClassDetail{
+			Name:                 sc.Name,
+			VolumeBindingMode:    mode,
+			AllowVolumeExpansion: allowExpansion,
+			BackendCompatible:    storageClassBackendCompatible(sc, ds.Backend),
+		}
+		if ds.Backend == "local" && mode == string(storagev1.VolumeBindingImmediate) {
+			detail.Warnings = append(detail.Warnings, "local datastore uses Immediate binding")
+		}
+		if !allowExpansion {
+			detail.Warnings = append(detail.Warnings, "volume expansion is disabled")
+		}
+		if ds.Backend == "cephfs" && (strings.TrimSpace(sc.Parameters["provisionerSecretName"]) == "" || strings.TrimSpace(sc.Parameters["provisionerSecretNamespace"]) == "") {
+			detail.Warnings = append(detail.Warnings, "cephfs provisioner secret references are incomplete")
+		}
+		if !detail.BackendCompatible {
+			detail.Warnings = append(detail.Warnings, "storage class backend does not match datastore backend")
+		}
+		details = append(details, detail)
+	}
+	sort.Slice(details, func(i, j int) bool {
+		return details[i].Name < details[j].Name
+	})
+	return details
+}
+
+func storageClassBackendCompatible(sc storagev1.StorageClass, backend string) bool {
+	switch backend {
+	case "cephfs":
+		if strings.EqualFold(sc.Parameters["driver"], "cephfs") || strings.Contains(strings.ToLower(sc.Provisioner), "cephfs") {
+			return true
+		}
+	case "ceph-rbd":
+		if strings.EqualFold(sc.Parameters["driver"], "ceph") || strings.EqualFold(sc.Parameters["driver"], "rbd") {
+			return true
+		}
+	}
+	return true
+}
+
+func nodeDisplayState(enabled, inCooldown, ready bool) string {
+	switch {
+	case !enabled:
+		return "Disabled"
+	case inCooldown:
+		return "HotplugCooldown"
+	case !ready:
+		return "VMNotReady"
+	default:
+		return "Ready"
+	}
+}
+
+func attachedVolumeHandlesDisplay(handles []string) string {
+	if len(handles) == 0 {
+		return "-"
+	}
+	if len(handles) <= 3 {
+		return strings.Join(handles, ",")
+	}
+	return fmt.Sprintf("%s (+%d more)", strings.Join(handles[:3], ","), len(handles)-3)
+}
+
 func filteredNodeLabels(labels map[string]string) map[string]string {
 	filtered := make(map[string]string)
 	for key, value := range labels {
@@ -903,6 +1272,20 @@ func boolCondition(value bool) metav1.ConditionStatus {
 		return metav1.ConditionTrue
 	}
 	return metav1.ConditionFalse
+}
+
+func boolReason(value bool, whenTrue, whenFalse string) string {
+	if value {
+		return whenTrue
+	}
+	return whenFalse
+}
+
+func boolMessage(value bool, whenTrue, whenFalse string) string {
+	if value {
+		return whenTrue
+	}
+	return whenFalse
 }
 
 func sortedKeys(values map[string]struct{}) []string {
@@ -966,6 +1349,28 @@ func maxInt64(left, right int64) int64 {
 		return left
 	}
 	return right
+}
+
+func (s *Syncer) loadHotplugStateMap(ctx context.Context) (map[string]opennebula.HotplugCooldownState, error) {
+	cm, err := s.kube.CoreV1().ConfigMaps(s.namespace).Get(ctx, hotplugStateConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return map[string]opennebula.HotplugCooldownState{}, nil
+		}
+		return nil, err
+	}
+	result := make(map[string]opennebula.HotplugCooldownState, len(cm.Data))
+	for node, raw := range cm.Data {
+		var state opennebula.HotplugCooldownState
+		if err := json.Unmarshal([]byte(raw), &state); err != nil {
+			continue
+		}
+		if time.Now().After(state.ExpiresAt) {
+			continue
+		}
+		result[node] = state
+	}
+	return result, nil
 }
 
 func loadInventoryLeaderElectionID(cfg config.CSIPluginConfig) string {

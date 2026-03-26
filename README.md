@@ -683,6 +683,54 @@ The workflow will:
 5. Re-index the Helm repo with `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
 6. Create a GitHub release for the tag
 
+## Inventory Datastore Status
+
+When the inventory controller is enabled, `kubectl get opennebuladatastores` is the operator-facing datastore inventory view.
+
+- object names remain stable as `ds-<id>`
+- the displayed datastore `Name` comes from OpenNebula, not `metadata.name`
+- `Status` values mean:
+  - `Enabled`: healthy and explicitly referenced by at least one StorageClass
+  - `Available`: healthy, not explicitly disabled, and not explicitly referenced by any StorageClass
+  - `Disabled`: explicitly disabled through the datastore object
+  - `Unavailable`: unhealthy, missing, invalid, or backend-mismatched
+- `Capacity` is rendered as `{available} / {total} ({usedPercent}%)`
+- `Metrics` shows a compact fio summary when validation succeeded, otherwise `-`
+
+Validation remains informational only in this release and does not by itself make a datastore unavailable.
+
+## Inventory Operator Controls
+
+- `spec.maintenanceMode=true` disables new provisioning for that datastore without renaming or deleting the object
+- `spec.maintenanceMessage` is surfaced through datastore conditions so operators can see why provisioning is blocked
+- `status.referencedByStorageClass`, `status.referenceCount`, and `status.storageClassDetails` make StorageClass risk visible directly in the CRD
+- local-backed StorageClasses using `Immediate` are flagged in inventory and preflight
+- `kubectl get opennebulanodes` now surfaces `displayState`, `systemDatastoreDisplay`, hotplug cooldown visibility, and attached-volume summaries
+
+## Inventory Commands
+
+The binary now includes two operator-oriented modes in addition to the CSI and inventory-controller modes:
+
+- `inventory-validate`
+  - patches a datastore validation run nonce, waits for completion, and prints a compact JSON summary
+  - example:
+
+```bash
+go run ./cmd/opennebula-csi \
+  --mode=inventory-validate \
+  --datastore-id=111 \
+  --storage-class=opennebula-default-rwo \
+  --size=1Gi
+```
+
+- `support-bundle`
+  - prints a JSON support snapshot including effective config, feature gates, leadership settings, hotplug cooldown snapshots, datastore/node inventory, StorageClass audit data, VolumeAttachments, and recent Events
+  - example:
+
+```bash
+go run ./cmd/opennebula-csi --mode=support-bundle > support-bundle.json
+```
+
 ## Upstream
 
 This project is derived from the OpenNebula storage provider. The fork keeps the Apache 2.0 license and focuses on SparkAI-specific OpenNebula and Omni requirements.

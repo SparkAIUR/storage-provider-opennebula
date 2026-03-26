@@ -108,7 +108,7 @@ func (d *Driver) Run(ctx context.Context) error {
 	d.metrics = NewDriverMetrics(d.version, d.commit)
 	d.kubeRuntime = NewKubeRuntime(d.name)
 
-	if enabled, _ := d.PluginConfig.GetBool(config.InventoryControllerEnabledVar); enabled {
+	if enabled, _ := d.PluginConfig.GetBool(config.InventoryControllerEnabledVar); enabled && strings.TrimSpace(d.nodeID) == "" {
 		restConfig, err := rest.InClusterConfig()
 		if err != nil {
 			return fmt.Errorf("failed to initialize Kubernetes config for inventory eligibility cache: %w", err)

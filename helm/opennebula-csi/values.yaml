@@ -14,7 +14,7 @@ credentials:
 
 image:
   repository: "nudevco/opennebula-csi"
-  tag: "v0.4.4"
+  tag: "v0.4.5rc0"
   pullPolicy: "IfNotPresent"
 
 imagePullSecrets: []
@@ -79,6 +79,40 @@ inventoryController:
   validation:
     enabled: true
     defaultImage: "ghcr.io/axboe/fio:latest"
+    profiles:
+      smoke:
+        size: "4Gi"
+        fioArgs:
+          - "--name=validate"
+          - "--filename=/data/validation.bin"
+          - "--rw=randrw"
+          - "--bs=4k"
+          - "--size=256Mi"
+          - "--iodepth=16"
+          - "--runtime=30"
+          - "--time_based"
+      throughput:
+        size: "8Gi"
+        fioArgs:
+          - "--name=validate"
+          - "--filename=/data/validation.bin"
+          - "--rw=read"
+          - "--bs=1M"
+          - "--size=1Gi"
+          - "--iodepth=32"
+          - "--runtime=60"
+          - "--time_based"
+      latency:
+        size: "4Gi"
+        fioArgs:
+          - "--name=validate"
+          - "--filename=/data/validation.bin"
+          - "--rw=randread"
+          - "--bs=4k"
+          - "--size=256Mi"
+          - "--iodepth=1"
+          - "--runtime=60"
+          - "--time_based"
   podAnnotations: {}
   resources: {}
   nodeSelector: {}

@@ -79,7 +79,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-{{ include "opennebula-csi.driverCommonEnv" . | nindent 12 }}
+{{ include "opennebula-csi.driverCommonEnv" (dict "context" . "inventoryEnabledOverride" false) | nindent 12 }}
             {{- with .Values.node.extraEnv }}
 {{ toYaml . | nindent 12 }}
             {{- end }}

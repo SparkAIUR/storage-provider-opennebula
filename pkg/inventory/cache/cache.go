@@ -109,7 +109,7 @@ func (p *Provider) FilterIdentifiers(identifiers []string) ([]string, error) {
 			filtered = append(filtered, trimmed)
 			continue
 		}
-		if !entry.Enabled || !entry.Allowed || entry.Phase == inventoryv1alpha1.DatastorePhaseNotFound {
+		if !entry.Enabled || !entry.Allowed || (entry.Phase != "" && entry.Phase != inventoryv1alpha1.DatastorePhaseEnabled && entry.Phase != inventoryv1alpha1.DatastorePhaseAvailable) {
 			return nil, fmt.Errorf("inventory authority rejected datastore %d because provisioning is disabled", id)
 		}
 		filtered = append(filtered, trimmed)

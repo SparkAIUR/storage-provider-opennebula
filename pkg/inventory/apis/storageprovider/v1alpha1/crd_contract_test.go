@@ -1,0 +1,48 @@
+package v1alpha1
+
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+)
+
+func TestDatastoreCRDIncludesDisplayColumnsAndTypedStatus(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to resolve current file path")
+	}
+	crdPath := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "../../../../../helm/opennebula-csi/crds/opennebuladatastores.storageprovider.opennebula.sparkaiur.io.yaml"))
+	payload, err := os.ReadFile(crdPath)
+	if err != nil {
+		t.Fatalf("failed reading datastore CRD: %v", err)
+	}
+	text := string(payload)
+
+	requiredSnippets := []string{
+		"- name: Status",
+		"- name: ID",
+		"- name: Name",
+		"- name: Capacity",
+		"- name: Type",
+		"- name: Backend",
+		"- name: SCs",
+		"- name: Metrics",
+		"capacityDisplay:",
+		"storageClassesDisplay:",
+		"metricsDisplay:",
+		"health:",
+		"maintenanceMode:",
+		"storageClassDetails:",
+		"validationLastOutcome:",
+	}
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(text, snippet) {
+			t.Fatalf("expected datastore CRD to contain %q", snippet)
+		}
+	}
+	if strings.Contains(text, "- name: Enabled") || strings.Contains(text, "jsonPath: .status.capacity.freeBytes") {
+		t.Fatal("legacy datastore printer columns are still present")
+	}
+}

@@ -113,3 +113,28 @@ func TestCheckLocalImmediateBindingPassesForWaitForFirstConsumer(t *testing.T) {
 	assert.Equal(t, "pass", outcome)
 	assert.Contains(t, message, "no local-backed StorageClasses")
 }
+
+func TestInspectStorageClassesIncludesWarnings(t *testing.T) {
+	cfg := config.LoadConfiguration()
+	immediate := storagev1.VolumeBindingImmediate
+	client := fake.NewSimpleClientset(&storagev1.StorageClass{
+		ObjectMeta:           metav1.ObjectMeta{Name: "local-immediate"},
+		Provisioner:          DefaultDriverName,
+		Parameters:           map[string]string{storageClassParamDatastoreIDs: "100"},
+		VolumeBindingMode:    &immediate,
+		AllowVolumeExpansion: boolPtrPreflight(false),
+	})
+
+	runner := NewPreflightRunner(cfg, nil, PreflightOptions{})
+	summaries := runner.inspectStorageClasses(context.Background(), client, []datastoreSchema.Datastore{
+		{ID: 100, Name: "local-ds", DSMad: "fs", TMMad: "local", StateRaw: 0, Type: "IMAGE"},
+	})
+
+	assert.Len(t, summaries, 1)
+	assert.Equal(t, "local", summaries[0].Backend)
+	assert.NotEmpty(t, summaries[0].Warnings)
+}
+
+func boolPtrPreflight(value bool) *bool {
+	return &value
+}

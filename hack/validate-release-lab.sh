@@ -71,10 +71,46 @@ kubectl -n "${NAMESPACE}" rollout status deployment/"${RELEASE_NAME}"-opennebula
 
 kubectl wait --for=condition=Established --timeout=2m crd/opennebuladatastores.storageprovider.opennebula.sparkaiur.io
 kubectl wait --for=condition=Established --timeout=2m crd/opennebulanodes.storageprovider.opennebula.sparkaiur.io
-kubectl get opennebuladatastores
-kubectl get opennebulanodes
+ds_output="$(kubectl get opennebuladatastores)"
+node_output="$(kubectl get opennebulanodes)"
+echo "${ds_output}"
+echo "${node_output}"
+echo "${ds_output}" | head -1 | grep -Eq 'STATUS|Status'
+echo "${ds_output}" | head -1 | grep -Eq 'ID'
+echo "${ds_output}" | head -1 | grep -Eq 'NAME|Name'
+echo "${ds_output}" | head -1 | grep -Eq 'CAPACITY|Capacity'
+echo "${ds_output}" | head -1 | grep -Eq 'METRICS|Metrics'
+echo "${node_output}" | head -1 | grep -Eq 'DISPLAY|Display'
+echo "${node_output}" | head -1 | grep -Eq 'SYSTEMDS|SystemDS'
 test -n "$(kubectl get opennebuladatastores -o jsonpath='{.items[0].metadata.name}')"
 test -n "$(kubectl get opennebulanodes -o jsonpath='{.items[0].metadata.name}')"
+
+maint_ds="$(kubectl get opennebuladatastores -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.id}{"\t"}{.status.phase}{"\t"}{.status.backend}{"\n"}{end}' | awk '$3=="Enabled" && $4=="local" {print $1; exit}')"
+if [[ -n "${maint_ds}" ]]; then
+  kubectl patch opennebuladatastore "${maint_ds}" --type merge -p '{"spec":{"maintenanceMode":true,"maintenanceMessage":"release validation maintenance mode"}}'
+  sleep 10
+  test "$(kubectl get opennebuladatastore "${maint_ds}" -o jsonpath='{.status.phase}')" = "Disabled"
+  kubectl apply -n "${VALIDATION_NAMESPACE}" -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: maintenance-block-test
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: ${SC_NAME}
+EOF
+  sleep 20
+  phase="$(kubectl -n "${VALIDATION_NAMESPACE}" get pvc maintenance-block-test -o jsonpath='{.status.phase}')"
+  if [[ "${phase}" == "Bound" ]]; then
+    echo "maintenance mode did not block new provisioning" >&2
+    exit 1
+  fi
+  kubectl delete -n "${VALIDATION_NAMESPACE}" pvc maintenance-block-test --ignore-not-found=true --wait=false
+  kubectl patch opennebuladatastore "${maint_ds}" --type merge -p '{"spec":{"maintenanceMode":false,"maintenanceMessage":""}}'
+fi
 
 kubectl apply -n "${VALIDATION_NAMESPACE}" -f - <<EOF
 apiVersion: v1
@@ -126,6 +162,17 @@ EOF
 
 kubectl -n "${VALIDATION_NAMESPACE}" wait --for=condition=Ready pod/release-local-smoke --timeout=10m
 kubectl -n "${VALIDATION_NAMESPACE}" exec release-local-smoke -- sh -c 'test "$(cat /data-a/check)" = "alpha" && test "$(cat /data-b/check)" = "beta"'
+
+validate_ds_id="$(kubectl get opennebuladatastores -o jsonpath='{range .items[*]}{.status.id}{"\t"}{.status.phase}{"\t"}{.status.backend}{"\n"}{end}' | awk '$2=="Enabled" && $3=="local" {print $1; exit}')"
+if [[ -n "${validate_ds_id}" ]]; then
+  go run ./cmd/opennebula-csi \
+    --mode=inventory-validate \
+    --datastore-id="${validate_ds_id}" \
+    --storage-class="${SC_NAME}" \
+    --size=1Gi >/tmp/inventory-validate.json
+  grep -q '"Phase": "Succeeded"' /tmp/inventory-validate.json
+  test "$(kubectl get opennebuladatastore "ds-${validate_ds_id}" -o jsonpath='{.status.metricsDisplay}')" != "-"
+fi
 
 kubectl -n "${VALIDATION_NAMESPACE}" patch pvc release-local-a --type merge -p '{"spec":{"resources":{"requests":{"storage":"2Gi"}}}}'
 kubectl -n "${VALIDATION_NAMESPACE}" wait --for=jsonpath='{.status.capacity.storage}'=2Gi pvc/release-local-a --timeout=10m || true
@@ -214,5 +261,29 @@ kubectl -n "${VALIDATION_NAMESPACE}" rollout status statefulset/cnpg-bootstrap-s
 ready_epoch="$(date +%s)"
 echo "cnpg_bootstrap_seconds=$((ready_epoch-start_epoch))"
 kubectl -n "${VALIDATION_NAMESPACE}" exec statefulset/cnpg-bootstrap-smoke -- test -s /var/lib/postgresql/data/bootstrap.txt
+
+go run ./cmd/opennebula-csi --mode=support-bundle >/tmp/opennebula-csi-support-bundle.json
+grep -q '"datastores"' /tmp/opennebula-csi-support-bundle.json
+grep -q '"nodes"' /tmp/opennebula-csi-support-bundle.json
+
+temp_sc_ds="$(kubectl get opennebuladatastores -o jsonpath='{range .items[*]}{.status.id}{"\t"}{.status.backend}{"\n"}{end}' | awk '$2=="local" {print $1; exit}')"
+if [[ -n "${temp_sc_ds}" ]]; then
+  kubectl apply -f - <<EOF
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: opennebula-local-immediate-validation
+provisioner: csi.opennebula.io
+volumeBindingMode: Immediate
+allowVolumeExpansion: false
+parameters:
+  datastoreIDs: "${temp_sc_ds}"
+EOF
+  if go run ./cmd/opennebula-csi --mode=preflight --output=json >/tmp/preflight.json 2>/dev/null; then
+    true
+  fi
+  grep -q 'local datastore should use WaitForFirstConsumer\|Immediate binding' /tmp/preflight.json
+  kubectl delete storageclass opennebula-local-immediate-validation --ignore-not-found=true
+fi
 
 echo "release lab validation passed"

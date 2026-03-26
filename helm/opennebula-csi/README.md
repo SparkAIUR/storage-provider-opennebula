@@ -241,7 +241,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
-| `image.tag` | Driver image tag. | `"v0.4.4"` | No |
+| `image.tag` | Driver image tag. | `"v0.4.5rc0"` | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
 
 ### Driver
@@ -329,6 +329,47 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | `metrics.ports.attacher` | `csi-attacher` metrics port. | `8686` | No |
 | `metrics.ports.resizer` | `csi-resizer` metrics port. | `8687` | No |
 | `metrics.ports.registrar` | `csi-node-driver-registrar` metrics port. | `8688` | No |
+
+### Inventory Datastore Status
+
+When `inventoryController.enabled=true`, `kubectl get opennebuladatastores` becomes the primary datastore inventory view.
+
+- object names remain stable as `ds-<id>`
+- the displayed `Name` column uses the OpenNebula datastore name
+- `Status` values are:
+  - `Enabled`: healthy and explicitly referenced by at least one StorageClass
+  - `Available`: healthy, not explicitly disabled, and not explicitly referenced by any StorageClass
+  - `Disabled`: explicitly disabled on the datastore object
+  - `Unavailable`: unhealthy, missing, invalid, or backend-mismatched
+- `Capacity` is rendered as `{available} / {total} ({usedPercent}%)`
+- `Metrics` shows a compact fio summary when validation succeeded, otherwise `-`
+
+Validation remains informational only and does not by itself turn a datastore unavailable.
+
+### Inventory Operator Controls
+
+- `OpenNebulaDatastore.spec.maintenanceMode=true` blocks new provisioning for that datastore while leaving attach, detach, and expand for existing volumes alone
+- `OpenNebulaDatastore.status.storageClassDetails` surfaces StorageClass binding and expansion risks, including local `Immediate` warnings
+- `OpenNebulaNode.status.displayState`, `systemDatastoreDisplay`, and hotplug fields make incident triage easier from `kubectl get opennebulanodes`
+
+### Inventory Validation Profiles
+
+The chart now ships reusable manual validation profiles under `inventoryController.validation.profiles`:
+
+- `smoke`
+- `throughput`
+- `latency`
+
+These are defaults for manual runs. They do not enable scheduled validation.
+
+### Operator Commands
+
+The driver image includes two cluster-operator modes that work well with a kubeconfig or in-cluster execution:
+
+- `--mode=inventory-validate`
+  - triggers a manual datastore validation run and waits for the result
+- `--mode=support-bundle`
+  - emits a JSON support bundle with inventory, hotplug, StorageClass, VolumeAttachment, and event data
 
 ### Preflight
 

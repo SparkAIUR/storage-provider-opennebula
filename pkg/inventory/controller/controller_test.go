@@ -1,0 +1,266 @@
+package controller
+
+import (
+	"testing"
+
+	datastoreSchema "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/datastore"
+	inventoryv1alpha1 "github.com/SparkAIUR/storage-provider-opennebula/pkg/inventory/apis/storageprovider/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+func TestBuildDatastoreStatusEnabled(t *testing.T) {
+	s := &Syncer{}
+	item := inventoryv1alpha1.OpenNebulaDatastore{
+		ObjectMeta: metav1.ObjectMeta{Name: "ds-111", Generation: 3},
+		Spec: inventoryv1alpha1.OpenNebulaDatastoreSpec{
+			DisplayName: "lvm_local_image",
+			Enabled:     true,
+			Discovery: inventoryv1alpha1.OpenNebulaDatastoreDiscoverySpec{
+				OpenNebulaDatastoreID: 111,
+				ExpectedBackend:       "local",
+				Allowed:               true,
+			},
+		},
+	}
+	ds := datastoreSchema.Datastore{
+		ID:      111,
+		Name:    "lvm_local_image",
+		Type:    "IMAGE",
+		TMMad:   "fs_lvm_ssh",
+		DSMad:   "fs",
+		TotalMB: 20 * 1024 * 1024,
+		FreeMB:  12 * 1024 * 1024,
+	}
+	scs := []storagev1.StorageClass{{
+		ObjectMeta: metav1.ObjectMeta{Name: "opennebula-default-rwo"},
+		Parameters: map[string]string{"datastoreIDs": "111"},
+	}}
+
+	status := s.buildDatastoreStatus(item, ds, nil, nil, scs, nil)
+	if status.Phase != inventoryv1alpha1.DatastorePhaseEnabled {
+		t.Fatalf("expected phase %q, got %q", inventoryv1alpha1.DatastorePhaseEnabled, status.Phase)
+	}
+	if status.Health != inventoryv1alpha1.DatastoreHealthHealthy {
+		t.Fatalf("expected health %q, got %q", inventoryv1alpha1.DatastoreHealthHealthy, status.Health)
+	}
+	if status.Name != "lvm_local_image" {
+		t.Fatalf("expected name to be datastore name, got %q", status.Name)
+	}
+	if status.Type != "IMAGE" {
+		t.Fatalf("expected type IMAGE, got %q", status.Type)
+	}
+	if status.Backend != "local" {
+		t.Fatalf("expected backend local, got %q", status.Backend)
+	}
+	if status.StorageClassesDisplay != "opennebula-default-rwo" {
+		t.Fatalf("unexpected storageClassesDisplay: %q", status.StorageClassesDisplay)
+	}
+	if status.CapacityDisplay != "12 TB / 20 TB (40%)" {
+		t.Fatalf("unexpected capacityDisplay: %q", status.CapacityDisplay)
+	}
+}
+
+func TestBuildDatastoreStatusAvailableDisabledAndUnavailable(t *testing.T) {
+	s := &Syncer{}
+	base := inventoryv1alpha1.OpenNebulaDatastore{
+		ObjectMeta: metav1.ObjectMeta{Name: "ds-100", Generation: 1},
+		Spec: inventoryv1alpha1.OpenNebulaDatastoreSpec{
+			Enabled: true,
+			Discovery: inventoryv1alpha1.OpenNebulaDatastoreDiscoverySpec{
+				OpenNebulaDatastoreID: 100,
+				ExpectedBackend:       "local",
+				Allowed:               true,
+			},
+		},
+	}
+	ds := datastoreSchema.Datastore{
+		ID:      100,
+		Name:    "default",
+		Type:    "IMAGE",
+		TMMad:   "ssh",
+		TotalMB: 3 * 1024 * 1024,
+		FreeMB:  3 * 1024 * 1024,
+	}
+
+	available := s.buildDatastoreStatus(base, ds, nil, nil, nil, nil)
+	if available.Phase != inventoryv1alpha1.DatastorePhaseAvailable {
+		t.Fatalf("expected available phase, got %q", available.Phase)
+	}
+
+	disabledItem := base.DeepCopy()
+	disabledItem.Spec.Enabled = false
+	disabled := s.buildDatastoreStatus(*disabledItem, ds, nil, nil, []storagev1.StorageClass{{
+		ObjectMeta: metav1.ObjectMeta{Name: "sc"},
+		Parameters: map[string]string{"datastoreIDs": "100"},
+	}}, nil)
+	if disabled.Phase != inventoryv1alpha1.DatastorePhaseDisabled {
+		t.Fatalf("expected disabled phase, got %q", disabled.Phase)
+	}
+
+	maintenanceItem := base.DeepCopy()
+	maintenanceItem.Spec.MaintenanceMode = true
+	maintenanceItem.Spec.MaintenanceMessage = "operator drain"
+	maintenance := s.buildDatastoreStatus(*maintenanceItem, ds, nil, nil, []storagev1.StorageClass{{
+		ObjectMeta: metav1.ObjectMeta{Name: "sc"},
+		Parameters: map[string]string{"datastoreIDs": "100"},
+	}}, nil)
+	if maintenance.Phase != inventoryv1alpha1.DatastorePhaseDisabled {
+		t.Fatalf("expected maintenance datastore to be disabled, got %q", maintenance.Phase)
+	}
+	if !maintenance.ReferencedByStorageClass || maintenance.ReferenceCount != 1 {
+		t.Fatalf("expected maintenance datastore reference count to be tracked, got referenced=%t count=%d", maintenance.ReferencedByStorageClass, maintenance.ReferenceCount)
+	}
+
+	unavailableItem := base.DeepCopy()
+	unavailableItem.Spec.Discovery.ExpectedBackend = "ceph-rbd"
+	unavailable := s.buildDatastoreStatus(*unavailableItem, ds, nil, nil, nil, nil)
+	if unavailable.Phase != inventoryv1alpha1.DatastorePhaseUnavailable {
+		t.Fatalf("expected unavailable phase, got %q", unavailable.Phase)
+	}
+	if unavailable.Health != inventoryv1alpha1.DatastoreHealthBackendMismatch {
+		t.Fatalf("expected backend mismatch health, got %q", unavailable.Health)
+	}
+}
+
+func TestBuildDatastoreStatusStorageClassDetails(t *testing.T) {
+	s := &Syncer{}
+	item := inventoryv1alpha1.OpenNebulaDatastore{
+		ObjectMeta: metav1.ObjectMeta{Name: "ds-111", Generation: 1},
+		Spec: inventoryv1alpha1.OpenNebulaDatastoreSpec{
+			Enabled: true,
+			Validation: inventoryv1alpha1.OpenNebulaDatastoreValidationSpec{
+				Mode: inventoryv1alpha1.DatastoreValidationModeManual,
+			},
+			Discovery: inventoryv1alpha1.OpenNebulaDatastoreDiscoverySpec{
+				OpenNebulaDatastoreID: 111,
+				ExpectedBackend:       "local",
+				Allowed:               true,
+			},
+		},
+	}
+	ds := datastoreSchema.Datastore{
+		ID:      111,
+		Name:    "lvm_local_image",
+		Type:    "IMAGE",
+		TMMad:   "fs_lvm_ssh",
+		DSMad:   "fs",
+		TotalMB: 1024,
+		FreeMB:  512,
+	}
+	immediate := storagev1.VolumeBindingImmediate
+	status := s.buildDatastoreStatus(item, ds, nil, nil, []storagev1.StorageClass{{
+		ObjectMeta:           metav1.ObjectMeta{Name: "opennebula-local"},
+		Parameters:           map[string]string{"datastoreIDs": "111"},
+		VolumeBindingMode:    &immediate,
+		AllowVolumeExpansion: boolPtr(false),
+	}}, nil)
+	if !status.ValidationEligible {
+		t.Fatal("expected validation to be eligible for local datastore")
+	}
+	if len(status.StorageClassDetails) != 1 {
+		t.Fatalf("expected one storage class detail, got %d", len(status.StorageClassDetails))
+	}
+	if len(status.StorageClassDetails[0].Warnings) < 2 {
+		t.Fatalf("expected storage class warnings to be populated, got %#v", status.StorageClassDetails[0].Warnings)
+	}
+}
+
+func TestValidationMetricsDisplayAndCapacityFallback(t *testing.T) {
+	read := int64(12000)
+	write := int64(8000)
+	p99 := int64(4000)
+	status := inventoryv1alpha1.OpenNebulaDatastoreValidationStatus{
+		Phase: inventoryv1alpha1.ValidationPhaseSucceeded,
+		Result: inventoryv1alpha1.ValidationResult{
+			ReadIops:         &read,
+			WriteIops:        &write,
+			LatencyP99Micros: &p99,
+		},
+	}
+	if got := validationMetricsDisplay(status); got != "R:12k W:8k p99:4ms" {
+		t.Fatalf("unexpected metrics display: %q", got)
+	}
+	if got := validationMetricsDisplay(inventoryv1alpha1.OpenNebulaDatastoreValidationStatus{}); got != "-" {
+		t.Fatalf("expected empty validation display to be '-', got %q", got)
+	}
+	if got := formatCapacityDisplay(0, 0); got != unknownCapacityDisplay {
+		t.Fatalf("expected unknown capacity display, got %q", got)
+	}
+	if got := formatCapacityDisplay(93*1024*1024*1024, 3*1024*1024*1024*1024); got != "93 GB / 3 TB (97%)" {
+		t.Fatalf("unexpected capacity display for 93GB/3TB: %q", got)
+	}
+}
+
+func TestBuildDatastoreStatusCountsPVCsAndClaims(t *testing.T) {
+	s := &Syncer{}
+	item := inventoryv1alpha1.OpenNebulaDatastore{
+		ObjectMeta: metav1.ObjectMeta{Name: "ds-111", Generation: 1},
+		Spec: inventoryv1alpha1.OpenNebulaDatastoreSpec{
+			Enabled: true,
+			Discovery: inventoryv1alpha1.OpenNebulaDatastoreDiscoverySpec{
+				OpenNebulaDatastoreID: 111,
+				Allowed:               true,
+			},
+		},
+	}
+	ds := datastoreSchema.Datastore{
+		ID:      111,
+		Name:    "lvm_local_image",
+		Type:    "IMAGE",
+		TMMad:   "ssh",
+		TotalMB: 1024,
+		FreeMB:  512,
+	}
+	pv := corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "pv-a",
+			Annotations: map[string]string{annotationDatastoreID: "111"},
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			StorageClassName: "sc-a",
+			Capacity:         corev1.ResourceList{corev1.ResourceStorage: resourceMustParse("2Gi")},
+			ClaimRef: &corev1.ObjectReference{
+				Namespace: "db",
+				Name:      "claim-a",
+				UID:       "uid-a",
+			},
+		},
+	}
+	pvc := corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "db", Name: "claim-a"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resourceMustParse("1Gi")},
+			},
+		},
+	}
+
+	status := s.buildDatastoreStatus(item, ds, []corev1.PersistentVolume{pv}, map[string]corev1.PersistentVolumeClaim{"db/claim-a": pvc}, nil, nil)
+	if status.Usage.BoundPVCCount != 1 {
+		t.Fatalf("expected 1 bound PVC, got %d", status.Usage.BoundPVCCount)
+	}
+	if status.Capacity.ProvisionedPVBytes == 0 || status.Capacity.RequestedPVCBytes == 0 {
+		t.Fatalf("expected non-zero provisioned/requested bytes, got pv=%d pvc=%d", status.Capacity.ProvisionedPVBytes, status.Capacity.RequestedPVCBytes)
+	}
+	if len(status.Usage.BoundClaims) != 1 || status.Usage.BoundClaims[0].Name != "claim-a" {
+		t.Fatalf("unexpected bound claims: %#v", status.Usage.BoundClaims)
+	}
+}
+
+func TestNodeDisplayState(t *testing.T) {
+	if got := nodeDisplayState(true, false, true); got != "Ready" {
+		t.Fatalf("expected Ready, got %q", got)
+	}
+	if got := nodeDisplayState(true, true, false); got != "HotplugCooldown" {
+		t.Fatalf("expected HotplugCooldown, got %q", got)
+	}
+	if got := nodeDisplayState(true, false, false); got != "VMNotReady" {
+		t.Fatalf("expected VMNotReady, got %q", got)
+	}
+}
+
+func boolPtr(value bool) *bool {
+	return &value
+}
