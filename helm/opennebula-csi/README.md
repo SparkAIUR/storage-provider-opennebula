@@ -162,13 +162,13 @@ does your client key have mgr caps?
 
 the provisioner secret is using a Ceph user without sufficient `mgr` privileges for subvolume lifecycle commands.
 
-The controller sidecar also needs a longer CSI RPC timeout than the default for CephFS create flows. The chart now renders:
+The controller sidecar also needs a longer CSI RPC timeout than the default for long-running create, attach, detach, and resize flows. The chart now renders:
 
 ```text
-csi-provisioner --timeout=2m
+csi-provisioner --timeout=960s
 ```
 
-Without that timeout increase, the driver may successfully create the CephFS subvolume but the external provisioner can still report `DeadlineExceeded` and leave the PVC pending.
+Without that timeout increase, the driver may successfully complete the backend work but the external sidecar can still report `DeadlineExceeded`.
 
 For CephFS expansion, add the standard CSI controller-expand secret refs to the StorageClass. In practice this is usually the same secret as the provisioner path:
 
@@ -201,7 +201,9 @@ For local-backed StorageClasses:
 - prefer `volumeBindingMode: WaitForFirstConsumer`
 - keep `featureGates.compatibilityAwareSelection=true`
 - do not assume the driver will live-migrate local PVC data between nodes
-- the controller serializes VM hotplug operations and waits up to `driver.vmHotplugTimeoutSeconds` for attach/detach stabilization to reduce transient OpenNebula `wrong state HOTPLUG` failures
+- the controller uses size-aware hotplug timeouts, allows only one active VM hotplug per node, and returns retryable `Aborted` when another same-node hotplug is already in progress
+- node-side device discovery uses the same per-volume timeout budget that the controller computed during publish
+- if a VM stays non-ready through the full timeout, the driver puts that VM into a temporary hotplug cooldown and rejects further hotplug work with retryable `Unavailable`
 - recreating MinIO tenants with local-backed PVCs should still be treated as node-sticky; use Ceph RBD or CephFS if the workload must remain portable across nodes
 - use Ceph RBD for portable RWO and CephFS for portable RWX
 
@@ -239,7 +241,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
-| `image.tag` | Driver image tag. | `"v0.4.1"` | No |
+| `image.tag` | Driver image tag. | `"v0.4.2"` | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
 
 ### Driver
@@ -249,7 +251,11 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.logLevel` | Kubernetes `-v` log level passed to the driver binary. | `5` | No |
 | `driver.defaultDatastores` | Default list of OpenNebula datastore IDs or aliases used when StorageClasses do not override `datastoreIDs`. | `[]` | Conditional |
 | `driver.datastoreSelectionPolicy` | Default datastore selection policy. Supported values: `least-used`, `ordered`, `autopilot`. | `"least-used"` | No |
-| `driver.vmHotplugTimeoutSeconds` | Bounded wait for VM disk hotplug stabilization after attach/detach before the driver returns an error. | `60` | No |
+| `driver.vmHotplugTimeoutSeconds` | Legacy alias for the base VM hotplug timeout. | `120` | No |
+| `driver.vmHotplugTimeoutBaseSeconds` | Base VM hotplug timeout before size scaling is applied. | `120` | No |
+| `driver.vmHotplugTimeoutPer100GiSeconds` | Additional timeout added for each 100 GiB bucket of actual disk size. | `60` | No |
+| `driver.vmHotplugTimeoutMaxSeconds` | Maximum timeout cap for a single VM hotplug operation. | `900` | No |
+| `driver.vmHotplugStuckVmCooldownSeconds` | Cooldown period applied after a VM stays stuck in hotplug through the full timeout. | `300` | No |
 | `driver.allowedDatastoreTypes` | Allowed backend types for provisioning. | `["local","ceph","cephfs"]` | No |
 | `driver.extraArgs` | Extra CLI args appended to both controller and node driver containers. | `[]` | No |
 | `driver.env` | Additional environment variables appended to both controller and node driver containers. Useful for advanced overrides such as `ONE_CSI_NODE_TOPOLOGY_SYSTEM_DS`. | `[]` | No |
@@ -261,8 +267,8 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `featureGates.compatibilityAwareSelection` | Enable compatibility-aware filtering for datastores such as `COMPATIBLE_SYS_DS`. | `true` | No |
-| `featureGates.detachedDiskExpansion` | Enable detached persistent-disk expansion through image-level resize. Stable and enabled by default in `v0.4.1`. | `true` | No |
-| `featureGates.cephfsExpansion` | Enable CephFS dynamic subvolume expansion. Stable and enabled by default in `v0.4.1`. | `true` | No |
+| `featureGates.detachedDiskExpansion` | Enable detached persistent-disk expansion through image-level resize. Stable and enabled by default in `v0.4.2`. | `true` | No |
+| `featureGates.cephfsExpansion` | Enable CephFS dynamic subvolume expansion. Stable and enabled by default in `v0.4.2`. | `true` | No |
 | `featureGates.cephfsSnapshots` | Enable CephFS snapshot RPC flows. | `false` | No |
 | `featureGates.cephfsClones` | Enable CephFS PVC clone and snapshot restore flows. | `false` | No |
 | `featureGates.cephfsSelfHealing` | Enable stale CephFS mount lazy-unmount/remount recovery in node stage. `NodeGetVolumeStats` still reports disconnected CephFS mounts as restage-needed errors because kubelet stats calls do not include remount credentials. | `false` | No |
@@ -273,6 +279,7 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `controller.replicaCount` | Number of controller replicas. | `1` | No |
+| `controller.sidecarTimeoutSeconds` | CSI sidecar RPC timeout used for the provisioner, attacher, and resizer. Set this above the maximum hotplug timeout budget. | `960` | No |
 | `controller.podAnnotations` | Extra annotations for the controller pod template. | `{}` | No |
 | `controller.resources` | Controller pod resource requests and limits. | `{}` | No |
 | `controller.nodeSelector` | Node selector for the controller StatefulSet. | `{}` | No |

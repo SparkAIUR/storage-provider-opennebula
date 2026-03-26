@@ -18,6 +18,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -50,6 +51,8 @@ var (
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY,
 	}
 )
+
+const publishContextHotplugTimeoutSeconds = "hotplugTimeoutSeconds"
 
 type ControllerServer struct {
 	driver                   *Driver
@@ -671,28 +674,71 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.NotFound, "node not found")
 	}
 
-	release := s.driver.operationLocks.Acquire(controllerNodeLockKey(req.NodeId), controllerVolumeLockKey(req.VolumeId))
-	defer release()
-
 	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err == nil {
+		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target)
 		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
 		klog.V(1).InfoS("Volume already attached to node",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
 		return &csi.ControllerPublishVolumeResponse{
-			PublishContext: map[string]string{
-				"volumeName": target,
-			},
+			PublishContext: publishContext,
+		}, nil
+	}
+
+	if cooldown, ok := s.hotplugCooldownState(ctx, req.NodeId); ok {
+		s.driver.metrics.RecordHotplugGuard("attach", "vm_cooldown", "rejected")
+		message := fmt.Sprintf(
+			"node %s is in hotplug recovery cooldown until %s after timed out %s (last observed attached=%t ready=%t)",
+			req.NodeId,
+			cooldown.ExpiresAt.Format(time.RFC3339),
+			cooldown.Operation,
+			cooldown.LastObservedAttached,
+			cooldown.LastObservedReady,
+		)
+		s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonHotplugCooldown, message)
+		return nil, status.Error(codes.Unavailable, message)
+	}
+
+	nodeRelease, ok := s.driver.operationLocks.TryAcquire(controllerNodeLockKey(req.NodeId))
+	if !ok {
+		s.driver.metrics.RecordHotplugGuard("attach", "node_busy", "rejected")
+		message := fmt.Sprintf("another hotplug operation is already in progress for node %s; retry later", req.NodeId)
+		s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonHotplugNodeBusy, message)
+		return nil, status.Error(codes.Aborted, message)
+	}
+	defer nodeRelease()
+
+	release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
+	defer release()
+
+	target, err = s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
+	if err == nil {
+		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target)
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
+		klog.V(1).InfoS("Volume already attached to node",
+			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
+		return &csi.ControllerPublishVolumeResponse{
+			PublishContext: publishContext,
 		}, nil
 	}
 
 	// TODO: Validate VolumeCapability
 
 	params := req.GetVolumeContext()
+	sizeBytes, err := s.volumeProvider.ResolveVolumeSizeBytes(ctx, req.VolumeId)
+	if err != nil {
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "internal", time.Since(started))
+		klog.V(0).ErrorS(err, "Failed to resolve volume size",
+			"method", "ControllerPublishVolume", "volumeID", req.VolumeId)
+		return nil, status.Error(codes.Internal, "failed to resolve volume size")
+	}
+	hotplugTimeout := s.volumeProvider.ComputeHotplugTimeout(sizeBytes)
+	s.recordPVCEventFromParams(ctx, params, eventReasonHotplugTimeoutScaled, fmt.Sprintf("computed hotplug timeout %s for volume size %d bytes", hotplugTimeout, sizeBytes))
 	klog.V(3).InfoS("Attaching volume to node",
-		"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID)
+		"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "sizeBytes", sizeBytes, "hotplugTimeout", hotplugTimeout)
 	err = s.volumeProvider.AttachVolume(ctx, req.VolumeId, req.NodeId, immutableVolume, params)
 	if err != nil {
+		s.handleHotplugTimeout(ctx, req.NodeId, req.VolumeId, params, "attach", "disk", err)
 		switch {
 		case opennebula.IsDatastoreConfigError(err):
 			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "failed_precondition", time.Since(started))
@@ -725,7 +771,8 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 	return &csi.ControllerPublishVolumeResponse{
 		PublishContext: map[string]string{
-			"volumeName": target,
+			"volumeName":                        target,
+			publishContextHotplugTimeoutSeconds: strconv.Itoa(int(hotplugTimeout.Seconds())),
 		},
 	}, nil
 }
@@ -751,9 +798,6 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId)
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
-
-	release := s.driver.operationLocks.Acquire(controllerNodeLockKey(req.NodeId), controllerVolumeLockKey(req.VolumeId))
-	defer release()
 
 	nodeID, err := s.volumeProvider.NodeExists(ctx, req.NodeId)
 	if err != nil || nodeID == -1 {
@@ -781,11 +825,43 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 
+	if cooldown, ok := s.hotplugCooldownState(ctx, req.NodeId); ok {
+		s.driver.metrics.RecordHotplugGuard("detach", "vm_cooldown", "rejected")
+		message := fmt.Sprintf(
+			"node %s is in hotplug recovery cooldown until %s after timed out %s (last observed attached=%t ready=%t)",
+			req.NodeId,
+			cooldown.ExpiresAt.Format(time.RFC3339),
+			cooldown.Operation,
+			cooldown.LastObservedAttached,
+			cooldown.LastObservedReady,
+		)
+		return nil, status.Error(codes.Unavailable, message)
+	}
+
+	nodeRelease, ok := s.driver.operationLocks.TryAcquire(controllerNodeLockKey(req.NodeId))
+	if !ok {
+		s.driver.metrics.RecordHotplugGuard("detach", "node_busy", "rejected")
+		message := fmt.Sprintf("another hotplug operation is already in progress for node %s; retry later", req.NodeId)
+		return nil, status.Error(codes.Aborted, message)
+	}
+	defer nodeRelease()
+
+	release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
+	defer release()
+
+	_, err = s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
+	if err != nil {
+		klog.V(1).InfoS("Volume does not exist in node, skipping unpublish",
+			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
+		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
+
 	klog.V(3).InfoS("Detaching volume from node",
 		"method", "ControllerUnpublishVolume", "volumeID", volumeID, "nodeID", nodeID)
 
 	err = s.volumeProvider.DetachVolume(ctx, req.VolumeId, req.NodeId)
 	if err != nil {
+		s.handleHotplugTimeout(ctx, req.NodeId, req.VolumeId, nil, "detach", "disk", err)
 		klog.V(0).ErrorS(err, "Failed to detach volume",
 			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
 		return nil, status.Error(codes.Internal, "failed to detach volume")
@@ -1008,6 +1084,60 @@ func controllerNodeLockKey(nodeID string) string {
 
 func controllerVolumeLockKey(volumeID string) string {
 	return "volume:" + volumeID
+}
+
+func (s *ControllerServer) hotplugCooldownState(ctx context.Context, node string) (opennebula.HotplugCooldownState, bool) {
+	cooldown, ok := s.driver.hotplugGuard.Get(node)
+	if !ok {
+		return opennebula.HotplugCooldownState{}, false
+	}
+	ready, err := s.volumeProvider.NodeReady(ctx, node)
+	if err == nil && ready {
+		s.driver.hotplugGuard.Clear(node)
+		return opennebula.HotplugCooldownState{}, false
+	}
+	return cooldown, true
+}
+
+func (s *ControllerServer) publishContextForVolume(ctx context.Context, volumeID, target string) map[string]string {
+	publishContext := map[string]string{
+		"volumeName": target,
+	}
+
+	sizeBytes, err := s.volumeProvider.ResolveVolumeSizeBytes(ctx, volumeID)
+	if err != nil {
+		klog.V(2).InfoS("Skipping dynamic hotplug timeout in publish context after size resolution failure",
+			"method", "publishContextForVolume", "volumeID", volumeID, "err", err)
+		return publishContext
+	}
+
+	hotplugTimeout := s.volumeProvider.ComputeHotplugTimeout(sizeBytes)
+	publishContext[publishContextHotplugTimeoutSeconds] = strconv.Itoa(int(hotplugTimeout.Seconds()))
+	return publishContext
+}
+
+func (s *ControllerServer) handleHotplugTimeout(ctx context.Context, node, volume string, params map[string]string, operation, backend string, err error) {
+	var timeoutErr *opennebula.HotplugTimeoutError
+	if !errors.As(err, &timeoutErr) {
+		return
+	}
+
+	s.driver.metrics.RecordHotplugTimeout(operation, backend, "timeout_exhausted")
+	if timeoutErr.LastObservedReady {
+		return
+	}
+
+	s.driver.hotplugGuard.MarkCooldown(node, operation, volume, timeoutErr.Timeout, timeoutErr.LastObservedAttached, timeoutErr.LastObservedReady)
+	s.driver.metrics.RecordHotplugGuard(operation, "timeout_exhausted", "cooldown")
+	message := fmt.Sprintf(
+		"node %s entered hotplug cooldown after %s timeout %s (attached=%t ready=%t)",
+		node,
+		operation,
+		timeoutErr.Timeout,
+		timeoutErr.LastObservedAttached,
+		timeoutErr.LastObservedReady,
+	)
+	s.recordPVCWarningFromParams(ctx, params, eventReasonHotplugCooldown, message)
 }
 
 // TODO: Implement methods specified in https://github.com/container-storage-interface/spec/blob/98819c45a37a67e0cd466bd02b813faf91af4e45/spec.md#controller-service-rpc

@@ -27,6 +27,8 @@ type DriverMetrics struct {
 	cephFSSubvolumeTotal    *prometheus.CounterVec
 	snapshotTotal           *prometheus.CounterVec
 	preflightTotal          *prometheus.CounterVec
+	hotplugGuardTotal       *prometheus.CounterVec
+	hotplugTimeoutTotal     *prometheus.CounterVec
 	datastoreFreeBytes      *prometheus.GaugeVec
 	datastoreTotalBytes     *prometheus.GaugeVec
 	buildInfo               *prometheus.GaugeVec
@@ -70,6 +72,14 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 			Name: "opennebula_csi_preflight_total",
 			Help: "Total number of preflight checks by check name and outcome.",
 		}, []string{"check", "outcome"}),
+		hotplugGuardTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_hotplug_guard_total",
+			Help: "Total number of hotplug guard decisions by operation, reason, and outcome.",
+		}, []string{"operation", "reason", "outcome"}),
+		hotplugTimeoutTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_hotplug_timeout_total",
+			Help: "Total number of block hotplug timeout outcomes by operation, backend, and outcome.",
+		}, []string{"operation", "backend", "outcome"}),
 		datastoreFreeBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "opennebula_csi_datastore_free_bytes",
 			Help: "Latest observed free capacity for a datastore by backend and datastore ID.",
@@ -92,6 +102,8 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 		metrics.cephFSSubvolumeTotal,
 		metrics.snapshotTotal,
 		metrics.preflightTotal,
+		metrics.hotplugGuardTotal,
+		metrics.hotplugTimeoutTotal,
 		metrics.datastoreFreeBytes,
 		metrics.datastoreTotalBytes,
 		metrics.buildInfo,
@@ -143,6 +155,20 @@ func (m *DriverMetrics) RecordPreflight(check, outcome string) {
 		return
 	}
 	m.preflightTotal.WithLabelValues(check, outcome).Inc()
+}
+
+func (m *DriverMetrics) RecordHotplugGuard(operation, reason, outcome string) {
+	if m == nil {
+		return
+	}
+	m.hotplugGuardTotal.WithLabelValues(operation, reason, outcome).Inc()
+}
+
+func (m *DriverMetrics) RecordHotplugTimeout(operation, backend, outcome string) {
+	if m == nil {
+		return
+	}
+	m.hotplugTimeoutTotal.WithLabelValues(operation, backend, outcome).Inc()
 }
 
 func (m *DriverMetrics) SetDatastoreCapacity(backend string, datastoreID int, freeBytes, totalBytes int64) {

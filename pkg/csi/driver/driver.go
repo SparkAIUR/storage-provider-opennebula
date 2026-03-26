@@ -53,6 +53,7 @@ type Driver struct {
 	controllerServerCapabilities []*csi.ControllerServiceCapability
 
 	operationLocks *OperationLocks
+	hotplugGuard   *HotplugGuard
 
 	maxVolumesPerNode int64
 
@@ -85,6 +86,7 @@ func NewDriver(options *DriverOptions) *Driver {
 		mounter:            options.Mounter,
 		featureGates:       loadFeatureGates(options.PluginConfig),
 		operationLocks:     NewOperationLocks(),
+		hotplugGuard:       NewHotplugGuard(loadHotplugCooldown(options.PluginConfig)),
 	}
 }
 
@@ -111,17 +113,12 @@ func (d *Driver) Run(ctx context.Context) error {
 	if !ok {
 		return fmt.Errorf("failed to get %s credentials from config", config.OpenNebulaCredentialsVar)
 	}
-	hotplugTimeoutSeconds, ok := d.PluginConfig.GetInt(config.VMHotplugTimeoutVar)
-	if !ok || hotplugTimeoutSeconds <= 0 {
-		hotplugTimeoutSeconds = 60
-	}
-
 	volumeProvider, err := opennebula.NewPersistentDiskVolumeProvider(
 		opennebula.NewClient(opennebula.OpenNebulaConfig{
 			Endpoint:    endpoint,
 			Credentials: credentials,
 		}),
-		time.Duration(hotplugTimeoutSeconds)*time.Second,
+		loadHotplugTimeoutPolicy(d.PluginConfig),
 	)
 	if err != nil || volumeProvider == nil {
 		return fmt.Errorf("failed to create PersistentDiskVolumeProvider: %v", err)
@@ -160,4 +157,44 @@ func (d *Driver) Run(ctx context.Context) error {
 	grpcServer.Wait()
 
 	return nil
+}
+
+func loadHotplugTimeoutPolicy(cfg config.CSIPluginConfig) opennebula.HotplugTimeoutPolicy {
+	baseTimeout, baseOK := cfg.GetInt(config.VMHotplugTimeoutBaseVar)
+	if !baseOK || baseTimeout <= 0 {
+		if legacyTimeout, legacyOK := cfg.GetInt(config.VMHotplugTimeoutVar); legacyOK && legacyTimeout > 0 {
+			baseTimeout = legacyTimeout
+		} else {
+			baseTimeout = 120
+		}
+	}
+
+	per100Gi, ok := cfg.GetInt(config.VMHotplugTimeoutPer100GiVar)
+	if !ok || per100Gi < 0 {
+		per100Gi = 60
+	}
+
+	maxTimeout, ok := cfg.GetInt(config.VMHotplugTimeoutMaxVar)
+	if !ok || maxTimeout <= 0 {
+		maxTimeout = 900
+	}
+	if maxTimeout < baseTimeout {
+		maxTimeout = baseTimeout
+	}
+
+	return opennebula.HotplugTimeoutPolicy{
+		BaseTimeout:  time.Duration(baseTimeout) * time.Second,
+		Per100GiB:    time.Duration(per100Gi) * time.Second,
+		MaxTimeout:   time.Duration(maxTimeout) * time.Second,
+		PollInterval: time.Second,
+	}
+}
+
+func loadHotplugCooldown(cfg config.CSIPluginConfig) time.Duration {
+	cooldownSeconds, ok := cfg.GetInt(config.VMHotplugStuckCooldownSecondsVar)
+	if !ok || cooldownSeconds <= 0 {
+		cooldownSeconds = 300
+	}
+
+	return time.Duration(cooldownSeconds) * time.Second
 }

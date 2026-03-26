@@ -24,9 +24,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-lib-utils/protosanitizer"
@@ -40,12 +43,15 @@ import (
 var (
 	nodeVolumePathStat = os.Stat
 	nodeVolumePathFS   = unix.Statfs
+	nodeDeviceSleep    = time.Sleep
 )
 
 const (
-	defaultFSType   = "ext4"  // Default filesystem type for volumes
-	defaultDiskPath = "/dev/" // Path to disk devices (probably we should include in volumecontext)
+	defaultFSType               = "ext4" // Default filesystem type for volumes
+	defaultNodeDevicePollPeriod = time.Second
 )
+
+var defaultDiskPath = "/dev/" // Path to disk devices (probably we should include in volumecontext)
 
 type mountPointMatch struct {
 	targetIsMountPoint bool // The target path is a mount point
@@ -112,7 +118,12 @@ func (ns *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 	if len(volName) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "[volumeName] entry is required in volume context")
 	}
-	devicePath := ns.getDeviceName(volName)
+	devicePath, err := ns.resolveDevicePath(volName, ns.deviceDiscoveryTimeout(volumeContext))
+	if err != nil {
+		klog.V(0).ErrorS(err, "Failed to resolve device path",
+			"method", "NodeStageVolume", "volumeID", volumeID, "volumeName", volName)
+		return nil, status.Error(codes.DeadlineExceeded, err.Error())
+	}
 
 	volMount := volumeCapability.GetMount()
 	mountFlags := volMount.GetMountFlags()
@@ -128,13 +139,6 @@ func (ns *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 
 	if accessMode.Mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY {
 		mountFlags = append(mountFlags, "ro")
-	}
-
-	// Check if device path for volumeID exists
-	if _, err := os.Stat(devicePath); os.IsNotExist(err) {
-		klog.V(0).ErrorS(err, "Device path does not exist",
-			"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath)
-		return nil, status.Error(codes.NotFound, "device path does not exist")
 	}
 
 	mountCheck, err := ns.checkMountPoint(devicePath, stagingTargetPath, volumeCapability)
@@ -305,7 +309,13 @@ func (ns *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 	var resp *csi.NodePublishVolumeResponse
 	switch accessType.(type) {
 	case *csi.VolumeCapability_Block:
-		resp, err = ns.handleBlockVolumePublish(ns.getDeviceName(volName), targetPath, volumeCapability, options)
+		devicePath, resolveErr := ns.resolveDevicePath(volName, ns.deviceDiscoveryTimeout(volumeContext))
+		if resolveErr != nil {
+			klog.V(0).ErrorS(resolveErr, "Failed to resolve device path for block volume publish",
+				"method", "NodePublishVolume", "volumeID", volumeID, "volumeName", volName)
+			return nil, status.Error(codes.DeadlineExceeded, resolveErr.Error())
+		}
+		resp, err = ns.handleBlockVolumePublish(devicePath, targetPath, volumeCapability, options)
 	case *csi.VolumeCapability_Mount:
 		resp, err = ns.handleMountVolumePublish(stagingTargetPath, targetPath, volumeCapability, options)
 	default:
@@ -651,6 +661,93 @@ func (ns *NodeServer) NodeGetInfo(_ context.Context, req *csi.NodeGetInfoRequest
 
 func (ns *NodeServer) getDeviceName(volumeName string) string {
 	return path.Join(defaultDiskPath, volumeName)
+}
+
+func (ns *NodeServer) resolveDevicePath(volumeName string, timeout time.Duration) (string, error) {
+	candidates := ns.deviceCandidates(volumeName)
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+
+	for {
+		for _, candidate := range candidates {
+			if _, err := nodeVolumePathStat(candidate); err == nil {
+				if candidate != ns.getDeviceName(volumeName) {
+					klog.V(2).InfoS("Resolved device path via alias",
+						"method", "resolveDevicePath", "volumeName", volumeName, "devicePath", candidate)
+				}
+				return candidate, nil
+			} else if !os.IsNotExist(err) {
+				lastErr = err
+			}
+		}
+
+		if time.Now().After(deadline) {
+			break
+		}
+
+		nodeDeviceSleep(defaultNodeDevicePollPeriod)
+	}
+
+	if lastErr != nil {
+		return "", fmt.Errorf(
+			"timed out after %s waiting for device path for volume %q (checked %s, last error: %v)",
+			timeout, volumeName, strings.Join(candidates, ", "), lastErr,
+		)
+	}
+
+	return "", fmt.Errorf(
+		"timed out after %s waiting for device path for volume %q (checked %s)",
+		timeout, volumeName, strings.Join(candidates, ", "),
+	)
+}
+
+func (ns *NodeServer) deviceDiscoveryTimeout(publishContext map[string]string) time.Duration {
+	if publishContext != nil {
+		if raw, ok := publishContext[publishContextHotplugTimeoutSeconds]; ok && raw != "" {
+			timeoutSeconds, err := strconv.Atoi(raw)
+			if err == nil && timeoutSeconds > 0 {
+				return time.Duration(timeoutSeconds) * time.Second
+			}
+		}
+	}
+
+	timeoutSeconds, ok := ns.Driver.PluginConfig.GetInt(config.VMHotplugTimeoutBaseVar)
+	if !ok || timeoutSeconds <= 0 {
+		timeoutSeconds, ok = ns.Driver.PluginConfig.GetInt(config.VMHotplugTimeoutVar)
+	}
+	if !ok || timeoutSeconds <= 0 {
+		timeoutSeconds = 120
+	}
+
+	return time.Duration(timeoutSeconds) * time.Second
+}
+
+func (ns *NodeServer) deviceCandidates(volumeName string) []string {
+	baseName := filepath.Base(volumeName)
+	names := []string{baseName}
+
+	switch {
+	case strings.HasPrefix(baseName, "sd"):
+		suffix := strings.TrimPrefix(baseName, "sd")
+		names = append(names, "vd"+suffix, "xvd"+suffix)
+	case strings.HasPrefix(baseName, "vd"):
+		suffix := strings.TrimPrefix(baseName, "vd")
+		names = append(names, "sd"+suffix, "xvd"+suffix)
+	case strings.HasPrefix(baseName, "xvd"):
+		suffix := strings.TrimPrefix(baseName, "xvd")
+		names = append(names, "vd"+suffix, "sd"+suffix)
+	}
+
+	candidates := make([]string, 0, len(names))
+	for _, name := range names {
+		candidate := ns.getDeviceName(name)
+		if slices.Contains(candidates, candidate) {
+			continue
+		}
+		candidates = append(candidates, candidate)
+	}
+
+	return candidates
 }
 
 func (ns *NodeServer) getMountedDevicePath(targetPath string) (string, error) {

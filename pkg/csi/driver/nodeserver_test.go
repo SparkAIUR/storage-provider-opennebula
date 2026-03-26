@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -59,8 +61,33 @@ func getTestNodeServer(mountPoints []string) *NodeServer {
 	return NewNodeServer(driver, mounter)
 }
 
+func withTestDiskPath(t *testing.T) string {
+	t.Helper()
+
+	originalDiskPath := defaultDiskPath
+	originalStat := nodeVolumePathStat
+	originalSleep := nodeDeviceSleep
+	diskPath := t.TempDir()
+
+	defaultDiskPath = diskPath
+	nodeVolumePathStat = os.Stat
+	nodeDeviceSleep = func(time.Duration) {}
+
+	t.Cleanup(func() {
+		defaultDiskPath = originalDiskPath
+		nodeVolumePathStat = originalStat
+		nodeDeviceSleep = originalSleep
+	})
+
+	return diskPath
+}
+
 func TestStageVolume(t *testing.T) {
 	tempDir := t.TempDir()
+	diskPath := withTestDiskPath(t)
+	err := os.WriteFile(filepath.Join(diskPath, "zero"), []byte("test"), 0o644)
+	assert.NoError(t, err)
+
 	tcs := []struct {
 		name           string
 		request        *csi.NodeStageVolumeRequest
@@ -107,6 +134,56 @@ func TestStageVolume(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResolveDevicePath(t *testing.T) {
+	t.Run("returns exact device path when present", func(t *testing.T) {
+		diskPath := withTestDiskPath(t)
+		err := os.WriteFile(filepath.Join(diskPath, "sde"), []byte("test"), 0o644)
+		assert.NoError(t, err)
+
+		ns := getTestNodeServer(nil)
+		devicePath, resolveErr := ns.resolveDevicePath("sde", time.Second)
+
+		assert.NoError(t, resolveErr)
+		assert.Equal(t, filepath.Join(diskPath, "sde"), devicePath)
+	})
+
+	t.Run("falls back to virtio alias when present", func(t *testing.T) {
+		diskPath := withTestDiskPath(t)
+		err := os.WriteFile(filepath.Join(diskPath, "vde"), []byte("test"), 0o644)
+		assert.NoError(t, err)
+
+		ns := getTestNodeServer(nil)
+		devicePath, resolveErr := ns.resolveDevicePath("sde", time.Second)
+
+		assert.NoError(t, resolveErr)
+		assert.Equal(t, filepath.Join(diskPath, "vde"), devicePath)
+	})
+
+	t.Run("times out when no candidate device appears", func(t *testing.T) {
+		withTestDiskPath(t)
+		ns := getTestNodeServer(nil)
+		ns.Driver.PluginConfig.OverrideVal(config.VMHotplugTimeoutBaseVar, 1)
+
+		devicePath, resolveErr := ns.resolveDevicePath("sdf", ns.deviceDiscoveryTimeout(nil))
+
+		assert.Empty(t, devicePath)
+		assert.Error(t, resolveErr)
+		assert.Contains(t, resolveErr.Error(), "timed out after 1s")
+		assert.Contains(t, resolveErr.Error(), "sdf")
+	})
+
+	t.Run("uses publish context timeout override when present", func(t *testing.T) {
+		ns := getTestNodeServer(nil)
+		ns.Driver.PluginConfig.OverrideVal(config.VMHotplugTimeoutBaseVar, 120)
+
+		timeout := ns.deviceDiscoveryTimeout(map[string]string{
+			publishContextHotplugTimeoutSeconds: "300",
+		})
+
+		assert.Equal(t, 300*time.Second, timeout)
+	})
 }
 
 func TestStageSharedFilesystemVolume(t *testing.T) {

@@ -19,9 +19,9 @@ This fork is focused on Omni deployments on OpenNebula and removes the old requi
 - Support `local`, OpenNebula Ceph RBD, and SparkAI CephFS datastores.
 - Keep the internal selection/provider structure ready for future `nfs` support.
 
-## Validated v0.4.1 matrix
+## Validated v0.4.2 matrix
 
-The `v0.4.1` release was validated on a live Omni + Talos + OpenNebula staging cluster with:
+The `v0.4.2` release was validated on a live Omni + Talos + OpenNebula staging cluster with:
 
 - local RWO volumes on an OpenNebula image datastore
 - Ceph RBD RWO volumes on a Ceph-backed image datastore with a Ceph system datastore
@@ -39,7 +39,7 @@ Staging-validated stable features:
 - `detachedDiskExpansion`
 - `cephfsExpansion`
 
-Features that remain gated in `v0.4.1`:
+Features that remain gated in `v0.4.2`:
 
 - `cephfsSnapshots`
 - `cephfsClones`
@@ -81,7 +81,11 @@ All other StorageClass parameters are passed through to the existing disk/image 
 - `ONE_CSI_ALLOWED_DATASTORE_TYPES`: CSV list, default `local,ceph,cephfs`
 - `ONE_CSI_FEATURE_GATES`: CSV feature-gate map for alpha features
 - `ONE_CSI_METRICS_ENDPOINT`: driver-native metrics endpoint, default `:9810`
-- `ONE_CSI_VM_HOTPLUG_TIMEOUT_SECONDS`: bounded wait for OpenNebula VM disk hotplug stabilization, default `60`
+- `ONE_CSI_VM_HOTPLUG_TIMEOUT_SECONDS`: legacy alias for the base VM hotplug timeout, default `120`
+- `ONE_CSI_VM_HOTPLUG_TIMEOUT_BASE_SECONDS`: base VM hotplug timeout, default `120`
+- `ONE_CSI_VM_HOTPLUG_TIMEOUT_PER_100GI_SECONDS`: additional timeout per 100 GiB bucket, default `60`
+- `ONE_CSI_VM_HOTPLUG_TIMEOUT_MAX_SECONDS`: maximum VM hotplug timeout, default `900`
+- `ONE_CSI_VM_HOTPLUG_STUCK_VM_COOLDOWN_SECONDS`: cooldown after a VM stays stuck in hotplug through the full timeout, default `300`
 
 ### Policy behavior
 
@@ -120,7 +124,9 @@ Important limitation:
 - the driver does not perform CSI-side host-to-host data migration for local-backed PVCs
 - when a pod lands on a different node, Kubernetes waits for detach/attach, but the underlying storage must already be attachable by OpenNebula from the configured image datastore path
 - if OpenNebula cannot resolve the source image path during attach, the fix is in datastore layout or transfer-manager configuration, not in CSI-side file sync
-- the controller serializes attach/detach/expand operations per VM and per volume to reduce transient OpenNebula `wrong state HOTPLUG` failures during bursty recreate flows
+- the controller serializes attach/detach/expand operations per volume, allows only one active VM hotplug per node at a time, and returns retryable `Aborted` for later same-node requests instead of letting them time out in-line
+- hotplug attach, detach, and node-side device discovery now use a size-aware timeout budget derived from the actual OpenNebula disk size
+- if a VM stays non-ready through the full hotplug timeout, the controller places that VM into a temporary recovery cooldown and rejects new hotplug work with retryable `Unavailable`
 - recreating a MinIO tenant with local-backed PVCs should still be treated as node-sticky; if the workload must move freely across nodes after recreation, use Ceph RBD or CephFS instead
 
 ## Access mode support
@@ -142,9 +148,9 @@ Routing is inferred from the requested access mode:
 
 - Databases and other single-writer application data should still use the OpenNebula `IMAGE` datastore path
 - Shared caches, model stores, and other multi-node RWX workloads can now use the CephFS shared-filesystem path
-- `ReadOnlyMany` remains on the disk path in `v0.4.1`
-- CephFS expansion is stable in `v0.4.1`
-- CephFS snapshots and clones remain implemented behind feature gates and stay alpha-off by default in `v0.4.1`
+- `ReadOnlyMany` remains on the disk path in `v0.4.2`
+- CephFS expansion is stable in `v0.4.2`
+- CephFS snapshots and clones remain implemented behind feature gates and stay alpha-off by default in `v0.4.2`
 
 ## Ceph RBD support
 
@@ -270,14 +276,14 @@ Current behavior:
 - Controller expansion is supported for OpenNebula volumes that are attached to a VM.
 - Filesystem expansion is supported on the node for mounted filesystem volumes.
 - Block volumes do not require node-side filesystem expansion.
-- CephFS shared-filesystem volumes support expansion for dynamic subvolumes by default in `v0.4.1`.
+- CephFS shared-filesystem volumes support expansion for dynamic subvolumes by default in `v0.4.2`.
 - Static CephFS paths created with `sharedFilesystemPath` are not expandable.
-- Detached-volume expansion is enabled by default in `v0.4.1` and uses image-level resize via `one.image.update`.
+- Detached-volume expansion is enabled by default in `v0.4.2` and uses image-level resize via `one.image.update`.
 - Shrinking remains unsupported for disk and CephFS paths.
 
 ## Snapshots and clones
 
-Stable disk-path data-management features in `v0.4.1`:
+Stable disk-path data-management features in `v0.4.2`:
 
 - CSI `CreateSnapshot`, `DeleteSnapshot`, and `ListSnapshots` for OpenNebula image-backed volumes
 - PVC-to-PVC clone through CSI `VolumeContentSource.volume`
@@ -587,7 +593,7 @@ For CephFS-backed Omni deployments:
 
 ## Staging validation gate
 
-`v0.4.1` was validated on a live Omni + Talos + OpenNebula staging cluster before release. The repo includes:
+`v0.4.2` was validated on a live Omni + Talos + OpenNebula staging cluster before release. The repo includes:
 
 - a local validation script: `hack/validate-staging-cephfs.sh`
 - a manual GitHub Actions workflow: `.github/workflows/staging-cephfs-validation.yaml`

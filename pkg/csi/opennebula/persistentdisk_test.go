@@ -59,7 +59,12 @@ func TestPersistentDiskLifecycle(t *testing.T) {
 		t.Fatal("failed to create OpenNebula client")
 	}
 
-	volumeProvider, err := NewPersistentDiskVolumeProvider(client, 60*time.Second)
+	volumeProvider, err := NewPersistentDiskVolumeProvider(client, HotplugTimeoutPolicy{
+		BaseTimeout:  60 * time.Second,
+		Per100GiB:    60 * time.Second,
+		MaxTimeout:   5 * time.Minute,
+		PollInterval: time.Second,
+	})
 	if err != nil {
 		t.Fatalf("failed to create PersistentDiskVolumeProvider: %v", err)
 	}
@@ -163,50 +168,172 @@ func TestIsHotplugStateError(t *testing.T) {
 	require.False(t, isHotplugStateError(nil))
 }
 
-func TestWaitForHotplugStateAttachSucceedsAfterSeveralPolls(t *testing.T) {
-	provider := &PersistentDiskVolumeProvider{}
-	attempts := 0
+func TestComputeHotplugTimeoutScalesWithVolumeSize(t *testing.T) {
+	provider := &PersistentDiskVolumeProvider{
+		hotplugPolicy: HotplugTimeoutPolicy{
+			BaseTimeout: 120 * time.Second,
+			Per100GiB:   60 * time.Second,
+			MaxTimeout:  15 * time.Minute,
+		},
+	}
 
-	err := provider.waitForHotplugState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
-		attempts++
-		switch attempts {
-		case 1, 2:
-			return false, false, nil
-		default:
-			return true, true, nil
-		}
-	}, "attach", "vol-a", "node-a")
-
-	require.NoError(t, err)
-	assert.GreaterOrEqual(t, attempts, 3)
+	assert.Equal(t, 3*time.Minute, provider.ComputeHotplugTimeout(1*1024*1024*1024))
+	assert.Equal(t, 5*time.Minute, provider.ComputeHotplugTimeout(300*1024*1024*1024))
+	assert.Equal(t, 6*time.Minute, provider.ComputeHotplugTimeout(301*1024*1024*1024))
 }
 
-func TestWaitForHotplugStateDetachSucceedsAfterSeveralPolls(t *testing.T) {
-	provider := &PersistentDiskVolumeProvider{}
-	attempts := 0
+func TestComputeHotplugTimeoutClampsToMax(t *testing.T) {
+	provider := &PersistentDiskVolumeProvider{
+		hotplugPolicy: HotplugTimeoutPolicy{
+			BaseTimeout: 120 * time.Second,
+			Per100GiB:   60 * time.Second,
+			MaxTimeout:  5 * time.Minute,
+		},
+	}
 
-	err := provider.waitForHotplugState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
-		attempts++
-		switch attempts {
-		case 1, 2:
-			return true, false, nil
-		default:
+	assert.Equal(t, 5*time.Minute, provider.ComputeHotplugTimeout(900*1024*1024*1024))
+}
+
+func TestWaitForAttachStateReturnsHotplugTimeoutError(t *testing.T) {
+	provider := &PersistentDiskVolumeProvider{}
+
+	err := provider.waitForAttachState(context.Background(), 5*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+		return false, false, nil
+	}, nil, "vol-a", "node-a")
+
+	var timeoutErr *HotplugTimeoutError
+	require.ErrorAs(t, err, &timeoutErr)
+	assert.Equal(t, "attach", timeoutErr.Operation)
+	assert.False(t, timeoutErr.LastObservedAttached)
+	assert.False(t, timeoutErr.LastObservedReady)
+	assert.Equal(t, 5*time.Millisecond, timeoutErr.Timeout)
+}
+
+func TestWaitForDetachStateReturnsHotplugTimeoutError(t *testing.T) {
+	provider := &PersistentDiskVolumeProvider{}
+
+	err := provider.waitForDetachState(context.Background(), 5*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+		return true, false, nil
+	}, nil, "vol-a", "node-a")
+
+	var timeoutErr *HotplugTimeoutError
+	require.ErrorAs(t, err, &timeoutErr)
+	assert.Equal(t, "detach", timeoutErr.Operation)
+	assert.True(t, timeoutErr.LastObservedAttached)
+	assert.False(t, timeoutErr.LastObservedReady)
+	assert.Equal(t, 5*time.Millisecond, timeoutErr.Timeout)
+}
+
+func TestWaitForAttachStateRetriesAfterNodeBecomesReady(t *testing.T) {
+	provider := &PersistentDiskVolumeProvider{}
+	retryCount := 0
+	attached := false
+
+	err := provider.waitForAttachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+		if retryCount == 0 {
 			return false, true, nil
 		}
-	}, "detach", "vol-a", "node-a")
+		if attached {
+			return true, true, nil
+		}
+		return false, false, nil
+	}, func() error {
+		retryCount++
+		attached = true
+		return nil
+	}, "vol-a", "node-a")
 
 	require.NoError(t, err)
-	assert.GreaterOrEqual(t, attempts, 3)
+	assert.Equal(t, 1, retryCount)
 }
 
-func TestWaitForHotplugStateTimesOutWhenAttachNeverStabilizes(t *testing.T) {
+func TestWaitForAttachStateRetriesHotplugUntilSuccess(t *testing.T) {
+	provider := &PersistentDiskVolumeProvider{}
+	retryCount := 0
+
+	err := provider.waitForAttachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+		if retryCount >= 2 {
+			return true, true, nil
+		}
+		return false, true, nil
+	}, func() error {
+		retryCount++
+		if retryCount == 1 {
+			return fmt.Errorf("wrong state HOTPLUG")
+		}
+		return nil
+	}, "vol-a", "node-a")
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, retryCount)
+}
+
+func TestWaitForAttachStateFailsOnNonHotplugRetryError(t *testing.T) {
 	provider := &PersistentDiskVolumeProvider{}
 
-	err := provider.waitForHotplugState(context.Background(), 5*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
-		return false, false, nil
-	}, "attach", "vol-a", "node-a")
+	err := provider.waitForAttachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+		return false, true, nil
+	}, func() error {
+		return fmt.Errorf("permission denied")
+	}, "vol-a", "node-a")
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "timed out")
-	assert.Contains(t, err.Error(), "attached=false")
+	assert.Contains(t, err.Error(), "failed to retry attach")
+}
+
+func TestWaitForDetachStateRetriesAfterNodeBecomesReady(t *testing.T) {
+	provider := &PersistentDiskVolumeProvider{}
+	retryCount := 0
+	attached := true
+
+	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+		if retryCount == 0 {
+			return true, true, nil
+		}
+		if !attached {
+			return false, true, nil
+		}
+		return true, false, nil
+	}, func() error {
+		retryCount++
+		attached = false
+		return nil
+	}, "vol-a", "node-a")
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, retryCount)
+}
+
+func TestWaitForDetachStateRetriesHotplugUntilSuccess(t *testing.T) {
+	provider := &PersistentDiskVolumeProvider{}
+	retryCount := 0
+
+	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+		if retryCount >= 2 {
+			return false, true, nil
+		}
+		return true, true, nil
+	}, func() error {
+		retryCount++
+		if retryCount == 1 {
+			return fmt.Errorf("wrong state HOTPLUG")
+		}
+		return nil
+	}, "vol-a", "node-a")
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, retryCount)
+}
+
+func TestWaitForDetachStateFailsOnNonHotplugRetryError(t *testing.T) {
+	provider := &PersistentDiskVolumeProvider{}
+
+	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+		return true, true, nil
+	}, func() error {
+		return fmt.Errorf("permission denied")
+	}, "vol-a", "node-a")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to retry detach")
 }

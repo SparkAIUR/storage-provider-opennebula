@@ -28,6 +28,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -52,6 +53,8 @@ func getTestControllerServerWithAllowedTypes(mockProvider *MockOpenNebulaVolumeP
 		grpcServerEndpoint: DefaultGRPCServerEndpoint,
 		nodeID:             "test-controller-id",
 		PluginConfig:       pluginConfig,
+		metrics:            NewDriverMetrics(driverVersion, "test"),
+		hotplugGuard:       NewHotplugGuard(5 * time.Minute),
 		operationLocks:     NewOperationLocks(),
 	}
 
@@ -73,7 +76,9 @@ func newTestDriver() *Driver {
 		grpcServerEndpoint: DefaultGRPCServerEndpoint,
 		nodeID:             "test-controller-id",
 		PluginConfig:       pluginConfig,
+		metrics:            NewDriverMetrics(driverVersion, "test"),
 		featureGates:       FeatureGates{DetachedDiskExpansion: true},
+		hotplugGuard:       NewHotplugGuard(5 * time.Minute),
 		operationLocks:     NewOperationLocks(),
 	}
 }
@@ -561,13 +566,14 @@ func TestControllerPublishVolume(t *testing.T) {
 			setupMock: func(m *MockOpenNebulaVolumeProviderTestify) {
 				m.On("VolumeExists", mock.Anything, "1234").Return(1, 1, nil)
 				m.On("NodeExists", mock.Anything, "test-node-id").Return(1, nil)
-				m.On("GetVolumeInNode", mock.Anything, 1, 1).Once().Return("", errors.New("volume not attached to node"))
+				m.On("GetVolumeInNode", mock.Anything, 1, 1).Twice().Return("", errors.New("volume not attached to node"))
 				m.On("AttachVolume", mock.Anything, "1234", "test-node-id", false, mock.Anything).Return(nil)
 				m.On("GetVolumeInNode", mock.Anything, 1, 1).Once().Return("attached-volume", nil)
 			},
 			expectResponse: &csi.ControllerPublishVolumeResponse{
 				PublishContext: map[string]string{
-					"volumeName": "attached-volume",
+					"volumeName":                        "attached-volume",
+					publishContextHotplugTimeoutSeconds: "180",
 				},
 			},
 			expectError: false,
@@ -591,7 +597,7 @@ func TestControllerPublishVolume(t *testing.T) {
 			setupMock: func(m *MockOpenNebulaVolumeProviderTestify) {
 				m.On("VolumeExists", mock.Anything, "1234").Return(1, 1, nil)
 				m.On("NodeExists", mock.Anything, "test-node-id").Return(1, nil)
-				m.On("GetVolumeInNode", mock.Anything, 1, 1).Once().Return("", errors.New("volume not attached to node"))
+				m.On("GetVolumeInNode", mock.Anything, 1, 1).Twice().Return("", errors.New("volume not attached to node"))
 				m.On("AttachVolume", mock.Anything, "1234", "test-node-id", false, mock.Anything).
 					Return(opennebula.NewDatastoreConfigError("ceph datastore mismatch"))
 			},
@@ -1192,7 +1198,7 @@ func TestControllerUnpublishVolume(t *testing.T) {
 			setupMock: func(m *MockOpenNebulaVolumeProviderTestify) {
 				m.On("VolumeExists", mock.Anything, "test-volume-id").Return(1, 1, nil)
 				m.On("NodeExists", mock.Anything, "test-node-id").Return(42, nil)
-				m.On("GetVolumeInNode", mock.Anything, 1, 42).Return("attached-target", nil)
+				m.On("GetVolumeInNode", mock.Anything, 1, 42).Return("attached-target", nil).Twice()
 				m.On("DetachVolume", mock.Anything, "test-volume-id", "test-node-id").Return(nil)
 			},
 			expectResponse: &csi.ControllerUnpublishVolumeResponse{},
@@ -1239,12 +1245,13 @@ func TestControllerPublishVolumeSerializesSameNodeHotplug(t *testing.T) {
 	mockProvider.On("VolumeExists", mock.Anything, "vol-1").Return(1, 1, nil)
 	mockProvider.On("VolumeExists", mock.Anything, "vol-2").Return(2, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", errors.New("not attached")).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", errors.New("not attached")).Twice()
 	mockProvider.On("GetVolumeInNode", mock.Anything, 2, 41).Return("", errors.New("not attached")).Once()
+	mockProvider.On("ResolveVolumeSizeBytes", mock.Anything, "vol-1").Return(int64(300*1024*1024*1024), nil).Maybe()
+	mockProvider.On("ResolveVolumeSizeBytes", mock.Anything, "vol-2").Return(int64(300*1024*1024*1024), nil).Maybe()
+	mockProvider.On("ComputeHotplugTimeout", int64(300*1024*1024*1024)).Return(5 * time.Minute).Maybe()
 	mockProvider.On("AttachVolume", mock.Anything, "vol-1", "node-1", false, mock.Anything).Return(nil).Once()
-	mockProvider.On("AttachVolume", mock.Anything, "vol-2", "node-1", false, mock.Anything).Return(nil).Once()
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("sdb", nil).Once()
-	mockProvider.On("GetVolumeInNode", mock.Anything, 2, 41).Return("sdc", nil).Once()
 
 	errs := make(chan error, 2)
 	go func() {
@@ -1259,16 +1266,16 @@ func TestControllerPublishVolumeSerializesSameNodeHotplug(t *testing.T) {
 	}()
 
 	select {
-	case <-provider.attachStarted:
-		t.Fatal("expected same-node publish to serialize attach operations")
-	case <-time.After(20 * time.Millisecond):
+	case err := <-errs:
+		require.Error(t, err)
+		assert.Equal(t, codes.Aborted, status.Code(err))
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected second same-node publish to fail fast while node hotplug is busy")
 	}
 
 	close(provider.attachGate)
 	<-provider.attachFinished
-	<-provider.attachFinished
 
-	assert.NoError(t, <-errs)
 	assert.NoError(t, <-errs)
 	assert.Equal(t, int32(1), atomic.LoadInt32(&provider.maxConcurrentAttach))
 	mockProvider.AssertExpectations(t)
@@ -1286,10 +1293,12 @@ func TestControllerExpandVolumeSerializesWithPublishOnSameVolume(t *testing.T) {
 
 	cs := NewControllerServer(newTestDriver(), provider, &MockSharedFilesystemProviderTestify{})
 
-	mockProvider.On("ExpandVolume", mock.Anything, "vol-1", int64(2*1024*1024*1024), true).Return(int64(2 * 1024 * 1024 * 1024), nil).Once()
+	mockProvider.On("ExpandVolume", mock.Anything, "vol-1", int64(2*1024*1024*1024), true).Return(int64(2*1024*1024*1024), nil).Once()
 	mockProvider.On("VolumeExists", mock.Anything, "vol-1").Return(1, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", errors.New("not attached")).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", errors.New("not attached")).Twice()
+	mockProvider.On("ResolveVolumeSizeBytes", mock.Anything, "vol-1").Return(int64(2*1024*1024*1024), nil).Maybe()
+	mockProvider.On("ComputeHotplugTimeout", int64(2*1024*1024*1024)).Return(3 * time.Minute).Maybe()
 	mockProvider.On("AttachVolume", mock.Anything, "vol-1", "node-1", false, mock.Anything).Return(nil).Once()
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("sdb", nil).Once()
 
@@ -1344,6 +1353,15 @@ type serializingVolumeProvider struct {
 
 type MockSharedFilesystemProviderTestify struct {
 	mock.Mock
+}
+
+func (m *MockOpenNebulaVolumeProviderTestify) hasExpectation(method string) bool {
+	for _, call := range m.ExpectedCalls {
+		if call.Method == method {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *MockOpenNebulaVolumeProviderTestify) CreateVolume(ctx context.Context, name string, size int64, owner string, immutable bool, fsType string, params map[string]string, selection opennebula.DatastoreSelectionConfig) (*opennebula.VolumeCreateResult, error) {
@@ -1444,6 +1462,46 @@ func (m *MockOpenNebulaVolumeProviderTestify) NodeExists(ctx context.Context, no
 func (m *MockOpenNebulaVolumeProviderTestify) GetVolumeInNode(ctx context.Context, volumeID int, nodeID int) (string, error) {
 	args := m.Called(ctx, volumeID, nodeID)
 	return args.Get(0).(string), args.Error(1)
+}
+
+func (m *MockOpenNebulaVolumeProviderTestify) ResolveVolumeSizeBytes(ctx context.Context, volume string) (int64, error) {
+	if !m.hasExpectation("ResolveVolumeSizeBytes") {
+		return int64(10 * 1024 * 1024 * 1024), nil
+	}
+	args := m.Called(ctx, volume)
+	return args.Get(0).(int64), args.Error(1)
+}
+
+func (m *MockOpenNebulaVolumeProviderTestify) ComputeHotplugTimeout(sizeBytes int64) time.Duration {
+	if !m.hasExpectation("ComputeHotplugTimeout") {
+		return 3 * time.Minute
+	}
+	args := m.Called(sizeBytes)
+	return args.Get(0).(time.Duration)
+}
+
+func (m *MockOpenNebulaVolumeProviderTestify) HotplugPolicy() opennebula.HotplugTimeoutPolicy {
+	if !m.hasExpectation("HotplugPolicy") {
+		return opennebula.HotplugTimeoutPolicy{
+			BaseTimeout:  time.Minute,
+			Per100GiB:    time.Minute,
+			MaxTimeout:   15 * time.Minute,
+			PollInterval: time.Second,
+		}
+	}
+	args := m.Called()
+	if policy := args.Get(0); policy != nil {
+		return policy.(opennebula.HotplugTimeoutPolicy)
+	}
+	return opennebula.HotplugTimeoutPolicy{}
+}
+
+func (m *MockOpenNebulaVolumeProviderTestify) NodeReady(ctx context.Context, node string) (bool, error) {
+	if !m.hasExpectation("NodeReady") {
+		return false, nil
+	}
+	args := m.Called(ctx, node)
+	return args.Bool(0), args.Error(1)
 }
 
 func (m *MockOpenNebulaVolumeProviderTestify) VolumeReadyWithTimeout(volumeID int) (bool, error) {

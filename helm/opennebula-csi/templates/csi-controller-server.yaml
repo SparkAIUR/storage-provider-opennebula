@@ -94,7 +94,7 @@ spec:
           args:
             - "--v=5"
             - "--csi-address=$(ADDRESS)"
-            - "--timeout=2m"
+            - "--timeout={{ .Values.controller.sidecarTimeoutSeconds }}s"
             - "--default-fstype=ext4"
             - "--extra-create-metadata"
             {{- if .Values.metrics.enabled }}
@@ -118,7 +118,7 @@ spec:
           args:
             - "--v=5"
             - "--csi-address=$(ADDRESS)"
-            - "--timeout=2m"
+            - "--timeout={{ .Values.controller.sidecarTimeoutSeconds }}s"
             {{- if .Values.metrics.enabled }}
             - "--http-endpoint=:{{ .Values.metrics.ports.attacher }}"
             {{- end }}
@@ -140,6 +140,7 @@ spec:
           args:
             - "--v=5"
             - "--csi-address=$(ADDRESS)"
+            - "--timeout={{ .Values.controller.sidecarTimeoutSeconds }}s"
             - "--leader-election"
             {{- if .Values.metrics.enabled }}
             - "--http-endpoint=:{{ .Values.metrics.ports.resizer }}"

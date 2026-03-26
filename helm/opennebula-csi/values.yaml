@@ -14,7 +14,7 @@ credentials:
 
 image:
   repository: "nudevco/opennebula-csi"
-  tag: "v0.4.1"
+  tag: "v0.4.2"
   pullPolicy: "IfNotPresent"
 
 imagePullSecrets: []
@@ -24,7 +24,11 @@ driver:
   logLevel: 5
   defaultDatastores: []
   datastoreSelectionPolicy: "least-used"
-  vmHotplugTimeoutSeconds: 60
+  vmHotplugTimeoutSeconds: 120
+  vmHotplugTimeoutBaseSeconds: 120
+  vmHotplugTimeoutPer100GiSeconds: 60
+  vmHotplugTimeoutMaxSeconds: 900
+  vmHotplugStuckVmCooldownSeconds: 300
   allowedDatastoreTypes:
     - "local"
     - "ceph"
@@ -43,6 +47,7 @@ featureGates:
 
 controller:
   replicaCount: 1
+  sidecarTimeoutSeconds: 960
   podAnnotations: {}
   resources: {}
   nodeSelector: {}

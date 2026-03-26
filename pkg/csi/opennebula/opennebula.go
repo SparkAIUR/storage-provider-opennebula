@@ -18,9 +18,54 @@ package opennebula
 
 import (
 	"context"
+	"time"
 
 	"github.com/OpenNebula/one/src/oca/go/src/goca"
 )
+
+type HotplugTimeoutPolicy struct {
+	BaseTimeout  time.Duration
+	Per100GiB    time.Duration
+	MaxTimeout   time.Duration
+	PollInterval time.Duration
+}
+
+type HotplugCooldownState struct {
+	Node                 string
+	Operation            string
+	Volume               string
+	ExpiresAt            time.Time
+	Timeout              time.Duration
+	LastObservedReady    bool
+	LastObservedAttached bool
+}
+
+type HotplugTimeoutError struct {
+	Operation            string
+	Volume               string
+	Node                 string
+	Timeout              time.Duration
+	LastObservedAttached bool
+	LastObservedReady    bool
+	Cause                error
+}
+
+func (e *HotplugTimeoutError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Cause != nil {
+		return e.Cause.Error()
+	}
+	return "hotplug timeout"
+}
+
+func (e *HotplugTimeoutError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
 
 type OpenNebulaConfig struct {
 	Endpoint    string
@@ -42,6 +87,10 @@ type OpenNebulaVolumeProvider interface {
 	ExpandVolume(ctx context.Context, volume string, size int64, allowDetached bool) (int64, error)
 	AttachVolume(ctx context.Context, volume string, node string, immutable bool, params map[string]string) error
 	DetachVolume(ctx context.Context, volume string, node string) error
+	ResolveVolumeSizeBytes(ctx context.Context, volume string) (int64, error)
+	ComputeHotplugTimeout(sizeBytes int64) time.Duration
+	HotplugPolicy() HotplugTimeoutPolicy
+	NodeReady(ctx context.Context, node string) (bool, error)
 	ListVolumes(ctx context.Context, owner string, maxEntries int32, startingToken string) ([]string, error)
 	GetCapacity(ctx context.Context, selection DatastoreSelectionConfig) (int64, error)
 	VolumeExists(ctx context.Context, volume string) (int, int, error)

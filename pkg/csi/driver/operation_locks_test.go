@@ -59,3 +59,27 @@ func TestOperationLocksDeduplicateAndSortKeys(t *testing.T) {
 		t.Fatalf("expected all lock refs to be released, got %d", len(locks.locks))
 	}
 }
+
+func TestOperationLocksTryAcquireSameKey(t *testing.T) {
+	locks := NewOperationLocks()
+	release := locks.Acquire("node:1")
+	defer release()
+
+	tryRelease, ok := locks.TryAcquire("node:1")
+	if ok {
+		defer tryRelease()
+		t.Fatal("try acquire should fail while the same key is held")
+	}
+}
+
+func TestOperationLocksTryAcquireDifferentKey(t *testing.T) {
+	locks := NewOperationLocks()
+	release := locks.Acquire("node:1")
+	defer release()
+
+	tryRelease, ok := locks.TryAcquire("node:2")
+	if !ok {
+		t.Fatal("try acquire should succeed for a different key")
+	}
+	tryRelease()
+}

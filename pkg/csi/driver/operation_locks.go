@@ -61,6 +61,42 @@ func (o *OperationLocks) Acquire(keys ...string) func() {
 	}
 }
 
+func (o *OperationLocks) TryAcquire(key string) (func(), bool) {
+	normalized := normalizeLockKeys([]string{key})
+	if len(normalized) == 0 {
+		return func() {}, true
+	}
+
+	o.mu.Lock()
+	ref := o.locks[normalized[0]]
+	if ref == nil {
+		ref = &operationLockRef{}
+		o.locks[normalized[0]] = ref
+	}
+	ref.refs++
+	o.mu.Unlock()
+
+	if !ref.mu.TryLock() {
+		o.mu.Lock()
+		ref.refs--
+		if ref.refs == 0 {
+			delete(o.locks, normalized[0])
+		}
+		o.mu.Unlock()
+		return nil, false
+	}
+
+	return func() {
+		ref.mu.Unlock()
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		ref.refs--
+		if ref.refs == 0 {
+			delete(o.locks, normalized[0])
+		}
+	}, true
+}
+
 func normalizeLockKeys(keys []string) []string {
 	if len(keys) == 0 {
 		return nil
