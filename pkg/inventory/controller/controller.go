@@ -288,10 +288,11 @@ func (s *Syncer) syncNodes(ctx context.Context) error {
 		return err
 	}
 
-	datastores, _ := s.ctrl.Datastores().InfoContext(ctx)
 	dsNames := make(map[int]string)
-	for _, ds := range datastores.Datastores {
-		dsNames[ds.ID] = ds.Name
+	if datastores, err := s.ctrl.Datastores().InfoContext(ctx); err != nil {
+		ctrl.Log.Error(err, "failed to list OpenNebula datastores for node inventory")
+	} else {
+		dsNames = datastoreNameMap(datastores)
 	}
 	hotplugStates, _ := s.loadHotplugStateMap(ctx)
 
@@ -1227,6 +1228,17 @@ func attachedVolumeHandlesDisplay(handles []string) string {
 		return strings.Join(handles, ",")
 	}
 	return fmt.Sprintf("%s (+%d more)", strings.Join(handles[:3], ","), len(handles)-3)
+}
+
+func datastoreNameMap(pool *datastoreSchema.Pool) map[int]string {
+	names := make(map[int]string)
+	if pool == nil {
+		return names
+	}
+	for _, ds := range pool.Datastores {
+		names[ds.ID] = ds.Name
+	}
+	return names
 }
 
 func filteredNodeLabels(labels map[string]string) map[string]string {

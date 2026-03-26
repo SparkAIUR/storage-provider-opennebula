@@ -261,6 +261,23 @@ func TestNodeDisplayState(t *testing.T) {
 	}
 }
 
+func TestDatastoreNameMapHandlesNilPool(t *testing.T) {
+	if got := datastoreNameMap(nil); len(got) != 0 {
+		t.Fatalf("expected empty map for nil pool, got %#v", got)
+	}
+
+	pool := &datastoreSchema.Pool{
+		Datastores: []datastoreSchema.Datastore{
+			{ID: 1, Name: "default"},
+			{ID: 100, Name: "lvm_local_image"},
+		},
+	}
+	got := datastoreNameMap(pool)
+	if got[1] != "default" || got[100] != "lvm_local_image" {
+		t.Fatalf("unexpected datastore name map: %#v", got)
+	}
+}
+
 func boolPtr(value bool) *bool {
 	return &value
 }
