@@ -78,7 +78,7 @@ inventoryController:
     nodes: 30
   validation:
     enabled: true
-    defaultImage: "ghcr.io/axboe/fio:latest"
+    defaultImage: "alpine:3.22"
     profiles:
       smoke:
         size: "4Gi"

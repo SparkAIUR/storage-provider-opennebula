@@ -1159,7 +1159,7 @@ func buildValidationCommand(args []string) string {
 	if len(args) == 0 {
 		args = defaultArgs
 	}
-	return "set -eu; fio " + strings.Join(args, " ") + " --output-format=json"
+	return "set -eu; if ! command -v fio >/dev/null 2>&1; then if command -v apk >/dev/null 2>&1; then apk add --no-cache fio >/dev/null; else echo 'fio binary is unavailable and apk is not installed' >&2; exit 1; fi; fi; fio " + strings.Join(args, " ") + " --output-format=json"
 }
 
 func datastoreObjectName(id int) string {

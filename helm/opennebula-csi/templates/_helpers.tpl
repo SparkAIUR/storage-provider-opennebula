@@ -101,7 +101,7 @@ Create chart name and version as used by the chart label.
 {{- $inventoryNamespace = include "opennebula-csi.namespace" $root -}}
 {{- end }}
 {{- $inventoryValidationEnabled := (get $inventoryValidation "enabled") | default true -}}
-{{- $inventoryValidationDefaultImage := (get $inventoryValidation "defaultImage") | default "ghcr.io/axboe/fio:latest" -}}
+{{- $inventoryValidationDefaultImage := (get $inventoryValidation "defaultImage") | default "alpine:3.22" -}}
 {{- if $root.Values.driver.defaultDatastores }}
 - name: ONE_CSI_DEFAULT_DATASTORES
   value: {{ join "," $root.Values.driver.defaultDatastores | quote }}
