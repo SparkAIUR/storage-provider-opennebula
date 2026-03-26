@@ -116,6 +116,60 @@ func TestPersistentDiskLifecycle(t *testing.T) {
 	t.Logf("volume %s deleted successfully", volumeTestName)
 }
 
+func TestPersistentDiskDetachedExpansion(t *testing.T) {
+	if os.Getenv("RUN_OPENNEBULA_INTEGRATION_TESTS") != "1" {
+		t.Skip("set RUN_OPENNEBULA_INTEGRATION_TESTS=1 to run OpenNebula integration tests")
+	}
+
+	cfg := OpenNebulaConfig{
+		Endpoint:    os.Getenv(config.OpenNebulaRPCEndpointVar),
+		Credentials: os.Getenv(config.OpenNebulaCredentialsVar),
+	}
+	if cfg.Endpoint == "" || cfg.Credentials == "" {
+		t.Skipf("%s or %s not set, skipping integration test",
+			config.OpenNebulaRPCEndpointVar,
+			config.OpenNebulaCredentialsVar)
+	}
+
+	client := NewClient(cfg)
+	volumeProvider, err := NewPersistentDiskVolumeProvider(client, HotplugTimeoutPolicy{
+		BaseTimeout:  60 * time.Second,
+		Per100GiB:    60 * time.Second,
+		MaxTimeout:   5 * time.Minute,
+		PollInterval: time.Second,
+	})
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	selection := DatastoreSelectionConfig{
+		Identifiers:  getIntegrationTestDatastores(),
+		Policy:       DatastoreSelectionPolicyLeastUsed,
+		AllowedTypes: []string{"local"},
+	}
+
+	params := map[string]string{
+		"devPrefix": "vd",
+	}
+
+	volumeTestName := fmt.Sprintf("%s-expand-%s", volumeName, uuid.New().String())
+	initialSize := int64(128 * 1024 * 1024)
+	expandedSize := int64(256 * 1024 * 1024)
+
+	_, err = volumeProvider.CreateVolume(ctx, volumeTestName, initialSize, testDriverName, false, "ext4", params, selection)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = volumeProvider.DeleteVolume(ctx, volumeTestName)
+	})
+
+	newSize, err := volumeProvider.ExpandVolume(ctx, volumeTestName, expandedSize, true)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, newSize, expandedSize)
+
+	_, resolvedSize, err := volumeProvider.VolumeExists(ctx, volumeTestName)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, int64(resolvedSize), expandedSize)
+}
+
 func getIntegrationTestDatastores() []string {
 	values := config.LoadConfiguration()
 	if datastores, ok := values.GetStringSlice(config.DefaultDatastoresVar); ok && len(datastores) > 0 {

@@ -26,6 +26,7 @@ import (
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/driver"
+	inventorycontroller "github.com/SparkAIUR/storage-provider-opennebula/pkg/inventory/controller"
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
 	"k8s.io/utils/exec"
@@ -36,7 +37,7 @@ var (
 	pluginEndpoint              = flag.String("endpoint", driver.DefaultGRPCServerEndpoint, "CSI plugin endpoint")
 	nodeID                      = flag.String("nodeid", "", "Node ID")
 	maxVolumesPerNode           = flag.Uint64("maxVolumesPerNode", 255, "Maximum number of volumes that can be attached to a node")
-	mode                        = flag.String("mode", "driver", "Execution mode: driver or preflight")
+	mode                        = flag.String("mode", "driver", "Execution mode: driver, preflight, or inventory-controller")
 	output                      = flag.String("output", "text", "Output format for preflight mode: text or json")
 	preflightDatastores         = flag.String("preflight-datastores", "", "Comma-separated datastore identifiers to validate during preflight")
 	preflightNodeStageSecrets   = flag.String("preflight-node-stage-secrets", "", "Comma-separated namespace/name secret references for CephFS node-stage validation")
@@ -111,6 +112,19 @@ func handle(cfg config.CSIPluginConfig) int {
 		}
 		if err := driver.RunPreflightCommand(ctx, cfg, exec.New(), opts, *output, os.Stdout); err != nil {
 			klog.Errorf("Preflight failed: %v", err)
+			return 1
+		}
+		return 0
+	case "inventory-controller":
+		namespace, _ := cfg.GetString(config.InventoryControllerNamespaceVar)
+		validationEnabled, _ := cfg.GetBool(config.InventoryValidationEnabledVar)
+		defaultImage, _ := cfg.GetString(config.InventoryValidationDefaultImageVar)
+		if err := inventorycontroller.Run(ctx, cfg, inventorycontroller.Options{
+			Namespace:         namespace,
+			ValidationEnabled: validationEnabled,
+			DefaultImage:      defaultImage,
+		}); err != nil {
+			klog.Errorf("Inventory controller failed: %v", err)
 			return 1
 		}
 		return 0

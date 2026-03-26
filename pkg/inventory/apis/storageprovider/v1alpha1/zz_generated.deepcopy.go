@@ -1,0 +1,312 @@
+package v1alpha1
+
+import (
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+)
+
+func (in *ObjectRefSummary) DeepCopyInto(out *ObjectRefSummary) {
+	*out = *in
+}
+
+func (in *ObjectRefSummary) DeepCopy() *ObjectRefSummary {
+	if in == nil {
+		return nil
+	}
+	out := new(ObjectRefSummary)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *ValidationJobTemplate) DeepCopyInto(out *ValidationJobTemplate) {
+	*out = *in
+	if in.FioArgs != nil {
+		out.FioArgs = append([]string(nil), in.FioArgs...)
+	}
+	if in.NodeSelector != nil {
+		out.NodeSelector = make(map[string]string, len(in.NodeSelector))
+		for key, value := range in.NodeSelector {
+			out.NodeSelector[key] = value
+		}
+	}
+	if in.Tolerations != nil {
+		out.Tolerations = make([]corev1.Toleration, len(in.Tolerations))
+		copy(out.Tolerations, in.Tolerations)
+	}
+	in.Resources.DeepCopyInto(&out.Resources)
+	if in.TTLSecondsAfterFinished != nil {
+		value := *in.TTLSecondsAfterFinished
+		out.TTLSecondsAfterFinished = &value
+	}
+}
+
+func (in *ValidationJobTemplate) DeepCopy() *ValidationJobTemplate {
+	if in == nil {
+		return nil
+	}
+	out := new(ValidationJobTemplate)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *OpenNebulaDatastoreValidationSpec) DeepCopyInto(out *OpenNebulaDatastoreValidationSpec) {
+	*out = *in
+	in.JobTemplate.DeepCopyInto(&out.JobTemplate)
+}
+
+func (in *OpenNebulaDatastoreDiscoverySpec) DeepCopyInto(out *OpenNebulaDatastoreDiscoverySpec) {
+	*out = *in
+}
+
+func (in *OpenNebulaDatastoreSpec) DeepCopyInto(out *OpenNebulaDatastoreSpec) {
+	*out = *in
+	in.Validation.DeepCopyInto(&out.Validation)
+	in.Discovery.DeepCopyInto(&out.Discovery)
+}
+
+func (in *OpenNebulaDatastoreOpenNebulaStatus) DeepCopyInto(out *OpenNebulaDatastoreOpenNebulaStatus) {
+	*out = *in
+	if in.ClusterIDs != nil {
+		out.ClusterIDs = append([]int(nil), in.ClusterIDs...)
+	}
+	if in.CompatibleSystemDatastores != nil {
+		out.CompatibleSystemDatastores = append([]int(nil), in.CompatibleSystemDatastores...)
+	}
+}
+
+func (in *OpenNebulaDatastoreCapacityStatus) DeepCopyInto(out *OpenNebulaDatastoreCapacityStatus) {
+	*out = *in
+}
+
+func (in *OpenNebulaDatastoreUsageStatus) DeepCopyInto(out *OpenNebulaDatastoreUsageStatus) {
+	*out = *in
+	if in.StorageClasses != nil {
+		out.StorageClasses = append([]string(nil), in.StorageClasses...)
+	}
+	if in.BoundClaims != nil {
+		out.BoundClaims = make([]ObjectRefSummary, len(in.BoundClaims))
+		copy(out.BoundClaims, in.BoundClaims)
+	}
+}
+
+func (in *ValidationResult) DeepCopyInto(out *ValidationResult) {
+	*out = *in
+	if in.ReadIops != nil {
+		value := *in.ReadIops
+		out.ReadIops = &value
+	}
+	if in.WriteIops != nil {
+		value := *in.WriteIops
+		out.WriteIops = &value
+	}
+	if in.ReadBwBytes != nil {
+		value := *in.ReadBwBytes
+		out.ReadBwBytes = &value
+	}
+	if in.WriteBwBytes != nil {
+		value := *in.WriteBwBytes
+		out.WriteBwBytes = &value
+	}
+	if in.LatencyP50Micros != nil {
+		value := *in.LatencyP50Micros
+		out.LatencyP50Micros = &value
+	}
+	if in.LatencyP99Micros != nil {
+		value := *in.LatencyP99Micros
+		out.LatencyP99Micros = &value
+	}
+}
+
+func (in *OpenNebulaDatastoreValidationStatus) DeepCopyInto(out *OpenNebulaDatastoreValidationStatus) {
+	*out = *in
+	if in.LastRunTime != nil {
+		value := in.LastRunTime.DeepCopy()
+		out.LastRunTime = value
+	}
+	if in.LastCompletedTime != nil {
+		value := in.LastCompletedTime.DeepCopy()
+		out.LastCompletedTime = value
+	}
+	in.Result.DeepCopyInto(&out.Result)
+}
+
+func (in *OpenNebulaDatastoreStatus) DeepCopyInto(out *OpenNebulaDatastoreStatus) {
+	*out = *in
+	in.OpenNebula.DeepCopyInto(&out.OpenNebula)
+	in.Capacity.DeepCopyInto(&out.Capacity)
+	in.Usage.DeepCopyInto(&out.Usage)
+	in.Validation.DeepCopyInto(&out.Validation)
+	if in.Conditions != nil {
+		out.Conditions = make([]metav1.Condition, len(in.Conditions))
+		copy(out.Conditions, in.Conditions)
+	}
+}
+
+func (in *OpenNebulaDatastore) DeepCopyInto(out *OpenNebulaDatastore) {
+	*out = *in
+	out.TypeMeta = in.TypeMeta
+	in.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
+	in.Spec.DeepCopyInto(&out.Spec)
+	in.Status.DeepCopyInto(&out.Status)
+}
+
+func (in *OpenNebulaDatastore) DeepCopy() *OpenNebulaDatastore {
+	if in == nil {
+		return nil
+	}
+	out := new(OpenNebulaDatastore)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *OpenNebulaDatastore) DeepCopyObject() runtime.Object {
+	return in.DeepCopy()
+}
+
+func (in *OpenNebulaDatastoreList) DeepCopyInto(out *OpenNebulaDatastoreList) {
+	*out = *in
+	out.TypeMeta = in.TypeMeta
+	in.ListMeta.DeepCopyInto(&out.ListMeta)
+	if in.Items != nil {
+		out.Items = make([]OpenNebulaDatastore, len(in.Items))
+		for i := range in.Items {
+			in.Items[i].DeepCopyInto(&out.Items[i])
+		}
+	}
+}
+
+func (in *OpenNebulaDatastoreList) DeepCopy() *OpenNebulaDatastoreList {
+	if in == nil {
+		return nil
+	}
+	out := new(OpenNebulaDatastoreList)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *OpenNebulaDatastoreList) DeepCopyObject() runtime.Object {
+	return in.DeepCopy()
+}
+
+func (in *OpenNebulaNodeSpec) DeepCopyInto(out *OpenNebulaNodeSpec) {
+	*out = *in
+}
+
+func (in *NodeConditionSummary) DeepCopyInto(out *NodeConditionSummary) {
+	*out = *in
+}
+
+func (in *AttachedDiskSummary) DeepCopyInto(out *AttachedDiskSummary) {
+	*out = *in
+}
+
+func (in *OpenNebulaNodeKubernetesStatus) DeepCopyInto(out *OpenNebulaNodeKubernetesStatus) {
+	*out = *in
+	if in.Labels != nil {
+		out.Labels = make(map[string]string, len(in.Labels))
+		for key, value := range in.Labels {
+			out.Labels[key] = value
+		}
+	}
+	if in.Taints != nil {
+		out.Taints = make([]corev1.Taint, len(in.Taints))
+		copy(out.Taints, in.Taints)
+	}
+	if in.Conditions != nil {
+		out.Conditions = make([]NodeConditionSummary, len(in.Conditions))
+		copy(out.Conditions, in.Conditions)
+	}
+	if in.Addresses != nil {
+		out.Addresses = make([]corev1.NodeAddress, len(in.Addresses))
+		copy(out.Addresses, in.Addresses)
+	}
+}
+
+func (in *OpenNebulaNodeOpenNebulaStatus) DeepCopyInto(out *OpenNebulaNodeOpenNebulaStatus) {
+	*out = *in
+}
+
+func (in *OpenNebulaNodeStorageStatus) DeepCopyInto(out *OpenNebulaNodeStorageStatus) {
+	*out = *in
+	if in.AttachedVolumeIDs != nil {
+		out.AttachedVolumeIDs = append([]string(nil), in.AttachedVolumeIDs...)
+	}
+	if in.AttachedPersistentDisks != nil {
+		out.AttachedPersistentDisks = make([]AttachedDiskSummary, len(in.AttachedPersistentDisks))
+		copy(out.AttachedPersistentDisks, in.AttachedPersistentDisks)
+	}
+}
+
+func (in *OpenNebulaNodeHotplugStatus) DeepCopyInto(out *OpenNebulaNodeHotplugStatus) {
+	*out = *in
+	if in.CooldownExpiresAt != nil {
+		out.CooldownExpiresAt = in.CooldownExpiresAt.DeepCopy()
+	}
+	if in.LastObservedAttached != nil {
+		value := *in.LastObservedAttached
+		out.LastObservedAttached = &value
+	}
+	if in.LastObservedReady != nil {
+		value := *in.LastObservedReady
+		out.LastObservedReady = &value
+	}
+}
+
+func (in *OpenNebulaNodeStatus) DeepCopyInto(out *OpenNebulaNodeStatus) {
+	*out = *in
+	in.Kubernetes.DeepCopyInto(&out.Kubernetes)
+	in.OpenNebula.DeepCopyInto(&out.OpenNebula)
+	in.Storage.DeepCopyInto(&out.Storage)
+	in.Hotplug.DeepCopyInto(&out.Hotplug)
+	if in.Conditions != nil {
+		out.Conditions = make([]metav1.Condition, len(in.Conditions))
+		copy(out.Conditions, in.Conditions)
+	}
+}
+
+func (in *OpenNebulaNode) DeepCopyInto(out *OpenNebulaNode) {
+	*out = *in
+	out.TypeMeta = in.TypeMeta
+	in.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
+	in.Spec.DeepCopyInto(&out.Spec)
+	in.Status.DeepCopyInto(&out.Status)
+}
+
+func (in *OpenNebulaNode) DeepCopy() *OpenNebulaNode {
+	if in == nil {
+		return nil
+	}
+	out := new(OpenNebulaNode)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *OpenNebulaNode) DeepCopyObject() runtime.Object {
+	return in.DeepCopy()
+}
+
+func (in *OpenNebulaNodeList) DeepCopyInto(out *OpenNebulaNodeList) {
+	*out = *in
+	out.TypeMeta = in.TypeMeta
+	in.ListMeta.DeepCopyInto(&out.ListMeta)
+	if in.Items != nil {
+		out.Items = make([]OpenNebulaNode, len(in.Items))
+		for i := range in.Items {
+			in.Items[i].DeepCopyInto(&out.Items[i])
+		}
+	}
+}
+
+func (in *OpenNebulaNodeList) DeepCopy() *OpenNebulaNodeList {
+	if in == nil {
+		return nil
+	}
+	out := new(OpenNebulaNodeList)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *OpenNebulaNodeList) DeepCopyObject() runtime.Object {
+	return in.DeepCopy()
+}

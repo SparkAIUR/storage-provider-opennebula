@@ -32,6 +32,18 @@ func (d *Driver) GetDatastoreSelectionConfig(params map[string]string) (opennebu
 		return opennebula.DatastoreSelectionConfig{}, fmt.Errorf("no datastores configured; set %s or storage class parameter %s", config.DefaultDatastoresVar, storageClassParamDatastoreIDs)
 	}
 
+	if d.inventoryEligibility != nil && d.inventoryEligibility.Enabled() {
+		filtered, err := d.inventoryEligibility.FilterIdentifiers(identifiers)
+		if err != nil {
+			return opennebula.DatastoreSelectionConfig{}, err
+		}
+		identifiers = filtered
+	}
+
+	if len(identifiers) == 0 {
+		return opennebula.DatastoreSelectionConfig{}, fmt.Errorf("no eligible datastores remain after inventory authority filtering")
+	}
+
 	return opennebula.DatastoreSelectionConfig{
 		Identifiers:  identifiers,
 		Policy:       policy,

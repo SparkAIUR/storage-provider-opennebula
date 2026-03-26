@@ -40,6 +40,10 @@ Create chart name and version as used by the chart label.
 {{- printf "%s-node-sa" (include "opennebula-csi.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
 
+{{- define "opennebula-csi.inventoryServiceAccountName" -}}
+{{- printf "%s-inventory-sa" (include "opennebula-csi.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
 {{- define "opennebula-csi.authSecretName" -}}
 {{- if .Values.credentials.existingSecret.name -}}
 {{- .Values.credentials.existingSecret.name -}}
@@ -95,6 +99,22 @@ Create chart name and version as used by the chart label.
   value: {{ .Values.driver.vmHotplugTimeoutMaxSeconds | quote }}
 - name: ONE_CSI_VM_HOTPLUG_STUCK_VM_COOLDOWN_SECONDS
   value: {{ .Values.driver.vmHotplugStuckVmCooldownSeconds | quote }}
+- name: ONE_CSI_INVENTORY_CONTROLLER_ENABLED
+  value: {{ .Values.inventoryController.enabled | quote }}
+- name: ONE_CSI_INVENTORY_DATASTORE_AUTHORITY_MODE
+  value: {{ .Values.inventoryController.authorityMode | quote }}
+- name: ONE_CSI_INVENTORY_RESYNC_DATASTORES_SECONDS
+  value: {{ .Values.inventoryController.resyncSeconds.datastores | quote }}
+- name: ONE_CSI_INVENTORY_RESYNC_NODES_SECONDS
+  value: {{ .Values.inventoryController.resyncSeconds.nodes | quote }}
+- name: ONE_CSI_INVENTORY_CONTROLLER_LEADER_ELECTION_ID
+  value: {{ .Values.inventoryController.leaderElectionID | quote }}
+- name: ONE_CSI_INVENTORY_CONTROLLER_NAMESPACE
+  value: {{ default (include "opennebula-csi.namespace" .) .Values.inventoryController.namespace | quote }}
+- name: ONE_CSI_INVENTORY_VALIDATION_ENABLED
+  value: {{ .Values.inventoryController.validation.enabled | quote }}
+- name: ONE_CSI_INVENTORY_VALIDATION_DEFAULT_IMAGE
+  value: {{ .Values.inventoryController.validation.defaultImage | quote }}
 - name: ONE_CSI_FEATURE_GATES
   value: "compatibilityAwareSelection={{ .Values.featureGates.compatibilityAwareSelection }},detachedDiskExpansion={{ .Values.featureGates.detachedDiskExpansion }},cephfsExpansion={{ .Values.featureGates.cephfsExpansion }},cephfsSnapshots={{ .Values.featureGates.cephfsSnapshots }},cephfsClones={{ .Values.featureGates.cephfsClones }},cephfsSelfHealing={{ .Values.featureGates.cephfsSelfHealing }},topologyAccessibility={{ .Values.featureGates.topologyAccessibility }}"
 {{- with .Values.driver.env }}

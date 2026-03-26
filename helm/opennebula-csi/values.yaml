@@ -14,7 +14,7 @@ credentials:
 
 image:
   repository: "nudevco/opennebula-csi"
-  tag: "v0.4.2"
+  tag: "v0.4.3"
   pullPolicy: "IfNotPresent"
 
 imagePullSecrets: []
@@ -48,6 +48,33 @@ featureGates:
 controller:
   replicaCount: 1
   sidecarTimeoutSeconds: 960
+  leaderElection:
+    enabled: true
+    leaseName: "opennebula-csi-controller"
+    leaseNamespace: ""
+    leaseDurationSeconds: 45
+    renewDeadlineSeconds: 30
+    retryPeriodSeconds: 10
+  podAnnotations: {}
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraArgs: []
+  extraEnv: []
+
+inventoryController:
+  enabled: false
+  namespace: ""
+  replicaCount: 1
+  authorityMode: "strict"
+  leaderElectionID: "opennebula-csi-inventory-controller"
+  resyncSeconds:
+    datastores: 60
+    nodes: 30
+  validation:
+    enabled: true
+    defaultImage: "ghcr.io/axboe/fio:latest"
   podAnnotations: {}
   resources: {}
   nodeSelector: {}

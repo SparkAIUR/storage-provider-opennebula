@@ -71,6 +71,18 @@ spec:
           env:
             - name: CSI_ENDPOINT
               value: unix:///csi/csi.sock
+            - name: ONE_CSI_CONTROLLER_LEADER_ELECTION_ENABLED
+              value: {{ .Values.controller.leaderElection.enabled | quote }}
+            - name: ONE_CSI_CONTROLLER_LEADER_ELECTION_LEASE_NAME
+              value: {{ .Values.controller.leaderElection.leaseName | quote }}
+            - name: ONE_CSI_CONTROLLER_LEADER_ELECTION_LEASE_NAMESPACE
+              value: {{ default (include "opennebula-csi.namespace" .) .Values.controller.leaderElection.leaseNamespace | quote }}
+            - name: ONE_CSI_CONTROLLER_LEADER_ELECTION_LEASE_DURATION_SECONDS
+              value: {{ .Values.controller.leaderElection.leaseDurationSeconds | quote }}
+            - name: ONE_CSI_CONTROLLER_LEADER_ELECTION_RENEW_DEADLINE_SECONDS
+              value: {{ .Values.controller.leaderElection.renewDeadlineSeconds | quote }}
+            - name: ONE_CSI_CONTROLLER_LEADER_ELECTION_RETRY_PERIOD_SECONDS
+              value: {{ .Values.controller.leaderElection.retryPeriodSeconds | quote }}
 {{ include "opennebula-csi.driverCommonEnv" . | nindent 12 }}
             {{- with .Values.controller.extraEnv }}
 {{ toYaml . | nindent 12 }}

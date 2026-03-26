@@ -1,0 +1,228 @@
+package v1alpha1
+
+import (
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+const (
+	DatastoreValidationModeDisabled = "Disabled"
+	DatastoreValidationModeManual   = "Manual"
+
+	DatastorePhaseReady    = "Ready"
+	DatastorePhaseDegraded = "Degraded"
+	DatastorePhaseDisabled = "Disabled"
+	DatastorePhaseNotFound = "NotFound"
+
+	NodePhaseReady    = "Ready"
+	NodePhaseDegraded = "Degraded"
+	NodePhaseDisabled = "Disabled"
+	NodePhaseNotFound = "NotFound"
+
+	ValidationPhaseIdle      = "Idle"
+	ValidationPhaseRunning   = "Running"
+	ValidationPhaseSucceeded = "Succeeded"
+	ValidationPhaseFailed    = "Failed"
+)
+
+type ObjectRefSummary struct {
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name,omitempty"`
+	UID       string `json:"uid,omitempty"`
+}
+
+type ValidationJobTemplate struct {
+	Image                   string                      `json:"image,omitempty"`
+	ImagePullPolicy         corev1.PullPolicy           `json:"imagePullPolicy,omitempty"`
+	StorageClassName        string                      `json:"storageClassName,omitempty"`
+	Size                    string                      `json:"size,omitempty"`
+	FioArgs                 []string                    `json:"fioArgs,omitempty"`
+	NodeSelector            map[string]string           `json:"nodeSelector,omitempty"`
+	Tolerations             []corev1.Toleration         `json:"tolerations,omitempty"`
+	Resources               corev1.ResourceRequirements `json:"resources,omitempty"`
+	TTLSecondsAfterFinished *int32                      `json:"ttlSecondsAfterFinished,omitempty"`
+}
+
+type OpenNebulaDatastoreValidationSpec struct {
+	Mode        string                `json:"mode,omitempty"`
+	JobTemplate ValidationJobTemplate `json:"jobTemplate,omitempty"`
+	RunNonce    string                `json:"runNonce,omitempty"`
+}
+
+type OpenNebulaDatastoreDiscoverySpec struct {
+	OpenNebulaDatastoreID int    `json:"opennebulaDatastoreID"`
+	ExpectedBackend       string `json:"expectedBackend,omitempty"`
+	Allowed               bool   `json:"allowed,omitempty"`
+}
+
+type OpenNebulaDatastoreSpec struct {
+	DisplayName string                            `json:"displayName,omitempty"`
+	Enabled     bool                              `json:"enabled,omitempty"`
+	Validation  OpenNebulaDatastoreValidationSpec `json:"validation,omitempty"`
+	Discovery   OpenNebulaDatastoreDiscoverySpec  `json:"discovery"`
+	Notes       string                            `json:"notes,omitempty"`
+}
+
+type OpenNebulaDatastoreOpenNebulaStatus struct {
+	ID                         int    `json:"id,omitempty"`
+	Name                       string `json:"name,omitempty"`
+	State                      string `json:"state,omitempty"`
+	DSMad                      string `json:"dsMad,omitempty"`
+	TMMad                      string `json:"tmMad,omitempty"`
+	Type                       string `json:"type,omitempty"`
+	ClusterIDs                 []int  `json:"clusterIDs,omitempty"`
+	CompatibleSystemDatastores []int  `json:"compatibleSystemDatastores,omitempty"`
+}
+
+type OpenNebulaDatastoreCapacityStatus struct {
+	TotalBytes         int64 `json:"totalBytes,omitempty"`
+	FreeBytes          int64 `json:"freeBytes,omitempty"`
+	UsedBytesApprox    int64 `json:"usedBytesApprox,omitempty"`
+	ProvisionedPVBytes int64 `json:"provisionedPVBytes,omitempty"`
+	RequestedPVCBytes  int64 `json:"requestedPVCBytes,omitempty"`
+}
+
+type OpenNebulaDatastoreUsageStatus struct {
+	PersistentVolumeCount int32              `json:"persistentVolumeCount,omitempty"`
+	BoundPVCCount         int32              `json:"boundPVCCount,omitempty"`
+	AttachedVolumeCount   int32              `json:"attachedVolumeCount,omitempty"`
+	StorageClasses        []string           `json:"storageClasses,omitempty"`
+	BoundClaims           []ObjectRefSummary `json:"boundClaims,omitempty"`
+}
+
+type ValidationResult struct {
+	ReadIops         *int64 `json:"readIops,omitempty"`
+	WriteIops        *int64 `json:"writeIops,omitempty"`
+	ReadBwBytes      *int64 `json:"readBwBytes,omitempty"`
+	WriteBwBytes     *int64 `json:"writeBwBytes,omitempty"`
+	LatencyP50Micros *int64 `json:"latencyP50Micros,omitempty"`
+	LatencyP99Micros *int64 `json:"latencyP99Micros,omitempty"`
+}
+
+type OpenNebulaDatastoreValidationStatus struct {
+	LastRunTime       *metav1.Time     `json:"lastRunTime,omitempty"`
+	LastCompletedTime *metav1.Time     `json:"lastCompletedTime,omitempty"`
+	LastRunNonce      string           `json:"lastRunNonce,omitempty"`
+	Phase             string           `json:"phase,omitempty"`
+	JobName           string           `json:"jobName,omitempty"`
+	Message           string           `json:"message,omitempty"`
+	Result            ValidationResult `json:"result,omitempty"`
+}
+
+type OpenNebulaDatastoreStatus struct {
+	ObservedGeneration int64                               `json:"observedGeneration,omitempty"`
+	Phase              string                              `json:"phase,omitempty"`
+	Backend            string                              `json:"backend,omitempty"`
+	OpenNebula         OpenNebulaDatastoreOpenNebulaStatus `json:"opennebula,omitempty"`
+	Capacity           OpenNebulaDatastoreCapacityStatus   `json:"capacity,omitempty"`
+	Usage              OpenNebulaDatastoreUsageStatus      `json:"usage,omitempty"`
+	Validation         OpenNebulaDatastoreValidationStatus `json:"validation,omitempty"`
+	Conditions         []metav1.Condition                  `json:"conditions,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Cluster,shortName=oneds
+type OpenNebulaDatastore struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   OpenNebulaDatastoreSpec   `json:"spec,omitempty"`
+	Status OpenNebulaDatastoreStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+type OpenNebulaDatastoreList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []OpenNebulaDatastore `json:"items"`
+}
+
+type OpenNebulaNodeSpec struct {
+	OpenNebulaVMName string `json:"opennebulaVMName,omitempty"`
+	ClusterName      string `json:"clusterName,omitempty"`
+	Enabled          bool   `json:"enabled,omitempty"`
+}
+
+type NodeConditionSummary struct {
+	Type               string      `json:"type,omitempty"`
+	Status             string      `json:"status,omitempty"`
+	Reason             string      `json:"reason,omitempty"`
+	Message            string      `json:"message,omitempty"`
+	LastTransitionTime metav1.Time `json:"lastTransitionTime,omitempty"`
+}
+
+type AttachedDiskSummary struct {
+	VolumeHandle     string `json:"volumeHandle,omitempty"`
+	PersistentDiskID int    `json:"persistentDiskID,omitempty"`
+	DeviceName       string `json:"deviceName,omitempty"`
+	ClaimNamespace   string `json:"claimNamespace,omitempty"`
+	ClaimName        string `json:"claimName,omitempty"`
+}
+
+type OpenNebulaNodeKubernetesStatus struct {
+	Name       string                 `json:"name,omitempty"`
+	UID        string                 `json:"uid,omitempty"`
+	ProviderID string                 `json:"providerID,omitempty"`
+	Labels     map[string]string      `json:"labels,omitempty"`
+	Taints     []corev1.Taint         `json:"taints,omitempty"`
+	Conditions []NodeConditionSummary `json:"conditions,omitempty"`
+	Addresses  []corev1.NodeAddress   `json:"addresses,omitempty"`
+}
+
+type OpenNebulaNodeOpenNebulaStatus struct {
+	VMID                int    `json:"vmID,omitempty"`
+	VMName              string `json:"vmName,omitempty"`
+	State               string `json:"state,omitempty"`
+	LCMState            string `json:"lcmState,omitempty"`
+	HostID              int    `json:"hostID,omitempty"`
+	HostName            string `json:"hostName,omitempty"`
+	ClusterID           int    `json:"clusterID,omitempty"`
+	SystemDatastoreID   int    `json:"systemDatastoreID,omitempty"`
+	SystemDatastoreName string `json:"systemDatastoreName,omitempty"`
+}
+
+type OpenNebulaNodeStorageStatus struct {
+	TopologySystemDatastore string                `json:"topologySystemDatastore,omitempty"`
+	AttachedVolumeCount     int32                 `json:"attachedVolumeCount,omitempty"`
+	AttachedVolumeIDs       []string              `json:"attachedVolumeIDs,omitempty"`
+	AttachedPersistentDisks []AttachedDiskSummary `json:"attachedPersistentDisks,omitempty"`
+}
+
+type OpenNebulaNodeHotplugStatus struct {
+	Ready                 bool         `json:"ready,omitempty"`
+	InCooldown            bool         `json:"inCooldown,omitempty"`
+	CooldownExpiresAt     *metav1.Time `json:"cooldownExpiresAt,omitempty"`
+	LastCooldownOperation string       `json:"lastCooldownOperation,omitempty"`
+	LastCooldownVolume    string       `json:"lastCooldownVolume,omitempty"`
+	LastObservedAttached  *bool        `json:"lastObservedAttached,omitempty"`
+	LastObservedReady     *bool        `json:"lastObservedReady,omitempty"`
+}
+
+type OpenNebulaNodeStatus struct {
+	ObservedGeneration int64                          `json:"observedGeneration,omitempty"`
+	Phase              string                         `json:"phase,omitempty"`
+	Kubernetes         OpenNebulaNodeKubernetesStatus `json:"kubernetes,omitempty"`
+	OpenNebula         OpenNebulaNodeOpenNebulaStatus `json:"opennebula,omitempty"`
+	Storage            OpenNebulaNodeStorageStatus    `json:"storage,omitempty"`
+	Hotplug            OpenNebulaNodeHotplugStatus    `json:"hotplug,omitempty"`
+	Conditions         []metav1.Condition             `json:"conditions,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Cluster,shortName=onenode
+type OpenNebulaNode struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   OpenNebulaNodeSpec   `json:"spec,omitempty"`
+	Status OpenNebulaNodeStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+type OpenNebulaNodeList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []OpenNebulaNode `json:"items"`
+}

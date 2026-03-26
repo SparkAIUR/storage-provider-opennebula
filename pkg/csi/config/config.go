@@ -25,31 +25,57 @@ import (
 
 const (
 	//Config var names
-	OpenNebulaRPCEndpointVar         = "ONE_XMLRPC"
-	OpenNebulaCredentialsVar         = "ONE_AUTH"
-	DefaultDatastoresVar             = "ONE_CSI_DEFAULT_DATASTORES"
-	DatastorePolicyVar               = "ONE_CSI_DATASTORE_SELECTION_POLICY"
-	AllowedDatastoreTypesVar         = "ONE_CSI_ALLOWED_DATASTORE_TYPES"
-	FeatureGatesVar                  = "ONE_CSI_FEATURE_GATES"
-	MetricsEndpointVar               = "ONE_CSI_METRICS_ENDPOINT"
-	NodeTopologySystemDSVar          = "ONE_CSI_NODE_TOPOLOGY_SYSTEM_DS"
-	VMHotplugTimeoutVar              = "ONE_CSI_VM_HOTPLUG_TIMEOUT_SECONDS"
-	VMHotplugTimeoutBaseVar          = "ONE_CSI_VM_HOTPLUG_TIMEOUT_BASE_SECONDS"
-	VMHotplugTimeoutPer100GiVar      = "ONE_CSI_VM_HOTPLUG_TIMEOUT_PER_100GI_SECONDS"
-	VMHotplugTimeoutMaxVar           = "ONE_CSI_VM_HOTPLUG_TIMEOUT_MAX_SECONDS"
-	VMHotplugStuckCooldownSecondsVar = "ONE_CSI_VM_HOTPLUG_STUCK_VM_COOLDOWN_SECONDS"
+	OpenNebulaRPCEndpointVar                  = "ONE_XMLRPC"
+	OpenNebulaCredentialsVar                  = "ONE_AUTH"
+	DefaultDatastoresVar                      = "ONE_CSI_DEFAULT_DATASTORES"
+	DatastorePolicyVar                        = "ONE_CSI_DATASTORE_SELECTION_POLICY"
+	AllowedDatastoreTypesVar                  = "ONE_CSI_ALLOWED_DATASTORE_TYPES"
+	FeatureGatesVar                           = "ONE_CSI_FEATURE_GATES"
+	MetricsEndpointVar                        = "ONE_CSI_METRICS_ENDPOINT"
+	NodeTopologySystemDSVar                   = "ONE_CSI_NODE_TOPOLOGY_SYSTEM_DS"
+	VMHotplugTimeoutVar                       = "ONE_CSI_VM_HOTPLUG_TIMEOUT_SECONDS"
+	VMHotplugTimeoutBaseVar                   = "ONE_CSI_VM_HOTPLUG_TIMEOUT_BASE_SECONDS"
+	VMHotplugTimeoutPer100GiVar               = "ONE_CSI_VM_HOTPLUG_TIMEOUT_PER_100GI_SECONDS"
+	VMHotplugTimeoutMaxVar                    = "ONE_CSI_VM_HOTPLUG_TIMEOUT_MAX_SECONDS"
+	VMHotplugStuckCooldownSecondsVar          = "ONE_CSI_VM_HOTPLUG_STUCK_VM_COOLDOWN_SECONDS"
+	ControllerLeaderElectionEnabledVar        = "ONE_CSI_CONTROLLER_LEADER_ELECTION_ENABLED"
+	ControllerLeaderElectionLeaseNameVar      = "ONE_CSI_CONTROLLER_LEADER_ELECTION_LEASE_NAME"
+	ControllerLeaderElectionLeaseNamespaceVar = "ONE_CSI_CONTROLLER_LEADER_ELECTION_LEASE_NAMESPACE"
+	ControllerLeaderElectionLeaseDurationVar  = "ONE_CSI_CONTROLLER_LEADER_ELECTION_LEASE_DURATION_SECONDS"
+	ControllerLeaderElectionRenewDeadlineVar  = "ONE_CSI_CONTROLLER_LEADER_ELECTION_RENEW_DEADLINE_SECONDS"
+	ControllerLeaderElectionRetryPeriodVar    = "ONE_CSI_CONTROLLER_LEADER_ELECTION_RETRY_PERIOD_SECONDS"
+	InventoryControllerEnabledVar             = "ONE_CSI_INVENTORY_CONTROLLER_ENABLED"
+	InventoryDatastoreAuthorityModeVar        = "ONE_CSI_INVENTORY_DATASTORE_AUTHORITY_MODE"
+	InventoryControllerResyncDatastoresVar    = "ONE_CSI_INVENTORY_RESYNC_DATASTORES_SECONDS"
+	InventoryControllerResyncNodesVar         = "ONE_CSI_INVENTORY_RESYNC_NODES_SECONDS"
+	InventoryControllerLeaderElectionIDVar    = "ONE_CSI_INVENTORY_CONTROLLER_LEADER_ELECTION_ID"
+	InventoryControllerNamespaceVar           = "ONE_CSI_INVENTORY_CONTROLLER_NAMESPACE"
+	InventoryValidationEnabledVar             = "ONE_CSI_INVENTORY_VALIDATION_ENABLED"
+	InventoryValidationDefaultImageVar        = "ONE_CSI_INVENTORY_VALIDATION_DEFAULT_IMAGE"
 
 	//Default values
-	defaultOpenNebulaRPCEndpoint = "http://localhost:2633/RPC2"
-	defaultDatastorePolicy       = "least-used"
-	defaultAllowedDatastoreTypes = "local,ceph,cephfs"
-	defaultFeatureGates          = "compatibilityAwareSelection=true,detachedDiskExpansion=false,cephfsExpansion=false,cephfsSnapshots=false,cephfsClones=false,cephfsSelfHealing=false,topologyAccessibility=false"
-	defaultMetricsEndpoint       = ":9810"
-	defaultVMHotplugTimeout      = 60
-	defaultVMHotplugTimeoutBase  = 120
-	defaultVMHotplugTimeoutStep  = 60
-	defaultVMHotplugTimeoutMax   = 900
-	defaultVMHotplugCooldown     = 300
+	defaultOpenNebulaRPCEndpoint                 = "http://localhost:2633/RPC2"
+	defaultDatastorePolicy                       = "least-used"
+	defaultAllowedDatastoreTypes                 = "local,ceph,cephfs"
+	defaultFeatureGates                          = "compatibilityAwareSelection=true,detachedDiskExpansion=false,cephfsExpansion=false,cephfsSnapshots=false,cephfsClones=false,cephfsSelfHealing=false,topologyAccessibility=false"
+	defaultMetricsEndpoint                       = ":9810"
+	defaultVMHotplugTimeout                      = 60
+	defaultVMHotplugTimeoutBase                  = 120
+	defaultVMHotplugTimeoutStep                  = 60
+	defaultVMHotplugTimeoutMax                   = 900
+	defaultVMHotplugCooldown                     = 300
+	defaultControllerLeaderElectionEnabled       = false
+	defaultControllerLeaderElectionLeaseDuration = 45
+	defaultControllerLeaderElectionRenewDeadline = 30
+	defaultControllerLeaderElectionRetryPeriod   = 10
+	defaultInventoryControllerEnabled            = false
+	defaultInventoryDatastoreAuthorityMode       = "strict"
+	defaultInventoryControllerResyncDatastores   = 60
+	defaultInventoryControllerResyncNodes        = 30
+	defaultInventoryControllerLeaderElectionID   = "opennebula-csi-inventory-controller"
+	defaultInventoryControllerNamespace          = "kube-system"
+	defaultInventoryValidationEnabled            = true
+	defaultInventoryValidationDefaultImage       = ""
 )
 
 // CSIPluginConfig holds the configuration for the CSI plugin
@@ -92,6 +118,18 @@ func initViper() *viper.Viper {
 	viper.SetDefault(VMHotplugTimeoutPer100GiVar, defaultVMHotplugTimeoutStep)
 	viper.SetDefault(VMHotplugTimeoutMaxVar, defaultVMHotplugTimeoutMax)
 	viper.SetDefault(VMHotplugStuckCooldownSecondsVar, defaultVMHotplugCooldown)
+	viper.SetDefault(ControllerLeaderElectionEnabledVar, defaultControllerLeaderElectionEnabled)
+	viper.SetDefault(ControllerLeaderElectionLeaseDurationVar, defaultControllerLeaderElectionLeaseDuration)
+	viper.SetDefault(ControllerLeaderElectionRenewDeadlineVar, defaultControllerLeaderElectionRenewDeadline)
+	viper.SetDefault(ControllerLeaderElectionRetryPeriodVar, defaultControllerLeaderElectionRetryPeriod)
+	viper.SetDefault(InventoryControllerEnabledVar, defaultInventoryControllerEnabled)
+	viper.SetDefault(InventoryDatastoreAuthorityModeVar, defaultInventoryDatastoreAuthorityMode)
+	viper.SetDefault(InventoryControllerResyncDatastoresVar, defaultInventoryControllerResyncDatastores)
+	viper.SetDefault(InventoryControllerResyncNodesVar, defaultInventoryControllerResyncNodes)
+	viper.SetDefault(InventoryControllerLeaderElectionIDVar, defaultInventoryControllerLeaderElectionID)
+	viper.SetDefault(InventoryControllerNamespaceVar, defaultInventoryControllerNamespace)
+	viper.SetDefault(InventoryValidationEnabledVar, defaultInventoryValidationEnabled)
+	viper.SetDefault(InventoryValidationDefaultImageVar, defaultInventoryValidationDefaultImage)
 
 	viper.AutomaticEnv()
 	viper.SetTypeByDefaultValue(true)

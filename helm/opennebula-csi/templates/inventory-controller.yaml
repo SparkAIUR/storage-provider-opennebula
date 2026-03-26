@@ -1,0 +1,63 @@
+{{- if .Values.inventoryController.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ printf "%s-inventory" (include "opennebula-csi.fullname" .) }}
+  namespace: {{ include "opennebula-csi.namespace" . }}
+spec:
+  replicas: {{ .Values.inventoryController.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "opennebula-csi.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: inventory-controller
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: inventory-controller
+        {{- with .Values.inventoryController.podAnnotations }}
+{{ toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        app.kubernetes.io/name: {{ include "opennebula-csi.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: inventory-controller
+    spec:
+      serviceAccountName: {{ include "opennebula-csi.inventoryServiceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.inventoryController.nodeSelector }}
+      nodeSelector:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.inventoryController.affinity }}
+      affinity:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.inventoryController.tolerations }}
+      tolerations:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: inventory-controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--mode=inventory-controller"
+            - "--v={{ .Values.driver.logLevel }}"
+            {{- with .Values.inventoryController.extraArgs }}
+{{ toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+{{ include "opennebula-csi.driverCommonEnv" . | nindent 12 }}
+            {{- with .Values.inventoryController.extraEnv }}
+{{ toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.inventoryController.resources }}
+          resources:
+{{ toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

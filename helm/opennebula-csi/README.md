@@ -241,7 +241,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
-| `image.tag` | Driver image tag. | `"v0.4.2"` | No |
+| `image.tag` | Driver image tag. | `"v0.4.3"` | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
 
 ### Driver
@@ -267,8 +267,8 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `featureGates.compatibilityAwareSelection` | Enable compatibility-aware filtering for datastores such as `COMPATIBLE_SYS_DS`. | `true` | No |
-| `featureGates.detachedDiskExpansion` | Enable detached persistent-disk expansion through image-level resize. Stable and enabled by default in `v0.4.2`. | `true` | No |
-| `featureGates.cephfsExpansion` | Enable CephFS dynamic subvolume expansion. Stable and enabled by default in `v0.4.2`. | `true` | No |
+| `featureGates.detachedDiskExpansion` | Enable detached persistent-disk expansion through image-level resize. Stable and enabled by default in `v0.4.3`. | `true` | No |
+| `featureGates.cephfsExpansion` | Enable CephFS dynamic subvolume expansion. Stable and enabled by default in `v0.4.3`. | `true` | No |
 | `featureGates.cephfsSnapshots` | Enable CephFS snapshot RPC flows. | `false` | No |
 | `featureGates.cephfsClones` | Enable CephFS PVC clone and snapshot restore flows. | `false` | No |
 | `featureGates.cephfsSelfHealing` | Enable stale CephFS mount lazy-unmount/remount recovery in node stage. `NodeGetVolumeStats` still reports disconnected CephFS mounts as restage-needed errors because kubelet stats calls do not include remount credentials. | `false` | No |

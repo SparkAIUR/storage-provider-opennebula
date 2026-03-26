@@ -19,9 +19,9 @@ This fork is focused on Omni deployments on OpenNebula and removes the old requi
 - Support `local`, OpenNebula Ceph RBD, and SparkAI CephFS datastores.
 - Keep the internal selection/provider structure ready for future `nfs` support.
 
-## Validated v0.4.2 matrix
+## Validated v0.4.3 matrix
 
-The `v0.4.2` release was validated on a live Omni + Talos + OpenNebula staging cluster with:
+The `v0.4.3` release was validated on a live Omni + Talos + OpenNebula staging cluster with:
 
 - local RWO volumes on an OpenNebula image datastore
 - Ceph RBD RWO volumes on a Ceph-backed image datastore with a Ceph system datastore
@@ -39,7 +39,7 @@ Staging-validated stable features:
 - `detachedDiskExpansion`
 - `cephfsExpansion`
 
-Features that remain gated in `v0.4.2`:
+Features that remain gated in `v0.4.3`:
 
 - `cephfsSnapshots`
 - `cephfsClones`
@@ -148,9 +148,9 @@ Routing is inferred from the requested access mode:
 
 - Databases and other single-writer application data should still use the OpenNebula `IMAGE` datastore path
 - Shared caches, model stores, and other multi-node RWX workloads can now use the CephFS shared-filesystem path
-- `ReadOnlyMany` remains on the disk path in `v0.4.2`
-- CephFS expansion is stable in `v0.4.2`
-- CephFS snapshots and clones remain implemented behind feature gates and stay alpha-off by default in `v0.4.2`
+- `ReadOnlyMany` remains on the disk path in `v0.4.3`
+- CephFS expansion is stable in `v0.4.3`
+- CephFS snapshots and clones remain implemented behind feature gates and stay alpha-off by default in `v0.4.3`
 
 ## Ceph RBD support
 
@@ -276,14 +276,14 @@ Current behavior:
 - Controller expansion is supported for OpenNebula volumes that are attached to a VM.
 - Filesystem expansion is supported on the node for mounted filesystem volumes.
 - Block volumes do not require node-side filesystem expansion.
-- CephFS shared-filesystem volumes support expansion for dynamic subvolumes by default in `v0.4.2`.
+- CephFS shared-filesystem volumes support expansion for dynamic subvolumes by default in `v0.4.3`.
 - Static CephFS paths created with `sharedFilesystemPath` are not expandable.
-- Detached-volume expansion is enabled by default in `v0.4.2` and uses image-level resize via `one.image.update`.
+- Detached-volume expansion is enabled by default in `v0.4.3` and uses image-level resize via `one.image.update`.
 - Shrinking remains unsupported for disk and CephFS paths.
 
 ## Snapshots and clones
 
-Stable disk-path data-management features in `v0.4.2`:
+Stable disk-path data-management features in `v0.4.3`:
 
 - CSI `CreateSnapshot`, `DeleteSnapshot`, and `ListSnapshots` for OpenNebula image-backed volumes
 - PVC-to-PVC clone through CSI `VolumeContentSource.volume`
@@ -593,7 +593,7 @@ For CephFS-backed Omni deployments:
 
 ## Staging validation gate
 
-`v0.4.2` was validated on a live Omni + Talos + OpenNebula staging cluster before release. The repo includes:
+`v0.4.3` was validated on a live Omni + Talos + OpenNebula staging cluster before release. The repo includes:
 
 - a local validation script: `hack/validate-staging-cephfs.sh`
 - a manual GitHub Actions workflow: `.github/workflows/staging-cephfs-validation.yaml`

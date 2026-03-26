@@ -18,11 +18,14 @@ package driver
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
+	inventorycache "github.com/SparkAIUR/storage-provider-opennebula/pkg/inventory/cache"
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
 )
@@ -52,8 +55,9 @@ type Driver struct {
 
 	controllerServerCapabilities []*csi.ControllerServiceCapability
 
-	operationLocks *OperationLocks
-	hotplugGuard   *HotplugGuard
+	operationLocks       *OperationLocks
+	hotplugGuard         *HotplugGuard
+	controllerLeadership *ControllerLeadership
 
 	maxVolumesPerNode int64
 
@@ -62,6 +66,8 @@ type Driver struct {
 	featureGates FeatureGates
 	metrics      *DriverMetrics
 	kubeRuntime  *KubeRuntime
+
+	inventoryEligibility inventorycache.DatastoreEligibilityProvider
 }
 
 type DriverOptions struct {
@@ -102,6 +108,32 @@ func (d *Driver) Run(ctx context.Context) error {
 	d.metrics = NewDriverMetrics(d.version, d.commit)
 	d.kubeRuntime = NewKubeRuntime(d.name)
 
+	if enabled, _ := d.PluginConfig.GetBool(config.InventoryControllerEnabledVar); enabled {
+		restConfig, err := rest.InClusterConfig()
+		if err != nil {
+			return fmt.Errorf("failed to initialize Kubernetes config for inventory eligibility cache: %w", err)
+		}
+		authorityMode, _ := d.PluginConfig.GetString(config.InventoryDatastoreAuthorityModeVar)
+		resyncSeconds, ok := d.PluginConfig.GetInt(config.InventoryControllerResyncDatastoresVar)
+		if !ok || resyncSeconds <= 0 {
+			resyncSeconds = 60
+		}
+		provider, err := inventorycache.NewProvider(restConfig, time.Duration(resyncSeconds)*time.Second, authorityMode)
+		if err != nil {
+			return fmt.Errorf("failed to initialize inventory eligibility cache: %w", err)
+		}
+		if err := provider.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start inventory eligibility cache: %w", err)
+		}
+		d.inventoryEligibility = provider
+	}
+
+	controllerLeadership, err := NewControllerLeadership(ctx, d.PluginConfig)
+	if err != nil {
+		return err
+	}
+	d.controllerLeadership = controllerLeadership
+
 	grpcServer := NewGRPCServer()
 
 	endpoint, ok := d.PluginConfig.GetString(config.OpenNebulaRPCEndpointVar)
@@ -140,6 +172,7 @@ func (d *Driver) Run(ctx context.Context) error {
 		NewIdentityServer(d),
 		NewNodeServer(d, d.mounter),
 		NewControllerServer(d, volumeProvider, sharedFilesystemProvider),
+		d.controllerLeadership,
 	)
 
 	metricsServer := NewMetricsServer(d.PluginConfig, d.metrics)
@@ -197,4 +230,16 @@ func loadHotplugCooldown(cfg config.CSIPluginConfig) time.Duration {
 	}
 
 	return time.Duration(cooldownSeconds) * time.Second
+}
+
+func (d *Driver) inventoryAuthorityMode() string {
+	value, ok := d.PluginConfig.GetString(config.InventoryDatastoreAuthorityModeVar)
+	if !ok {
+		return inventorycache.AuthorityModeStrict
+	}
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return inventorycache.AuthorityModeStrict
+	}
+	return value
 }

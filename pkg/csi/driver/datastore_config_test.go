@@ -1,6 +1,8 @@
 package driver
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
@@ -8,6 +10,26 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type fakeInventoryEligibilityProvider struct {
+	filtered []string
+	err      error
+}
+
+func (f *fakeInventoryEligibilityProvider) Start(_ context.Context) error {
+	return nil
+}
+
+func (f *fakeInventoryEligibilityProvider) Enabled() bool {
+	return true
+}
+
+func (f *fakeInventoryEligibilityProvider) FilterIdentifiers(_ []string) ([]string, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return append([]string(nil), f.filtered...), nil
+}
 
 func TestGetDatastoreSelectionConfigUsesStorageClassOverride(t *testing.T) {
 	pluginConfig := config.LoadConfiguration()
@@ -79,4 +101,32 @@ func TestGetAllowedDatastoreTypesUsesCephEnabledDefault(t *testing.T) {
 	driver := &Driver{PluginConfig: pluginConfig}
 
 	assert.Equal(t, []string{"local", "ceph", "cephfs"}, driver.getAllowedDatastoreTypes())
+}
+
+func TestGetDatastoreSelectionConfigAppliesInventoryFiltering(t *testing.T) {
+	pluginConfig := config.LoadConfiguration()
+	pluginConfig.OverrideVal(config.DefaultDatastoresVar, "100,101")
+
+	driver := &Driver{
+		PluginConfig:         pluginConfig,
+		inventoryEligibility: &fakeInventoryEligibilityProvider{filtered: []string{"101"}},
+	}
+
+	selection, err := driver.GetDatastoreSelectionConfig(nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"101"}, selection.Identifiers)
+}
+
+func TestGetDatastoreSelectionConfigReturnsInventoryFilteringError(t *testing.T) {
+	pluginConfig := config.LoadConfiguration()
+	pluginConfig.OverrideVal(config.DefaultDatastoresVar, "100")
+
+	driver := &Driver{
+		PluginConfig:         pluginConfig,
+		inventoryEligibility: &fakeInventoryEligibilityProvider{err: fmt.Errorf("inventory rejected datastore")},
+	}
+
+	_, err := driver.GetDatastoreSelectionConfig(nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "inventory rejected datastore")
 }
