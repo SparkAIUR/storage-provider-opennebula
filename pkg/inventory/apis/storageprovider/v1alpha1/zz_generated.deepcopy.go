@@ -147,6 +147,87 @@ func (in *OpenNebulaDatastoreValidationStatus) DeepCopyInto(out *OpenNebulaDatas
 	in.Result.DeepCopyInto(&out.Result)
 }
 
+func (in *OpenNebulaDatastoreBenchmarkRunSpec) DeepCopyInto(out *OpenNebulaDatastoreBenchmarkRunSpec) {
+	*out = *in
+	if in.FioArgs != nil {
+		out.FioArgs = append([]string(nil), in.FioArgs...)
+	}
+	if in.NodeSelector != nil {
+		out.NodeSelector = make(map[string]string, len(in.NodeSelector))
+		for key, value := range in.NodeSelector {
+			out.NodeSelector[key] = value
+		}
+	}
+	if in.Tolerations != nil {
+		out.Tolerations = make([]corev1.Toleration, len(in.Tolerations))
+		copy(out.Tolerations, in.Tolerations)
+	}
+	in.Resources.DeepCopyInto(&out.Resources)
+	if in.TTLSecondsAfterFinished != nil {
+		value := *in.TTLSecondsAfterFinished
+		out.TTLSecondsAfterFinished = &value
+	}
+}
+
+func (in *OpenNebulaDatastoreBenchmarkRunStatus) DeepCopyInto(out *OpenNebulaDatastoreBenchmarkRunStatus) {
+	*out = *in
+	if in.StartedAt != nil {
+		value := in.StartedAt.DeepCopy()
+		out.StartedAt = value
+	}
+	if in.CompletedAt != nil {
+		value := in.CompletedAt.DeepCopy()
+		out.CompletedAt = value
+	}
+	in.Result.DeepCopyInto(&out.Result)
+}
+
+func (in *OpenNebulaDatastoreBenchmarkRun) DeepCopyInto(out *OpenNebulaDatastoreBenchmarkRun) {
+	*out = *in
+	out.TypeMeta = in.TypeMeta
+	in.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
+	in.Spec.DeepCopyInto(&out.Spec)
+	in.Status.DeepCopyInto(&out.Status)
+}
+
+func (in *OpenNebulaDatastoreBenchmarkRun) DeepCopy() *OpenNebulaDatastoreBenchmarkRun {
+	if in == nil {
+		return nil
+	}
+	out := new(OpenNebulaDatastoreBenchmarkRun)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *OpenNebulaDatastoreBenchmarkRun) DeepCopyObject() runtime.Object {
+	return in.DeepCopy()
+}
+
+func (in *OpenNebulaDatastoreBenchmarkRunList) DeepCopyInto(out *OpenNebulaDatastoreBenchmarkRunList) {
+	*out = *in
+	out.TypeMeta = in.TypeMeta
+	in.ListMeta.DeepCopyInto(&out.ListMeta)
+	if in.Items != nil {
+		out.Items = make([]OpenNebulaDatastoreBenchmarkRun, len(in.Items))
+		for i := range in.Items {
+			in.Items[i].DeepCopyInto(&out.Items[i])
+		}
+	}
+}
+
+func (in *OpenNebulaDatastoreBenchmarkRunList) DeepCopy() *OpenNebulaDatastoreBenchmarkRunList {
+	if in == nil {
+		return nil
+	}
+	out := new(OpenNebulaDatastoreBenchmarkRunList)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *OpenNebulaDatastoreBenchmarkRunList) DeepCopyObject() runtime.Object {
+	return in.DeepCopy()
+}
+
 func (in *OpenNebulaDatastoreStatus) DeepCopyInto(out *OpenNebulaDatastoreStatus) {
 	*out = *in
 	in.OpenNebula.DeepCopyInto(&out.OpenNebula)

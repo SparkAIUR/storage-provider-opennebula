@@ -151,6 +151,53 @@ type OpenNebulaDatastoreStatus struct {
 	Conditions               []metav1.Condition                  `json:"conditions,omitempty"`
 }
 
+type OpenNebulaDatastoreBenchmarkRunSpec struct {
+	DatastoreID             int                         `json:"datastoreID"`
+	StorageClassName        string                      `json:"storageClassName,omitempty"`
+	Size                    string                      `json:"size,omitempty"`
+	FioArgs                 []string                    `json:"fioArgs,omitempty"`
+	Image                   string                      `json:"image,omitempty"`
+	ImagePullPolicy         corev1.PullPolicy           `json:"imagePullPolicy,omitempty"`
+	NodeSelector            map[string]string           `json:"nodeSelector,omitempty"`
+	Tolerations             []corev1.Toleration         `json:"tolerations,omitempty"`
+	Resources               corev1.ResourceRequirements `json:"resources,omitempty"`
+	TTLSecondsAfterFinished *int32                      `json:"ttlSecondsAfterFinished,omitempty"`
+	Notes                   string                      `json:"notes,omitempty"`
+}
+
+type OpenNebulaDatastoreBenchmarkRunStatus struct {
+	ObservedGeneration int64            `json:"observedGeneration,omitempty"`
+	Phase              string           `json:"phase,omitempty"`
+	DatastoreID        int              `json:"datastoreID,omitempty"`
+	DatastoreName      string           `json:"datastoreName,omitempty"`
+	Backend            string           `json:"backend,omitempty"`
+	JobName            string           `json:"jobName,omitempty"`
+	PVCName            string           `json:"pvcName,omitempty"`
+	StartedAt          *metav1.Time     `json:"startedAt,omitempty"`
+	CompletedAt        *metav1.Time     `json:"completedAt,omitempty"`
+	Summary            string           `json:"summary,omitempty"`
+	Message            string           `json:"message,omitempty"`
+	Result             ValidationResult `json:"result,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Cluster,shortName=onedsbench
+type OpenNebulaDatastoreBenchmarkRun struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   OpenNebulaDatastoreBenchmarkRunSpec   `json:"spec,omitempty"`
+	Status OpenNebulaDatastoreBenchmarkRunStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+type OpenNebulaDatastoreBenchmarkRunList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []OpenNebulaDatastoreBenchmarkRun `json:"items"`
+}
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=oneds

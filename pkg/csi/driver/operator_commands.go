@@ -38,16 +38,17 @@ type inventoryValidateResult struct {
 }
 
 type SupportBundle struct {
-	Timestamp            time.Time                               `json:"timestamp"`
-	Config               map[string]any                          `json:"config"`
-	FeatureGates         FeatureGates                            `json:"featureGates"`
-	ControllerLeadership map[string]any                          `json:"controllerLeadership"`
-	HotplugCooldowns     map[string]any                          `json:"hotplugCooldowns"`
-	Datastores           []inventoryv1alpha1.OpenNebulaDatastore `json:"datastores"`
-	Nodes                []inventoryv1alpha1.OpenNebulaNode      `json:"nodes"`
-	StorageClassAudit    []inventoryv1alpha1.StorageClassDetail  `json:"storageClassAudit"`
-	VolumeAttachments    []storagev1.VolumeAttachment            `json:"volumeAttachments"`
-	Events               []corev1.Event                          `json:"events"`
+	Timestamp            time.Time                                           `json:"timestamp"`
+	Config               map[string]any                                      `json:"config"`
+	FeatureGates         FeatureGates                                        `json:"featureGates"`
+	ControllerLeadership map[string]any                                      `json:"controllerLeadership"`
+	HotplugCooldowns     map[string]any                                      `json:"hotplugCooldowns"`
+	Datastores           []inventoryv1alpha1.OpenNebulaDatastore             `json:"datastores"`
+	BenchmarkRuns        []inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun `json:"benchmarkRuns"`
+	Nodes                []inventoryv1alpha1.OpenNebulaNode                  `json:"nodes"`
+	StorageClassAudit    []inventoryv1alpha1.StorageClassDetail              `json:"storageClassAudit"`
+	VolumeAttachments    []storagev1.VolumeAttachment                        `json:"volumeAttachments"`
+	Events               []corev1.Event                                      `json:"events"`
 }
 
 func RunInventoryValidateCommand(ctx context.Context, cfg config.CSIPluginConfig, opts InventoryValidateOptions, w io.Writer) error {
@@ -72,42 +73,44 @@ func RunInventoryValidateCommand(ctx context.Context, cfg config.CSIPluginConfig
 	}
 
 	runNonce := fmt.Sprintf("manual-%d", time.Now().UnixNano())
-	updated := ds.DeepCopy()
-	updated.Spec.Validation.Mode = inventoryv1alpha1.DatastoreValidationModeManual
-	updated.Spec.Validation.RunNonce = runNonce
-	updated.Spec.Validation.JobTemplate.StorageClassName = opts.StorageClass
-	if strings.TrimSpace(opts.Size) != "" {
-		updated.Spec.Validation.JobTemplate.Size = opts.Size
+	runName := fmt.Sprintf("ds-%d-%d", opts.DatastoreID, time.Now().Unix())
+	benchmarkRun := &inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: inventoryv1alpha1.SchemeGroupVersion.String(),
+			Kind:       "OpenNebulaDatastoreBenchmarkRun",
+		},
+		ObjectMeta: metav1.ObjectMeta{Name: runName},
+		Spec: inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunSpec{
+			DatastoreID:      opts.DatastoreID,
+			StorageClassName: opts.StorageClass,
+			Size:             opts.Size,
+			FioArgs:          append([]string(nil), opts.FioArgs...),
+		},
 	}
-	if len(opts.FioArgs) > 0 {
-		updated.Spec.Validation.JobTemplate.FioArgs = append([]string(nil), opts.FioArgs...)
-	}
-	if err := client.Update(ctx, updated); err != nil {
-		return fmt.Errorf("failed to update datastore validation spec: %w", err)
+	if err := client.Create(ctx, benchmarkRun); err != nil {
+		return fmt.Errorf("failed to create datastore benchmark run: %w", err)
 	}
 
 	deadlineCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
 
 	for {
-		current := &inventoryv1alpha1.OpenNebulaDatastore{}
-		if err := client.Get(deadlineCtx, ctrlclient.ObjectKey{Name: ds.Name}, current); err != nil {
+		current := &inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun{}
+		if err := client.Get(deadlineCtx, ctrlclient.ObjectKey{Name: runName}, current); err != nil {
 			return err
 		}
-		if current.Status.Validation.LastRunNonce == runNonce {
-			switch current.Status.Validation.Phase {
-			case inventoryv1alpha1.ValidationPhaseSucceeded, inventoryv1alpha1.ValidationPhaseFailed:
-				result := inventoryValidateResult{
-					DatastoreID: current.Status.ID,
-					Name:        current.Status.Name,
-					Phase:       current.Status.Validation.Phase,
-					Summary:     validationSummaryForCommand(current.Status),
-					RunNonce:    runNonce,
-				}
-				enc := json.NewEncoder(w)
-				enc.SetIndent("", "  ")
-				return enc.Encode(result)
+		switch current.Status.Phase {
+		case inventoryv1alpha1.ValidationPhaseSucceeded, inventoryv1alpha1.ValidationPhaseFailed:
+			result := inventoryValidateResult{
+				DatastoreID: current.Status.DatastoreID,
+				Name:        ds.Status.Name,
+				Phase:       current.Status.Phase,
+				Summary:     benchmarkSummaryForCommand(current.Status),
+				RunNonce:    runNonce,
 			}
+			enc := json.NewEncoder(w)
+			enc.SetIndent("", "  ")
+			return enc.Encode(result)
 		}
 		select {
 		case <-deadlineCtx.Done():
@@ -133,6 +136,10 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 	}
 	var nodeList inventoryv1alpha1.OpenNebulaNodeList
 	if err := invClient.List(ctx, &nodeList); err != nil {
+		return err
+	}
+	var benchmarkList inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunList
+	if err := invClient.List(ctx, &benchmarkList); err != nil {
 		return err
 	}
 
@@ -174,6 +181,7 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 		},
 		HotplugCooldowns:  hotplugSnapshot,
 		Datastores:        dsList.Items,
+		BenchmarkRuns:     benchmarkList.Items,
 		Nodes:             nodeList.Items,
 		StorageClassAudit: flattenStorageClassDetails(dsList.Items, scList.Items),
 		VolumeAttachments: vaList.Items,
@@ -240,6 +248,16 @@ func validationSummaryForCommand(status inventoryv1alpha1.OpenNebulaDatastoreSta
 		return status.Validation.Message
 	}
 	return status.Validation.Phase
+}
+
+func benchmarkSummaryForCommand(status inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunStatus) string {
+	if strings.TrimSpace(status.Summary) != "" && status.Summary != "-" {
+		return status.Summary
+	}
+	if strings.TrimSpace(status.Message) != "" {
+		return status.Message
+	}
+	return status.Phase
 }
 
 func supportBundleConfig(cfg config.CSIPluginConfig) map[string]any {

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"testing"
+	"time"
 
 	datastoreSchema "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/datastore"
 	inventoryv1alpha1 "github.com/SparkAIUR/storage-provider-opennebula/pkg/inventory/apis/storageprovider/v1alpha1"
@@ -38,7 +39,7 @@ func TestBuildDatastoreStatusEnabled(t *testing.T) {
 		Parameters: map[string]string{"datastoreIDs": "111"},
 	}}
 
-	status := s.buildDatastoreStatus(item, ds, nil, nil, scs, nil)
+	status := s.buildDatastoreStatus(item, ds, nil, nil, scs, nil, nil)
 	if status.Phase != inventoryv1alpha1.DatastorePhaseEnabled {
 		t.Fatalf("expected phase %q, got %q", inventoryv1alpha1.DatastorePhaseEnabled, status.Phase)
 	}
@@ -84,7 +85,7 @@ func TestBuildDatastoreStatusAvailableDisabledAndUnavailable(t *testing.T) {
 		FreeMB:  3 * 1024 * 1024,
 	}
 
-	available := s.buildDatastoreStatus(base, ds, nil, nil, nil, nil)
+	available := s.buildDatastoreStatus(base, ds, nil, nil, nil, nil, nil)
 	if available.Phase != inventoryv1alpha1.DatastorePhaseAvailable {
 		t.Fatalf("expected available phase, got %q", available.Phase)
 	}
@@ -94,7 +95,7 @@ func TestBuildDatastoreStatusAvailableDisabledAndUnavailable(t *testing.T) {
 	disabled := s.buildDatastoreStatus(*disabledItem, ds, nil, nil, []storagev1.StorageClass{{
 		ObjectMeta: metav1.ObjectMeta{Name: "sc"},
 		Parameters: map[string]string{"datastoreIDs": "100"},
-	}}, nil)
+	}}, nil, nil)
 	if disabled.Phase != inventoryv1alpha1.DatastorePhaseDisabled {
 		t.Fatalf("expected disabled phase, got %q", disabled.Phase)
 	}
@@ -105,7 +106,7 @@ func TestBuildDatastoreStatusAvailableDisabledAndUnavailable(t *testing.T) {
 	maintenance := s.buildDatastoreStatus(*maintenanceItem, ds, nil, nil, []storagev1.StorageClass{{
 		ObjectMeta: metav1.ObjectMeta{Name: "sc"},
 		Parameters: map[string]string{"datastoreIDs": "100"},
-	}}, nil)
+	}}, nil, nil)
 	if maintenance.Phase != inventoryv1alpha1.DatastorePhaseDisabled {
 		t.Fatalf("expected maintenance datastore to be disabled, got %q", maintenance.Phase)
 	}
@@ -115,7 +116,7 @@ func TestBuildDatastoreStatusAvailableDisabledAndUnavailable(t *testing.T) {
 
 	unavailableItem := base.DeepCopy()
 	unavailableItem.Spec.Discovery.ExpectedBackend = "ceph-rbd"
-	unavailable := s.buildDatastoreStatus(*unavailableItem, ds, nil, nil, nil, nil)
+	unavailable := s.buildDatastoreStatus(*unavailableItem, ds, nil, nil, nil, nil, nil)
 	if unavailable.Phase != inventoryv1alpha1.DatastorePhaseUnavailable {
 		t.Fatalf("expected unavailable phase, got %q", unavailable.Phase)
 	}
@@ -155,7 +156,7 @@ func TestBuildDatastoreStatusStorageClassDetails(t *testing.T) {
 		Parameters:           map[string]string{"datastoreIDs": "111"},
 		VolumeBindingMode:    &immediate,
 		AllowVolumeExpansion: boolPtr(false),
-	}}, nil)
+	}}, nil, nil)
 	if !status.ValidationEligible {
 		t.Fatal("expected validation to be eligible for local datastore")
 	}
@@ -196,6 +197,7 @@ func TestNormalizeDatastoreTypeAndBackend(t *testing.T) {
 		nil,
 		nil,
 		nil,
+		nil,
 	)
 	if status.Type != string(datastoreSchema.File) {
 		t.Fatalf("expected datastore type %q, got %q", datastoreSchema.File, status.Type)
@@ -228,6 +230,61 @@ func TestValidationMetricsDisplayAndCapacityFallback(t *testing.T) {
 	}
 	if got := formatCapacityDisplay(93*1024*1024*1024, 3*1024*1024*1024*1024); got != "93 GB / 3 TB (97%)" {
 		t.Fatalf("unexpected capacity display for 93GB/3TB: %q", got)
+	}
+}
+
+func TestBuildDatastoreStatusPrefersLatestBenchmarkMetrics(t *testing.T) {
+	s := &Syncer{}
+	item := inventoryv1alpha1.OpenNebulaDatastore{
+		ObjectMeta: metav1.ObjectMeta{Name: "ds-111", Generation: 1},
+		Spec: inventoryv1alpha1.OpenNebulaDatastoreSpec{
+			Enabled: true,
+			Discovery: inventoryv1alpha1.OpenNebulaDatastoreDiscoverySpec{
+				OpenNebulaDatastoreID: 111,
+				ExpectedBackend:       "local",
+				Allowed:               true,
+			},
+			Validation: inventoryv1alpha1.OpenNebulaDatastoreValidationSpec{
+				Mode: inventoryv1alpha1.DatastoreValidationModeManual,
+			},
+		},
+		Status: inventoryv1alpha1.OpenNebulaDatastoreStatus{
+			Validation: inventoryv1alpha1.OpenNebulaDatastoreValidationStatus{
+				Phase: inventoryv1alpha1.ValidationPhaseSucceeded,
+				Result: inventoryv1alpha1.ValidationResult{
+					ReadIops: int64Ptr(1000),
+				},
+			},
+		},
+	}
+	ds := datastoreSchema.Datastore{ID: 111, Name: "default", Type: "IMAGE", TMMad: "ssh", TotalMB: 1024, FreeMB: 512}
+	benchmark := &latestBenchmarkResult{
+		RunName: "ds-111-20260326",
+		Status: inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunStatus{
+			Phase: inventoryv1alpha1.ValidationPhaseSucceeded,
+			Result: inventoryv1alpha1.ValidationResult{
+				ReadIops:         int64Ptr(12000),
+				WriteIops:        int64Ptr(8000),
+				LatencyP99Micros: int64Ptr(4000),
+			},
+		},
+	}
+	status := s.buildDatastoreStatus(item, ds, nil, nil, nil, nil, benchmark)
+	if status.MetricsDisplay != "R:12k W:8k p99:4ms" {
+		t.Fatalf("expected benchmark metrics display to win, got %q", status.MetricsDisplay)
+	}
+}
+
+func TestBenchmarkHelpers(t *testing.T) {
+	scs := []storagev1.StorageClass{
+		{ObjectMeta: metav1.ObjectMeta{Name: "b"}, Parameters: map[string]string{"datastoreIDs": "111"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "a"}, Parameters: map[string]string{"datastoreIDs": "111"}},
+	}
+	if got := defaultBenchmarkStorageClassName(scs, 111); got != "a" {
+		t.Fatalf("expected sorted default storage class, got %q", got)
+	}
+	if got := benchmarkRunObjectName(111, time.Date(2026, time.March, 26, 23, 30, 45, 0, time.UTC)); got != "ds-111-20260326-233045" {
+		t.Fatalf("unexpected benchmark object name: %q", got)
 	}
 }
 
@@ -275,7 +332,7 @@ func TestBuildDatastoreStatusCountsPVCsAndClaims(t *testing.T) {
 		},
 	}
 
-	status := s.buildDatastoreStatus(item, ds, []corev1.PersistentVolume{pv}, map[string]corev1.PersistentVolumeClaim{"db/claim-a": pvc}, nil, nil)
+	status := s.buildDatastoreStatus(item, ds, []corev1.PersistentVolume{pv}, map[string]corev1.PersistentVolumeClaim{"db/claim-a": pvc}, nil, nil, nil)
 	if status.Usage.BoundPVCCount != 1 {
 		t.Fatalf("expected 1 bound PVC, got %d", status.Usage.BoundPVCCount)
 	}
@@ -317,5 +374,9 @@ func TestDatastoreNameMapHandlesNilPool(t *testing.T) {
 }
 
 func boolPtr(value bool) *bool {
+	return &value
+}
+
+func int64Ptr(value int64) *int64 {
 	return &value
 }

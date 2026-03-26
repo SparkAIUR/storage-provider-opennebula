@@ -42,6 +42,8 @@ const (
 	validationNamespace                                = "kube-system"
 	validationPVCPrefix                                = "one-ds-validate-pvc-"
 	validationJobPrefix                                = "one-ds-validate-job-"
+	benchmarkPVCPrefix                                 = "one-ds-bench-pvc-"
+	benchmarkJobPrefix                                 = "one-ds-bench-job-"
 	eventReasonValidationTriggered                     = "ValidationTriggered"
 	eventReasonValidationSucceeded                     = "ValidationSucceeded"
 	eventReasonValidationFailed                        = "ValidationFailed"
@@ -55,6 +57,11 @@ const (
 	sharedBackendAttr                                  = "SPARKAI_CSI_SHARE_BACKEND"
 	defaultValidationImagePullPolicy corev1.PullPolicy = corev1.PullIfNotPresent
 )
+
+type latestBenchmarkResult struct {
+	RunName string
+	Status  inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunStatus
+}
 
 type Options struct {
 	Namespace         string
@@ -219,6 +226,13 @@ func (s *Syncer) syncDatastores(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.reconcileBenchmarkRuns(ctx, discoveredIDs, scs.Items); err != nil {
+		return err
+	}
+	latestBenchmarks, err := s.loadLatestBenchmarkResults(ctx)
+	if err != nil {
+		return err
+	}
 
 	var dsList inventoryv1alpha1.OpenNebulaDatastoreList
 	if err := s.client.List(ctx, &dsList); err != nil {
@@ -270,7 +284,7 @@ func (s *Syncer) syncDatastores(ctx context.Context) error {
 			)
 			continue
 		}
-		nextStatus := s.buildDatastoreStatus(item, ds, pvs.Items, pvcByNSName, scs.Items, vas.Items)
+		nextStatus := s.buildDatastoreStatus(item, ds, pvs.Items, pvcByNSName, scs.Items, vas.Items, latestBenchmarks[ds.ID])
 		status.Status = nextStatus
 		log.Info("patching datastore status",
 			"datastoreObject", item.Name,
@@ -436,7 +450,7 @@ func (s *Syncer) ensureNodeObject(ctx context.Context, node corev1.Node) error {
 	return s.client.Create(ctx, obj)
 }
 
-func (s *Syncer) buildDatastoreStatus(item inventoryv1alpha1.OpenNebulaDatastore, ds datastoreSchema.Datastore, pvs []corev1.PersistentVolume, pvcByNSName map[string]corev1.PersistentVolumeClaim, scs []storagev1.StorageClass, vas []storagev1.VolumeAttachment) inventoryv1alpha1.OpenNebulaDatastoreStatus {
+func (s *Syncer) buildDatastoreStatus(item inventoryv1alpha1.OpenNebulaDatastore, ds datastoreSchema.Datastore, pvs []corev1.PersistentVolume, pvcByNSName map[string]corev1.PersistentVolumeClaim, scs []storagev1.StorageClass, vas []storagev1.VolumeAttachment, benchmark *latestBenchmarkResult) inventoryv1alpha1.OpenNebulaDatastoreStatus {
 	normalized := normalizeDatastore(ds)
 	status := inventoryv1alpha1.OpenNebulaDatastoreStatus{
 		ObservedGeneration: item.Generation,
@@ -511,6 +525,11 @@ func (s *Syncer) buildDatastoreStatus(item inventoryv1alpha1.OpenNebulaDatastore
 	status.StorageClassesDisplay = storageClassesDisplay(status.Usage.StorageClasses)
 	status.CapacityDisplay = formatCapacityDisplay(status.Capacity.FreeBytes, status.Capacity.TotalBytes)
 	status.MetricsDisplay = validationMetricsDisplay(status.Validation)
+	if benchmark != nil {
+		if summary := benchmarkSummaryDisplay(benchmark.Status); summary != "-" {
+			status.MetricsDisplay = summary
+		}
+	}
 	status.Health = datastoreHealthForDisplay(status.Capacity.TotalBytes, item.Spec.Discovery.ExpectedBackend, normalized.Backend)
 	status.Phase = datastorePhaseForDisplay(status.Health, item.Spec.Enabled, item.Spec.Discovery.Allowed, item.Spec.MaintenanceMode, referencedByStorageClass)
 	status.ValidationEligible = validationEligible(item, normalized.Backend)
@@ -654,6 +673,203 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 	return status
 }
 
+func (s *Syncer) reconcileBenchmarkRuns(ctx context.Context, discovered map[int]datastoreSchema.Datastore, scs []storagev1.StorageClass) error {
+	var runList inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunList
+	if err := s.client.List(ctx, &runList); err != nil {
+		return err
+	}
+	for _, item := range runList.Items {
+		if strings.EqualFold(item.Name, "auto") {
+			if err := s.expandAutoBenchmarkRun(ctx, &item, scs); err != nil {
+				return err
+			}
+			continue
+		}
+
+		current := item.DeepCopy()
+		ds, ok := discovered[item.Spec.DatastoreID]
+		if !ok {
+			current.Status = inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunStatus{
+				ObservedGeneration: item.Generation,
+				Phase:              inventoryv1alpha1.ValidationPhaseFailed,
+				DatastoreID:        item.Spec.DatastoreID,
+				Message:            fmt.Sprintf("OpenNebula datastore %d was not found", item.Spec.DatastoreID),
+			}
+			if err := s.client.Status().Patch(ctx, current, ctrlclient.MergeFrom(item.DeepCopy())); err != nil {
+				return err
+			}
+			continue
+		}
+
+		resolved := s.resolveBenchmarkRun(item, ds, scs)
+		jobName := validationResourceName(benchmarkJobPrefix, resolved.Name, strconv.Itoa(resolved.Spec.DatastoreID))
+		pvcName := validationResourceName(benchmarkPVCPrefix, resolved.Name, strconv.Itoa(resolved.Spec.DatastoreID))
+
+		pvc := &corev1.PersistentVolumeClaim{}
+		err := s.client.Get(ctx, types.NamespacedName{Namespace: s.namespace, Name: pvcName}, pvc)
+		if err != nil && apierrors.IsNotFound(err) {
+			if err := s.client.Create(ctx, s.buildBenchmarkPVC(&resolved, pvcName)); err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		}
+
+		job := &batchv1.Job{}
+		err = s.client.Get(ctx, types.NamespacedName{Namespace: s.namespace, Name: jobName}, job)
+		if err != nil && apierrors.IsNotFound(err) {
+			if err := s.client.Create(ctx, s.buildBenchmarkJob(&resolved, jobName, pvcName)); err != nil {
+				return err
+			}
+			now := metav1.Now()
+			current.Status = inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunStatus{
+				ObservedGeneration: resolved.Generation,
+				Phase:              inventoryv1alpha1.ValidationPhaseRunning,
+				DatastoreID:        resolved.Spec.DatastoreID,
+				DatastoreName:      ds.Name,
+				Backend:            normalizeDatastoreBackend(ds),
+				JobName:            jobName,
+				PVCName:            pvcName,
+				StartedAt:          &now,
+				Message:            "benchmark job created",
+			}
+			if err := s.client.Status().Patch(ctx, current, ctrlclient.MergeFrom(item.DeepCopy())); err != nil {
+				return err
+			}
+			continue
+		} else if err != nil {
+			return err
+		}
+
+		nextStatus := current.Status
+		nextStatus.ObservedGeneration = resolved.Generation
+		nextStatus.DatastoreID = resolved.Spec.DatastoreID
+		nextStatus.DatastoreName = ds.Name
+		nextStatus.Backend = normalizeDatastoreBackend(ds)
+		nextStatus.JobName = jobName
+		nextStatus.PVCName = pvcName
+		if nextStatus.StartedAt == nil {
+			now := metav1.Now()
+			nextStatus.StartedAt = &now
+		}
+		nextStatus.Phase = inventoryv1alpha1.ValidationPhaseRunning
+		nextStatus.Message = "benchmark job is running"
+		nextStatus.Summary = "-"
+
+		if job.Status.Succeeded > 0 {
+			now := metav1.Now()
+			nextStatus.CompletedAt = &now
+			nextStatus.Phase = inventoryv1alpha1.ValidationPhaseSucceeded
+			nextStatus.Message = "benchmark completed successfully"
+			if result, err := s.parseValidationJobLogs(ctx, job); err == nil {
+				nextStatus.Result = result
+				nextStatus.Summary = validationMetricsDisplay(inventoryv1alpha1.OpenNebulaDatastoreValidationStatus{
+					Phase:  inventoryv1alpha1.ValidationPhaseSucceeded,
+					Result: result,
+				})
+			}
+			current.Status = nextStatus
+			if err := s.client.Status().Patch(ctx, current, ctrlclient.MergeFrom(item.DeepCopy())); err != nil {
+				return err
+			}
+			_ = s.client.Delete(ctx, pvc)
+			continue
+		}
+		if job.Status.Failed > 0 {
+			now := metav1.Now()
+			nextStatus.CompletedAt = &now
+			nextStatus.Phase = inventoryv1alpha1.ValidationPhaseFailed
+			nextStatus.Message = "benchmark failed"
+			current.Status = nextStatus
+			if err := s.client.Status().Patch(ctx, current, ctrlclient.MergeFrom(item.DeepCopy())); err != nil {
+				return err
+			}
+			_ = s.client.Delete(ctx, pvc)
+			continue
+		}
+
+		current.Status = nextStatus
+		if err := s.client.Status().Patch(ctx, current, ctrlclient.MergeFrom(item.DeepCopy())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Syncer) expandAutoBenchmarkRun(ctx context.Context, item *inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun, scs []storagev1.StorageClass) error {
+	if item.Spec.DatastoreID <= 0 {
+		current := item.DeepCopy()
+		current.Status = inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunStatus{
+			ObservedGeneration: item.Generation,
+			Phase:              inventoryv1alpha1.ValidationPhaseFailed,
+			DatastoreID:        item.Spec.DatastoreID,
+			Message:            "auto benchmark runs require spec.datastoreID",
+		}
+		return s.client.Status().Patch(ctx, current, ctrlclient.MergeFrom(item.DeepCopy()))
+	}
+	resolved := item.DeepCopy()
+	if strings.TrimSpace(resolved.Spec.StorageClassName) == "" {
+		resolved.Spec.StorageClassName = defaultBenchmarkStorageClassName(scs, resolved.Spec.DatastoreID)
+	}
+	if strings.TrimSpace(resolved.Spec.Size) == "" {
+		resolved.Spec.Size = "1Gi"
+	}
+	name := benchmarkRunObjectName(resolved.Spec.DatastoreID, time.Now().UTC())
+	created := &inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: inventoryv1alpha1.SchemeGroupVersion.String(),
+			Kind:       "OpenNebulaDatastoreBenchmarkRun",
+		},
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       resolved.Spec,
+	}
+	if err := s.client.Create(ctx, created); err != nil && !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	return s.client.Delete(ctx, item)
+}
+
+func (s *Syncer) resolveBenchmarkRun(item inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun, ds datastoreSchema.Datastore, scs []storagev1.StorageClass) inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun {
+	resolved := *item.DeepCopy()
+	if strings.TrimSpace(resolved.Spec.StorageClassName) == "" {
+		resolved.Spec.StorageClassName = defaultBenchmarkStorageClassName(scs, resolved.Spec.DatastoreID)
+	}
+	if strings.TrimSpace(resolved.Spec.Size) == "" {
+		resolved.Spec.Size = "1Gi"
+	}
+	if strings.TrimSpace(resolved.Spec.Image) == "" {
+		resolved.Spec.Image = s.defaultValidationImage
+	}
+	if resolved.Spec.ImagePullPolicy == "" {
+		resolved.Spec.ImagePullPolicy = defaultValidationImagePullPolicy
+	}
+	_ = ds
+	return resolved
+}
+
+func (s *Syncer) loadLatestBenchmarkResults(ctx context.Context) (map[int]*latestBenchmarkResult, error) {
+	var runList inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunList
+	if err := s.client.List(ctx, &runList); err != nil {
+		return nil, err
+	}
+	results := make(map[int]*latestBenchmarkResult)
+	for i := range runList.Items {
+		run := runList.Items[i]
+		if run.Status.Phase != inventoryv1alpha1.ValidationPhaseSucceeded {
+			continue
+		}
+		existing, ok := results[run.Spec.DatastoreID]
+		if !ok || benchmarkCompletedAfter(run.Status.CompletedAt, existing.Status.CompletedAt) {
+			statusCopy := run.Status
+			results[run.Spec.DatastoreID] = &latestBenchmarkResult{
+				RunName: run.Name,
+				Status:  statusCopy,
+			}
+		}
+	}
+	return results, nil
+}
+
 func (s *Syncer) reconcileValidation(ctx context.Context, ds *inventoryv1alpha1.OpenNebulaDatastore) error {
 	if ds.Spec.Validation.Mode != inventoryv1alpha1.DatastoreValidationModeManual {
 		return nil
@@ -747,6 +963,28 @@ func (s *Syncer) buildValidationPVC(ds *inventoryv1alpha1.OpenNebulaDatastore, p
 	}
 }
 
+func (s *Syncer) buildBenchmarkPVC(run *inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun, pvcName string) *corev1.PersistentVolumeClaim {
+	size := run.Spec.Size
+	if strings.TrimSpace(size) == "" {
+		size = "1Gi"
+	}
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pvcName,
+			Namespace: s.namespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			StorageClassName: stringPtr(run.Spec.StorageClassName),
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resourceMustParse(size),
+				},
+			},
+		},
+	}
+}
+
 func (s *Syncer) buildValidationJob(ds *inventoryv1alpha1.OpenNebulaDatastore, jobName, pvcName string) *batchv1.Job {
 	image := ds.Spec.Validation.JobTemplate.Image
 	if strings.TrimSpace(image) == "" {
@@ -778,6 +1016,56 @@ func (s *Syncer) buildValidationJob(ds *inventoryv1alpha1.OpenNebulaDatastore, j
 						Command:         command,
 						Args:            args,
 						Resources:       ds.Spec.Validation.JobTemplate.Resources,
+						VolumeMounts: []corev1.VolumeMount{{
+							Name:      "data",
+							MountPath: "/data",
+						}},
+					}},
+					Volumes: []corev1.Volume{{
+						Name: "data",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: pvcName,
+							},
+						},
+					}},
+				},
+			},
+		},
+	}
+}
+
+func (s *Syncer) buildBenchmarkJob(run *inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun, jobName, pvcName string) *batchv1.Job {
+	image := run.Spec.Image
+	if strings.TrimSpace(image) == "" {
+		image = s.defaultValidationImage
+	}
+	policy := run.Spec.ImagePullPolicy
+	if policy == "" {
+		policy = defaultValidationImagePullPolicy
+	}
+	ttl := run.Spec.TTLSecondsAfterFinished
+	command := []string{"/bin/sh", "-c"}
+	args := []string{buildValidationCommand(run.Spec.FioArgs)}
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: s.namespace,
+		},
+		Spec: batchv1.JobSpec{
+			TTLSecondsAfterFinished: ttl,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					NodeSelector:  run.Spec.NodeSelector,
+					Tolerations:   run.Spec.Tolerations,
+					Containers: []corev1.Container{{
+						Name:            "fio",
+						Image:           image,
+						ImagePullPolicy: policy,
+						Command:         command,
+						Args:            args,
+						Resources:       run.Spec.Resources,
 						VolumeMounts: []corev1.VolumeMount{{
 							Name:      "data",
 							MountPath: "/data",
@@ -1019,6 +1307,13 @@ func validationMetricsDisplay(status inventoryv1alpha1.OpenNebulaDatastoreValida
 	return fmt.Sprintf("R:%s W:%s p99:%s", compactIOPS(status.Result.ReadIops), compactIOPS(status.Result.WriteIops), humanizeLatency(status.Result.LatencyP99Micros))
 }
 
+func benchmarkSummaryDisplay(status inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunStatus) string {
+	if status.Phase != inventoryv1alpha1.ValidationPhaseSucceeded || (status.Result.ReadIops == nil && status.Result.WriteIops == nil && status.Result.LatencyP99Micros == nil) {
+		return "-"
+	}
+	return fmt.Sprintf("R:%s W:%s p99:%s", compactIOPS(status.Result.ReadIops), compactIOPS(status.Result.WriteIops), humanizeLatency(status.Result.LatencyP99Micros))
+}
+
 func validationEligible(ds inventoryv1alpha1.OpenNebulaDatastore, backend string) bool {
 	return ds.Spec.Validation.Mode == inventoryv1alpha1.DatastoreValidationModeManual && backend != "cephfs"
 }
@@ -1069,6 +1364,34 @@ func validationSummaryDisplay(status inventoryv1alpha1.OpenNebulaDatastoreValida
 	default:
 		return "-"
 	}
+}
+
+func benchmarkCompletedAfter(left, right *metav1.Time) bool {
+	if left == nil {
+		return false
+	}
+	if right == nil {
+		return true
+	}
+	return left.Time.After(right.Time)
+}
+
+func benchmarkRunObjectName(datastoreID int, ts time.Time) string {
+	return fmt.Sprintf("ds-%d-%s", datastoreID, ts.UTC().Format("20060102-150405"))
+}
+
+func defaultBenchmarkStorageClassName(scs []storagev1.StorageClass, datastoreID int) string {
+	names := make([]string, 0)
+	for _, sc := range scs {
+		if storageClassUsesDatastore(sc, datastoreID) {
+			names = append(names, sc.Name)
+		}
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		return ""
+	}
+	return names[0]
 }
 
 func humanizeDurationSince(ts time.Time) string {

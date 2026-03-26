@@ -22,6 +22,17 @@ func TestValidationSummaryForCommandPrefersDisplaySummary(t *testing.T) {
 	}
 }
 
+func TestBenchmarkSummaryForCommandPrefersDisplaySummary(t *testing.T) {
+	status := inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunStatus{
+		Phase:   inventoryv1alpha1.ValidationPhaseSucceeded,
+		Summary: "R:12k W:8k p99:4ms",
+		Message: "benchmark completed",
+	}
+	if got := benchmarkSummaryForCommand(status); got != "R:12k W:8k p99:4ms" {
+		t.Fatalf("unexpected benchmark summary: %q", got)
+	}
+}
+
 func TestFlattenStorageClassDetails(t *testing.T) {
 	datastores := []inventoryv1alpha1.OpenNebulaDatastore{
 		{

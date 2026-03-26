@@ -46,3 +46,30 @@ func TestDatastoreCRDIncludesDisplayColumnsAndTypedStatus(t *testing.T) {
 		t.Fatal("legacy datastore printer columns are still present")
 	}
 }
+
+func TestBenchmarkRunCRDExists(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to resolve current file path")
+	}
+	crdPath := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "../../../../../helm/opennebula-csi/crds/opennebuladatastorebenchmarkruns.storageprovider.opennebula.sparkaiur.io.yaml"))
+	payload, err := os.ReadFile(crdPath)
+	if err != nil {
+		t.Fatalf("failed reading benchmark run CRD: %v", err)
+	}
+	text := string(payload)
+	requiredSnippets := []string{
+		"kind: OpenNebulaDatastoreBenchmarkRun",
+		"plural: opennebuladatastorebenchmarkruns",
+		"- name: Datastore",
+		"- name: Phase",
+		"datastoreID:",
+		"fioArgs:",
+		"summary:",
+	}
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(text, snippet) {
+			t.Fatalf("expected benchmark CRD to contain %q", snippet)
+		}
+	}
+}

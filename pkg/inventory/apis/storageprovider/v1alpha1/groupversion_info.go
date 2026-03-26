@@ -21,6 +21,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(SchemeGroupVersion,
 		&OpenNebulaDatastore{},
 		&OpenNebulaDatastoreList{},
+		&OpenNebulaDatastoreBenchmarkRun{},
+		&OpenNebulaDatastoreBenchmarkRunList{},
 		&OpenNebulaNode{},
 		&OpenNebulaNodeList{},
 	)
