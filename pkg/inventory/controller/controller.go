@@ -1106,6 +1106,12 @@ func (s *Syncer) parseValidationJobLogs(ctx context.Context, job *batchv1.Job) (
 }
 
 func parseFIOResult(payload []byte) (inventoryv1alpha1.ValidationResult, error) {
+	trimmed := strings.TrimSpace(string(payload))
+	start := strings.Index(trimmed, "{")
+	end := strings.LastIndex(trimmed, "}")
+	if start < 0 || end < start {
+		return inventoryv1alpha1.ValidationResult{}, fmt.Errorf("fio result did not include a JSON object")
+	}
 	var decoded struct {
 		Jobs []struct {
 			Read struct {
@@ -1124,7 +1130,7 @@ func parseFIOResult(payload []byte) (inventoryv1alpha1.ValidationResult, error) 
 			} `json:"write"`
 		} `json:"jobs"`
 	}
-	if err := json.Unmarshal(payload, &decoded); err != nil {
+	if err := json.Unmarshal([]byte(trimmed[start:end+1]), &decoded); err != nil {
 		return inventoryv1alpha1.ValidationResult{}, err
 	}
 	if len(decoded.Jobs) == 0 {

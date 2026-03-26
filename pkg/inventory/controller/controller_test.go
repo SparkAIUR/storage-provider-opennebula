@@ -288,6 +288,23 @@ func TestBenchmarkHelpers(t *testing.T) {
 	}
 }
 
+func TestParseFIOResultSkipsLeadingNoise(t *testing.T) {
+	payload := []byte("note: queue depth will be capped at 1\n{\"jobs\":[{\"read\":{\"iops\":12000,\"bw_bytes\":4096,\"clat_ns\":{\"percentile\":{\"50.000000\":4000000,\"99.000000\":5000000}}},\"write\":{\"iops\":8000,\"bw_bytes\":2048,\"clat_ns\":{\"percentile\":{\"99.000000\":6000000}}}}]}")
+	result, err := parseFIOResult(payload)
+	if err != nil {
+		t.Fatalf("expected fio payload with warning prefix to parse, got %v", err)
+	}
+	if result.ReadIops == nil || *result.ReadIops != 12000 {
+		t.Fatalf("unexpected read iops: %#v", result.ReadIops)
+	}
+	if result.WriteIops == nil || *result.WriteIops != 8000 {
+		t.Fatalf("unexpected write iops: %#v", result.WriteIops)
+	}
+	if result.LatencyP99Micros == nil || *result.LatencyP99Micros != 5000 {
+		t.Fatalf("unexpected p99 latency: %#v", result.LatencyP99Micros)
+	}
+}
+
 func TestBuildDatastoreStatusCountsPVCsAndClaims(t *testing.T) {
 	s := &Syncer{}
 	item := inventoryv1alpha1.OpenNebulaDatastore{
