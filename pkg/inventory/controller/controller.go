@@ -34,6 +34,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
@@ -148,6 +149,12 @@ func (s *Syncer) NeedLeaderElection() bool {
 }
 
 func (s *Syncer) Start(ctx context.Context) error {
+	log := crlog.FromContext(ctx).WithName("inventory-sync")
+	log.Info("starting inventory sync loops",
+		"resyncDatastores", s.resyncDatastores.String(),
+		"resyncNodes", s.resyncNodes.String(),
+		"validationEnabled", s.validationEnabled,
+	)
 	dsTicker := time.NewTicker(s.resyncDatastores)
 	defer dsTicker.Stop()
 	nodeTicker := time.NewTicker(s.resyncNodes)
@@ -177,6 +184,7 @@ func (s *Syncer) Start(ctx context.Context) error {
 }
 
 func (s *Syncer) syncDatastores(ctx context.Context) error {
+	log := crlog.FromContext(ctx).WithName("inventory-datastores")
 	dsPool, err := s.ctrl.Datastores().InfoContext(ctx)
 	if err != nil {
 		return err
@@ -215,9 +223,11 @@ func (s *Syncer) syncDatastores(ctx context.Context) error {
 	if err := s.client.List(ctx, &dsList); err != nil {
 		return err
 	}
+	log.Info("reconciling datastore inventory", "discoveredCount", len(dsPool.Datastores), "objectCount", len(dsList.Items))
 
 	for _, item := range dsList.Items {
 		ds, ok := discoveredIDs[item.Spec.Discovery.OpenNebulaDatastoreID]
+		base := item.DeepCopy()
 		status := item.DeepCopy()
 		if !ok {
 			status.Status = inventoryv1alpha1.OpenNebulaDatastoreStatus{
@@ -239,16 +249,46 @@ func (s *Syncer) syncDatastores(ctx context.Context) error {
 					newCondition("Discovered", metav1.ConditionFalse, "DatastoreMissing", "Datastore was not found in OpenNebula"),
 				},
 			}
-			if err := s.client.Status().Update(ctx, status); err != nil {
+			log.Info("patching datastore status",
+				"datastoreObject", item.Name,
+				"datastoreID", item.Spec.Discovery.OpenNebulaDatastoreID,
+				"phase", status.Status.Phase,
+				"health", status.Status.Health,
+			)
+			if err := s.client.Status().Patch(ctx, status, ctrlclient.MergeFrom(base)); err != nil {
+				log.Error(err, "failed to patch datastore status", "datastoreObject", item.Name, "datastoreID", item.Spec.Discovery.OpenNebulaDatastoreID)
 				return err
 			}
+			log.Info("patched datastore status",
+				"datastoreObject", item.Name,
+				"datastoreID", item.Spec.Discovery.OpenNebulaDatastoreID,
+				"phase", status.Status.Phase,
+				"name", status.Status.Name,
+				"backend", status.Status.Backend,
+				"capacityDisplay", status.Status.CapacityDisplay,
+			)
 			continue
 		}
 		nextStatus := s.buildDatastoreStatus(item, ds, pvs.Items, pvcByNSName, scs.Items, vas.Items)
 		status.Status = nextStatus
-		if err := s.client.Status().Update(ctx, status); err != nil {
+		log.Info("patching datastore status",
+			"datastoreObject", item.Name,
+			"datastoreID", nextStatus.ID,
+			"phase", nextStatus.Phase,
+			"health", nextStatus.Health,
+		)
+		if err := s.client.Status().Patch(ctx, status, ctrlclient.MergeFrom(base)); err != nil {
+			log.Error(err, "failed to patch datastore status", "datastoreObject", item.Name, "datastoreID", nextStatus.ID)
 			return err
 		}
+		log.Info("patched datastore status",
+			"datastoreObject", item.Name,
+			"datastoreID", nextStatus.ID,
+			"phase", nextStatus.Phase,
+			"name", nextStatus.Name,
+			"backend", nextStatus.Backend,
+			"capacityDisplay", nextStatus.CapacityDisplay,
+		)
 		if s.validationEnabled {
 			if err := s.reconcileValidation(ctx, status); err != nil {
 				ctrl.Log.Error(err, "failed reconciling datastore validation", "datastore", status.Name)
@@ -259,6 +299,7 @@ func (s *Syncer) syncDatastores(ctx context.Context) error {
 }
 
 func (s *Syncer) syncNodes(ctx context.Context) error {
+	log := crlog.FromContext(ctx).WithName("inventory-nodes")
 	nodes, err := s.kube.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return err
@@ -287,10 +328,11 @@ func (s *Syncer) syncNodes(ctx context.Context) error {
 	if err := s.client.List(ctx, &nodeList); err != nil {
 		return err
 	}
+	log.Info("reconciling node inventory", "kubernetesNodeCount", len(nodes.Items), "objectCount", len(nodeList.Items))
 
 	dsNames := make(map[int]string)
 	if datastores, err := s.ctrl.Datastores().InfoContext(ctx); err != nil {
-		ctrl.Log.Error(err, "failed to list OpenNebula datastores for node inventory")
+		log.Error(err, "failed to list OpenNebula datastores for node inventory")
 	} else {
 		dsNames = datastoreNameMap(datastores)
 	}
@@ -473,6 +515,7 @@ func (s *Syncer) buildDatastoreStatus(item inventoryv1alpha1.OpenNebulaDatastore
 }
 
 func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.OpenNebulaNode, node corev1.Node, vas []storagev1.VolumeAttachment, pvByName map[string]corev1.PersistentVolume, datastoreNames map[int]string, hotplugStates map[string]opennebula.HotplugCooldownState) inventoryv1alpha1.OpenNebulaNodeStatus {
+	log := crlog.FromContext(ctx).WithName("inventory-node-status")
 	status := inventoryv1alpha1.OpenNebulaNodeStatus{
 		ObservedGeneration: item.Generation,
 		Kubernetes: inventoryv1alpha1.OpenNebulaNodeKubernetesStatus{
@@ -493,9 +536,18 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 	if strings.TrimSpace(vmName) == "" {
 		vmName = node.Name
 	}
-	vmID, err := s.ctrl.VMs().ByName(vmName)
+	vmID, resolutionPath, err := opennebula.ResolveNodeVMID(ctx, s.ctrl, vmName)
 	if err != nil {
+		log.Info("resolved node vm", "node", node.Name, "vmName", vmName, "resolutionPath", resolutionPath, "resolvedVMID", -1, "error", err.Error())
 		status.Phase = inventoryv1alpha1.NodePhaseNotFound
+		if _, ok := err.(*opennebula.VMDuplicateNameError); ok {
+			status.DisplayState = "VMNotFound"
+			status.Conditions = []metav1.Condition{
+				newCondition("KubernetesNodeFound", metav1.ConditionTrue, "NodeFound", "Kubernetes node was found"),
+				newCondition("OpenNebulaVMFound", metav1.ConditionFalse, "VMDuplicateMatch", "Multiple OpenNebula VMs matched the node name"),
+			}
+			return status
+		}
 		status.DisplayState = "VMNotFound"
 		status.Conditions = []metav1.Condition{
 			newCondition("KubernetesNodeFound", metav1.ConditionTrue, "NodeFound", "Kubernetes node was found"),
@@ -503,6 +555,7 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 		}
 		return status
 	}
+	log.Info("resolved node vm", "node", node.Name, "vmName", vmName, "resolutionPath", resolutionPath, "resolvedVMID", vmID)
 	vmInfo, err := s.ctrl.VM(vmID).InfoContext(ctx, true)
 	if err != nil {
 		status.Phase = inventoryv1alpha1.NodePhaseDegraded

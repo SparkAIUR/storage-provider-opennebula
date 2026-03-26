@@ -996,7 +996,7 @@ func (p *PersistentDiskVolumeProvider) ResolveVolumeSizeBytes(ctx context.Contex
 }
 
 func (p *PersistentDiskVolumeProvider) NodeExists(ctx context.Context, node string) (int, error) {
-	vmID, err := p.ctrl.VMs().ByName(node)
+	vmID, _, err := ResolveNodeVMID(ctx, p.ctrl, node)
 	if err != nil {
 		return -1, fmt.Errorf("Failed to fetch VM: %w", err)
 	}

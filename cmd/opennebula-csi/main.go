@@ -30,6 +30,7 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
 	"k8s.io/utils/exec"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 var (
@@ -53,6 +54,7 @@ var (
 func main() {
 	klog.InitFlags(nil)
 	_ = flag.Set("logtostderr", "true")
+	ctrl.SetLogger(klog.Background())
 	flag.Parse()
 
 	config := config.LoadConfiguration()
