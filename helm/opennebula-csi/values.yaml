@@ -47,6 +47,8 @@ featureGates:
 
 controller:
   replicaCount: 1
+  logLevel: 3
+  sidecarLogLevel: 3
   sidecarTimeoutSeconds: 960
   leaderElection:
     enabled: true
@@ -67,6 +69,7 @@ inventoryController:
   enabled: false
   namespace: ""
   replicaCount: 1
+  logLevel: 3
   authorityMode: "strict"
   leaderElectionID: "opennebula-csi-inventory-controller"
   resyncSeconds:

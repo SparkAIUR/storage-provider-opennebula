@@ -654,7 +654,22 @@ These suites are disabled by default because they require real infrastructure:
 
 ## Release flow
 
-Push a semantic tag such as `v0.1.0` to trigger the release workflow.
+Every semantic release must be validated in the `hplcsi` lab before the tag is created.
+
+Required release gate:
+
+1. Build the candidate image from the branch under test
+2. Deploy that candidate image into the lab cluster, not the previous tagged release
+3. Validate the feature area touched by the change on live infrastructure
+4. Only after lab validation passes, create or move the semantic tag and publish the release
+
+At minimum, release validation should include:
+
+- `go test ./...`
+- `helm template opennebula-csi ./helm/opennebula-csi ...`
+- a live lab validation for the feature or hotfix being released
+
+Push a semantic tag such as `v0.1.0` only after that validation to trigger the release workflow.
 
 The workflow will:
 

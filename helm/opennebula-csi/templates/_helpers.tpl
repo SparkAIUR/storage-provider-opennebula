@@ -66,6 +66,9 @@ Create chart name and version as used by the chart label.
 {{- end }}
 
 {{- define "opennebula-csi.driverCommonEnv" -}}
+{{- $inventory := (get .Values "inventoryController") | default dict -}}
+{{- $inventoryResync := (get $inventory "resyncSeconds") | default dict -}}
+{{- $inventoryValidation := (get $inventory "validation") | default dict -}}
 - name: ONE_XMLRPC
   value: {{ .Values.oneApiEndpoint | quote }}
 - name: ONE_AUTH
@@ -73,6 +76,17 @@ Create chart name and version as used by the chart label.
     secretKeyRef:
       name: {{ include "opennebula-csi.authSecretName" . }}
       key: {{ include "opennebula-csi.authSecretKey" . }}
+{{- $inventoryEnabled := (get $inventory "enabled") | default false -}}
+{{- $inventoryAuthorityMode := (get $inventory "authorityMode") | default "strict" -}}
+{{- $inventoryResyncDatastores := (get $inventoryResync "datastores") | default 60 -}}
+{{- $inventoryResyncNodes := (get $inventoryResync "nodes") | default 30 -}}
+{{- $inventoryLeaderElectionID := (get $inventory "leaderElectionID") | default "opennebula-csi-inventory-controller" -}}
+{{- $inventoryNamespace := (get $inventory "namespace") | default "" -}}
+{{- if eq (trim (printf "%v" $inventoryNamespace)) "" -}}
+{{- $inventoryNamespace = include "opennebula-csi.namespace" . -}}
+{{- end }}
+{{- $inventoryValidationEnabled := (get $inventoryValidation "enabled") | default true -}}
+{{- $inventoryValidationDefaultImage := (get $inventoryValidation "defaultImage") | default "ghcr.io/axboe/fio:latest" -}}
 {{- if .Values.driver.defaultDatastores }}
 - name: ONE_CSI_DEFAULT_DATASTORES
   value: {{ join "," .Values.driver.defaultDatastores | quote }}
@@ -100,21 +114,21 @@ Create chart name and version as used by the chart label.
 - name: ONE_CSI_VM_HOTPLUG_STUCK_VM_COOLDOWN_SECONDS
   value: {{ .Values.driver.vmHotplugStuckVmCooldownSeconds | quote }}
 - name: ONE_CSI_INVENTORY_CONTROLLER_ENABLED
-  value: {{ .Values.inventoryController.enabled | quote }}
+  value: {{ $inventoryEnabled | quote }}
 - name: ONE_CSI_INVENTORY_DATASTORE_AUTHORITY_MODE
-  value: {{ .Values.inventoryController.authorityMode | quote }}
+  value: {{ $inventoryAuthorityMode | quote }}
 - name: ONE_CSI_INVENTORY_RESYNC_DATASTORES_SECONDS
-  value: {{ .Values.inventoryController.resyncSeconds.datastores | quote }}
+  value: {{ $inventoryResyncDatastores | quote }}
 - name: ONE_CSI_INVENTORY_RESYNC_NODES_SECONDS
-  value: {{ .Values.inventoryController.resyncSeconds.nodes | quote }}
+  value: {{ $inventoryResyncNodes | quote }}
 - name: ONE_CSI_INVENTORY_CONTROLLER_LEADER_ELECTION_ID
-  value: {{ .Values.inventoryController.leaderElectionID | quote }}
+  value: {{ $inventoryLeaderElectionID | quote }}
 - name: ONE_CSI_INVENTORY_CONTROLLER_NAMESPACE
-  value: {{ default (include "opennebula-csi.namespace" .) .Values.inventoryController.namespace | quote }}
+  value: {{ $inventoryNamespace | quote }}
 - name: ONE_CSI_INVENTORY_VALIDATION_ENABLED
-  value: {{ .Values.inventoryController.validation.enabled | quote }}
+  value: {{ $inventoryValidationEnabled | quote }}
 - name: ONE_CSI_INVENTORY_VALIDATION_DEFAULT_IMAGE
-  value: {{ .Values.inventoryController.validation.defaultImage | quote }}
+  value: {{ $inventoryValidationDefaultImage | quote }}
 - name: ONE_CSI_FEATURE_GATES
   value: "compatibilityAwareSelection={{ .Values.featureGates.compatibilityAwareSelection }},detachedDiskExpansion={{ .Values.featureGates.detachedDiskExpansion }},cephfsExpansion={{ .Values.featureGates.cephfsExpansion }},cephfsSnapshots={{ .Values.featureGates.cephfsSnapshots }},cephfsClones={{ .Values.featureGates.cephfsClones }},cephfsSelfHealing={{ .Values.featureGates.cephfsSelfHealing }},topologyAccessibility={{ .Values.featureGates.topologyAccessibility }}"
 {{- with .Values.driver.env }}

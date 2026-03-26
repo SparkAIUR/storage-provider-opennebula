@@ -1,4 +1,17 @@
 ---
+{{- $controller := (get .Values "controller") | default dict -}}
+{{- $controllerLeaderElection := (get $controller "leaderElection") | default dict -}}
+{{- $controllerLogLevel := (get $controller "logLevel") | default 3 -}}
+{{- $controllerSidecarLogLevel := (get $controller "sidecarLogLevel") | default 3 -}}
+{{- $leaderElectionEnabled := (get $controllerLeaderElection "enabled") | default true -}}
+{{- $leaderElectionLeaseName := (get $controllerLeaderElection "leaseName") | default "opennebula-csi-controller" -}}
+{{- $leaderElectionLeaseNamespace := (get $controllerLeaderElection "leaseNamespace") | default "" -}}
+{{- if eq (trim (printf "%v" $leaderElectionLeaseNamespace)) "" -}}
+{{- $leaderElectionLeaseNamespace = include "opennebula-csi.namespace" . -}}
+{{- end }}
+{{- $leaderElectionLeaseDuration := (get $controllerLeaderElection "leaseDurationSeconds") | default 45 -}}
+{{- $leaderElectionRenewDeadline := (get $controllerLeaderElection "renewDeadlineSeconds") | default 30 -}}
+{{ $leaderElectionRetryPeriod := (get $controllerLeaderElection "retryPeriodSeconds") | default 10 }}
 kind: StatefulSet
 apiVersion: apps/v1
 metadata:
@@ -61,7 +74,8 @@ spec:
           {{- end }}
           args:
             - "--endpoint=$(CSI_ENDPOINT)"
-            - "--v={{ .Values.driver.logLevel }}"
+            - "--v={{ $controllerLogLevel }}"
+            - "--vmodule=leaderelection=0"
             {{- with .Values.driver.extraArgs }}
 {{ toYaml . | nindent 12 }}
             {{- end }}
@@ -72,17 +86,17 @@ spec:
             - name: CSI_ENDPOINT
               value: unix:///csi/csi.sock
             - name: ONE_CSI_CONTROLLER_LEADER_ELECTION_ENABLED
-              value: {{ .Values.controller.leaderElection.enabled | quote }}
+              value: {{ $leaderElectionEnabled | quote }}
             - name: ONE_CSI_CONTROLLER_LEADER_ELECTION_LEASE_NAME
-              value: {{ .Values.controller.leaderElection.leaseName | quote }}
+              value: {{ $leaderElectionLeaseName | quote }}
             - name: ONE_CSI_CONTROLLER_LEADER_ELECTION_LEASE_NAMESPACE
-              value: {{ default (include "opennebula-csi.namespace" .) .Values.controller.leaderElection.leaseNamespace | quote }}
+              value: {{ $leaderElectionLeaseNamespace | quote }}
             - name: ONE_CSI_CONTROLLER_LEADER_ELECTION_LEASE_DURATION_SECONDS
-              value: {{ .Values.controller.leaderElection.leaseDurationSeconds | quote }}
+              value: {{ $leaderElectionLeaseDuration | quote }}
             - name: ONE_CSI_CONTROLLER_LEADER_ELECTION_RENEW_DEADLINE_SECONDS
-              value: {{ .Values.controller.leaderElection.renewDeadlineSeconds | quote }}
+              value: {{ $leaderElectionRenewDeadline | quote }}
             - name: ONE_CSI_CONTROLLER_LEADER_ELECTION_RETRY_PERIOD_SECONDS
-              value: {{ .Values.controller.leaderElection.retryPeriodSeconds | quote }}
+              value: {{ $leaderElectionRetryPeriod | quote }}
 {{ include "opennebula-csi.driverCommonEnv" . | nindent 12 }}
             {{- with .Values.controller.extraEnv }}
 {{ toYaml . | nindent 12 }}
@@ -104,7 +118,8 @@ spec:
               protocol: TCP
           {{- end }}
           args:
-            - "--v=5"
+            - "--v={{ $controllerSidecarLogLevel }}"
+            - "--vmodule=leaderelection=0"
             - "--csi-address=$(ADDRESS)"
             - "--timeout={{ .Values.controller.sidecarTimeoutSeconds }}s"
             - "--default-fstype=ext4"
@@ -128,7 +143,8 @@ spec:
               protocol: TCP
           {{- end }}
           args:
-            - "--v=5"
+            - "--v={{ $controllerSidecarLogLevel }}"
+            - "--vmodule=leaderelection=0"
             - "--csi-address=$(ADDRESS)"
             - "--timeout={{ .Values.controller.sidecarTimeoutSeconds }}s"
             {{- if .Values.metrics.enabled }}
@@ -150,7 +166,8 @@ spec:
               protocol: TCP
           {{- end }}
           args:
-            - "--v=5"
+            - "--v={{ $controllerSidecarLogLevel }}"
+            - "--vmodule=leaderelection=0"
             - "--csi-address=$(ADDRESS)"
             - "--timeout={{ .Values.controller.sidecarTimeoutSeconds }}s"
             - "--leader-election"
@@ -168,7 +185,8 @@ spec:
           image: {{ .Values.snapshotter.image | quote }}
           imagePullPolicy: IfNotPresent
           args:
-            - "--v=5"
+            - "--v={{ $controllerSidecarLogLevel }}"
+            - "--vmodule=leaderelection=0"
             - "--csi-address=$(ADDRESS)"
             - "--leader-election"
             {{- with .Values.snapshotter.extraArgs }}

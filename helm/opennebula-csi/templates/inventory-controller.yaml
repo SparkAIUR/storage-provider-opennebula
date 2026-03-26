@@ -1,4 +1,15 @@
-{{- if .Values.inventoryController.enabled }}
+{{- $inventory := (get .Values "inventoryController") | default dict -}}
+{{- $inventoryEnabled := (get $inventory "enabled") | default false -}}
+{{- if $inventoryEnabled }}
+{{- $inventoryReplicaCount := (get $inventory "replicaCount") | default 1 -}}
+{{- $inventoryLogLevel := (get $inventory "logLevel") | default 3 -}}
+{{- $inventoryPodAnnotations := (get $inventory "podAnnotations") | default (dict) -}}
+{{- $inventoryNodeSelector := (get $inventory "nodeSelector") | default (dict) -}}
+{{- $inventoryAffinity := (get $inventory "affinity") | default (dict) -}}
+{{- $inventoryTolerations := (get $inventory "tolerations") | default (list) -}}
+{{- $inventoryExtraArgs := (get $inventory "extraArgs") | default (list) -}}
+{{- $inventoryExtraEnv := (get $inventory "extraEnv") | default (list) -}}
+{{ $inventoryResources := (get $inventory "resources") | default (dict) }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -6,7 +17,7 @@ metadata:
   name: {{ printf "%s-inventory" (include "opennebula-csi.fullname" .) }}
   namespace: {{ include "opennebula-csi.namespace" . }}
 spec:
-  replicas: {{ .Values.inventoryController.replicaCount }}
+  replicas: {{ $inventoryReplicaCount }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "opennebula-csi.name" . }}
@@ -16,7 +27,7 @@ spec:
     metadata:
       annotations:
         kubectl.kubernetes.io/default-container: inventory-controller
-        {{- with .Values.inventoryController.podAnnotations }}
+        {{- with $inventoryPodAnnotations }}
 {{ toYaml . | nindent 8 }}
         {{- end }}
       labels:
@@ -29,15 +40,15 @@ spec:
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.inventoryController.nodeSelector }}
+      {{- with $inventoryNodeSelector }}
       nodeSelector:
 {{ toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.inventoryController.affinity }}
+      {{- with $inventoryAffinity }}
       affinity:
 {{ toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.inventoryController.tolerations }}
+      {{- with $inventoryTolerations }}
       tolerations:
 {{ toYaml . | nindent 8 }}
       {{- end }}
@@ -47,16 +58,17 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "--mode=inventory-controller"
-            - "--v={{ .Values.driver.logLevel }}"
-            {{- with .Values.inventoryController.extraArgs }}
+            - "--v={{ $inventoryLogLevel }}"
+            - "--vmodule=leaderelection=0"
+            {{- with $inventoryExtraArgs }}
 {{ toYaml . | nindent 12 }}
             {{- end }}
           env:
 {{ include "opennebula-csi.driverCommonEnv" . | nindent 12 }}
-            {{- with .Values.inventoryController.extraEnv }}
+            {{- with $inventoryExtraEnv }}
 {{ toYaml . | nindent 12 }}
             {{- end }}
-          {{- with .Values.inventoryController.resources }}
+          {{- with $inventoryResources }}
           resources:
 {{ toYaml . | nindent 12 }}
           {{- end }}
