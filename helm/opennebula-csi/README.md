@@ -362,6 +362,35 @@ The chart now ships reusable manual validation profiles under `inventoryControll
 
 These are defaults for manual runs. They do not enable scheduled validation.
 
+To trigger a one-shot datastore benchmark run directly, create an `OpenNebulaDatastoreBenchmarkRun`. If you use `metadata.name: auto`, the inventory controller replaces it with a concrete object named `ds-<id>-<timestamp>` and starts the fio Job for you.
+
+```bash
+kubectl apply -f - <<EOF
+apiVersion: storageprovider.opennebula.sparkaiur.io/v1alpha1
+kind: OpenNebulaDatastoreBenchmarkRun
+metadata:
+  name: auto
+spec:
+  datastoreID: 1
+  storageClassName: opennebula-default-rwo
+  size: 1Gi
+  fioArgs:
+    - --name=smoke
+    - --rw=randrw
+    - --bs=4k
+    - --iodepth=8
+    - --runtime=30
+    - --time_based=1
+EOF
+```
+
+Check the run and the resulting datastore metrics with:
+
+```bash
+kubectl get opennebuladatastorebenchmarkruns -o wide
+kubectl get opennebuladatastores -o wide
+```
+
 ### Operator Commands
 
 The driver image includes two cluster-operator modes that work well with a kubeconfig or in-cluster execution:
