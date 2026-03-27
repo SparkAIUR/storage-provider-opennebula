@@ -128,7 +128,11 @@ kubectl get opennebuladatastores -o jsonpath='{range .items[*]}{.metadata.name}{
       wait_for_datastore_phase "${stale_ds}" "Enabled" 120
     done
 
-maint_ds="$(kubectl get opennebuladatastores -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.id}{"\t"}{.status.phase}{"\t"}{.status.backend}{"\n"}{end}' | awk '$3=="Enabled" && $4=="local" {print $1; exit}')"
+sc_datastore_name="$(kubectl get opennebuladatastores -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.storageClassesDisplay}{"\n"}{end}' | awk -F'\t' -v sc="${SC_NAME}" '$2 ~ "(^|,)" sc "($|,)" {print $1; exit}')"
+maint_ds="$(kubectl get opennebuladatastores -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.backend}{"\n"}{end}' | awk -v exclude="${sc_datastore_name}" '$2=="Enabled" && $3=="local" && $1!=exclude {print $1; exit}')"
+if [[ -z "${maint_ds}" ]]; then
+  maint_ds="$(kubectl get opennebuladatastores -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.backend}{"\n"}{end}' | awk '$2=="Enabled" && $3=="local" {print $1; exit}')"
+fi
 if [[ -n "${maint_ds}" ]]; then
   kubectl patch opennebuladatastore "${maint_ds}" --type merge -p '{"spec":{"maintenanceMode":true,"maintenanceMessage":"release validation maintenance mode"}}'
   wait_for_datastore_phase "${maint_ds}" "Disabled" 120
