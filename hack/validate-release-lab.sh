@@ -146,6 +146,11 @@ controller_name="$(first_matching_name statefulset "${RELEASE_NAME}-controller" 
 node_name="$(first_matching_name daemonset "${RELEASE_NAME}-node" "${RELEASE_NAME}-opennebula-csi-node")"
 inventory_name="$(first_matching_name deployment "${RELEASE_NAME}-inventory" "${RELEASE_NAME}-opennebula-csi-inventory-controller")"
 
+kubectl -n "${NAMESPACE}" rollout restart statefulset/"${controller_name}" || true
+kubectl -n "${NAMESPACE}" rollout restart daemonset/"${node_name}" || true
+kubectl -n "${NAMESPACE}" rollout restart deployment/"${inventory_name}" || true
+kubectl -n "${NAMESPACE}" delete pod "${controller_name}-0" --ignore-not-found=true --wait=false || true
+
 kubectl -n "${NAMESPACE}" rollout status statefulset/"${controller_name}" --timeout=10m
 kubectl -n "${NAMESPACE}" rollout status daemonset/"${node_name}" --timeout=10m
 kubectl -n "${NAMESPACE}" rollout status deployment/"${inventory_name}" --timeout=10m
@@ -356,9 +361,12 @@ sticky_pvc="data-sticky-local-restart-0"
 sticky_pv="$(kubectl -n "${VALIDATION_NAMESPACE}" get pvc "${sticky_pvc}" -o jsonpath='{.spec.volumeName}')"
 sticky_handle="$(kubectl get pv "${sticky_pv}" -o jsonpath='{.spec.csi.volumeHandle}')"
 sticky_pod="sticky-local-restart-0"
-kubectl -n "${VALIDATION_NAMESPACE}" delete pod "${sticky_pod}" --wait=true
+kubectl -n "${VALIDATION_NAMESPACE}" scale statefulset sticky-local-restart --replicas=0
+kubectl -n "${VALIDATION_NAMESPACE}" rollout status statefulset/sticky-local-restart --timeout=10m
 wait_for_configmap_key "${NAMESPACE}" "opennebula-csi-sticky-attachment-state" "${sticky_handle}" "present" 120
 wait_for_event_reason "${VALIDATION_NAMESPACE}" "${sticky_pvc}" "DetachGraceStarted" 120
+kubectl -n "${VALIDATION_NAMESPACE}" scale statefulset sticky-local-restart --replicas=1
+kubectl -n "${VALIDATION_NAMESPACE}" rollout status statefulset/sticky-local-restart --timeout="${STICKY_TIMEOUT_SECONDS}s"
 kubectl -n "${VALIDATION_NAMESPACE}" wait --for=condition=Ready pod/"${sticky_pod}" --timeout="${STICKY_TIMEOUT_SECONDS}s"
 wait_for_configmap_key "${NAMESPACE}" "opennebula-csi-sticky-attachment-state" "${sticky_handle}" "absent" 120
 wait_for_event_reason "${VALIDATION_NAMESPACE}" "${sticky_pvc}" "DetachGraceReused" 120
@@ -417,10 +425,13 @@ kubectl -n "${VALIDATION_NAMESPACE}" rollout status statefulset/sticky-local-mov
 move_pvc="data-sticky-local-move-0"
 move_pv="$(kubectl -n "${VALIDATION_NAMESPACE}" get pvc "${move_pvc}" -o jsonpath='{.spec.volumeName}')"
 move_handle="$(kubectl get pv "${move_pv}" -o jsonpath='{.spec.csi.volumeHandle}')"
-kubectl -n "${VALIDATION_NAMESPACE}" patch statefulset sticky-local-move --type merge -p "{\"spec\":{\"template\":{\"spec\":{\"nodeName\":\"${LOCAL_NODE_ALT}\"}}}}"
-kubectl -n "${VALIDATION_NAMESPACE}" delete pod sticky-local-move-0 --wait=true
+kubectl -n "${VALIDATION_NAMESPACE}" scale statefulset sticky-local-move --replicas=0
+kubectl -n "${VALIDATION_NAMESPACE}" rollout status statefulset/sticky-local-move --timeout=10m
 wait_for_configmap_key "${NAMESPACE}" "opennebula-csi-sticky-attachment-state" "${move_handle}" "present" 120
 wait_for_event_reason "${VALIDATION_NAMESPACE}" "${move_pvc}" "DetachGraceStarted" 120
+kubectl -n "${VALIDATION_NAMESPACE}" patch statefulset sticky-local-move --type merge -p "{\"spec\":{\"template\":{\"spec\":{\"nodeName\":\"${LOCAL_NODE_ALT}\"}}}}"
+kubectl -n "${VALIDATION_NAMESPACE}" scale statefulset sticky-local-move --replicas=1
+kubectl -n "${VALIDATION_NAMESPACE}" rollout status statefulset/sticky-local-move --timeout=10m
 kubectl -n "${VALIDATION_NAMESPACE}" wait --for=condition=Ready pod/sticky-local-move-0 --timeout=10m
 wait_for_configmap_key "${NAMESPACE}" "opennebula-csi-sticky-attachment-state" "${move_handle}" "absent" 180
 wait_for_event_reason "${VALIDATION_NAMESPACE}" "${move_pvc}" "DetachGraceCancelled" 180
