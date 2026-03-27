@@ -74,10 +74,6 @@ helm template "${RELEASE_NAME}" helm/opennebula-csi \
 kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1 || kubectl create namespace "${NAMESPACE}"
 kubectl create namespace "${VALIDATION_NAMESPACE}" >/dev/null 2>&1 || true
 
-kubectl -n "${NAMESPACE}" create secret generic opennebula-csi-auth \
-  --from-literal=credentials="${ONE_AUTH}" \
-  --dry-run=client -o yaml | kubectl apply -f -
-
 helm_args=(
   upgrade --install "${RELEASE_NAME}" helm/opennebula-csi
   --namespace "${NAMESPACE}"
@@ -85,6 +81,7 @@ helm_args=(
   --force-conflicts
   --take-ownership
   --set "oneApiEndpoint=${ONE_XMLRPC}"
+  --set-string "credentials.inlineAuth=${ONE_AUTH}"
   --set "inventoryController.enabled=true"
   --values "${VALUES_FILE}"
 )
@@ -93,7 +90,7 @@ if [[ -n "${CSI_IMAGE_REPOSITORY}" ]]; then
   helm_args+=(--set "image.repository=${CSI_IMAGE_REPOSITORY}")
 fi
 if [[ -n "${CSI_IMAGE_TAG}" ]]; then
-  helm_args+=(--set "image.tag=${CSI_IMAGE_TAG}")
+  helm_args+=(--set "image.tag=${CSI_IMAGE_TAG}" --set "image.pullPolicy=Always")
 fi
 
 helm "${helm_args[@]}"
