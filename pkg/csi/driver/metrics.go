@@ -33,6 +33,9 @@ type DriverMetrics struct {
 	nodeStageDuration            *prometheus.HistogramVec
 	nodeDeviceResolutionDuration *prometheus.HistogramVec
 	hotplugRecoveryTotal         *prometheus.CounterVec
+	stickyDetachTotal            *prometheus.CounterVec
+	stickyDetachResidency        *prometheus.HistogramVec
+	sameNodeRestartReuseTotal    *prometheus.CounterVec
 	datastoreFreeBytes           *prometheus.GaugeVec
 	datastoreTotalBytes          *prometheus.GaugeVec
 	buildInfo                    *prometheus.GaugeVec
@@ -103,6 +106,19 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 			Name: "opennebula_csi_hotplug_recovery_total",
 			Help: "Total number of hotplug recovery path decisions by operation, reason, and outcome.",
 		}, []string{"operation", "reason", "outcome"}),
+		stickyDetachTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_sticky_detach_total",
+			Help: "Total number of sticky detach lifecycle outcomes by outcome and reason.",
+		}, []string{"outcome", "reason"}),
+		stickyDetachResidency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "opennebula_csi_sticky_detach_residency_seconds",
+			Help:    "How long a sticky detach state remained active before completion.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"outcome"}),
+		sameNodeRestartReuseTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_same_node_restart_reuse_total",
+			Help: "Total number of same-node restart attachment reuses by backend.",
+		}, []string{"backend"}),
 		datastoreFreeBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "opennebula_csi_datastore_free_bytes",
 			Help: "Latest observed free capacity for a datastore by backend and datastore ID.",
@@ -131,6 +147,9 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 		metrics.nodeStageDuration,
 		metrics.nodeDeviceResolutionDuration,
 		metrics.hotplugRecoveryTotal,
+		metrics.stickyDetachTotal,
+		metrics.stickyDetachResidency,
+		metrics.sameNodeRestartReuseTotal,
 		metrics.datastoreFreeBytes,
 		metrics.datastoreTotalBytes,
 		metrics.buildInfo,
@@ -224,6 +243,27 @@ func (m *DriverMetrics) RecordHotplugRecovery(operation, reason, outcome string)
 		return
 	}
 	m.hotplugRecoveryTotal.WithLabelValues(operation, reason, outcome).Inc()
+}
+
+func (m *DriverMetrics) RecordStickyDetach(outcome, reason string) {
+	if m == nil {
+		return
+	}
+	m.stickyDetachTotal.WithLabelValues(outcome, reason).Inc()
+}
+
+func (m *DriverMetrics) RecordStickyDetachResidency(outcome string, duration time.Duration) {
+	if m == nil {
+		return
+	}
+	m.stickyDetachResidency.WithLabelValues(outcome).Observe(duration.Seconds())
+}
+
+func (m *DriverMetrics) RecordSameNodeRestartReuse(backend string) {
+	if m == nil {
+		return
+	}
+	m.sameNodeRestartReuseTotal.WithLabelValues(backend).Inc()
 }
 
 func (m *DriverMetrics) SetDatastoreCapacity(backend string, datastoreID int, freeBytes, totalBytes int64) {

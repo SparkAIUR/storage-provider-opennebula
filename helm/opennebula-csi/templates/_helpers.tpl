@@ -81,6 +81,11 @@ Create chart name and version as used by the chart label.
 {{- $inventory := (get $root.Values "inventoryController") | default dict -}}
 {{- $inventoryResync := (get $inventory "resyncSeconds") | default dict -}}
 {{- $inventoryValidation := (get $inventory "validation") | default dict -}}
+{{- $localRestart := (get $root.Values.driver "localRestartOptimization") | default dict -}}
+{{- $localRestartEnabled := (get $localRestart "enabled") | default true -}}
+{{- $localRestartDetachGrace := (get $localRestart "detachGraceSeconds") | default 90 -}}
+{{- $localRestartDetachGraceMax := (get $localRestart "maxDetachGraceSeconds") | default 300 -}}
+{{- $localRestartRequireNodeReady := (get $localRestart "requireNodeReady") | default true -}}
 - name: ONE_XMLRPC
   value: {{ $root.Values.oneApiEndpoint | quote }}
 - name: ONE_AUTH
@@ -130,6 +135,14 @@ Create chart name and version as used by the chart label.
   value: {{ $root.Values.driver.vmHotplugStuckVmCooldownSeconds | quote }}
 - name: ONE_CSI_NODE_DEVICE_DISCOVERY_TIMEOUT_SECONDS
   value: {{ $root.Values.driver.nodeDeviceDiscoveryTimeoutSeconds | quote }}
+- name: ONE_CSI_LOCAL_RESTART_OPTIMIZATION_ENABLED
+  value: {{ $localRestartEnabled | quote }}
+- name: ONE_CSI_LOCAL_RESTART_DETACH_GRACE_SECONDS
+  value: {{ $localRestartDetachGrace | quote }}
+- name: ONE_CSI_LOCAL_RESTART_DETACH_GRACE_MAX_SECONDS
+  value: {{ $localRestartDetachGraceMax | quote }}
+- name: ONE_CSI_LOCAL_RESTART_REQUIRE_NODE_READY
+  value: {{ $localRestartRequireNodeReady | quote }}
 - name: ONE_CSI_PREFLIGHT_LOCAL_IMMEDIATE_BINDING_POLICY
   value: {{ $root.Values.preflight.localImmediateBindingPolicy | quote }}
 - name: ONE_CSI_INVENTORY_CONTROLLER_ENABLED

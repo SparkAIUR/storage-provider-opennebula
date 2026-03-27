@@ -86,6 +86,10 @@ All other StorageClass parameters are passed through to the existing disk/image 
 - `ONE_CSI_VM_HOTPLUG_TIMEOUT_PER_100GI_SECONDS`: additional timeout per 100 GiB bucket, default `60`
 - `ONE_CSI_VM_HOTPLUG_TIMEOUT_MAX_SECONDS`: maximum VM hotplug timeout, default `900`
 - `ONE_CSI_VM_HOTPLUG_STUCK_VM_COOLDOWN_SECONDS`: cooldown after a VM stays stuck in hotplug through the full timeout, default `300`
+- `ONE_CSI_LOCAL_RESTART_OPTIMIZATION_ENABLED`: enable best-effort same-node restart reuse for opted-in local PVCs, default `true`
+- `ONE_CSI_LOCAL_RESTART_DETACH_GRACE_SECONDS`: default delayed-detach grace for opted-in local PVCs, default `90`
+- `ONE_CSI_LOCAL_RESTART_DETACH_GRACE_MAX_SECONDS`: maximum delayed-detach grace allowed by per-PVC override, default `300`
+- `ONE_CSI_LOCAL_RESTART_REQUIRE_NODE_READY`: require Kubernetes node and OpenNebula VM readiness before using delayed detach, default `true`
 
 ### Policy behavior
 
@@ -129,6 +133,44 @@ Important limitation:
 - node-side device discovery now uses a smaller dedicated timeout budget so healthy fast-path mounts fail and retry quickly instead of waiting through the full hotplug recovery budget
 - if a VM stays non-ready through the full hotplug timeout, the controller places that VM into a temporary recovery cooldown and rejects new hotplug work with retryable `Unavailable`
 - recreating a MinIO tenant with local-backed PVCs should still be treated as node-sticky; if the workload must move freely across nodes after recreation, use Ceph RBD or CephFS instead
+
+### Restart optimization for local StatefulSets
+
+The driver now supports an opt-in delayed-detach path for local-backed `ReadWriteOnce` PVCs. This is aimed at MinIO-like StatefulSet restarts where the replacement pod often lands back on the same node.
+
+Behavior:
+
+- `ControllerUnpublishVolume` does not detach immediately for opted-in local PVCs
+- the disk stays attached for a short grace period, default `90s`
+- if the replacement pod is published back to the same node during that window, the controller reuses the existing attachment and skips detach/reattach
+- if the replacement pod lands on a different node, the controller cancels the grace and detaches immediately so normal attach can continue
+
+This is best-effort same-node reuse only. The CSI driver does not force Kubernetes to reschedule the pod onto the previous node.
+
+Opt in from a StatefulSet `volumeClaimTemplates` entry:
+
+```yaml
+volumeClaimTemplates:
+  - metadata:
+      name: data
+      annotations:
+        storage-provider.opennebula.sparkaiur.io/restart-optimization: "sticky-local-restart-v1"
+        storage-provider.opennebula.sparkaiur.io/detach-grace-seconds: "90"
+    spec:
+      accessModes:
+        - ReadWriteOnce
+      storageClassName: opennebula-local-rwo
+      resources:
+        requests:
+          storage: 8Gi
+```
+
+Recommended workload-side guidance:
+
+- use a local `RWO` StorageClass with `volumeBindingMode: WaitForFirstConsumer`
+- prefer ordinary StatefulSet rollout/restart flows over delete-and-recreate workflows
+- keep replica placement predictable with anti-affinity or topology spread when appropriate
+- do not use this as a substitute for portable storage; use Ceph RBD or CephFS if the workload must move freely across nodes
 
 ## Access mode support
 

@@ -63,9 +63,10 @@ type Driver struct {
 
 	mounter *mount.SafeFormatAndMount
 
-	featureGates FeatureGates
-	metrics      *DriverMetrics
-	kubeRuntime  *KubeRuntime
+	featureGates      FeatureGates
+	metrics           *DriverMetrics
+	kubeRuntime       *KubeRuntime
+	stickyAttachments *StickyAttachmentManager
 
 	inventoryEligibility inventorycache.DatastoreEligibilityProvider
 }
@@ -107,6 +108,10 @@ func (d *Driver) Run(ctx context.Context) error {
 
 	d.metrics = NewDriverMetrics(d.version, d.commit)
 	d.kubeRuntime = NewKubeRuntime(d.name)
+	d.stickyAttachments = NewStickyAttachmentManager(d.kubeRuntime, "")
+	if err := d.stickyAttachments.LoadFromConfigMap(ctx); err != nil {
+		klog.V(2).InfoS("Failed to load sticky attachment state", "err", err)
+	}
 
 	if enabled, _ := d.PluginConfig.GetBool(config.InventoryControllerEnabledVar); enabled && strings.TrimSpace(d.nodeID) == "" {
 		restConfig, err := rest.InClusterConfig()
@@ -167,13 +172,15 @@ func (d *Driver) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to create CephFSVolumeProvider: %v", err)
 	}
 
+	controllerServer := NewControllerServer(d, volumeProvider, sharedFilesystemProvider)
 	grpcServer.Start(
 		d.grpcServerEndpoint,
 		NewIdentityServer(d),
 		NewNodeServer(d, d.mounter),
-		NewControllerServer(d, volumeProvider, sharedFilesystemProvider),
+		controllerServer,
 		d.controllerLeadership,
 	)
+	controllerServer.StartBackgroundWorkers(ctx)
 
 	metricsServer := NewMetricsServer(d.PluginConfig, d.metrics)
 	metricsServer.Start()

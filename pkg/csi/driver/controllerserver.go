@@ -32,6 +32,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 )
 
@@ -55,6 +56,7 @@ var (
 
 const publishContextHotplugTimeoutSeconds = "hotplugTimeoutSeconds"
 const publishContextDeviceDiscoveryTimeoutSeconds = "deviceDiscoveryTimeoutSeconds"
+const stickyDetachReaperInterval = 5 * time.Second
 
 type ControllerServer struct {
 	driver                   *Driver
@@ -72,6 +74,13 @@ func NewControllerServer(d *Driver, vp opennebula.OpenNebulaVolumeProvider, shar
 		volumeProvider:           vp,
 		sharedFilesystemProvider: sharedProvider,
 	}
+}
+
+func (s *ControllerServer) StartBackgroundWorkers(ctx context.Context) {
+	if s == nil || s.driver == nil || strings.TrimSpace(s.driver.nodeID) != "" || s.driver.stickyAttachments == nil {
+		return
+	}
+	go s.runStickyDetachReaper(ctx)
 }
 
 func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
@@ -678,6 +687,8 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err == nil {
+		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
+		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
 		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext())
 		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
 		s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
@@ -716,8 +727,22 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
 	defer release()
 
+	if reused, response, reuseErr := s.reuseStickyAttachment(ctx, req, volumeID, nodeID); reused {
+		if reuseErr != nil {
+			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "internal", time.Since(started))
+			s.driver.metrics.RecordControllerPublishDuration("disk", "internal", time.Since(started))
+			return nil, reuseErr
+		}
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
+		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
+		return response, nil
+	}
+
 	target, err = s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err == nil {
+		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
+		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
 		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext())
 		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
 		s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
@@ -778,6 +803,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	s.recordPVCEventFromParams(ctx, req.GetVolumeContext(), eventReasonAttachValidated, fmt.Sprintf("validated and attached volume %s to node %s", req.GetVolumeId(), req.GetNodeId()))
 	klog.V(1).InfoS("Volume attached successfully",
 		"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
+	s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
 
 	return &csi.ControllerPublishVolumeResponse{
 		PublishContext: s.publishContextForVolume(ctx, req.VolumeId, target, deviceDiscoveryTimeout, req.GetVolumeContext()),
@@ -861,6 +887,21 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		klog.V(1).InfoS("Volume does not exist in node, skipping unpublish",
 			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
+
+	runtimeCtx, stickyState, stickyEligible, stickyReason := s.shouldDelayDetach(ctx, req)
+	if stickyEligible {
+		if err := s.startDetachGrace(ctx, runtimeCtx, stickyState); err != nil {
+			klog.V(2).InfoS("Sticky detach grace start failed, falling back to immediate detach",
+				"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId, "err", err)
+			s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonDetachGraceBypassed, fmt.Sprintf("failed to persist detach grace for volume %s: %v", req.VolumeId, err))
+			s.driver.metrics.RecordStickyDetach("bypassed", "persist_failed")
+		} else {
+			return &csi.ControllerUnpublishVolumeResponse{}, nil
+		}
+	} else if stickyReason != "" {
+		s.driver.metrics.RecordStickyDetach("bypassed", stickyReason)
+		s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonDetachGraceBypassed, fmt.Sprintf("detach grace bypassed for volume %s: %s", req.VolumeId, stickyReason))
 	}
 
 	klog.V(3).InfoS("Detaching volume from node",
@@ -1306,4 +1347,300 @@ func (s *ControllerServer) annotatePlacementFromParams(ctx context.Context, para
 		return
 	}
 	s.driver.kubeRuntime.AnnotatePVAsync(ctx, params[paramPVName], report)
+}
+
+func (s *ControllerServer) runStickyDetachReaper(ctx context.Context) {
+	ticker := time.NewTicker(stickyDetachReaperInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if s.driver != nil && s.driver.controllerLeadership != nil && !s.driver.controllerLeadership.IsLeader() {
+				continue
+			}
+			for _, state := range s.driver.stickyAttachments.ListExpired(time.Now()) {
+				s.expireStickyDetach(ctx, state)
+			}
+		}
+	}
+}
+
+func (s *ControllerServer) shouldDelayDetach(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*VolumeRuntimeContext, StickyAttachmentState, bool, string) {
+	if s == nil || s.driver == nil {
+		return nil, StickyAttachmentState{}, false, "driver_unavailable"
+	}
+	if !s.localRestartOptimizationEnabled() {
+		return nil, StickyAttachmentState{}, false, "feature_disabled"
+	}
+	if s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
+		return nil, StickyAttachmentState{}, false, "kubernetes_runtime_disabled"
+	}
+
+	runtimeCtx, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId)
+	if err != nil {
+		return nil, StickyAttachmentState{}, false, "volume_runtime_context_unavailable"
+	}
+	if runtimeCtx.RestartMode != restartOptimizationAnnotationValue {
+		return runtimeCtx, StickyAttachmentState{}, false, "not_opted_in"
+	}
+	if !strings.EqualFold(strings.TrimSpace(runtimeCtx.Backend), "local") {
+		return runtimeCtx, StickyAttachmentState{}, false, "backend_not_local"
+	}
+	if opennebula.IsSharedFilesystemVolumeID(req.VolumeId) {
+		return runtimeCtx, StickyAttachmentState{}, false, "shared_filesystem"
+	}
+	if !hasSingleWriterAccessMode(runtimeCtx.AccessModes) {
+		return runtimeCtx, StickyAttachmentState{}, false, "access_mode_not_rwo"
+	}
+	if _, ok := s.hotplugCooldownState(ctx, req.NodeId); ok {
+		return runtimeCtx, StickyAttachmentState{}, false, "hotplug_cooldown"
+	}
+	if s.localRestartRequireNodeReady() {
+		kubeReady, err := s.driver.kubeRuntime.IsNodeReady(ctx, req.NodeId)
+		if err != nil || !kubeReady {
+			return runtimeCtx, StickyAttachmentState{}, false, "kubernetes_node_not_ready"
+		}
+		vmReady, err := s.volumeProvider.NodeReady(ctx, req.NodeId)
+		if err != nil || !vmReady {
+			return runtimeCtx, StickyAttachmentState{}, false, "vm_not_ready"
+		}
+	}
+
+	graceSeconds := s.effectiveDetachGraceSeconds(runtimeCtx)
+	state := StickyAttachmentState{
+		VolumeID:           req.VolumeId,
+		NodeID:             req.NodeId,
+		Backend:            "local",
+		DatastoreID:        runtimeCtx.DatastoreID,
+		PVCNamespace:       runtimeCtx.PVCNamespace,
+		PVCName:            runtimeCtx.PVCName,
+		StartedAt:          time.Now().UTC(),
+		ExpiresAt:          time.Now().UTC().Add(time.Duration(graceSeconds) * time.Second),
+		GraceSeconds:       graceSeconds,
+		Reason:             "stateful_restart",
+		LastKnownNodeReady: true,
+	}
+	return runtimeCtx, state, true, ""
+}
+
+func (s *ControllerServer) startDetachGrace(ctx context.Context, runtimeCtx *VolumeRuntimeContext, state StickyAttachmentState) error {
+	if s == nil || s.driver == nil || s.driver.stickyAttachments == nil {
+		return fmt.Errorf("sticky attachment manager is not configured")
+	}
+	if err := s.driver.stickyAttachments.StartGrace(state); err != nil {
+		return err
+	}
+	s.driver.metrics.RecordStickyDetach("started", state.Reason)
+	s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonDetachGraceStarted, fmt.Sprintf("delaying detach for volume %s on node %s for %ds to allow same-node restart reuse", state.VolumeID, state.NodeID, state.GraceSeconds))
+	s.annotateRestartOptimization(ctx, runtimeCtx, state.NodeID, state.GraceSeconds)
+	return nil
+}
+
+func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.ControllerPublishVolumeRequest, volumeID, nodeID int) (bool, *csi.ControllerPublishVolumeResponse, error) {
+	if s == nil || s.driver == nil || s.driver.stickyAttachments == nil {
+		return false, nil, nil
+	}
+
+	state, ok := s.driver.stickyAttachments.Get(req.VolumeId)
+	if !ok {
+		return false, nil, nil
+	}
+
+	if strings.TrimSpace(state.NodeID) == strings.TrimSpace(req.NodeId) {
+		target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
+		if err != nil {
+			_ = s.driver.stickyAttachments.Clear(req.VolumeId)
+			return false, nil, nil
+		}
+		if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
+			return true, nil, status.Errorf(codes.Internal, "failed to clear sticky attachment state: %v", err)
+		}
+		s.driver.metrics.RecordStickyDetach("reused", state.Reason)
+		s.driver.metrics.RecordStickyDetachResidency("reused", time.Since(state.StartedAt))
+		s.driver.metrics.RecordSameNodeRestartReuse(state.Backend)
+		s.recordPVCEventFromStickyState(ctx, state, eventReasonDetachGraceReused, fmt.Sprintf("reused existing local attachment on node %s for volume %s", req.NodeId, req.VolumeId))
+		return true, &csi.ControllerPublishVolumeResponse{
+			PublishContext: s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext()),
+		}, nil
+	}
+
+	oldNodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(state.NodeID))
+	defer oldNodeRelease()
+
+	if err := s.volumeProvider.DetachVolume(ctx, req.VolumeId, state.NodeID); err != nil {
+		return true, nil, status.Error(codes.Internal, "failed to detach stale same-volume attachment before moving to a different node")
+	}
+	if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
+		return true, nil, status.Errorf(codes.Internal, "failed to clear sticky attachment state: %v", err)
+	}
+	s.driver.metrics.RecordStickyDetach("cancelled", state.Reason)
+	s.driver.metrics.RecordStickyDetachResidency("cancelled", time.Since(state.StartedAt))
+	s.recordPVCEventFromStickyState(ctx, state, eventReasonDetachGraceCancelled, fmt.Sprintf("cancelled delayed detach for volume %s and detached from node %s before publishing to node %s", req.VolumeId, state.NodeID, req.NodeId))
+	return false, nil, nil
+}
+
+func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyAttachmentState) {
+	if s == nil || s.driver == nil || s.driver.stickyAttachments == nil {
+		return
+	}
+	current, ok := s.driver.stickyAttachments.Get(state.VolumeID)
+	if !ok || current.ExpiresAt.After(time.Now()) {
+		return
+	}
+
+	release, ok := s.driver.operationLocks.TryAcquire(controllerNodeLockKey(current.NodeID))
+	if !ok {
+		return
+	}
+	defer release()
+
+	volumeRelease := s.driver.operationLocks.Acquire(controllerVolumeLockKey(current.VolumeID))
+	defer volumeRelease()
+
+	confirmed, ok := s.driver.stickyAttachments.Get(current.VolumeID)
+	if !ok || confirmed.ExpiresAt.After(time.Now()) {
+		return
+	}
+
+	if err := s.volumeProvider.DetachVolume(ctx, confirmed.VolumeID, confirmed.NodeID); err != nil {
+		klog.V(2).InfoS("Failed to detach sticky attachment after grace expiry", "volumeID", confirmed.VolumeID, "nodeID", confirmed.NodeID, "err", err)
+		return
+	}
+	if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
+		klog.V(2).InfoS("Failed to clear sticky attachment state after detach", "volumeID", confirmed.VolumeID, "err", err)
+		return
+	}
+	s.driver.metrics.RecordStickyDetach("expired", confirmed.Reason)
+	s.driver.metrics.RecordStickyDetachResidency("expired", time.Since(confirmed.StartedAt))
+	s.recordPVCEventFromStickyState(ctx, confirmed, eventReasonDetachGraceExpired, fmt.Sprintf("detach grace expired for volume %s on node %s; detached volume", confirmed.VolumeID, confirmed.NodeID))
+}
+
+func (s *ControllerServer) clearStickyReuseState(ctx context.Context, volumeID, nodeID, backend string) {
+	if s == nil || s.driver == nil || s.driver.stickyAttachments == nil {
+		return
+	}
+	state, ok := s.driver.stickyAttachments.Get(volumeID)
+	if !ok || strings.TrimSpace(state.NodeID) != strings.TrimSpace(nodeID) {
+		return
+	}
+	if err := s.driver.stickyAttachments.Clear(volumeID); err != nil {
+		klog.V(2).InfoS("Failed to clear sticky attachment state after same-node fast-path validation", "volumeID", volumeID, "nodeID", nodeID, "err", err)
+		return
+	}
+	s.driver.metrics.RecordStickyDetach("reused", state.Reason)
+	s.driver.metrics.RecordStickyDetachResidency("reused", time.Since(state.StartedAt))
+	s.driver.metrics.RecordSameNodeRestartReuse(backend)
+	s.recordPVCEventFromStickyState(ctx, state, eventReasonDetachGraceReused, fmt.Sprintf("reused existing local attachment on node %s for volume %s", nodeID, volumeID))
+}
+
+func (s *ControllerServer) annotateRestartOptimization(ctx context.Context, runtimeCtx *VolumeRuntimeContext, nodeID string, graceSeconds int) {
+	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil || runtimeCtx == nil {
+		return
+	}
+	s.driver.kubeRuntime.AnnotatePVAsync(ctx, runtimeCtx.PVName, PlacementReport{
+		Backend:             runtimeCtx.Backend,
+		DatastoreID:         runtimeCtx.DatastoreID,
+		DatastoreName:       runtimeCtx.PVAnnotations[annotationDatastoreName],
+		SelectionPolicy:     runtimeCtx.PVAnnotations[annotationSelectionPolicy],
+		LastAttachedNode:    nodeID,
+		RestartOptimization: runtimeCtx.RestartMode,
+		DetachGraceSeconds:  graceSeconds,
+	})
+}
+
+func (s *ControllerServer) annotateRestartOptimizationForVolume(ctx context.Context, volumeID, nodeID string) {
+	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
+		return
+	}
+	runtimeCtx, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeID)
+	if err != nil {
+		return
+	}
+	s.annotateRestartOptimization(ctx, runtimeCtx, nodeID, s.effectiveDetachGraceSeconds(runtimeCtx))
+}
+
+func (s *ControllerServer) recordPVCEventFromRuntimeContext(ctx context.Context, runtimeCtx *VolumeRuntimeContext, reason, message string) {
+	if runtimeCtx == nil {
+		return
+	}
+	s.recordPVCEventFromParams(ctx, map[string]string{
+		paramPVCNamespace: runtimeCtx.PVCNamespace,
+		paramPVCName:      runtimeCtx.PVCName,
+	}, reason, message)
+}
+
+func (s *ControllerServer) recordPVCWarningFromRuntimeContext(ctx context.Context, runtimeCtx *VolumeRuntimeContext, reason, message string) {
+	if runtimeCtx == nil {
+		return
+	}
+	s.recordPVCWarningFromParams(ctx, map[string]string{
+		paramPVCNamespace: runtimeCtx.PVCNamespace,
+		paramPVCName:      runtimeCtx.PVCName,
+	}, reason, message)
+}
+
+func (s *ControllerServer) recordPVCEventFromStickyState(ctx context.Context, state StickyAttachmentState, reason, message string) {
+	s.recordPVCEventFromParams(ctx, map[string]string{
+		paramPVCNamespace: state.PVCNamespace,
+		paramPVCName:      state.PVCName,
+	}, reason, message)
+}
+
+func (s *ControllerServer) localRestartOptimizationEnabled() bool {
+	if s == nil || s.driver == nil {
+		return false
+	}
+	enabled, ok := s.driver.PluginConfig.GetBool(config.LocalRestartOptimizationEnabledVar)
+	return !ok || enabled
+}
+
+func (s *ControllerServer) localRestartRequireNodeReady() bool {
+	if s == nil || s.driver == nil {
+		return true
+	}
+	enabled, ok := s.driver.PluginConfig.GetBool(config.LocalRestartRequireNodeReadyVar)
+	return !ok || enabled
+}
+
+func (s *ControllerServer) effectiveDetachGraceSeconds(runtimeCtx *VolumeRuntimeContext) int {
+	defaultGrace, ok := s.driver.PluginConfig.GetInt(config.LocalRestartDetachGraceSecondsVar)
+	if !ok || defaultGrace <= 0 {
+		defaultGrace = 90
+	}
+	maxGrace, ok := s.driver.PluginConfig.GetInt(config.LocalRestartDetachGraceMaxSecondsVar)
+	if !ok || maxGrace <= 0 {
+		maxGrace = 300
+	}
+	grace := defaultGrace
+	if runtimeCtx != nil && runtimeCtx.DetachGraceHint > 0 {
+		grace = runtimeCtx.DetachGraceHint
+	}
+	if grace < 30 {
+		grace = 30
+	}
+	if grace > maxGrace {
+		grace = maxGrace
+	}
+	return grace
+}
+
+func hasSingleWriterAccessMode(modes []corev1.PersistentVolumeAccessMode) bool {
+	if len(modes) == 0 {
+		return false
+	}
+	for _, mode := range modes {
+		switch mode {
+		case corev1.ReadWriteMany, corev1.ReadOnlyMany:
+			return false
+		}
+	}
+	for _, mode := range modes {
+		if mode == corev1.ReadWriteOnce || mode == corev1.ReadWriteOncePod {
+			return true
+		}
+	}
+	return false
 }

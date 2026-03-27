@@ -11,7 +11,9 @@ LAB_KUBECONFIG="${LAB_KUBECONFIG:-${KUBECONFIG:-${ROOT_DIR}/refs/kubeconfig.yaml
 VALIDATION_NAMESPACE="${VALIDATION_NAMESPACE:-opennebula-csi-release-validation}"
 SC_NAME="${SC_NAME:-opennebula-default-rwo}"
 LOCAL_NODE="${LOCAL_NODE:-hplcsiw01}"
+LOCAL_NODE_ALT="${LOCAL_NODE_ALT:-hplcsiw02}"
 CNPG_TIMEOUT_SECONDS="${CNPG_TIMEOUT_SECONDS:-600}"
+STICKY_TIMEOUT_SECONDS="${STICKY_TIMEOUT_SECONDS:-240}"
 
 require() {
   local var_name="$1"
@@ -56,6 +58,50 @@ cleanup() {
   kubectl --kubeconfig "${LAB_KUBECONFIG}" delete namespace "${VALIDATION_NAMESPACE}" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+
+configmap_has_key() {
+  local namespace="$1"
+  local name="$2"
+  local key="$3"
+  kubectl -n "${namespace}" get configmap "${name}" -o jsonpath="{.data.${key}}" 2>/dev/null | grep -q .
+}
+
+wait_for_configmap_key() {
+  local namespace="$1"
+  local name="$2"
+  local key="$3"
+  local expect_present="$4"
+  local timeout_seconds="${5:-180}"
+  local deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    if configmap_has_key "${namespace}" "${name}" "${key}"; then
+      [[ "${expect_present}" == "present" ]] && return 0
+    else
+      [[ "${expect_present}" == "absent" ]] && return 0
+    fi
+    sleep 5
+  done
+  echo "timed out waiting for configmap ${namespace}/${name} key ${key} to become ${expect_present}" >&2
+  kubectl -n "${namespace}" get configmap "${name}" -o yaml >&2 || true
+  return 1
+}
+
+wait_for_event_reason() {
+  local namespace="$1"
+  local object_name="$2"
+  local reason="$3"
+  local timeout_seconds="${4:-180}"
+  local deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    if kubectl -n "${namespace}" get events --field-selector "involvedObject.name=${object_name},reason=${reason}" --no-headers 2>/dev/null | grep -q .; then
+      return 0
+    fi
+    sleep 5
+  done
+  echo "timed out waiting for event ${reason} on ${namespace}/${object_name}" >&2
+  kubectl -n "${namespace}" get events --field-selector "involvedObject.name=${object_name}" >&2 || true
+  return 1
+}
 
 require ONE_XMLRPC
 require ONE_AUTH
@@ -228,7 +274,11 @@ fi
 
 kubectl -n "${VALIDATION_NAMESPACE}" patch pvc release-local-a --type merge -p '{"spec":{"resources":{"requests":{"storage":"2Gi"}}}}'
 kubectl -n "${VALIDATION_NAMESPACE}" wait --for=jsonpath='{.status.capacity.storage}'=2Gi pvc/release-local-a --timeout=10m || true
+non_opt_in_pv="$(kubectl -n "${VALIDATION_NAMESPACE}" get pvc release-local-a -o jsonpath='{.spec.volumeName}')"
+non_opt_in_handle="$(kubectl get pv "${non_opt_in_pv}" -o jsonpath='{.spec.csi.volumeHandle}')"
 kubectl -n "${VALIDATION_NAMESPACE}" delete pod release-local-smoke --wait=true
+sleep 10
+wait_for_configmap_key "${NAMESPACE}" "opennebula-csi-sticky-attachment-state" "${non_opt_in_handle}" "absent" 30
 kubectl -n "${VALIDATION_NAMESPACE}" apply -f - <<EOF
 apiVersion: v1
 kind: Pod
@@ -260,6 +310,122 @@ if [[ "${size_bytes}" -lt 1800000000 ]]; then
   echo "expanded filesystem size too small: ${size_bytes}" >&2
   exit 1
 fi
+
+sticky_start_epoch="$(date +%s)"
+kubectl apply -n "${VALIDATION_NAMESPACE}" -f - <<EOF
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sticky-local-restart
+spec:
+  serviceName: sticky-local-restart
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sticky-local-restart
+  template:
+    metadata:
+      labels:
+        app: sticky-local-restart
+    spec:
+      nodeName: ${LOCAL_NODE}
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: busybox
+          image: busybox:1.36
+          command: ["sh", "-c", "echo sticky >/data/check && sleep 300"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        annotations:
+          storage-provider.opennebula.sparkaiur.io/restart-optimization: "sticky-local-restart-v1"
+          storage-provider.opennebula.sparkaiur.io/detach-grace-seconds: "90"
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: ${SC_NAME}
+        resources:
+          requests:
+            storage: 1Gi
+EOF
+kubectl -n "${VALIDATION_NAMESPACE}" rollout status statefulset/sticky-local-restart --timeout=10m
+sticky_pvc="data-sticky-local-restart-0"
+sticky_pv="$(kubectl -n "${VALIDATION_NAMESPACE}" get pvc "${sticky_pvc}" -o jsonpath='{.spec.volumeName}')"
+sticky_handle="$(kubectl get pv "${sticky_pv}" -o jsonpath='{.spec.csi.volumeHandle}')"
+sticky_pod="sticky-local-restart-0"
+kubectl -n "${VALIDATION_NAMESPACE}" delete pod "${sticky_pod}" --wait=true
+wait_for_configmap_key "${NAMESPACE}" "opennebula-csi-sticky-attachment-state" "${sticky_handle}" "present" 120
+wait_for_event_reason "${VALIDATION_NAMESPACE}" "${sticky_pvc}" "DetachGraceStarted" 120
+kubectl -n "${VALIDATION_NAMESPACE}" wait --for=condition=Ready pod/"${sticky_pod}" --timeout="${STICKY_TIMEOUT_SECONDS}s"
+wait_for_configmap_key "${NAMESPACE}" "opennebula-csi-sticky-attachment-state" "${sticky_handle}" "absent" 120
+wait_for_event_reason "${VALIDATION_NAMESPACE}" "${sticky_pvc}" "DetachGraceReused" 120
+sticky_ready_epoch="$(date +%s)"
+echo "sticky_same_node_restart_seconds=$((sticky_ready_epoch-sticky_start_epoch))"
+last_attached_node="$(kubectl get pv "${sticky_pv}" -o jsonpath='{.metadata.annotations.storage-provider\.opennebula\.sparkaiur\.io/last-attached-node}')"
+[[ "${last_attached_node}" == "${LOCAL_NODE}" ]]
+
+kubectl -n "${VALIDATION_NAMESPACE}" scale statefulset sticky-local-restart --replicas=0
+kubectl -n "${VALIDATION_NAMESPACE}" rollout status statefulset/sticky-local-restart --timeout=10m
+wait_for_configmap_key "${NAMESPACE}" "opennebula-csi-sticky-attachment-state" "${sticky_handle}" "present" 120
+wait_for_event_reason "${VALIDATION_NAMESPACE}" "${sticky_pvc}" "DetachGraceStarted" 120
+wait_for_configmap_key "${NAMESPACE}" "opennebula-csi-sticky-attachment-state" "${sticky_handle}" "absent" 180
+wait_for_event_reason "${VALIDATION_NAMESPACE}" "${sticky_pvc}" "DetachGraceExpired" 180
+
+kubectl -n "${VALIDATION_NAMESPACE}" apply -f - <<EOF
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sticky-local-move
+spec:
+  serviceName: sticky-local-move
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sticky-local-move
+  template:
+    metadata:
+      labels:
+        app: sticky-local-move
+    spec:
+      nodeName: ${LOCAL_NODE}
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: busybox
+          image: busybox:1.36
+          command: ["sh", "-c", "echo move >/data/check && sleep 300"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        annotations:
+          storage-provider.opennebula.sparkaiur.io/restart-optimization: "sticky-local-restart-v1"
+          storage-provider.opennebula.sparkaiur.io/detach-grace-seconds: "90"
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: ${SC_NAME}
+        resources:
+          requests:
+            storage: 1Gi
+EOF
+kubectl -n "${VALIDATION_NAMESPACE}" rollout status statefulset/sticky-local-move --timeout=10m
+move_pvc="data-sticky-local-move-0"
+move_pv="$(kubectl -n "${VALIDATION_NAMESPACE}" get pvc "${move_pvc}" -o jsonpath='{.spec.volumeName}')"
+move_handle="$(kubectl get pv "${move_pv}" -o jsonpath='{.spec.csi.volumeHandle}')"
+kubectl -n "${VALIDATION_NAMESPACE}" patch statefulset sticky-local-move --type merge -p "{\"spec\":{\"template\":{\"spec\":{\"nodeName\":\"${LOCAL_NODE_ALT}\"}}}}"
+kubectl -n "${VALIDATION_NAMESPACE}" delete pod sticky-local-move-0 --wait=true
+wait_for_configmap_key "${NAMESPACE}" "opennebula-csi-sticky-attachment-state" "${move_handle}" "present" 120
+wait_for_event_reason "${VALIDATION_NAMESPACE}" "${move_pvc}" "DetachGraceStarted" 120
+kubectl -n "${VALIDATION_NAMESPACE}" wait --for=condition=Ready pod/sticky-local-move-0 --timeout=10m
+wait_for_configmap_key "${NAMESPACE}" "opennebula-csi-sticky-attachment-state" "${move_handle}" "absent" 180
+wait_for_event_reason "${VALIDATION_NAMESPACE}" "${move_pvc}" "DetachGraceCancelled" 180
+move_last_node="$(kubectl get pv "${move_pv}" -o jsonpath='{.metadata.annotations.storage-provider\.opennebula\.sparkaiur\.io/last-attached-node}')"
+[[ "${move_last_node}" == "${LOCAL_NODE_ALT}" ]]
 
 start_epoch="$(date +%s)"
 kubectl apply -n "${VALIDATION_NAMESPACE}" -f - <<EOF

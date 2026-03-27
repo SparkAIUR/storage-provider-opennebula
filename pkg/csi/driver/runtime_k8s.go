@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +33,11 @@ const (
 	annotationDatastoreName    = "storage-provider.opennebula.sparkaiur.io/datastore-name"
 	annotationSelectionPolicy  = "storage-provider.opennebula.sparkaiur.io/selection-policy"
 	annotationPlacementSummary = "storage-provider.opennebula.sparkaiur.io/placement-summary"
+	annotationLastAttachedNode = "storage-provider.opennebula.sparkaiur.io/last-attached-node"
+	annotationRestartOpt       = "storage-provider.opennebula.sparkaiur.io/restart-optimization"
+	annotationDetachGrace      = "storage-provider.opennebula.sparkaiur.io/detach-grace-seconds"
+
+	restartOptimizationAnnotationValue = "sticky-local-restart-v1"
 
 	topologySystemDSLabel = "topology.opennebula.sparkaiur.io/system-ds"
 )
@@ -43,6 +49,22 @@ type PlacementReport struct {
 	SelectionPolicy             string `json:"selectionPolicy"`
 	FallbackUsed                bool   `json:"fallbackUsed"`
 	CompatibilityAwareSelection bool   `json:"compatibilityAwareSelection"`
+	LastAttachedNode            string `json:"lastAttachedNode,omitempty"`
+	RestartOptimization         string `json:"restartOptimization,omitempty"`
+	DetachGraceSeconds          int    `json:"detachGraceSeconds,omitempty"`
+}
+
+type VolumeRuntimeContext struct {
+	PVName          string
+	PVCNamespace    string
+	PVCName         string
+	PVAnnotations   map[string]string
+	PVCAnnotations  map[string]string
+	AccessModes     []corev1.PersistentVolumeAccessMode
+	Backend         string
+	DatastoreID     int
+	RestartMode     string
+	DetachGraceHint int
 }
 
 type KubeRuntime struct {
@@ -230,6 +252,84 @@ func (r *KubeRuntime) GetConfigMap(ctx context.Context, namespace, name string) 
 	return r.client.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
 }
 
+func (r *KubeRuntime) ResolveVolumeRuntimeContext(ctx context.Context, volumeHandle string) (*VolumeRuntimeContext, error) {
+	if r == nil || !r.enabled {
+		return nil, fmt.Errorf("kubernetes runtime is not enabled")
+	}
+	if strings.TrimSpace(volumeHandle) == "" {
+		return nil, fmt.Errorf("volume handle is required")
+	}
+
+	pvs, err := r.client.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range pvs.Items {
+		pv := &pvs.Items[i]
+		if pv.Spec.CSI == nil || pv.Spec.CSI.VolumeHandle != volumeHandle {
+			continue
+		}
+
+		runtimeCtx := &VolumeRuntimeContext{
+			PVName:        pv.Name,
+			PVAnnotations: cloneStringMap(pv.Annotations),
+			AccessModes:   append([]corev1.PersistentVolumeAccessMode(nil), pv.Spec.AccessModes...),
+		}
+		runtimeCtx.Backend = strings.TrimSpace(runtimeCtx.PVAnnotations[annotationBackend])
+		runtimeCtx.RestartMode = strings.TrimSpace(runtimeCtx.PVAnnotations[annotationRestartOpt])
+		if rawGrace := strings.TrimSpace(runtimeCtx.PVAnnotations[annotationDetachGrace]); rawGrace != "" {
+			if parsed, convErr := strconv.Atoi(rawGrace); convErr == nil {
+				runtimeCtx.DetachGraceHint = parsed
+			}
+		}
+		if rawDatastoreID := strings.TrimSpace(runtimeCtx.PVAnnotations[annotationDatastoreID]); rawDatastoreID != "" {
+			if parsed, convErr := strconv.Atoi(rawDatastoreID); convErr == nil {
+				runtimeCtx.DatastoreID = parsed
+			}
+		}
+
+		if pv.Spec.ClaimRef != nil {
+			runtimeCtx.PVCNamespace = pv.Spec.ClaimRef.Namespace
+			runtimeCtx.PVCName = pv.Spec.ClaimRef.Name
+			pvc, pvcErr := r.client.CoreV1().PersistentVolumeClaims(runtimeCtx.PVCNamespace).Get(ctx, runtimeCtx.PVCName, metav1.GetOptions{})
+			if pvcErr == nil {
+				runtimeCtx.PVCAnnotations = cloneStringMap(pvc.Annotations)
+				if runtimeCtx.RestartMode == "" {
+					runtimeCtx.RestartMode = strings.TrimSpace(runtimeCtx.PVCAnnotations[annotationRestartOpt])
+				}
+				if runtimeCtx.DetachGraceHint == 0 {
+					if rawGrace := strings.TrimSpace(runtimeCtx.PVCAnnotations[annotationDetachGrace]); rawGrace != "" {
+						if parsed, convErr := strconv.Atoi(rawGrace); convErr == nil {
+							runtimeCtx.DetachGraceHint = parsed
+						}
+					}
+				}
+			}
+		}
+
+		return runtimeCtx, nil
+	}
+
+	return nil, fmt.Errorf("persistent volume for handle %s not found", volumeHandle)
+}
+
+func (r *KubeRuntime) IsNodeReady(ctx context.Context, nodeName string) (bool, error) {
+	if r == nil || !r.enabled {
+		return false, fmt.Errorf("kubernetes runtime is not enabled")
+	}
+	node, err := r.client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady {
+			return condition.Status == corev1.ConditionTrue, nil
+		}
+	}
+	return false, nil
+}
+
 func (r *KubeRuntime) emitNamespacedEvent(ctx context.Context, namespace, name string, uid types.UID, kind, eventType, reason, message string) {
 	if r == nil || !r.enabled || namespace == "" || name == "" {
 		return
@@ -279,6 +379,15 @@ func buildPVAnnotationPatch(report PlacementReport) ([]byte, error) {
 		annotationSelectionPolicy:  report.SelectionPolicy,
 		annotationPlacementSummary: string(summary),
 	}
+	if strings.TrimSpace(report.LastAttachedNode) != "" {
+		annotations[annotationLastAttachedNode] = strings.TrimSpace(report.LastAttachedNode)
+	}
+	if strings.TrimSpace(report.RestartOptimization) != "" {
+		annotations[annotationRestartOpt] = strings.TrimSpace(report.RestartOptimization)
+	}
+	if report.DetachGraceSeconds > 0 {
+		annotations[annotationDetachGrace] = strconv.Itoa(report.DetachGraceSeconds)
+	}
 
 	patch := map[string]any{
 		"metadata": map[string]any{
@@ -297,4 +406,15 @@ func namespaceFromServiceAccount() string {
 		return value
 	}
 	return "default"
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return map[string]string{}
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
 }

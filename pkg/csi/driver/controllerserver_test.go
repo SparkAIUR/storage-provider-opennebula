@@ -19,6 +19,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -31,6 +32,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 const (
@@ -80,6 +85,92 @@ func newTestDriver() *Driver {
 		featureGates:       FeatureGates{DetachedDiskExpansion: true},
 		hotplugGuard:       NewHotplugGuard(5 * time.Minute),
 		operationLocks:     NewOperationLocks(),
+	}
+}
+
+func newStickyTestDriver(t *testing.T, objects ...runtime.Object) *Driver {
+	t.Helper()
+	pluginConfig := config.LoadConfiguration()
+	pluginConfig.OverrideVal(config.DefaultDatastoresVar, "100,101")
+	pluginConfig.OverrideVal(config.AllowedDatastoreTypesVar, "local")
+	pluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, true)
+	pluginConfig.OverrideVal(config.LocalRestartDetachGraceSecondsVar, 90)
+	pluginConfig.OverrideVal(config.LocalRestartDetachGraceMaxSecondsVar, 300)
+	pluginConfig.OverrideVal(config.LocalRestartRequireNodeReadyVar, false)
+
+	client := fake.NewSimpleClientset(objects...)
+	runtime := &KubeRuntime{client: client, enabled: true}
+
+	driver := &Driver{
+		name:               DefaultDriverName,
+		version:            driverVersion,
+		grpcServerEndpoint: DefaultGRPCServerEndpoint,
+		nodeID:             "",
+		PluginConfig:       pluginConfig,
+		metrics:            NewDriverMetrics(driverVersion, "test"),
+		hotplugGuard:       NewHotplugGuard(5 * time.Minute),
+		operationLocks:     NewOperationLocks(),
+		kubeRuntime:        runtime,
+	}
+	driver.stickyAttachments = NewStickyAttachmentManager(runtime, "default")
+	require.NoError(t, driver.stickyAttachments.LoadFromConfigMap(context.Background()))
+	return driver
+}
+
+func newLocalPVAndPVC(volumeHandle string, accessModes []corev1.PersistentVolumeAccessMode, pvcAnnotations map[string]string) (*corev1.PersistentVolume, *corev1.PersistentVolumeClaim) {
+	pvAnnotations := map[string]string{
+		annotationBackend:         "local",
+		annotationDatastoreID:     "1",
+		annotationDatastoreName:   "default",
+		annotationSelectionPolicy: "least-used",
+	}
+	for key, value := range pvcAnnotations {
+		if key == annotationBackend || key == annotationDatastoreID || key == annotationDatastoreName || key == annotationSelectionPolicy {
+			pvAnnotations[key] = value
+		}
+	}
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "pv-" + volumeHandle,
+			Annotations: pvAnnotations,
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			AccessModes: accessModes,
+			ClaimRef: &corev1.ObjectReference{
+				Namespace: "default",
+				Name:      "pvc-" + volumeHandle,
+			},
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{
+					Driver:       DefaultDriverName,
+					VolumeHandle: volumeHandle,
+				},
+			},
+		},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "default",
+			Name:        "pvc-" + volumeHandle,
+			Annotations: pvcAnnotations,
+		},
+	}
+	return pv, pvc
+}
+
+func newReadyNode(name string, ready bool) *corev1.Node {
+	conditionStatus := corev1.ConditionFalse
+	if ready {
+		conditionStatus = corev1.ConditionTrue
+	}
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{{
+				Type:   corev1.NodeReady,
+				Status: conditionStatus,
+			}},
+		},
 	}
 }
 
@@ -1260,6 +1351,129 @@ func TestControllerUnpublishVolume(t *testing.T) {
 			mockProvider.AssertExpectations(t)
 		})
 	}
+}
+
+func TestControllerUnpublishVolumeStartsStickyDetachGraceForOptedInLocalPVC(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-sticky", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationRestartOpt:  restartOptimizationAnnotationValue,
+		annotationDetachGrace: "120",
+	})
+	driver := newStickyTestDriver(t, pv, pvc)
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	mockProvider.On("VolumeExists", mock.Anything, "vol-sticky").Return(1, 1, nil)
+	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdb", nil).Twice()
+
+	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
+	resp, err := cs.ControllerUnpublishVolume(context.Background(), &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: "vol-sticky",
+		NodeId:   "node-1",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	state, ok := driver.stickyAttachments.Get("vol-sticky")
+	require.True(t, ok)
+	assert.Equal(t, "node-1", state.NodeID)
+	assert.Equal(t, 120, state.GraceSeconds)
+	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, "vol-sticky", "node-1")
+	mockProvider.AssertExpectations(t)
+}
+
+func TestControllerPublishVolumeReusesStickyAttachmentOnSameNode(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-reuse", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationRestartOpt: restartOptimizationAnnotationValue,
+	})
+	driver := newStickyTestDriver(t, pv, pvc)
+	require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
+		VolumeID:     "vol-reuse",
+		NodeID:       "node-1",
+		Backend:      "local",
+		PVCNamespace: "default",
+		PVCName:      "pvc-vol-reuse",
+		StartedAt:    time.Now().Add(-10 * time.Second),
+		ExpiresAt:    time.Now().Add(90 * time.Second),
+		GraceSeconds: 90,
+		Reason:       "stateful_restart",
+	}))
+
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	mockProvider.On("VolumeExists", mock.Anything, "vol-reuse").Return(1, 1, nil)
+	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", fmt.Errorf("not attached")).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdc", nil).Once()
+
+	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
+	resp, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-reuse", "node-1"))
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, "vdc", resp.GetPublishContext()["volumeName"])
+	_, ok := driver.stickyAttachments.Get("vol-reuse")
+	assert.False(t, ok)
+	mockProvider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+	mockProvider.AssertExpectations(t)
+}
+
+func TestControllerPublishVolumeCancelsStickyAttachmentOnDifferentNode(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-move", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationRestartOpt: restartOptimizationAnnotationValue,
+	})
+	driver := newStickyTestDriver(t, pv, pvc)
+	require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
+		VolumeID:     "vol-move",
+		NodeID:       "node-old",
+		Backend:      "local",
+		PVCNamespace: "default",
+		PVCName:      "pvc-vol-move",
+		StartedAt:    time.Now().Add(-10 * time.Second),
+		ExpiresAt:    time.Now().Add(90 * time.Second),
+		GraceSeconds: 90,
+		Reason:       "stateful_restart",
+	}))
+
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	mockProvider.On("VolumeExists", mock.Anything, "vol-move").Return(1, 1, nil)
+	mockProvider.On("NodeExists", mock.Anything, "node-new").Return(42, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 42).Return("", fmt.Errorf("not attached")).Twice()
+	mockProvider.On("DetachVolume", mock.Anything, "vol-move", "node-old").Return(nil).Once()
+	mockProvider.On("AttachVolume", mock.Anything, "vol-move", "node-new", false, mock.Anything).Return(nil).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 42).Return("vdd", nil).Once()
+
+	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
+	resp, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-move", "node-new"))
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, "vdd", resp.GetPublishContext()["volumeName"])
+	_, ok := driver.stickyAttachments.Get("vol-move")
+	assert.False(t, ok)
+	mockProvider.AssertExpectations(t)
+}
+
+func TestControllerUnpublishVolumeBypassesStickyDetachWhenNodeNotReady(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-bypass", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationRestartOpt: restartOptimizationAnnotationValue,
+	})
+	node := newReadyNode("node-1", false)
+	driver := newStickyTestDriver(t, pv, pvc, node)
+	driver.PluginConfig.OverrideVal(config.LocalRestartRequireNodeReadyVar, true)
+
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	mockProvider.On("VolumeExists", mock.Anything, "vol-bypass").Return(1, 1, nil)
+	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdb", nil).Twice()
+	mockProvider.On("DetachVolume", mock.Anything, "vol-bypass", "node-1").Return(nil).Once()
+
+	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
+	resp, err := cs.ControllerUnpublishVolume(context.Background(), &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: "vol-bypass",
+		NodeId:   "node-1",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	_, ok := driver.stickyAttachments.Get("vol-bypass")
+	assert.False(t, ok)
+	mockProvider.AssertExpectations(t)
 }
 
 func TestControllerPublishVolumeSerializesSameNodeHotplug(t *testing.T) {

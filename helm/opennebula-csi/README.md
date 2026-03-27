@@ -207,6 +207,58 @@ For local-backed StorageClasses:
 - recreating MinIO tenants with local-backed PVCs should still be treated as node-sticky; use Ceph RBD or CephFS if the workload must remain portable across nodes
 - use Ceph RBD for portable RWO and CephFS for portable RWX
 
+### Restart-optimized local StatefulSets
+
+For MinIO-like StatefulSets on local datastores, the chart can enable a best-effort same-node restart fast path. It is enabled at the driver level by default, but only activates for PVCs that opt in with annotations.
+
+Opt-in example:
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minio
+spec:
+  serviceName: minio
+  replicas: 3
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:latest
+          args: ["server", "/data"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        annotations:
+          storage-provider.opennebula.sparkaiur.io/restart-optimization: "sticky-local-restart-v1"
+          storage-provider.opennebula.sparkaiur.io/detach-grace-seconds: "90"
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: opennebula-local-rwo
+        resources:
+          requests:
+            storage: 8Gi
+```
+
+Behavior:
+
+- on `ControllerUnpublishVolume`, the driver keeps the local disk attached for a short grace period instead of detaching immediately
+- if the replacement pod is scheduled back to the same node during that grace window, the driver reuses the existing attachment and skips detach/reattach
+- if the pod lands on a different node, the grace is cancelled and the normal detach/attach path proceeds immediately
+
+This is best-effort same-node reuse only. The CSI driver does not pin scheduling to the previous node.
+
 ## Values Reference
 
 `Required` meanings:
@@ -241,7 +293,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
-| `image.tag` | Driver image tag. | `"v0.4.5"` | No |
+| `image.tag` | Driver image tag. | `"v0.4.6"` | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
 
 ### Driver
@@ -257,6 +309,10 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.vmHotplugTimeoutMaxSeconds` | Maximum timeout cap for a single VM hotplug operation. | `900` | No |
 | `driver.vmHotplugStuckVmCooldownSeconds` | Cooldown period applied after a VM stays stuck in hotplug through the full timeout. | `300` | No |
 | `driver.nodeDeviceDiscoveryTimeoutSeconds` | Dedicated node-side device discovery timeout. This stays shorter than the controller hotplug budget so healthy fast-path retries happen quickly. | `30` | No |
+| `driver.localRestartOptimization.enabled` | Enable best-effort same-node restart reuse for opted-in local PVCs. | `true` | No |
+| `driver.localRestartOptimization.detachGraceSeconds` | Default delayed-detach grace used for opted-in local PVCs. | `90` | No |
+| `driver.localRestartOptimization.maxDetachGraceSeconds` | Upper bound for per-PVC delayed-detach overrides. | `300` | No |
+| `driver.localRestartOptimization.requireNodeReady` | Require Kubernetes node and OpenNebula VM readiness before starting delayed detach. | `true` | No |
 | `driver.allowedDatastoreTypes` | Allowed backend types for provisioning. | `["local","ceph","cephfs"]` | No |
 | `driver.extraArgs` | Extra CLI args appended to both controller and node driver containers. | `[]` | No |
 | `driver.env` | Additional environment variables appended to both controller and node driver containers. Useful for advanced overrides such as `ONE_CSI_NODE_TOPOLOGY_SYSTEM_DS`. | `[]` | No |

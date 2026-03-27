@@ -15,6 +15,11 @@ const (
 	eventReasonHotplugCooldown              = "HotplugCooldown"
 	eventReasonDeviceDiscoverySlow          = "DeviceDiscoverySlow"
 	eventReasonDeviceDiscoveryTimeout       = "DeviceDiscoveryTimeout"
+	eventReasonDetachGraceStarted           = "DetachGraceStarted"
+	eventReasonDetachGraceReused            = "DetachGraceReused"
+	eventReasonDetachGraceExpired           = "DetachGraceExpired"
+	eventReasonDetachGraceCancelled         = "DetachGraceCancelled"
+	eventReasonDetachGraceBypassed          = "DetachGraceBypassed"
 	eventReasonLocalImmediateBindingWarning = "LocalImmediateBindingWarning"
 	eventReasonPreflightFailed              = "PreflightFailed"
 )

@@ -39,6 +39,10 @@ const (
 	VMHotplugTimeoutMaxVar                    = "ONE_CSI_VM_HOTPLUG_TIMEOUT_MAX_SECONDS"
 	VMHotplugStuckCooldownSecondsVar          = "ONE_CSI_VM_HOTPLUG_STUCK_VM_COOLDOWN_SECONDS"
 	NodeDeviceDiscoveryTimeoutVar             = "ONE_CSI_NODE_DEVICE_DISCOVERY_TIMEOUT_SECONDS"
+	LocalRestartOptimizationEnabledVar        = "ONE_CSI_LOCAL_RESTART_OPTIMIZATION_ENABLED"
+	LocalRestartDetachGraceSecondsVar         = "ONE_CSI_LOCAL_RESTART_DETACH_GRACE_SECONDS"
+	LocalRestartDetachGraceMaxSecondsVar      = "ONE_CSI_LOCAL_RESTART_DETACH_GRACE_MAX_SECONDS"
+	LocalRestartRequireNodeReadyVar           = "ONE_CSI_LOCAL_RESTART_REQUIRE_NODE_READY"
 	PreflightLocalImmediateBindingPolicyVar   = "ONE_CSI_PREFLIGHT_LOCAL_IMMEDIATE_BINDING_POLICY"
 	ControllerLeaderElectionEnabledVar        = "ONE_CSI_CONTROLLER_LEADER_ELECTION_ENABLED"
 	ControllerLeaderElectionLeaseNameVar      = "ONE_CSI_CONTROLLER_LEADER_ELECTION_LEASE_NAME"
@@ -67,6 +71,10 @@ const (
 	defaultVMHotplugTimeoutMax                   = 900
 	defaultVMHotplugCooldown                     = 300
 	defaultNodeDeviceDiscoveryTimeout            = 30
+	defaultLocalRestartOptimizationEnabled       = true
+	defaultLocalRestartDetachGraceSeconds        = 90
+	defaultLocalRestartDetachGraceMaxSeconds     = 300
+	defaultLocalRestartRequireNodeReady          = true
 	defaultPreflightLocalImmediateBindingPolicy  = "warn"
 	defaultControllerLeaderElectionEnabled       = false
 	defaultControllerLeaderElectionLeaseDuration = 45
@@ -123,6 +131,10 @@ func initViper() *viper.Viper {
 	viper.SetDefault(VMHotplugTimeoutMaxVar, defaultVMHotplugTimeoutMax)
 	viper.SetDefault(VMHotplugStuckCooldownSecondsVar, defaultVMHotplugCooldown)
 	viper.SetDefault(NodeDeviceDiscoveryTimeoutVar, defaultNodeDeviceDiscoveryTimeout)
+	viper.SetDefault(LocalRestartOptimizationEnabledVar, defaultLocalRestartOptimizationEnabled)
+	viper.SetDefault(LocalRestartDetachGraceSecondsVar, defaultLocalRestartDetachGraceSeconds)
+	viper.SetDefault(LocalRestartDetachGraceMaxSecondsVar, defaultLocalRestartDetachGraceMaxSeconds)
+	viper.SetDefault(LocalRestartRequireNodeReadyVar, defaultLocalRestartRequireNodeReady)
 	viper.SetDefault(PreflightLocalImmediateBindingPolicyVar, defaultPreflightLocalImmediateBindingPolicy)
 	viper.SetDefault(ControllerLeaderElectionEnabledVar, defaultControllerLeaderElectionEnabled)
 	viper.SetDefault(ControllerLeaderElectionLeaseDurationVar, defaultControllerLeaderElectionLeaseDuration)

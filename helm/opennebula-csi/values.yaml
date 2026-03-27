@@ -14,7 +14,7 @@ credentials:
 
 image:
   repository: "nudevco/opennebula-csi"
-  tag: "v0.4.5"
+  tag: "v0.4.6"
   pullPolicy: "IfNotPresent"
 
 imagePullSecrets: []
@@ -30,6 +30,11 @@ driver:
   vmHotplugTimeoutMaxSeconds: 900
   vmHotplugStuckVmCooldownSeconds: 300
   nodeDeviceDiscoveryTimeoutSeconds: 30
+  localRestartOptimization:
+    enabled: true
+    detachGraceSeconds: 90
+    maxDetachGraceSeconds: 300
+    requireNodeReady: true
   allowedDatastoreTypes:
     - "local"
     - "ceph"
