@@ -222,7 +222,7 @@ if [[ -n "${validate_ds_id}" ]]; then
     --datastore-id="${validate_ds_id}" \
     --storage-class="${SC_NAME}" \
     --size=1Gi >/tmp/inventory-validate.json
-  grep -q '"Phase": "Succeeded"' /tmp/inventory-validate.json
+  grep -q '"phase": "Succeeded"' /tmp/inventory-validate.json
   test "$(kubectl get opennebuladatastore "ds-${validate_ds_id}" -o jsonpath='{.status.metricsDisplay}')" != "-"
 fi
 
@@ -317,6 +317,7 @@ kubectl -n "${VALIDATION_NAMESPACE}" exec statefulset/cnpg-bootstrap-smoke -- te
 go run ./cmd/opennebula-csi --mode=support-bundle >/tmp/opennebula-csi-support-bundle.json
 grep -q '"datastores"' /tmp/opennebula-csi-support-bundle.json
 grep -q '"nodes"' /tmp/opennebula-csi-support-bundle.json
+grep -q '"benchmarkRuns"' /tmp/opennebula-csi-support-bundle.json
 
 temp_sc_ds="$(kubectl get opennebuladatastores -o jsonpath='{range .items[*]}{.status.id}{"\t"}{.status.backend}{"\n"}{end}' | awk '$2=="local" {print $1; exit}')"
 if [[ -n "${temp_sc_ds}" ]]; then
