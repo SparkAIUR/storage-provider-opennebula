@@ -121,7 +121,7 @@ test -n "$(kubectl get opennebuladatastores -o jsonpath='{.items[0].metadata.nam
 test -n "$(kubectl get opennebulanodes -o jsonpath='{.items[0].metadata.name}')"
 
 kubectl get opennebuladatastores -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.maintenanceMode}{"\t"}{.spec.maintenanceMessage}{"\n"}{end}' \
-  | awk '$2=="true" && $3=="release validation maintenance mode" {print $1}' \
+  | awk '$2=="true" {print $1}' \
   | while read -r stale_ds; do
       [[ -n "${stale_ds}" ]] || continue
       kubectl patch opennebuladatastore "${stale_ds}" --type merge -p '{"spec":{"maintenanceMode":false,"maintenanceMessage":""}}'
