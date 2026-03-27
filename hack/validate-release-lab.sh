@@ -134,6 +134,11 @@ if [[ -z "${maint_ds}" ]]; then
   maint_ds="$(kubectl get opennebuladatastores -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.backend}{"\n"}{end}' | awk '$2=="Enabled" && $3=="local" {print $1; exit}')"
 fi
 if [[ -n "${maint_ds}" ]]; then
+  maint_sc_name="$(kubectl get opennebuladatastore "${maint_ds}" -o jsonpath='{.status.storageClassesDisplay}' | cut -d',' -f1)"
+  if [[ -z "${maint_sc_name}" || "${maint_sc_name}" == "-" ]]; then
+    echo "no StorageClass found for maintenance validation datastore ${maint_ds}" >&2
+    exit 1
+  fi
   kubectl patch opennebuladatastore "${maint_ds}" --type merge -p '{"spec":{"maintenanceMode":true,"maintenanceMessage":"release validation maintenance mode"}}'
   wait_for_datastore_phase "${maint_ds}" "Disabled" 120
   kubectl apply -n "${VALIDATION_NAMESPACE}" -f - <<EOF
@@ -146,7 +151,7 @@ spec:
   resources:
     requests:
       storage: 1Gi
-  storageClassName: ${SC_NAME}
+  storageClassName: ${maint_sc_name}
 EOF
   sleep 20
   phase="$(kubectl -n "${VALIDATION_NAMESPACE}" get pvc maintenance-block-test -o jsonpath='{.status.phase}')"
