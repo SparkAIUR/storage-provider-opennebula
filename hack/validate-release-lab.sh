@@ -21,6 +21,37 @@ require() {
   fi
 }
 
+first_matching_name() {
+  local kind="$1"
+  shift
+  local candidate
+  for candidate in "$@"; do
+    if kubectl -n "${NAMESPACE}" get "${kind}/${candidate}" >/dev/null 2>&1; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+wait_for_datastore_phase() {
+  local datastore_name="$1"
+  local expected_phase="$2"
+  local timeout_seconds="${3:-120}"
+  local deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    local current_phase
+    current_phase="$(kubectl get opennebuladatastore "${datastore_name}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    if [[ "${current_phase}" == "${expected_phase}" ]]; then
+      return 0
+    fi
+    sleep 5
+  done
+  echo "timed out waiting for ${datastore_name} phase ${expected_phase}" >&2
+  kubectl get opennebuladatastore "${datastore_name}" -o yaml >&2 || true
+  return 1
+}
+
 cleanup() {
   kubectl --kubeconfig "${LAB_KUBECONFIG}" delete namespace "${VALIDATION_NAMESPACE}" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
 }
@@ -51,6 +82,8 @@ helm_args=(
   upgrade --install "${RELEASE_NAME}" helm/opennebula-csi
   --namespace "${NAMESPACE}"
   --create-namespace
+  --force-conflicts
+  --take-ownership
   --set "oneApiEndpoint=${ONE_XMLRPC}"
   --set "inventoryController.enabled=true"
   --values "${VALUES_FILE}"
@@ -65,9 +98,13 @@ fi
 
 helm "${helm_args[@]}"
 
-kubectl -n "${NAMESPACE}" rollout status statefulset/"${RELEASE_NAME}"-opennebula-csi-controller --timeout=10m
-kubectl -n "${NAMESPACE}" rollout status daemonset/"${RELEASE_NAME}"-opennebula-csi-node --timeout=10m
-kubectl -n "${NAMESPACE}" rollout status deployment/"${RELEASE_NAME}"-opennebula-csi-inventory-controller --timeout=10m
+controller_name="$(first_matching_name statefulset "${RELEASE_NAME}-controller" "${RELEASE_NAME}-opennebula-csi-controller")"
+node_name="$(first_matching_name daemonset "${RELEASE_NAME}-node" "${RELEASE_NAME}-opennebula-csi-node")"
+inventory_name="$(first_matching_name deployment "${RELEASE_NAME}-inventory" "${RELEASE_NAME}-opennebula-csi-inventory-controller")"
+
+kubectl -n "${NAMESPACE}" rollout status statefulset/"${controller_name}" --timeout=10m
+kubectl -n "${NAMESPACE}" rollout status daemonset/"${node_name}" --timeout=10m
+kubectl -n "${NAMESPACE}" rollout status deployment/"${inventory_name}" --timeout=10m
 
 kubectl wait --for=condition=Established --timeout=2m crd/opennebuladatastores.storageprovider.opennebula.sparkaiur.io
 kubectl wait --for=condition=Established --timeout=2m crd/opennebulanodes.storageprovider.opennebula.sparkaiur.io
@@ -88,8 +125,7 @@ test -n "$(kubectl get opennebulanodes -o jsonpath='{.items[0].metadata.name}')"
 maint_ds="$(kubectl get opennebuladatastores -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.id}{"\t"}{.status.phase}{"\t"}{.status.backend}{"\n"}{end}' | awk '$3=="Enabled" && $4=="local" {print $1; exit}')"
 if [[ -n "${maint_ds}" ]]; then
   kubectl patch opennebuladatastore "${maint_ds}" --type merge -p '{"spec":{"maintenanceMode":true,"maintenanceMessage":"release validation maintenance mode"}}'
-  sleep 10
-  test "$(kubectl get opennebuladatastore "${maint_ds}" -o jsonpath='{.status.phase}')" = "Disabled"
+  wait_for_datastore_phase "${maint_ds}" "Disabled" 120
   kubectl apply -n "${VALIDATION_NAMESPACE}" -f - <<EOF
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -110,6 +146,7 @@ EOF
   fi
   kubectl delete -n "${VALIDATION_NAMESPACE}" pvc maintenance-block-test --ignore-not-found=true --wait=false
   kubectl patch opennebuladatastore "${maint_ds}" --type merge -p '{"spec":{"maintenanceMode":false,"maintenanceMessage":""}}'
+  wait_for_datastore_phase "${maint_ds}" "Enabled" 120
 fi
 
 kubectl apply -n "${VALIDATION_NAMESPACE}" -f - <<EOF

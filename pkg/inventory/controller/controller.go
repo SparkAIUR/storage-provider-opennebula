@@ -71,6 +71,7 @@ type Options struct {
 
 type Syncer struct {
 	client                 ctrlclient.Client
+	apiReader              ctrlclient.Reader
 	scheme                 *runtime.Scheme
 	kube                   kubernetes.Interface
 	ctrl                   *goca.Controller
@@ -129,6 +130,7 @@ func Run(ctx context.Context, cfg config.CSIPluginConfig, options Options) error
 
 	syncer := &Syncer{
 		client:                 mgr.GetClient(),
+		apiReader:              mgr.GetAPIReader(),
 		scheme:                 scheme,
 		kube:                   kube,
 		ctrl:                   goca.NewController(opennebula.NewClient(opennebula.OpenNebulaConfig{Endpoint: endpoint, Credentials: credentials}).Client),
@@ -235,7 +237,7 @@ func (s *Syncer) syncDatastores(ctx context.Context) error {
 	}
 
 	var dsList inventoryv1alpha1.OpenNebulaDatastoreList
-	if err := s.client.List(ctx, &dsList); err != nil {
+	if err := s.apiReader.List(ctx, &dsList); err != nil {
 		return err
 	}
 	log.Info("reconciling datastore inventory", "discoveredCount", len(dsPool.Datastores), "objectCount", len(dsList.Items))
@@ -675,7 +677,7 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 
 func (s *Syncer) reconcileBenchmarkRuns(ctx context.Context, discovered map[int]datastoreSchema.Datastore, scs []storagev1.StorageClass) error {
 	var runList inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunList
-	if err := s.client.List(ctx, &runList); err != nil {
+	if err := s.apiReader.List(ctx, &runList); err != nil {
 		return err
 	}
 	for _, item := range runList.Items {
@@ -849,7 +851,7 @@ func (s *Syncer) resolveBenchmarkRun(item inventoryv1alpha1.OpenNebulaDatastoreB
 
 func (s *Syncer) loadLatestBenchmarkResults(ctx context.Context) (map[int]*latestBenchmarkResult, error) {
 	var runList inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunList
-	if err := s.client.List(ctx, &runList); err != nil {
+	if err := s.apiReader.List(ctx, &runList); err != nil {
 		return nil, err
 	}
 	results := make(map[int]*latestBenchmarkResult)
