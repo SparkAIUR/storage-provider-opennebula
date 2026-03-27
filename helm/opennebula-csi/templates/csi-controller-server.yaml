@@ -77,7 +77,7 @@ spec:
             {{- end }}
             {{- if $lastNodePreferenceWebhookEnabled }}
             - containerPort: {{ $lastNodePreferenceWebhookPort }}
-              name: last-node-webhook
+              name: lastnode-wh
               protocol: TCP
             {{- end }}
           {{- end }}
