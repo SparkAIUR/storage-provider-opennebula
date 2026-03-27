@@ -30,6 +30,30 @@ type HotplugTimeoutPolicy struct {
 	PollInterval time.Duration
 }
 
+type HotplugObservationKey struct {
+	Operation  string `json:"operation"`
+	Backend    string `json:"backend"`
+	SizeBucket string `json:"sizeBucket"`
+}
+
+type HotplugTimeoutRecommendation struct {
+	Key            HotplugObservationKey `json:"key"`
+	SampleCount    int                   `json:"sampleCount"`
+	Recommended    time.Duration         `json:"recommended"`
+	StaticFloor    time.Duration         `json:"staticFloor"`
+	AdaptiveMax    time.Duration         `json:"adaptiveMax"`
+	LastObservedAt time.Time             `json:"lastObservedAt"`
+}
+
+type ObservedAttachment struct {
+	VolumeHandle string `json:"volumeHandle"`
+	ImageID      int    `json:"imageID"`
+	NodeName     string `json:"nodeName"`
+	NodeID       int    `json:"nodeID"`
+	DiskID       int    `json:"diskID"`
+	Backend      string `json:"backend"`
+}
+
 type HotplugCooldownState struct {
 	Node                 string
 	Operation            string
@@ -100,6 +124,7 @@ type OpenNebulaVolumeProvider interface {
 	NodeExists(ctx context.Context, node string) (int, error)
 	GetVolumeInNode(ctx context.Context, volumeID int, nodeID int) (string, error)
 	VolumeReadyWithTimeout(volumeID int) (bool, error)
+	ListCurrentAttachments(ctx context.Context) ([]ObservedAttachment, error)
 }
 
 type SharedFilesystemProvider interface {

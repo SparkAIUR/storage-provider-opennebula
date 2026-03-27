@@ -28,16 +28,20 @@ const (
 	paramPVCNamespace = "csi.storage.k8s.io/pvc/namespace"
 	paramPVName       = "csi.storage.k8s.io/pv/name"
 
-	annotationBackend          = "storage-provider.opennebula.sparkaiur.io/backend"
-	annotationDatastoreID      = "storage-provider.opennebula.sparkaiur.io/datastore-id"
-	annotationDatastoreName    = "storage-provider.opennebula.sparkaiur.io/datastore-name"
-	annotationSelectionPolicy  = "storage-provider.opennebula.sparkaiur.io/selection-policy"
-	annotationPlacementSummary = "storage-provider.opennebula.sparkaiur.io/placement-summary"
-	annotationLastAttachedNode = "storage-provider.opennebula.sparkaiur.io/last-attached-node"
-	annotationRestartOpt       = "storage-provider.opennebula.sparkaiur.io/restart-optimization"
-	annotationDetachGrace      = "storage-provider.opennebula.sparkaiur.io/detach-grace-seconds"
+	annotationBackend           = "storage-provider.opennebula.sparkaiur.io/backend"
+	annotationDatastoreID       = "storage-provider.opennebula.sparkaiur.io/datastore-id"
+	annotationDatastoreName     = "storage-provider.opennebula.sparkaiur.io/datastore-name"
+	annotationSelectionPolicy   = "storage-provider.opennebula.sparkaiur.io/selection-policy"
+	annotationPlacementSummary  = "storage-provider.opennebula.sparkaiur.io/placement-summary"
+	annotationLastAttachedNode  = "storage-provider.opennebula.sparkaiur.io/last-attached-node"
+	annotationRestartOpt        = "storage-provider.opennebula.sparkaiur.io/restart-optimization"
+	annotationDetachGrace       = "storage-provider.opennebula.sparkaiur.io/detach-grace-seconds"
+	annotationLastNodePref      = "storage-provider.opennebula.sparkaiur.io/last-node-preference"
+	annotationPreferredLastNode = "storage-provider.opennebula.sparkaiur.io/preferred-last-node"
+	annotationLastNodeInjected  = "storage-provider.opennebula.sparkaiur.io/last-node-preference-injected"
 
 	restartOptimizationAnnotationValue = "sticky-local-restart-v1"
+	lastNodePreferenceDisabledValue    = "disabled"
 
 	topologySystemDSLabel = "topology.opennebula.sparkaiur.io/system-ds"
 )
@@ -185,6 +189,17 @@ func (r *KubeRuntime) GetNodeLabel(ctx context.Context, nodeName, labelKey strin
 	}
 
 	return strings.TrimSpace(node.Labels[labelKey]), nil
+}
+
+func (r *KubeRuntime) GetNodeHostname(ctx context.Context, nodeName string) (string, error) {
+	value, err := r.GetNodeLabel(ctx, nodeName, corev1.LabelHostname)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(value) != "" {
+		return strings.TrimSpace(value), nil
+	}
+	return strings.TrimSpace(nodeName), nil
 }
 
 func (r *KubeRuntime) UpsertConfigMapData(ctx context.Context, namespace, name string, data map[string]string) error {

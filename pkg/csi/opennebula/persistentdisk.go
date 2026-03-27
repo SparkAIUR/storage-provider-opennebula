@@ -500,6 +500,7 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 	}
 	disk := shared.NewDisk()
 	disk.Add(shared.ImageID, volumeID)
+	disk.Add(shared.Serial, fmt.Sprintf("onecsi-%d", volumeID))
 	addDiskParams(disk, params)
 	if immutable {
 		disk.Add("READONLY", "YES")
@@ -1245,6 +1246,63 @@ func (p *PersistentDiskVolumeProvider) GetVolumeInNode(ctx context.Context, volu
 		}
 	}
 	return "", fmt.Errorf("volume %d not found on node %d", volumeID, nodeID)
+}
+
+func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Context) ([]ObservedAttachment, error) {
+	vmPool, err := p.ctrl.VMs().InfoContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list virtual machines: %w", err)
+	}
+
+	attachments := make([]ObservedAttachment, 0)
+	imageCache := map[int]struct {
+		name    string
+		backend string
+	}{}
+	for _, vmInfo := range vmPool.VMs {
+		for _, disk := range vmInfo.Template.GetDisks() {
+			diskImageID, diskErr := disk.GetI(shared.ImageID)
+			if diskErr != nil || diskImageID <= 0 {
+				continue
+			}
+			diskID, diskIDErr := disk.GetI(shared.DiskID)
+			if diskIDErr != nil {
+				continue
+			}
+			imageMeta, ok := imageCache[diskImageID]
+			if !ok {
+				imageInfo, imageErr := p.ctrl.Image(diskImageID).Info(true)
+				if imageErr != nil {
+					return nil, fmt.Errorf("failed to inspect image %d while listing attachments: %w", diskImageID, imageErr)
+				}
+				backend := ""
+				if imageInfo.DatastoreID != nil {
+					if datastorePool, poolErr := p.ctrl.Datastores().InfoContext(ctx); poolErr == nil {
+						if datastore, dsErr := findDatastoreByID(datastorePool.Datastores, *imageInfo.DatastoreID); dsErr == nil {
+							backend = datastoreFromSchema(datastore).Backend
+						}
+					}
+				}
+				imageMeta = struct {
+					name    string
+					backend string
+				}{
+					name:    imageInfo.Name,
+					backend: backend,
+				}
+				imageCache[diskImageID] = imageMeta
+			}
+			attachments = append(attachments, ObservedAttachment{
+				VolumeHandle: imageMeta.name,
+				ImageID:      diskImageID,
+				NodeName:     vmInfo.Name,
+				NodeID:       vmInfo.ID,
+				DiskID:       diskID,
+				Backend:      imageMeta.backend,
+			})
+		}
+	}
+	return attachments, nil
 }
 
 func findDatastoreByID(pool []datastoreSchema.Datastore, id int) (datastoreSchema.Datastore, error) {

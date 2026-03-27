@@ -39,10 +39,31 @@ const (
 	VMHotplugTimeoutMaxVar                    = "ONE_CSI_VM_HOTPLUG_TIMEOUT_MAX_SECONDS"
 	VMHotplugStuckCooldownSecondsVar          = "ONE_CSI_VM_HOTPLUG_STUCK_VM_COOLDOWN_SECONDS"
 	NodeDeviceDiscoveryTimeoutVar             = "ONE_CSI_NODE_DEVICE_DISCOVERY_TIMEOUT_SECONDS"
+	NodeDeviceCacheEnabledVar                 = "ONE_CSI_NODE_DEVICE_CACHE_ENABLED"
+	NodeDeviceCacheTTLSecondsVar              = "ONE_CSI_NODE_DEVICE_CACHE_TTL_SECONDS"
+	NodeDeviceUdevSettleTimeoutSecondsVar     = "ONE_CSI_NODE_DEVICE_UDEV_SETTLE_TIMEOUT_SECONDS"
+	NodeDeviceRescanOnMissEnabledVar          = "ONE_CSI_NODE_DEVICE_RESCAN_ON_MISS_ENABLED"
+	HotplugQueueEnabledVar                    = "ONE_CSI_HOTPLUG_QUEUE_ENABLED"
+	HotplugQueueMaxWaitSecondsVar             = "ONE_CSI_HOTPLUG_QUEUE_MAX_WAIT_SECONDS"
+	HotplugQueueAgeBoostSecondsVar            = "ONE_CSI_HOTPLUG_QUEUE_AGE_BOOST_SECONDS"
 	LocalRestartOptimizationEnabledVar        = "ONE_CSI_LOCAL_RESTART_OPTIMIZATION_ENABLED"
 	LocalRestartDetachGraceSecondsVar         = "ONE_CSI_LOCAL_RESTART_DETACH_GRACE_SECONDS"
 	LocalRestartDetachGraceMaxSecondsVar      = "ONE_CSI_LOCAL_RESTART_DETACH_GRACE_MAX_SECONDS"
 	LocalRestartRequireNodeReadyVar           = "ONE_CSI_LOCAL_RESTART_REQUIRE_NODE_READY"
+	LastNodePreferenceEnabledVar              = "ONE_CSI_LAST_NODE_PREFERENCE_ENABLED"
+	LastNodePreferencePolicyVar               = "ONE_CSI_LAST_NODE_PREFERENCE_POLICY"
+	LastNodePreferenceWebhookEnabledVar       = "ONE_CSI_LAST_NODE_PREFERENCE_WEBHOOK_ENABLED"
+	LastNodePreferenceWebhookPortVar          = "ONE_CSI_LAST_NODE_PREFERENCE_WEBHOOK_PORT"
+	LastNodePreferenceWebhookFailurePolicyVar = "ONE_CSI_LAST_NODE_PREFERENCE_FAILURE_POLICY"
+	StuckAttachmentReconcilerEnabledVar       = "ONE_CSI_STUCK_ATTACHMENT_RECONCILER_ENABLED"
+	StuckAttachmentReconcilerIntervalVar      = "ONE_CSI_STUCK_ATTACHMENT_RECONCILER_INTERVAL_SECONDS"
+	StuckAttachmentOrphanGraceSecondsVar      = "ONE_CSI_STUCK_ATTACHMENT_ORPHAN_GRACE_SECONDS"
+	StuckAttachmentStaleVAGraceSecondsVar     = "ONE_CSI_STUCK_ATTACHMENT_STALE_VA_GRACE_SECONDS"
+	HotplugAdaptiveTimeoutEnabledVar          = "ONE_CSI_HOTPLUG_ADAPTIVE_TIMEOUT_ENABLED"
+	HotplugAdaptiveMinSamplesVar              = "ONE_CSI_HOTPLUG_ADAPTIVE_MIN_SAMPLES"
+	HotplugAdaptiveSampleWindowVar            = "ONE_CSI_HOTPLUG_ADAPTIVE_SAMPLE_WINDOW"
+	HotplugAdaptiveP95MultiplierPercentVar    = "ONE_CSI_HOTPLUG_ADAPTIVE_P95_MULTIPLIER_PERCENT"
+	HotplugAdaptiveMaxSecondsVar              = "ONE_CSI_HOTPLUG_ADAPTIVE_MAX_SECONDS"
 	PreflightLocalImmediateBindingPolicyVar   = "ONE_CSI_PREFLIGHT_LOCAL_IMMEDIATE_BINDING_POLICY"
 	ControllerLeaderElectionEnabledVar        = "ONE_CSI_CONTROLLER_LEADER_ELECTION_ENABLED"
 	ControllerLeaderElectionLeaseNameVar      = "ONE_CSI_CONTROLLER_LEADER_ELECTION_LEASE_NAME"
@@ -60,34 +81,55 @@ const (
 	InventoryValidationDefaultImageVar        = "ONE_CSI_INVENTORY_VALIDATION_DEFAULT_IMAGE"
 
 	//Default values
-	defaultOpenNebulaRPCEndpoint                 = "http://localhost:2633/RPC2"
-	defaultDatastorePolicy                       = "least-used"
-	defaultAllowedDatastoreTypes                 = "local,ceph,cephfs"
-	defaultFeatureGates                          = "compatibilityAwareSelection=true,detachedDiskExpansion=false,cephfsExpansion=false,cephfsSnapshots=false,cephfsClones=false,cephfsSelfHealing=false,topologyAccessibility=false"
-	defaultMetricsEndpoint                       = ":9810"
-	defaultVMHotplugTimeout                      = 60
-	defaultVMHotplugTimeoutBase                  = 120
-	defaultVMHotplugTimeoutStep                  = 60
-	defaultVMHotplugTimeoutMax                   = 900
-	defaultVMHotplugCooldown                     = 300
-	defaultNodeDeviceDiscoveryTimeout            = 30
-	defaultLocalRestartOptimizationEnabled       = true
-	defaultLocalRestartDetachGraceSeconds        = 90
-	defaultLocalRestartDetachGraceMaxSeconds     = 300
-	defaultLocalRestartRequireNodeReady          = true
-	defaultPreflightLocalImmediateBindingPolicy  = "warn"
-	defaultControllerLeaderElectionEnabled       = false
-	defaultControllerLeaderElectionLeaseDuration = 45
-	defaultControllerLeaderElectionRenewDeadline = 30
-	defaultControllerLeaderElectionRetryPeriod   = 10
-	defaultInventoryControllerEnabled            = false
-	defaultInventoryDatastoreAuthorityMode       = "strict"
-	defaultInventoryControllerResyncDatastores   = 60
-	defaultInventoryControllerResyncNodes        = 30
-	defaultInventoryControllerLeaderElectionID   = "opennebula-csi-inventory-controller"
-	defaultInventoryControllerNamespace          = "kube-system"
-	defaultInventoryValidationEnabled            = true
-	defaultInventoryValidationDefaultImage       = ""
+	defaultOpenNebulaRPCEndpoint                  = "http://localhost:2633/RPC2"
+	defaultDatastorePolicy                        = "least-used"
+	defaultAllowedDatastoreTypes                  = "local,ceph,cephfs"
+	defaultFeatureGates                           = "compatibilityAwareSelection=true,detachedDiskExpansion=false,cephfsExpansion=false,cephfsSnapshots=false,cephfsClones=false,cephfsSelfHealing=false,topologyAccessibility=false"
+	defaultMetricsEndpoint                        = ":9810"
+	defaultVMHotplugTimeout                       = 60
+	defaultVMHotplugTimeoutBase                   = 120
+	defaultVMHotplugTimeoutStep                   = 60
+	defaultVMHotplugTimeoutMax                    = 900
+	defaultVMHotplugCooldown                      = 300
+	defaultNodeDeviceDiscoveryTimeout             = 30
+	defaultNodeDeviceCacheEnabled                 = true
+	defaultNodeDeviceCacheTTLSeconds              = 600
+	defaultNodeDeviceUdevSettleTimeoutSeconds     = 10
+	defaultNodeDeviceRescanOnMissEnabled          = true
+	defaultHotplugQueueEnabled                    = true
+	defaultHotplugQueueMaxWaitSeconds             = 180
+	defaultHotplugQueueAgeBoostSeconds            = 30
+	defaultLocalRestartOptimizationEnabled        = true
+	defaultLocalRestartDetachGraceSeconds         = 90
+	defaultLocalRestartDetachGraceMaxSeconds      = 300
+	defaultLocalRestartRequireNodeReady           = true
+	defaultLastNodePreferenceEnabled              = true
+	defaultLastNodePreferencePolicy               = "local-single-writer"
+	defaultLastNodePreferenceWebhookEnabled       = true
+	defaultLastNodePreferenceWebhookPort          = 9443
+	defaultLastNodePreferenceWebhookFailurePolicy = "Ignore"
+	defaultStuckAttachmentReconcilerEnabled       = true
+	defaultStuckAttachmentReconcilerInterval      = 60
+	defaultStuckAttachmentOrphanGraceSeconds      = 120
+	defaultStuckAttachmentStaleVAGraceSeconds     = 90
+	defaultHotplugAdaptiveTimeoutEnabled          = true
+	defaultHotplugAdaptiveMinSamples              = 8
+	defaultHotplugAdaptiveSampleWindow            = 20
+	defaultHotplugAdaptiveP95MultiplierPercent    = 400
+	defaultHotplugAdaptiveMaxSeconds              = 1800
+	defaultPreflightLocalImmediateBindingPolicy   = "warn"
+	defaultControllerLeaderElectionEnabled        = false
+	defaultControllerLeaderElectionLeaseDuration  = 45
+	defaultControllerLeaderElectionRenewDeadline  = 30
+	defaultControllerLeaderElectionRetryPeriod    = 10
+	defaultInventoryControllerEnabled             = false
+	defaultInventoryDatastoreAuthorityMode        = "strict"
+	defaultInventoryControllerResyncDatastores    = 60
+	defaultInventoryControllerResyncNodes         = 30
+	defaultInventoryControllerLeaderElectionID    = "opennebula-csi-inventory-controller"
+	defaultInventoryControllerNamespace           = "kube-system"
+	defaultInventoryValidationEnabled             = true
+	defaultInventoryValidationDefaultImage        = ""
 )
 
 // CSIPluginConfig holds the configuration for the CSI plugin
@@ -131,10 +173,31 @@ func initViper() *viper.Viper {
 	viper.SetDefault(VMHotplugTimeoutMaxVar, defaultVMHotplugTimeoutMax)
 	viper.SetDefault(VMHotplugStuckCooldownSecondsVar, defaultVMHotplugCooldown)
 	viper.SetDefault(NodeDeviceDiscoveryTimeoutVar, defaultNodeDeviceDiscoveryTimeout)
+	viper.SetDefault(NodeDeviceCacheEnabledVar, defaultNodeDeviceCacheEnabled)
+	viper.SetDefault(NodeDeviceCacheTTLSecondsVar, defaultNodeDeviceCacheTTLSeconds)
+	viper.SetDefault(NodeDeviceUdevSettleTimeoutSecondsVar, defaultNodeDeviceUdevSettleTimeoutSeconds)
+	viper.SetDefault(NodeDeviceRescanOnMissEnabledVar, defaultNodeDeviceRescanOnMissEnabled)
+	viper.SetDefault(HotplugQueueEnabledVar, defaultHotplugQueueEnabled)
+	viper.SetDefault(HotplugQueueMaxWaitSecondsVar, defaultHotplugQueueMaxWaitSeconds)
+	viper.SetDefault(HotplugQueueAgeBoostSecondsVar, defaultHotplugQueueAgeBoostSeconds)
 	viper.SetDefault(LocalRestartOptimizationEnabledVar, defaultLocalRestartOptimizationEnabled)
 	viper.SetDefault(LocalRestartDetachGraceSecondsVar, defaultLocalRestartDetachGraceSeconds)
 	viper.SetDefault(LocalRestartDetachGraceMaxSecondsVar, defaultLocalRestartDetachGraceMaxSeconds)
 	viper.SetDefault(LocalRestartRequireNodeReadyVar, defaultLocalRestartRequireNodeReady)
+	viper.SetDefault(LastNodePreferenceEnabledVar, defaultLastNodePreferenceEnabled)
+	viper.SetDefault(LastNodePreferencePolicyVar, defaultLastNodePreferencePolicy)
+	viper.SetDefault(LastNodePreferenceWebhookEnabledVar, defaultLastNodePreferenceWebhookEnabled)
+	viper.SetDefault(LastNodePreferenceWebhookPortVar, defaultLastNodePreferenceWebhookPort)
+	viper.SetDefault(LastNodePreferenceWebhookFailurePolicyVar, defaultLastNodePreferenceWebhookFailurePolicy)
+	viper.SetDefault(StuckAttachmentReconcilerEnabledVar, defaultStuckAttachmentReconcilerEnabled)
+	viper.SetDefault(StuckAttachmentReconcilerIntervalVar, defaultStuckAttachmentReconcilerInterval)
+	viper.SetDefault(StuckAttachmentOrphanGraceSecondsVar, defaultStuckAttachmentOrphanGraceSeconds)
+	viper.SetDefault(StuckAttachmentStaleVAGraceSecondsVar, defaultStuckAttachmentStaleVAGraceSeconds)
+	viper.SetDefault(HotplugAdaptiveTimeoutEnabledVar, defaultHotplugAdaptiveTimeoutEnabled)
+	viper.SetDefault(HotplugAdaptiveMinSamplesVar, defaultHotplugAdaptiveMinSamples)
+	viper.SetDefault(HotplugAdaptiveSampleWindowVar, defaultHotplugAdaptiveSampleWindow)
+	viper.SetDefault(HotplugAdaptiveP95MultiplierPercentVar, defaultHotplugAdaptiveP95MultiplierPercent)
+	viper.SetDefault(HotplugAdaptiveMaxSecondsVar, defaultHotplugAdaptiveMaxSeconds)
 	viper.SetDefault(PreflightLocalImmediateBindingPolicyVar, defaultPreflightLocalImmediateBindingPolicy)
 	viper.SetDefault(ControllerLeaderElectionEnabledVar, defaultControllerLeaderElectionEnabled)
 	viper.SetDefault(ControllerLeaderElectionLeaseDurationVar, defaultControllerLeaderElectionLeaseDuration)

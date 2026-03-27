@@ -14,7 +14,7 @@ credentials:
 
 image:
   repository: "nudevco/opennebula-csi"
-  tag: "v0.4.6"
+  tag: "v0.4.7rc0"
   pullPolicy: "IfNotPresent"
 
 imagePullSecrets: []
@@ -30,11 +30,38 @@ driver:
   vmHotplugTimeoutMaxSeconds: 900
   vmHotplugStuckVmCooldownSeconds: 300
   nodeDeviceDiscoveryTimeoutSeconds: 30
+  nodeDeviceCache:
+    enabled: true
+    ttlSeconds: 600
+    udevSettleTimeoutSeconds: 10
+    rescanOnMissEnabled: true
+  hotplugQueue:
+    enabled: true
+    maxWaitSeconds: 180
+    ageBoostSeconds: 30
   localRestartOptimization:
     enabled: true
     detachGraceSeconds: 90
     maxDetachGraceSeconds: 300
     requireNodeReady: true
+  lastNodePreference:
+    enabled: true
+    policy: "local-single-writer"
+    webhook:
+      enabled: true
+      port: 9443
+      failurePolicy: "Ignore"
+  stuckAttachmentReconciler:
+    enabled: true
+    intervalSeconds: 60
+    orphanGraceSeconds: 120
+    staleVolumeAttachmentGraceSeconds: 90
+  adaptiveTimeout:
+    enabled: true
+    minSamples: 8
+    sampleWindow: 20
+    p95MultiplierPercent: 400
+    maxSeconds: 1800
   allowedDatastoreTypes:
     - "local"
     - "ceph"

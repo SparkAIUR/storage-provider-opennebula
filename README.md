@@ -172,6 +172,26 @@ Recommended workload-side guidance:
 - keep replica placement predictable with anti-affinity or topology spread when appropriate
 - do not use this as a substitute for portable storage; use Ceph RBD or CephFS if the workload must move freely across nodes
 
+### CSI fast-path improvements in `v0.4.7`
+
+`v0.4.7` extends the local restart path with a broader CSI performance and stability layer:
+
+- the node plugin now prefers stable `/dev/disk/by-id` resolution using an explicit OpenNebula disk serial and keeps a short-lived in-memory device cache
+- same-node hotplug work is queued fairly instead of failing fast with `node_busy`
+- the controller can inject a soft last-node scheduling preference for local single-writer pods so StatefulSet restarts are more likely to land back on the previous node
+- a conservative stuck-attachment reconciler repairs orphaned OpenNebula attachments and stale `VolumeAttachment` objects
+- attach, detach, and device-resolution latencies now feed an adaptive timeout window so slower environments raise budgets without reducing the current static timeout floor
+
+New workload controls:
+
+- pod or PVC opt-out annotation:
+  `storage-provider.opennebula.sparkaiur.io/last-node-preference: "disabled"`
+
+New support signals:
+
+- support bundles now include sticky attachment state, hotplug queue state, and adaptive timeout observations/recommendations
+- controller/node metrics expose queue depth, device-resolution methods, last-node preference outcomes, reconciler actions, and adaptive timeout recommendations
+
 ## Access mode support
 
 Current access mode matrix:

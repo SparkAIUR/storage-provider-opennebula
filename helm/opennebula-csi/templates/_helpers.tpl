@@ -44,6 +44,14 @@ Create chart name and version as used by the chart label.
 {{- printf "%s-inventory-sa" (include "opennebula-csi.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
 
+{{- define "opennebula-csi.lastNodeWebhookServiceName" -}}
+{{- printf "%s-last-node-webhook" (include "opennebula-csi.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{- define "opennebula-csi.lastNodeWebhookSecretName" -}}
+{{- printf "%s-last-node-webhook-tls" (include "opennebula-csi.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
 {{- define "opennebula-csi.authSecretName" -}}
 {{- if .Values.credentials.existingSecret.name -}}
 {{- .Values.credentials.existingSecret.name -}}
@@ -81,11 +89,38 @@ Create chart name and version as used by the chart label.
 {{- $inventory := (get $root.Values "inventoryController") | default dict -}}
 {{- $inventoryResync := (get $inventory "resyncSeconds") | default dict -}}
 {{- $inventoryValidation := (get $inventory "validation") | default dict -}}
+{{- $nodeDeviceCache := (get $root.Values.driver "nodeDeviceCache") | default dict -}}
+{{- $hotplugQueue := (get $root.Values.driver "hotplugQueue") | default dict -}}
 {{- $localRestart := (get $root.Values.driver "localRestartOptimization") | default dict -}}
+{{- $lastNodePreference := (get $root.Values.driver "lastNodePreference") | default dict -}}
+{{- $lastNodePreferenceWebhook := (get $lastNodePreference "webhook") | default dict -}}
+{{- $stuckAttachmentReconciler := (get $root.Values.driver "stuckAttachmentReconciler") | default dict -}}
+{{- $adaptiveTimeout := (get $root.Values.driver "adaptiveTimeout") | default dict -}}
+{{- $nodeDeviceCacheEnabled := (get $nodeDeviceCache "enabled") | default true -}}
+{{- $nodeDeviceCacheTTLSeconds := (get $nodeDeviceCache "ttlSeconds") | default 600 -}}
+{{- $nodeDeviceUdevSettleTimeoutSeconds := (get $nodeDeviceCache "udevSettleTimeoutSeconds") | default 10 -}}
+{{- $nodeDeviceRescanOnMissEnabled := (get $nodeDeviceCache "rescanOnMissEnabled") | default true -}}
+{{- $hotplugQueueEnabled := (get $hotplugQueue "enabled") | default true -}}
+{{- $hotplugQueueMaxWaitSeconds := (get $hotplugQueue "maxWaitSeconds") | default 180 -}}
+{{- $hotplugQueueAgeBoostSeconds := (get $hotplugQueue "ageBoostSeconds") | default 30 -}}
 {{- $localRestartEnabled := (get $localRestart "enabled") | default true -}}
 {{- $localRestartDetachGrace := (get $localRestart "detachGraceSeconds") | default 90 -}}
 {{- $localRestartDetachGraceMax := (get $localRestart "maxDetachGraceSeconds") | default 300 -}}
 {{- $localRestartRequireNodeReady := (get $localRestart "requireNodeReady") | default true -}}
+{{- $lastNodePreferenceEnabled := (get $lastNodePreference "enabled") | default true -}}
+{{- $lastNodePreferencePolicy := (get $lastNodePreference "policy") | default "local-single-writer" -}}
+{{- $lastNodePreferenceWebhookEnabled := (get $lastNodePreferenceWebhook "enabled") | default true -}}
+{{- $lastNodePreferenceWebhookPort := (get $lastNodePreferenceWebhook "port") | default 9443 -}}
+{{- $lastNodePreferenceWebhookFailurePolicy := (get $lastNodePreferenceWebhook "failurePolicy") | default "Ignore" -}}
+{{- $stuckAttachmentReconcilerEnabled := (get $stuckAttachmentReconciler "enabled") | default true -}}
+{{- $stuckAttachmentReconcilerIntervalSeconds := (get $stuckAttachmentReconciler "intervalSeconds") | default 60 -}}
+{{- $stuckAttachmentOrphanGraceSeconds := (get $stuckAttachmentReconciler "orphanGraceSeconds") | default 120 -}}
+{{- $stuckAttachmentStaleVAGraceSeconds := (get $stuckAttachmentReconciler "staleVolumeAttachmentGraceSeconds") | default 90 -}}
+{{- $adaptiveTimeoutEnabled := (get $adaptiveTimeout "enabled") | default true -}}
+{{- $adaptiveTimeoutMinSamples := (get $adaptiveTimeout "minSamples") | default 8 -}}
+{{- $adaptiveTimeoutSampleWindow := (get $adaptiveTimeout "sampleWindow") | default 20 -}}
+{{- $adaptiveTimeoutP95MultiplierPercent := (get $adaptiveTimeout "p95MultiplierPercent") | default 400 -}}
+{{- $adaptiveTimeoutMaxSeconds := (get $adaptiveTimeout "maxSeconds") | default 1800 -}}
 - name: ONE_XMLRPC
   value: {{ $root.Values.oneApiEndpoint | quote }}
 - name: ONE_AUTH
@@ -135,6 +170,20 @@ Create chart name and version as used by the chart label.
   value: {{ $root.Values.driver.vmHotplugStuckVmCooldownSeconds | quote }}
 - name: ONE_CSI_NODE_DEVICE_DISCOVERY_TIMEOUT_SECONDS
   value: {{ $root.Values.driver.nodeDeviceDiscoveryTimeoutSeconds | quote }}
+- name: ONE_CSI_NODE_DEVICE_CACHE_ENABLED
+  value: {{ $nodeDeviceCacheEnabled | quote }}
+- name: ONE_CSI_NODE_DEVICE_CACHE_TTL_SECONDS
+  value: {{ $nodeDeviceCacheTTLSeconds | quote }}
+- name: ONE_CSI_NODE_DEVICE_UDEV_SETTLE_TIMEOUT_SECONDS
+  value: {{ $nodeDeviceUdevSettleTimeoutSeconds | quote }}
+- name: ONE_CSI_NODE_DEVICE_RESCAN_ON_MISS_ENABLED
+  value: {{ $nodeDeviceRescanOnMissEnabled | quote }}
+- name: ONE_CSI_HOTPLUG_QUEUE_ENABLED
+  value: {{ $hotplugQueueEnabled | quote }}
+- name: ONE_CSI_HOTPLUG_QUEUE_MAX_WAIT_SECONDS
+  value: {{ $hotplugQueueMaxWaitSeconds | quote }}
+- name: ONE_CSI_HOTPLUG_QUEUE_AGE_BOOST_SECONDS
+  value: {{ $hotplugQueueAgeBoostSeconds | quote }}
 - name: ONE_CSI_LOCAL_RESTART_OPTIMIZATION_ENABLED
   value: {{ $localRestartEnabled | quote }}
 - name: ONE_CSI_LOCAL_RESTART_DETACH_GRACE_SECONDS
@@ -143,6 +192,34 @@ Create chart name and version as used by the chart label.
   value: {{ $localRestartDetachGraceMax | quote }}
 - name: ONE_CSI_LOCAL_RESTART_REQUIRE_NODE_READY
   value: {{ $localRestartRequireNodeReady | quote }}
+- name: ONE_CSI_LAST_NODE_PREFERENCE_ENABLED
+  value: {{ $lastNodePreferenceEnabled | quote }}
+- name: ONE_CSI_LAST_NODE_PREFERENCE_POLICY
+  value: {{ $lastNodePreferencePolicy | quote }}
+- name: ONE_CSI_LAST_NODE_PREFERENCE_WEBHOOK_ENABLED
+  value: {{ $lastNodePreferenceWebhookEnabled | quote }}
+- name: ONE_CSI_LAST_NODE_PREFERENCE_WEBHOOK_PORT
+  value: {{ $lastNodePreferenceWebhookPort | quote }}
+- name: ONE_CSI_LAST_NODE_PREFERENCE_FAILURE_POLICY
+  value: {{ $lastNodePreferenceWebhookFailurePolicy | quote }}
+- name: ONE_CSI_STUCK_ATTACHMENT_RECONCILER_ENABLED
+  value: {{ $stuckAttachmentReconcilerEnabled | quote }}
+- name: ONE_CSI_STUCK_ATTACHMENT_RECONCILER_INTERVAL_SECONDS
+  value: {{ $stuckAttachmentReconcilerIntervalSeconds | quote }}
+- name: ONE_CSI_STUCK_ATTACHMENT_ORPHAN_GRACE_SECONDS
+  value: {{ $stuckAttachmentOrphanGraceSeconds | quote }}
+- name: ONE_CSI_STUCK_ATTACHMENT_STALE_VA_GRACE_SECONDS
+  value: {{ $stuckAttachmentStaleVAGraceSeconds | quote }}
+- name: ONE_CSI_HOTPLUG_ADAPTIVE_TIMEOUT_ENABLED
+  value: {{ $adaptiveTimeoutEnabled | quote }}
+- name: ONE_CSI_HOTPLUG_ADAPTIVE_MIN_SAMPLES
+  value: {{ $adaptiveTimeoutMinSamples | quote }}
+- name: ONE_CSI_HOTPLUG_ADAPTIVE_SAMPLE_WINDOW
+  value: {{ $adaptiveTimeoutSampleWindow | quote }}
+- name: ONE_CSI_HOTPLUG_ADAPTIVE_P95_MULTIPLIER_PERCENT
+  value: {{ $adaptiveTimeoutP95MultiplierPercent | quote }}
+- name: ONE_CSI_HOTPLUG_ADAPTIVE_MAX_SECONDS
+  value: {{ $adaptiveTimeoutMaxSeconds | quote }}
 - name: ONE_CSI_PREFLIGHT_LOCAL_IMMEDIATE_BINDING_POLICY
   value: {{ $root.Values.preflight.localImmediateBindingPolicy | quote }}
 - name: ONE_CSI_INVENTORY_CONTROLLER_ENABLED

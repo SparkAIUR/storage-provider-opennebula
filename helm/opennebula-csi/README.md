@@ -259,6 +259,21 @@ Behavior:
 
 This is best-effort same-node reuse only. The CSI driver does not pin scheduling to the previous node.
 
+`v0.4.7` adds four supporting behaviors on top of that restart fast path:
+
+- node-side device discovery prefers `/dev/disk/by-id` with a cache-backed serial lookup
+- same-node hotplug work is queued fairly instead of failing fast
+- a mutating webhook adds a soft last-node preference to eligible local single-writer pods
+- a conservative attachment reconciler repairs stale OpenNebula and `VolumeAttachment` drift
+
+To opt out of the soft last-node preference for a specific Pod or PVC, set:
+
+```yaml
+metadata:
+  annotations:
+    storage-provider.opennebula.sparkaiur.io/last-node-preference: "disabled"
+```
+
 ## Values Reference
 
 `Required` meanings:
@@ -293,7 +308,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
-| `image.tag` | Driver image tag. | `"v0.4.6"` | No |
+| `image.tag` | Driver image tag. | `"v0.4.7rc0"` | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
 
 ### Driver
@@ -309,10 +324,31 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.vmHotplugTimeoutMaxSeconds` | Maximum timeout cap for a single VM hotplug operation. | `900` | No |
 | `driver.vmHotplugStuckVmCooldownSeconds` | Cooldown period applied after a VM stays stuck in hotplug through the full timeout. | `300` | No |
 | `driver.nodeDeviceDiscoveryTimeoutSeconds` | Dedicated node-side device discovery timeout. This stays shorter than the controller hotplug budget so healthy fast-path retries happen quickly. | `30` | No |
+| `driver.nodeDeviceCache.enabled` | Enable node-local device cache and stable serial/by-id resolution. | `true` | No |
+| `driver.nodeDeviceCache.ttlSeconds` | Cache TTL for confirmed device paths. | `600` | No |
+| `driver.nodeDeviceCache.udevSettleTimeoutSeconds` | Timeout for `udevadm settle` before device rescan on miss. | `10` | No |
+| `driver.nodeDeviceCache.rescanOnMissEnabled` | Allow SCSI host rescan when device resolution misses. | `true` | No |
+| `driver.hotplugQueue.enabled` | Queue same-node hotplug work instead of failing fast on lock contention. | `true` | No |
+| `driver.hotplugQueue.maxWaitSeconds` | Maximum time a queued hotplug request waits before failing. | `180` | No |
+| `driver.hotplugQueue.ageBoostSeconds` | Time after which older queued work is promoted one priority class. | `30` | No |
 | `driver.localRestartOptimization.enabled` | Enable best-effort same-node restart reuse for opted-in local PVCs. | `true` | No |
 | `driver.localRestartOptimization.detachGraceSeconds` | Default delayed-detach grace used for opted-in local PVCs. | `90` | No |
 | `driver.localRestartOptimization.maxDetachGraceSeconds` | Upper bound for per-PVC delayed-detach overrides. | `300` | No |
 | `driver.localRestartOptimization.requireNodeReady` | Require Kubernetes node and OpenNebula VM readiness before starting delayed detach. | `true` | No |
+| `driver.lastNodePreference.enabled` | Enable soft last-node preference injection for eligible local single-writer pods. | `true` | No |
+| `driver.lastNodePreference.policy` | Last-node preference policy. `local-single-writer` is the supported `v0.4.7` policy. | `"local-single-writer"` | No |
+| `driver.lastNodePreference.webhook.enabled` | Enable the mutating admission webhook service and configuration. | `true` | No |
+| `driver.lastNodePreference.webhook.port` | HTTPS port exposed by the controller pod for webhook traffic. | `9443` | No |
+| `driver.lastNodePreference.webhook.failurePolicy` | Admission webhook failure policy. | `"Ignore"` | No |
+| `driver.stuckAttachmentReconciler.enabled` | Enable conservative stale attachment reconciliation in the controller leader. | `true` | No |
+| `driver.stuckAttachmentReconciler.intervalSeconds` | Reconciler scan interval. | `60` | No |
+| `driver.stuckAttachmentReconciler.orphanGraceSeconds` | Grace before detaching orphan or divergent OpenNebula attachments. | `120` | No |
+| `driver.stuckAttachmentReconciler.staleVolumeAttachmentGraceSeconds` | Grace before deleting a stale attached `VolumeAttachment`. | `90` | No |
+| `driver.adaptiveTimeout.enabled` | Enable adaptive timeout recommendations from recent hotplug observations. | `true` | No |
+| `driver.adaptiveTimeout.minSamples` | Minimum successful samples before adaptive tuning activates. | `8` | No |
+| `driver.adaptiveTimeout.sampleWindow` | Rolling observation window size per operation/backend/size bucket. | `20` | No |
+| `driver.adaptiveTimeout.p95MultiplierPercent` | Multiplier applied to observed p95 latency to form the recommendation. | `400` | No |
+| `driver.adaptiveTimeout.maxSeconds` | Maximum adaptive timeout recommendation. | `1800` | No |
 | `driver.allowedDatastoreTypes` | Allowed backend types for provisioning. | `["local","ceph","cephfs"]` | No |
 | `driver.extraArgs` | Extra CLI args appended to both controller and node driver containers. | `[]` | No |
 | `driver.env` | Additional environment variables appended to both controller and node driver containers. Useful for advanced overrides such as `ONE_CSI_NODE_TOPOLOGY_SYSTEM_DS`. | `[]` | No |

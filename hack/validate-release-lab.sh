@@ -145,6 +145,8 @@ helm "${helm_args[@]}"
 controller_name="$(first_matching_name statefulset "${RELEASE_NAME}-controller" "${RELEASE_NAME}-opennebula-csi-controller")"
 node_name="$(first_matching_name daemonset "${RELEASE_NAME}-node" "${RELEASE_NAME}-opennebula-csi-node")"
 inventory_name="$(first_matching_name deployment "${RELEASE_NAME}-inventory" "${RELEASE_NAME}-opennebula-csi-inventory-controller")"
+webhook_service_name="$(first_matching_name service "${RELEASE_NAME}-last-node-webhook" "${RELEASE_NAME}-opennebula-csi-last-node-webhook")"
+webhook_config_name="$(kubectl get mutatingwebhookconfiguration -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -E "^(${RELEASE_NAME}-last-node-preference|${RELEASE_NAME}-opennebula-csi-last-node-preference)$" | head -1)"
 
 kubectl -n "${NAMESPACE}" rollout restart statefulset/"${controller_name}" || true
 kubectl -n "${NAMESPACE}" rollout restart daemonset/"${node_name}" || true
@@ -154,6 +156,14 @@ kubectl -n "${NAMESPACE}" delete pod "${controller_name}-0" --ignore-not-found=t
 kubectl -n "${NAMESPACE}" rollout status statefulset/"${controller_name}" --timeout=10m
 kubectl -n "${NAMESPACE}" rollout status daemonset/"${node_name}" --timeout=10m
 kubectl -n "${NAMESPACE}" rollout status deployment/"${inventory_name}" --timeout=10m
+kubectl -n "${NAMESPACE}" get service "${webhook_service_name}" >/dev/null
+kubectl get mutatingwebhookconfiguration "${webhook_config_name}" >/dev/null
+
+node_pod="$(kubectl -n "${NAMESPACE}" get pods -l app.kubernetes.io/component=node -o wide --no-headers | awk -v node="${LOCAL_NODE}" '$7==node {print $1; exit}')"
+if [[ -z "${node_pod}" ]]; then
+  echo "failed to resolve node daemonset pod on ${LOCAL_NODE}" >&2
+  exit 1
+fi
 
 kubectl wait --for=condition=Established --timeout=2m crd/opennebuladatastores.storageprovider.opennebula.sparkaiur.io
 kubectl wait --for=condition=Established --timeout=2m crd/opennebulanodes.storageprovider.opennebula.sparkaiur.io
@@ -265,6 +275,7 @@ EOF
 
 kubectl -n "${VALIDATION_NAMESPACE}" wait --for=condition=Ready pod/release-local-smoke --timeout=10m
 kubectl -n "${VALIDATION_NAMESPACE}" exec release-local-smoke -- sh -c 'test "$(cat /data-a/check)" = "alpha" && test "$(cat /data-b/check)" = "beta"'
+kubectl -n "${NAMESPACE}" logs "${node_pod}" -c opennebula-csi | grep -Eq 'resolvedBy.*(by-id|cache|alias|exact)'
 
 validate_ds_id="$(kubectl get opennebuladatastores -o jsonpath='{range .items[*]}{.status.id}{"\t"}{.status.phase}{"\t"}{.status.backend}{"\n"}{end}' | awk '$2=="Enabled" && $3=="local" {print $1; exit}')"
 if [[ -n "${validate_ds_id}" ]]; then
@@ -382,6 +393,30 @@ wait_for_event_reason "${VALIDATION_NAMESPACE}" "${sticky_pvc}" "DetachGraceStar
 wait_for_configmap_key "${NAMESPACE}" "opennebula-csi-sticky-attachment-state" "${sticky_handle}" "absent" 180
 wait_for_event_reason "${VALIDATION_NAMESPACE}" "${sticky_pvc}" "DetachGraceExpired" 180
 
+kubectl apply -n "${VALIDATION_NAMESPACE}" -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: last-node-preference-probe
+spec:
+  restartPolicy: Never
+  containers:
+    - name: busybox
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 300"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: ${sticky_pvc}
+EOF
+preferred_last_node="$(kubectl -n "${VALIDATION_NAMESPACE}" get pod last-node-preference-probe -o jsonpath='{.metadata.annotations.storage-provider\.opennebula\.sparkaiur\.io/preferred-last-node}')"
+[[ "${preferred_last_node}" == "${LOCAL_NODE}" ]]
+kubectl -n "${VALIDATION_NAMESPACE}" get pod last-node-preference-probe -o yaml | grep -q 'preferredDuringSchedulingIgnoredDuringExecution'
+kubectl -n "${VALIDATION_NAMESPACE}" delete pod last-node-preference-probe --wait=true
+
 kubectl -n "${VALIDATION_NAMESPACE}" apply -f - <<EOF
 apiVersion: apps/v1
 kind: StatefulSet
@@ -495,6 +530,10 @@ go run ./cmd/opennebula-csi --mode=support-bundle >/tmp/opennebula-csi-support-b
 grep -q '"datastores"' /tmp/opennebula-csi-support-bundle.json
 grep -q '"nodes"' /tmp/opennebula-csi-support-bundle.json
 grep -q '"benchmarkRuns"' /tmp/opennebula-csi-support-bundle.json
+grep -q '"stickyAttachments"' /tmp/opennebula-csi-support-bundle.json
+grep -q '"hotplugQueue"' /tmp/opennebula-csi-support-bundle.json
+grep -q '"adaptiveTimeouts"' /tmp/opennebula-csi-support-bundle.json
+grep -q '"adaptiveRecommendations"' /tmp/opennebula-csi-support-bundle.json
 
 temp_sc_ds="$(kubectl get opennebuladatastores -o jsonpath='{range .items[*]}{.status.id}{"\t"}{.status.backend}{"\n"}{end}' | awk '$2=="local" {print $1; exit}')"
 if [[ -n "${temp_sc_ds}" ]]; then

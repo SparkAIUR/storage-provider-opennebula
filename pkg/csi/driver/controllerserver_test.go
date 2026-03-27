@@ -317,6 +317,8 @@ func TestPublishContextForVolumeIncludesDedicatedDeviceDiscoveryTimeout(t *testi
 	assert.Equal(t, "sdd", publishContext["volumeName"])
 	assert.Equal(t, "180", publishContext[publishContextHotplugTimeoutSeconds])
 	assert.Equal(t, "30", publishContext[publishContextDeviceDiscoveryTimeoutSeconds])
+	assert.Equal(t, "1", publishContext[publishContextOpenNebulaImageID])
+	assert.Equal(t, "onecsi-1", publishContext[publishContextDeviceSerial])
 	assert.Equal(t, "data-pvc", publishContext[paramPVCName])
 	assert.Equal(t, "default", publishContext[paramPVCNamespace])
 	assert.Equal(t, "pv-data-pvc", publishContext[paramPVName])
@@ -327,7 +329,7 @@ func TestNodeDeviceDiscoveryTimeoutCapsToHotplugTimeout(t *testing.T) {
 	cs := getTestControllerServer(mockProvider)
 	cs.driver.PluginConfig.OverrideVal(config.NodeDeviceDiscoveryTimeoutVar, 30)
 
-	timeout := cs.nodeDeviceDiscoveryTimeout(15 * time.Second)
+	timeout := cs.nodeDeviceDiscoveryTimeout("disk", 1, 15*time.Second)
 
 	assert.Equal(t, 15*time.Second, timeout)
 }
@@ -692,6 +694,8 @@ func TestControllerPublishVolume(t *testing.T) {
 			expectResponse: &csi.ControllerPublishVolumeResponse{
 				PublishContext: map[string]string{
 					"volumeName":                                "attached-volume",
+					publishContextDeviceSerial:                  "onecsi-1",
+					publishContextOpenNebulaImageID:             "1",
 					publishContextHotplugTimeoutSeconds:         "180",
 					publishContextDeviceDiscoveryTimeoutSeconds: "30",
 				},
@@ -1489,12 +1493,14 @@ func TestControllerPublishVolumeSerializesSameNodeHotplug(t *testing.T) {
 	mockProvider.On("VolumeExists", mock.Anything, "vol-2").Return(2, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", errors.New("not attached")).Twice()
-	mockProvider.On("GetVolumeInNode", mock.Anything, 2, 41).Return("", errors.New("not attached")).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 2, 41).Return("", errors.New("not attached")).Twice()
 	mockProvider.On("ResolveVolumeSizeBytes", mock.Anything, "vol-1").Return(int64(300*1024*1024*1024), nil).Maybe()
 	mockProvider.On("ResolveVolumeSizeBytes", mock.Anything, "vol-2").Return(int64(300*1024*1024*1024), nil).Maybe()
 	mockProvider.On("ComputeHotplugTimeout", int64(300*1024*1024*1024)).Return(5 * time.Minute).Maybe()
 	mockProvider.On("AttachVolume", mock.Anything, "vol-1", "node-1", false, mock.Anything).Return(nil).Once()
+	mockProvider.On("AttachVolume", mock.Anything, "vol-2", "node-1", false, mock.Anything).Return(nil).Once()
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("sdb", nil).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 2, 41).Return("sdc", nil).Once()
 
 	errs := make(chan error, 2)
 	go func() {
@@ -1509,14 +1515,17 @@ func TestControllerPublishVolumeSerializesSameNodeHotplug(t *testing.T) {
 	}()
 
 	select {
+	case <-provider.attachStarted:
+		t.Fatal("expected second same-node publish to remain queued until the first attach completed")
 	case err := <-errs:
-		require.Error(t, err)
-		assert.Equal(t, codes.Aborted, status.Code(err))
+		t.Fatalf("expected second same-node publish to remain queued, got early completion: %v", err)
 	case <-time.After(100 * time.Millisecond):
-		t.Fatal("expected second same-node publish to fail fast while node hotplug is busy")
 	}
 
 	close(provider.attachGate)
+	<-provider.attachFinished
+	assert.NoError(t, <-errs)
+	<-provider.attachStarted
 	<-provider.attachFinished
 
 	assert.NoError(t, <-errs)
@@ -1675,6 +1684,9 @@ func (m *MockOpenNebulaVolumeProviderTestify) GetCapacity(ctx context.Context, s
 }
 
 func (m *MockOpenNebulaVolumeProviderTestify) VolumeExists(ctx context.Context, volume string) (int, int, error) {
+	if !m.hasExpectation("VolumeExists") {
+		return 1, volumeSize, nil
+	}
 	args := m.Called(ctx, volume)
 	return args.Get(0).(int), args.Get(1).(int), args.Error(2)
 }
@@ -1750,6 +1762,17 @@ func (m *MockOpenNebulaVolumeProviderTestify) NodeReady(ctx context.Context, nod
 func (m *MockOpenNebulaVolumeProviderTestify) VolumeReadyWithTimeout(volumeID int) (bool, error) {
 	args := m.Called(volumeID)
 	return args.Bool(0), args.Error(1)
+}
+
+func (m *MockOpenNebulaVolumeProviderTestify) ListCurrentAttachments(ctx context.Context) ([]opennebula.ObservedAttachment, error) {
+	if !m.hasExpectation("ListCurrentAttachments") {
+		return nil, nil
+	}
+	args := m.Called(ctx)
+	if attachments := args.Get(0); attachments != nil {
+		return attachments.([]opennebula.ObservedAttachment), args.Error(1)
+	}
+	return nil, args.Error(1)
 }
 
 func (p *serializingVolumeProvider) ExpandVolume(ctx context.Context, volume string, size int64, allowDetached bool) (int64, error) {

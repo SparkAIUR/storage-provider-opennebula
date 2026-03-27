@@ -5,17 +5,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	inventoryv1alpha1 "github.com/SparkAIUR/storage-provider-opennebula/pkg/inventory/apis/storageprovider/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -38,17 +41,21 @@ type inventoryValidateResult struct {
 }
 
 type SupportBundle struct {
-	Timestamp            time.Time                                           `json:"timestamp"`
-	Config               map[string]any                                      `json:"config"`
-	FeatureGates         FeatureGates                                        `json:"featureGates"`
-	ControllerLeadership map[string]any                                      `json:"controllerLeadership"`
-	HotplugCooldowns     map[string]any                                      `json:"hotplugCooldowns"`
-	Datastores           []inventoryv1alpha1.OpenNebulaDatastore             `json:"datastores"`
-	BenchmarkRuns        []inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun `json:"benchmarkRuns"`
-	Nodes                []inventoryv1alpha1.OpenNebulaNode                  `json:"nodes"`
-	StorageClassAudit    []inventoryv1alpha1.StorageClassDetail              `json:"storageClassAudit"`
-	VolumeAttachments    []storagev1.VolumeAttachment                        `json:"volumeAttachments"`
-	Events               []corev1.Event                                      `json:"events"`
+	Timestamp               time.Time                                           `json:"timestamp"`
+	Config                  map[string]any                                      `json:"config"`
+	FeatureGates            FeatureGates                                        `json:"featureGates"`
+	ControllerLeadership    map[string]any                                      `json:"controllerLeadership"`
+	HotplugCooldowns        map[string]any                                      `json:"hotplugCooldowns"`
+	StickyAttachments       map[string]any                                      `json:"stickyAttachments"`
+	HotplugQueue            map[string]any                                      `json:"hotplugQueue"`
+	AdaptiveTimeouts        map[string]any                                      `json:"adaptiveTimeouts"`
+	AdaptiveRecommendations map[string]any                                      `json:"adaptiveRecommendations"`
+	Datastores              []inventoryv1alpha1.OpenNebulaDatastore             `json:"datastores"`
+	BenchmarkRuns           []inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun `json:"benchmarkRuns"`
+	Nodes                   []inventoryv1alpha1.OpenNebulaNode                  `json:"nodes"`
+	StorageClassAudit       []inventoryv1alpha1.StorageClassDetail              `json:"storageClassAudit"`
+	VolumeAttachments       []storagev1.VolumeAttachment                        `json:"volumeAttachments"`
+	Events                  []corev1.Event                                      `json:"events"`
 }
 
 func RunInventoryValidateCommand(ctx context.Context, cfg config.CSIPluginConfig, opts InventoryValidateOptions, w io.Writer) error {
@@ -166,6 +173,10 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 			hotplugSnapshot[node] = parsed
 		}
 	}
+	stickySnapshot := configMapJSONSnapshot(ctx, kubeClient, stickyAttachmentStateConfigMapName)
+	queueSnapshot := configMapJSONSnapshot(ctx, kubeClient, hotplugQueueStateConfigMapName)
+	adaptiveSnapshot := configMapJSONSnapshot(ctx, kubeClient, adaptiveTimeoutObservationsConfigMapName)
+	adaptiveRecommendations := adaptiveRecommendationSnapshot(cfg, adaptiveSnapshot)
 
 	bundle := SupportBundle{
 		Timestamp:    time.Now().UTC(),
@@ -179,13 +190,17 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 			"renewDeadline":  getInt(cfg, config.ControllerLeaderElectionRenewDeadlineVar),
 			"retryPeriod":    getInt(cfg, config.ControllerLeaderElectionRetryPeriodVar),
 		},
-		HotplugCooldowns:  hotplugSnapshot,
-		Datastores:        dsList.Items,
-		BenchmarkRuns:     benchmarkList.Items,
-		Nodes:             nodeList.Items,
-		StorageClassAudit: flattenStorageClassDetails(dsList.Items, scList.Items),
-		VolumeAttachments: vaList.Items,
-		Events:            eventList.Items,
+		HotplugCooldowns:        hotplugSnapshot,
+		StickyAttachments:       stickySnapshot,
+		HotplugQueue:            queueSnapshot,
+		AdaptiveTimeouts:        adaptiveSnapshot,
+		AdaptiveRecommendations: adaptiveRecommendations,
+		Datastores:              dsList.Items,
+		BenchmarkRuns:           benchmarkList.Items,
+		Nodes:                   nodeList.Items,
+		StorageClassAudit:       flattenStorageClassDetails(dsList.Items, scList.Items),
+		VolumeAttachments:       vaList.Items,
+		Events:                  eventList.Items,
 	}
 
 	enc := json.NewEncoder(w)
@@ -258,6 +273,91 @@ func benchmarkSummaryForCommand(status inventoryv1alpha1.OpenNebulaDatastoreBenc
 		return status.Message
 	}
 	return status.Phase
+}
+
+func configMapJSONSnapshot(ctx context.Context, kubeClient kubernetes.Interface, name string) map[string]any {
+	snapshot := map[string]any{}
+	cm, err := kubeClient.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return snapshot
+	}
+	for key, raw := range cm.Data {
+		var parsed any
+		if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+			snapshot[key] = raw
+			continue
+		}
+		snapshot[key] = parsed
+	}
+	return snapshot
+}
+
+func adaptiveRecommendationSnapshot(cfg config.CSIPluginConfig, observations map[string]any) map[string]any {
+	recommendations := map[string]any{}
+	trackerCfg := loadAdaptiveTimeoutConfig(cfg)
+	for source, raw := range observations {
+		rawJSON, err := json.Marshal(raw)
+		if err != nil {
+			continue
+		}
+		tracker := opennebula.NewAdaptiveTimeoutTracker(trackerCfg)
+		if err := tracker.UnmarshalJSON(rawJSON); err != nil {
+			continue
+		}
+		sourceRecommendations := map[string]opennebula.HotplugTimeoutRecommendation{}
+		for rawKey, snapshot := range tracker.Snapshot() {
+			recommendation := tracker.Recommend(snapshot.Key, adaptiveStaticFloor(cfg, snapshot.Key))
+			sourceRecommendations[rawKey] = recommendation
+		}
+		recommendations[source] = sourceRecommendations
+	}
+	return recommendations
+}
+
+func adaptiveStaticFloor(cfg config.CSIPluginConfig, key opennebula.HotplugObservationKey) time.Duration {
+	if key.Operation == "device_resolution" {
+		timeoutSeconds, ok := cfg.GetInt(config.NodeDeviceDiscoveryTimeoutVar)
+		if !ok || timeoutSeconds <= 0 {
+			timeoutSeconds = 30
+		}
+		return time.Duration(timeoutSeconds) * time.Second
+	}
+	sizeBytes := adaptiveRepresentativeSizeBytes(key.SizeBucket)
+	policy := loadHotplugTimeoutPolicy(cfg)
+	timeout := policy.BaseTimeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	if sizeBytes > 0 && policy.Per100GiB > 0 {
+		sizeGi := int64(math.Ceil(float64(sizeBytes) / float64(1024*1024*1024)))
+		increments := int64(math.Ceil(float64(sizeGi) / 100.0))
+		if increments < 1 {
+			increments = 1
+		}
+		timeout += time.Duration(increments) * policy.Per100GiB
+	}
+	if policy.MaxTimeout > 0 && timeout > policy.MaxTimeout {
+		timeout = policy.MaxTimeout
+	}
+	if timeout < policy.BaseTimeout {
+		timeout = policy.BaseTimeout
+	}
+	return timeout
+}
+
+func adaptiveRepresentativeSizeBytes(bucket string) int64 {
+	switch bucket {
+	case "le20Gi":
+		return 20 * 1024 * 1024 * 1024
+	case "gt20Gi-le100Gi":
+		return 100 * 1024 * 1024 * 1024
+	case "gt100Gi-le500Gi":
+		return 500 * 1024 * 1024 * 1024
+	case "gt500Gi":
+		return 1024 * 1024 * 1024 * 1024
+	default:
+		return 20 * 1024 * 1024 * 1024
+	}
 }
 
 func supportBundleConfig(cfg config.CSIPluginConfig) map[string]any {

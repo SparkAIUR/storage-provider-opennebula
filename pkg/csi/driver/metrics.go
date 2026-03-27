@@ -32,10 +32,19 @@ type DriverMetrics struct {
 	controllerPublishDuration    *prometheus.HistogramVec
 	nodeStageDuration            *prometheus.HistogramVec
 	nodeDeviceResolutionDuration *prometheus.HistogramVec
+	nodeDeviceResolutionTotal    *prometheus.CounterVec
+	deviceCacheTotal             *prometheus.CounterVec
 	hotplugRecoveryTotal         *prometheus.CounterVec
 	stickyDetachTotal            *prometheus.CounterVec
 	stickyDetachResidency        *prometheus.HistogramVec
 	sameNodeRestartReuseTotal    *prometheus.CounterVec
+	hotplugQueueDepth            *prometheus.GaugeVec
+	hotplugQueueWait             *prometheus.HistogramVec
+	hotplugQueueDispatchTotal    *prometheus.CounterVec
+	lastNodePreferenceTotal      *prometheus.CounterVec
+	attachmentReconcilerTotal    *prometheus.CounterVec
+	hotplugRecommendedTimeout    *prometheus.GaugeVec
+	hotplugObservationSamples    *prometheus.GaugeVec
 	datastoreFreeBytes           *prometheus.GaugeVec
 	datastoreTotalBytes          *prometheus.GaugeVec
 	buildInfo                    *prometheus.GaugeVec
@@ -102,6 +111,14 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 			Help:    "Duration of node device path resolution by backend and outcome.",
 			Buckets: prometheus.DefBuckets,
 		}, []string{"backend", "outcome"}),
+		nodeDeviceResolutionTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_node_device_resolution_total",
+			Help: "Total number of node device resolution attempts partitioned by method and outcome.",
+		}, []string{"method", "outcome"}),
+		deviceCacheTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_device_cache_total",
+			Help: "Total number of node device cache operations by operation and outcome.",
+		}, []string{"operation", "outcome"}),
 		hotplugRecoveryTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "opennebula_csi_hotplug_recovery_total",
 			Help: "Total number of hotplug recovery path decisions by operation, reason, and outcome.",
@@ -119,6 +136,35 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 			Name: "opennebula_csi_same_node_restart_reuse_total",
 			Help: "Total number of same-node restart attachment reuses by backend.",
 		}, []string{"backend"}),
+		hotplugQueueDepth: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "opennebula_csi_hotplug_queue_depth",
+			Help: "Current hotplug queue depth by priority.",
+		}, []string{"priority"}),
+		hotplugQueueWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "opennebula_csi_hotplug_queue_wait_seconds",
+			Help:    "Time spent waiting in the hotplug queue by operation and outcome.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"operation", "outcome"}),
+		hotplugQueueDispatchTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_hotplug_queue_dispatch_total",
+			Help: "Total number of hotplug queue dispatch decisions by operation, priority, and outcome.",
+		}, []string{"operation", "priority", "outcome"}),
+		lastNodePreferenceTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_last_node_preference_total",
+			Help: "Total number of soft last-node preference webhook outcomes by outcome and reason.",
+		}, []string{"outcome", "reason"}),
+		attachmentReconcilerTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_attachment_reconciler_total",
+			Help: "Total number of attachment reconciliation checks by check, action, and outcome.",
+		}, []string{"check", "action", "outcome"}),
+		hotplugRecommendedTimeout: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "opennebula_csi_hotplug_recommended_timeout_seconds",
+			Help: "Latest adaptive hotplug timeout recommendation by operation, backend, and size bucket.",
+		}, []string{"operation", "backend", "size_bucket"}),
+		hotplugObservationSamples: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "opennebula_csi_hotplug_observation_samples",
+			Help: "Number of adaptive timeout observations by operation, backend, and size bucket.",
+		}, []string{"operation", "backend", "size_bucket"}),
 		datastoreFreeBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "opennebula_csi_datastore_free_bytes",
 			Help: "Latest observed free capacity for a datastore by backend and datastore ID.",
@@ -146,10 +192,19 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 		metrics.controllerPublishDuration,
 		metrics.nodeStageDuration,
 		metrics.nodeDeviceResolutionDuration,
+		metrics.nodeDeviceResolutionTotal,
+		metrics.deviceCacheTotal,
 		metrics.hotplugRecoveryTotal,
 		metrics.stickyDetachTotal,
 		metrics.stickyDetachResidency,
 		metrics.sameNodeRestartReuseTotal,
+		metrics.hotplugQueueDepth,
+		metrics.hotplugQueueWait,
+		metrics.hotplugQueueDispatchTotal,
+		metrics.lastNodePreferenceTotal,
+		metrics.attachmentReconcilerTotal,
+		metrics.hotplugRecommendedTimeout,
+		metrics.hotplugObservationSamples,
 		metrics.datastoreFreeBytes,
 		metrics.datastoreTotalBytes,
 		metrics.buildInfo,
@@ -238,6 +293,20 @@ func (m *DriverMetrics) RecordNodeDeviceResolutionDuration(backend, outcome stri
 	m.nodeDeviceResolutionDuration.WithLabelValues(backend, outcome).Observe(duration.Seconds())
 }
 
+func (m *DriverMetrics) RecordNodeDeviceResolution(method, outcome string) {
+	if m == nil {
+		return
+	}
+	m.nodeDeviceResolutionTotal.WithLabelValues(method, outcome).Inc()
+}
+
+func (m *DriverMetrics) RecordDeviceCache(operation, outcome string) {
+	if m == nil {
+		return
+	}
+	m.deviceCacheTotal.WithLabelValues(operation, outcome).Inc()
+}
+
 func (m *DriverMetrics) RecordHotplugRecovery(operation, reason, outcome string) {
 	if m == nil {
 		return
@@ -264,6 +333,49 @@ func (m *DriverMetrics) RecordSameNodeRestartReuse(backend string) {
 		return
 	}
 	m.sameNodeRestartReuseTotal.WithLabelValues(backend).Inc()
+}
+
+func (m *DriverMetrics) SetHotplugQueueDepth(priority string, depth int) {
+	if m == nil {
+		return
+	}
+	m.hotplugQueueDepth.WithLabelValues(priority).Set(float64(depth))
+}
+
+func (m *DriverMetrics) RecordHotplugQueueWait(operation, outcome string, duration time.Duration) {
+	if m == nil {
+		return
+	}
+	m.hotplugQueueWait.WithLabelValues(operation, outcome).Observe(duration.Seconds())
+}
+
+func (m *DriverMetrics) RecordHotplugQueueDispatch(operation, priority, outcome string) {
+	if m == nil {
+		return
+	}
+	m.hotplugQueueDispatchTotal.WithLabelValues(operation, priority, outcome).Inc()
+}
+
+func (m *DriverMetrics) RecordLastNodePreference(outcome, reason string) {
+	if m == nil {
+		return
+	}
+	m.lastNodePreferenceTotal.WithLabelValues(outcome, reason).Inc()
+}
+
+func (m *DriverMetrics) RecordAttachmentReconciler(check, action, outcome string) {
+	if m == nil {
+		return
+	}
+	m.attachmentReconcilerTotal.WithLabelValues(check, action, outcome).Inc()
+}
+
+func (m *DriverMetrics) SetHotplugRecommendation(operation, backend, sizeBucket string, timeout time.Duration, samples int) {
+	if m == nil {
+		return
+	}
+	m.hotplugRecommendedTimeout.WithLabelValues(operation, backend, sizeBucket).Set(timeout.Seconds())
+	m.hotplugObservationSamples.WithLabelValues(operation, backend, sizeBucket).Set(float64(samples))
 }
 
 func (m *DriverMetrics) SetDatastoreCapacity(backend string, datastoreID int, freeBytes, totalBytes int64) {

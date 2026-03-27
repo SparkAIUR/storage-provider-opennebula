@@ -25,6 +25,7 @@ import (
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	inventorycache "github.com/SparkAIUR/storage-provider-opennebula/pkg/inventory/cache"
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
@@ -67,6 +68,8 @@ type Driver struct {
 	metrics           *DriverMetrics
 	kubeRuntime       *KubeRuntime
 	stickyAttachments *StickyAttachmentManager
+	hotplugQueue      *HotplugQueueManager
+	adaptiveTimeouts  *opennebula.AdaptiveTimeoutTracker
 
 	inventoryEligibility inventorycache.DatastoreEligibilityProvider
 }
@@ -111,6 +114,11 @@ func (d *Driver) Run(ctx context.Context) error {
 	d.stickyAttachments = NewStickyAttachmentManager(d.kubeRuntime, "")
 	if err := d.stickyAttachments.LoadFromConfigMap(ctx); err != nil {
 		klog.V(2).InfoS("Failed to load sticky attachment state", "err", err)
+	}
+	d.hotplugQueue = NewHotplugQueueManager(d.kubeRuntime, "", d.metrics, loadHotplugQueueMaxWait(d.PluginConfig), loadHotplugQueueAgeBoost(d.PluginConfig))
+	d.adaptiveTimeouts = opennebula.NewAdaptiveTimeoutTracker(loadAdaptiveTimeoutConfig(d.PluginConfig))
+	if err := d.loadAdaptiveTimeoutObservations(ctx); err != nil {
+		klog.V(2).InfoS("Failed to load adaptive timeout observations", "err", err)
 	}
 
 	if enabled, _ := d.PluginConfig.GetBool(config.InventoryControllerEnabledVar); enabled && strings.TrimSpace(d.nodeID) == "" {
@@ -181,6 +189,7 @@ func (d *Driver) Run(ctx context.Context) error {
 		d.controllerLeadership,
 	)
 	controllerServer.StartBackgroundWorkers(ctx)
+	d.maybeStartWebhookServer(ctx)
 
 	metricsServer := NewMetricsServer(d.PluginConfig, d.metrics)
 	metricsServer.Start()
@@ -239,6 +248,52 @@ func loadHotplugCooldown(cfg config.CSIPluginConfig) time.Duration {
 	return time.Duration(cooldownSeconds) * time.Second
 }
 
+func loadHotplugQueueMaxWait(cfg config.CSIPluginConfig) time.Duration {
+	seconds, ok := cfg.GetInt(config.HotplugQueueMaxWaitSecondsVar)
+	if !ok || seconds <= 0 {
+		seconds = 180
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func loadHotplugQueueAgeBoost(cfg config.CSIPluginConfig) time.Duration {
+	seconds, ok := cfg.GetInt(config.HotplugQueueAgeBoostSecondsVar)
+	if !ok || seconds <= 0 {
+		seconds = 30
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func loadAdaptiveTimeoutConfig(cfg config.CSIPluginConfig) opennebula.AdaptiveTimeoutConfig {
+	enabled, ok := cfg.GetBool(config.HotplugAdaptiveTimeoutEnabledVar)
+	if !ok {
+		enabled = true
+	}
+	minSamples, ok := cfg.GetInt(config.HotplugAdaptiveMinSamplesVar)
+	if !ok || minSamples <= 0 {
+		minSamples = 8
+	}
+	sampleWindow, ok := cfg.GetInt(config.HotplugAdaptiveSampleWindowVar)
+	if !ok || sampleWindow <= 0 {
+		sampleWindow = 20
+	}
+	multiplier, ok := cfg.GetInt(config.HotplugAdaptiveP95MultiplierPercentVar)
+	if !ok || multiplier <= 0 {
+		multiplier = 400
+	}
+	maxSeconds, ok := cfg.GetInt(config.HotplugAdaptiveMaxSecondsVar)
+	if !ok || maxSeconds <= 0 {
+		maxSeconds = 1800
+	}
+	return opennebula.AdaptiveTimeoutConfig{
+		Enabled:              enabled,
+		MinSamples:           minSamples,
+		SampleWindow:         sampleWindow,
+		P95MultiplierPercent: multiplier,
+		MaxTimeout:           time.Duration(maxSeconds) * time.Second,
+	}
+}
+
 func (d *Driver) inventoryAuthorityMode() string {
 	value, ok := d.PluginConfig.GetString(config.InventoryDatastoreAuthorityModeVar)
 	if !ok {
@@ -249,4 +304,59 @@ func (d *Driver) inventoryAuthorityMode() string {
 		return inventorycache.AuthorityModeStrict
 	}
 	return value
+}
+
+const adaptiveTimeoutObservationsConfigMapName = "opennebula-csi-hotplug-observations"
+
+func (d *Driver) adaptiveTimeoutSourceID() string {
+	if d == nil {
+		return ""
+	}
+	if strings.TrimSpace(d.nodeID) == "" {
+		return "controller"
+	}
+	return "node:" + strings.TrimSpace(d.nodeID)
+}
+
+func (d *Driver) loadAdaptiveTimeoutObservations(ctx context.Context) error {
+	if d == nil || d.kubeRuntime == nil || !d.kubeRuntime.enabled || d.adaptiveTimeouts == nil {
+		return nil
+	}
+	cm, err := d.kubeRuntime.GetConfigMap(ctx, namespaceFromServiceAccount(), adaptiveTimeoutObservationsConfigMapName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	payload, ok := cm.Data[d.adaptiveTimeoutSourceID()]
+	if !ok || strings.TrimSpace(payload) == "" {
+		return nil
+	}
+	return d.adaptiveTimeouts.UnmarshalJSON([]byte(payload))
+}
+
+func (d *Driver) persistAdaptiveTimeoutObservations(ctx context.Context) {
+	if d == nil || d.kubeRuntime == nil || !d.kubeRuntime.enabled || d.adaptiveTimeouts == nil {
+		return
+	}
+	payload, err := d.adaptiveTimeouts.MarshalJSON()
+	if err != nil {
+		klog.V(4).InfoS("Failed to marshal adaptive timeout observations", "source", d.adaptiveTimeoutSourceID(), "err", err)
+		return
+	}
+	if err := d.kubeRuntime.UpsertConfigMapData(ctx, namespaceFromServiceAccount(), adaptiveTimeoutObservationsConfigMapName, map[string]string{
+		d.adaptiveTimeoutSourceID(): string(payload),
+	}); err != nil {
+		klog.V(4).InfoS("Failed to persist adaptive timeout observations", "source", d.adaptiveTimeoutSourceID(), "err", err)
+	}
+}
+
+func (d *Driver) observeAdaptiveTimeout(ctx context.Context, operation, backend string, sizeBytes int64, duration time.Duration) {
+	if d == nil || d.adaptiveTimeouts == nil || duration <= 0 {
+		return
+	}
+	key := opennebula.NormalizeObservationKey(operation, backend, sizeBytes)
+	d.adaptiveTimeouts.Observe(key, duration)
+	d.persistAdaptiveTimeoutObservations(ctx)
 }

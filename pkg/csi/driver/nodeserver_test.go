@@ -25,6 +25,8 @@ const (
 
 func getTestNodeServer(mountPoints []string) *NodeServer {
 	pluginConfig := config.LoadConfiguration()
+	pluginConfig.OverrideVal(config.NodeDeviceRescanOnMissEnabledVar, false)
+	pluginConfig.OverrideVal(config.NodeDeviceUdevSettleTimeoutSecondsVar, 0)
 	driver := &Driver{
 		name:               DefaultDriverName,
 		version:            driverVersion,

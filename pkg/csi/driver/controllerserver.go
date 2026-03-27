@@ -81,6 +81,9 @@ func (s *ControllerServer) StartBackgroundWorkers(ctx context.Context) {
 		return
 	}
 	go s.runStickyDetachReaper(ctx)
+	if enabled, ok := s.driver.PluginConfig.GetBool(config.StuckAttachmentReconcilerEnabledVar); !ok || enabled {
+		go NewAttachmentReconciler(s).Run(ctx)
+	}
 }
 
 func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
@@ -714,100 +717,96 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.Unavailable, message)
 	}
 
-	nodeRelease, ok := s.driver.operationLocks.TryAcquire(controllerNodeLockKey(req.NodeId))
-	if !ok {
-		s.driver.metrics.RecordHotplugGuard("attach", "node_busy", "rejected")
-		s.driver.metrics.RecordHotplugRecovery("attach", "node_busy", "rejected")
-		message := fmt.Sprintf("another hotplug operation is already in progress for node %s; retry later", req.NodeId)
-		s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonHotplugNodeBusy, message)
-		return nil, status.Error(codes.Aborted, message)
+	priority := hotplugQueuePriorityNormal
+	if _, ok := s.driver.stickyAttachments.Get(req.VolumeId); ok {
+		priority = hotplugQueuePriorityCritical
 	}
-	defer nodeRelease()
+	var response *csi.ControllerPublishVolumeResponse
+	queueErr := s.withQueuedHotplug(ctx, req.NodeId, "attach", req.VolumeId, priority, func(queueCtx context.Context) error {
+		nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(req.NodeId))
+		defer nodeRelease()
 
-	release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
-	defer release()
+		release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
+		defer release()
 
-	if reused, response, reuseErr := s.reuseStickyAttachment(ctx, req, volumeID, nodeID); reused {
-		if reuseErr != nil {
-			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "internal", time.Since(started))
-			s.driver.metrics.RecordControllerPublishDuration("disk", "internal", time.Since(started))
-			return nil, reuseErr
+		if reused, reusedResponse, reuseErr := s.reuseStickyAttachment(queueCtx, req, volumeID, nodeID); reused {
+			if reuseErr != nil {
+				return reuseErr
+			}
+			s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
+			response = reusedResponse
+			return nil
 		}
-		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
-		s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
-		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
-		return response, nil
-	}
 
-	target, err = s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
-	if err == nil {
-		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
-		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
-		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext())
-		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
-		s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
-		klog.V(1).InfoS("Volume already attached to node",
-			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
-		return &csi.ControllerPublishVolumeResponse{
-			PublishContext: publishContext,
-		}, nil
-	}
-
-	// TODO: Validate VolumeCapability
-
-	params := req.GetVolumeContext()
-	sizeBytes, err := s.volumeProvider.ResolveVolumeSizeBytes(ctx, req.VolumeId)
-	if err != nil {
-		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "internal", time.Since(started))
-		klog.V(0).ErrorS(err, "Failed to resolve volume size",
-			"method", "ControllerPublishVolume", "volumeID", req.VolumeId)
-		return nil, status.Error(codes.Internal, "failed to resolve volume size")
-	}
-	hotplugTimeout := s.volumeProvider.ComputeHotplugTimeout(sizeBytes)
-	deviceDiscoveryTimeout := s.nodeDeviceDiscoveryTimeout(hotplugTimeout)
-	s.recordPVCEventFromParams(ctx, params, eventReasonHotplugTimeoutScaled, fmt.Sprintf("computed hotplug timeout %s for volume size %d bytes", hotplugTimeout, sizeBytes))
-	klog.V(3).InfoS("Attaching volume to node",
-		"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "sizeBytes", sizeBytes, "hotplugTimeout", hotplugTimeout, "deviceDiscoveryTimeout", deviceDiscoveryTimeout)
-	err = s.volumeProvider.AttachVolume(ctx, req.VolumeId, req.NodeId, immutableVolume, params)
-	if err != nil {
-		s.handleHotplugTimeout(ctx, req.NodeId, req.VolumeId, params, "attach", "disk", err)
-		switch {
-		case opennebula.IsDatastoreConfigError(err):
-			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "failed_precondition", time.Since(started))
-			return nil, status.Error(codes.FailedPrecondition, err.Error())
-		case opennebula.IsDatastoreCapacityError(err):
-			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "resource_exhausted", time.Since(started))
-			return nil, status.Error(codes.ResourceExhausted, err.Error())
+		target, err = s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
+		if err == nil {
+			s.clearStickyReuseState(queueCtx, req.VolumeId, req.NodeId, "disk")
+			s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
+			response = &csi.ControllerPublishVolumeResponse{
+				PublishContext: s.publishContextForVolume(queueCtx, req.VolumeId, target, 0, req.GetVolumeContext()),
+			}
+			return nil
 		}
-		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "internal", time.Since(started))
-		s.driver.metrics.RecordControllerPublishDuration("disk", "internal", time.Since(started))
-		klog.V(0).ErrorS(err, "Failed to attach volume",
-			"method", "ControllerPublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
-		return nil, status.Error(codes.Internal, "failed to attach volume")
-	}
 
-	klog.V(3).InfoS("Checking if volume is attached",
-		"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID)
-	target, err = s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
-	if err != nil {
-		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "internal", time.Since(started))
-		s.driver.metrics.RecordControllerPublishDuration("disk", "internal", time.Since(started))
-		klog.V(0).ErrorS(err, "Failed to get volume in node",
+		params := req.GetVolumeContext()
+		sizeBytes, err := s.volumeProvider.ResolveVolumeSizeBytes(queueCtx, req.VolumeId)
+		if err != nil {
+			return status.Error(codes.Internal, "failed to resolve volume size")
+		}
+		hotplugTimeout := s.effectiveHotplugTimeout("attach", "disk", sizeBytes, s.volumeProvider.ComputeHotplugTimeout(sizeBytes))
+		deviceDiscoveryTimeout := s.nodeDeviceDiscoveryTimeout("disk", sizeBytes, hotplugTimeout)
+		s.recordPVCEventFromParams(queueCtx, params, eventReasonHotplugQueued, fmt.Sprintf("queued attach for volume %s on node %s", req.GetVolumeId(), req.GetNodeId()))
+		s.recordPVCEventFromParams(queueCtx, params, eventReasonHotplugTimeoutScaled, fmt.Sprintf("computed hotplug timeout %s for volume size %d bytes", hotplugTimeout, sizeBytes))
+		klog.V(3).InfoS("Attaching volume to node",
+			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "sizeBytes", sizeBytes, "hotplugTimeout", hotplugTimeout, "deviceDiscoveryTimeout", deviceDiscoveryTimeout)
+		attachStarted := time.Now()
+		err = s.volumeProvider.AttachVolume(queueCtx, req.VolumeId, req.NodeId, immutableVolume, params)
+		if err != nil {
+			s.handleHotplugTimeout(queueCtx, req.NodeId, req.VolumeId, params, "attach", "disk", err)
+			switch {
+			case opennebula.IsDatastoreConfigError(err):
+				return status.Error(codes.FailedPrecondition, err.Error())
+			case opennebula.IsDatastoreCapacityError(err):
+				return status.Error(codes.ResourceExhausted, err.Error())
+			}
+			return status.Error(codes.Internal, "failed to attach volume")
+		}
+
+		klog.V(3).InfoS("Checking if volume is attached",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID)
-		return nil, status.Error(codes.Internal, "failed to get volume in node")
+		target, err = s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
+		if err != nil {
+			return status.Error(codes.Internal, "failed to get volume in node")
+		}
+		s.driver.observeAdaptiveTimeout(queueCtx, "attach", "disk", sizeBytes, time.Since(attachStarted))
+
+		s.driver.metrics.RecordAttachValidation("disk", "attach", "success")
+		s.recordPVCEventFromParams(queueCtx, req.GetVolumeContext(), eventReasonAttachValidated, fmt.Sprintf("validated and attached volume %s to node %s", req.GetVolumeId(), req.GetNodeId()))
+		klog.V(1).InfoS("Volume attached successfully",
+			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
+		s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
+		response = &csi.ControllerPublishVolumeResponse{
+			PublishContext: s.publishContextForVolume(queueCtx, req.VolumeId, target, deviceDiscoveryTimeout, req.GetVolumeContext()),
+		}
+		return nil
+	})
+	if queueErr != nil {
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "internal", time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", "internal", time.Since(started))
+		var queueTimeoutErr *HotplugQueueTimeoutError
+		if errors.As(queueErr, &queueTimeoutErr) {
+			s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonHotplugQueueTimeout, queueTimeoutErr.Error())
+			return nil, status.Error(codes.DeadlineExceeded, queueTimeoutErr.Error())
+		}
+		if status.Code(queueErr) == codes.Unknown {
+			return nil, status.Error(codes.Aborted, queueErr.Error())
+		}
+		return nil, queueErr
 	}
 
 	s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
 	s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
-	s.driver.metrics.RecordAttachValidation("disk", "attach", "success")
-	s.recordPVCEventFromParams(ctx, req.GetVolumeContext(), eventReasonAttachValidated, fmt.Sprintf("validated and attached volume %s to node %s", req.GetVolumeId(), req.GetNodeId()))
-	klog.V(1).InfoS("Volume attached successfully",
-		"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
-	s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
-
-	return &csi.ControllerPublishVolumeResponse{
-		PublishContext: s.publishContextForVolume(ctx, req.VolumeId, target, deviceDiscoveryTimeout, req.GetVolumeContext()),
-	}, nil
+	return response, nil
 }
 
 func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
@@ -871,52 +870,72 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return nil, status.Error(codes.Unavailable, message)
 	}
 
-	nodeRelease, ok := s.driver.operationLocks.TryAcquire(controllerNodeLockKey(req.NodeId))
-	if !ok {
-		s.driver.metrics.RecordHotplugGuard("detach", "node_busy", "rejected")
-		message := fmt.Sprintf("another hotplug operation is already in progress for node %s; retry later", req.NodeId)
-		return nil, status.Error(codes.Aborted, message)
-	}
-	defer nodeRelease()
+	queueErr := s.withQueuedHotplug(ctx, req.NodeId, "detach", req.VolumeId, hotplugQueuePriorityNormal, func(queueCtx context.Context) error {
+		nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(req.NodeId))
+		defer nodeRelease()
 
-	release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
-	defer release()
+		release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
+		defer release()
 
-	_, err = s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
-	if err != nil {
-		klog.V(1).InfoS("Volume does not exist in node, skipping unpublish",
-			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
-		return &csi.ControllerUnpublishVolumeResponse{}, nil
-	}
-
-	runtimeCtx, stickyState, stickyEligible, stickyReason := s.shouldDelayDetach(ctx, req)
-	if stickyEligible {
-		if err := s.startDetachGrace(ctx, runtimeCtx, stickyState); err != nil {
-			klog.V(2).InfoS("Sticky detach grace start failed, falling back to immediate detach",
-				"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId, "err", err)
-			s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonDetachGraceBypassed, fmt.Sprintf("failed to persist detach grace for volume %s: %v", req.VolumeId, err))
-			s.driver.metrics.RecordStickyDetach("bypassed", "persist_failed")
-		} else {
-			return &csi.ControllerUnpublishVolumeResponse{}, nil
+		_, err = s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
+		if err != nil {
+			klog.V(1).InfoS("Volume does not exist in node, skipping unpublish",
+				"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
+			return nil
 		}
-	} else if stickyReason != "" {
-		s.driver.metrics.RecordStickyDetach("bypassed", stickyReason)
-		s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonDetachGraceBypassed, fmt.Sprintf("detach grace bypassed for volume %s: %s", req.VolumeId, stickyReason))
+
+		runtimeCtx, stickyState, stickyEligible, stickyReason := s.shouldDelayDetach(queueCtx, req)
+		if stickyEligible {
+			if err := s.startDetachGrace(queueCtx, runtimeCtx, stickyState); err != nil {
+				klog.V(2).InfoS("Sticky detach grace start failed, falling back to immediate detach",
+					"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId, "err", err)
+				s.recordPVCWarningFromRuntimeContext(queueCtx, runtimeCtx, eventReasonDetachGraceBypassed, fmt.Sprintf("failed to persist detach grace for volume %s: %v", req.VolumeId, err))
+				s.driver.metrics.RecordStickyDetach("bypassed", "persist_failed")
+			} else {
+				return nil
+			}
+		} else if stickyReason != "" {
+			s.driver.metrics.RecordStickyDetach("bypassed", stickyReason)
+			s.recordPVCEventFromRuntimeContext(queueCtx, runtimeCtx, eventReasonDetachGraceBypassed, fmt.Sprintf("detach grace bypassed for volume %s: %s", req.VolumeId, stickyReason))
+		}
+
+		if runtimeCtx != nil {
+			s.recordPVCEventFromParams(queueCtx, map[string]string{
+				paramPVCName:      runtimeCtx.PVCName,
+				paramPVCNamespace: runtimeCtx.PVCNamespace,
+			}, eventReasonHotplugQueued, fmt.Sprintf("queued detach for volume %s on node %s", req.GetVolumeId(), req.GetNodeId()))
+		}
+		klog.V(3).InfoS("Detaching volume from node",
+			"method", "ControllerUnpublishVolume", "volumeID", volumeID, "nodeID", nodeID)
+
+		detachStarted := time.Now()
+		err = s.volumeProvider.DetachVolume(queueCtx, req.VolumeId, req.NodeId)
+		if err != nil {
+			s.handleHotplugTimeout(queueCtx, req.NodeId, req.VolumeId, nil, "detach", "disk", err)
+			klog.V(0).ErrorS(err, "Failed to detach volume",
+				"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
+			return status.Error(codes.Internal, "failed to detach volume")
+		}
+		sizeBytes, sizeErr := s.volumeProvider.ResolveVolumeSizeBytes(queueCtx, req.VolumeId)
+		if sizeErr == nil {
+			s.driver.observeAdaptiveTimeout(queueCtx, "detach", "disk", sizeBytes, time.Since(detachStarted))
+		}
+
+		klog.V(1).InfoS("Volume detached successfully",
+			"method", "ControllerUnpublishVolume", "volumeID", volumeID, "nodeID", nodeID)
+		return nil
+	})
+	if queueErr != nil {
+		var queueTimeoutErr *HotplugQueueTimeoutError
+		if errors.As(queueErr, &queueTimeoutErr) {
+			s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReasonHotplugQueueTimeout, queueTimeoutErr.Error())
+			return nil, status.Error(codes.DeadlineExceeded, queueTimeoutErr.Error())
+		}
+		if status.Code(queueErr) == codes.Unknown {
+			return nil, status.Error(codes.Aborted, queueErr.Error())
+		}
+		return nil, queueErr
 	}
-
-	klog.V(3).InfoS("Detaching volume from node",
-		"method", "ControllerUnpublishVolume", "volumeID", volumeID, "nodeID", nodeID)
-
-	err = s.volumeProvider.DetachVolume(ctx, req.VolumeId, req.NodeId)
-	if err != nil {
-		s.handleHotplugTimeout(ctx, req.NodeId, req.VolumeId, nil, "detach", "disk", err)
-		klog.V(0).ErrorS(err, "Failed to detach volume",
-			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
-		return nil, status.Error(codes.Internal, "failed to detach volume")
-	}
-
-	klog.V(1).InfoS("Volume detached successfully",
-		"method", "ControllerUnpublishVolume", "volumeID", volumeID, "nodeID", nodeID)
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
@@ -1158,6 +1177,19 @@ func (s *ControllerServer) publishContextForVolume(ctx context.Context, volumeID
 		}
 	}
 
+	opennebulaImageID, _, imageIDErr := s.volumeProvider.VolumeExists(ctx, volumeID)
+	if imageIDErr == nil && opennebulaImageID > 0 {
+		publishContext[publishContextOpenNebulaImageID] = strconv.Itoa(opennebulaImageID)
+		publishContext[publishContextDeviceSerial] = fmt.Sprintf("onecsi-%d", opennebulaImageID)
+	}
+	if s.driver != nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
+		if runtimeCtx, runtimeErr := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeID); runtimeErr == nil {
+			if backend := strings.TrimSpace(runtimeCtx.Backend); backend != "" {
+				publishContext[annotationBackend] = backend
+			}
+		}
+	}
+
 	sizeBytes, err := s.volumeProvider.ResolveVolumeSizeBytes(ctx, volumeID)
 	if err != nil {
 		klog.V(2).InfoS("Skipping dynamic hotplug timeout in publish context after size resolution failure",
@@ -1168,23 +1200,55 @@ func (s *ControllerServer) publishContextForVolume(ctx context.Context, volumeID
 	hotplugTimeout := s.volumeProvider.ComputeHotplugTimeout(sizeBytes)
 	publishContext[publishContextHotplugTimeoutSeconds] = strconv.Itoa(int(hotplugTimeout.Seconds()))
 	if deviceDiscoveryTimeout <= 0 {
-		deviceDiscoveryTimeout = s.nodeDeviceDiscoveryTimeout(hotplugTimeout)
+		deviceDiscoveryTimeout = s.nodeDeviceDiscoveryTimeout("disk", sizeBytes, hotplugTimeout)
 	}
 	publishContext[publishContextDeviceDiscoveryTimeoutSeconds] = strconv.Itoa(int(deviceDiscoveryTimeout.Seconds()))
 	return publishContext
 }
 
-func (s *ControllerServer) nodeDeviceDiscoveryTimeout(hotplugTimeout time.Duration) time.Duration {
+func (s *ControllerServer) nodeDeviceDiscoveryTimeout(backend string, sizeBytes int64, hotplugTimeout time.Duration) time.Duration {
 	timeoutSeconds, ok := s.driver.PluginConfig.GetInt(config.NodeDeviceDiscoveryTimeoutVar)
 	if !ok || timeoutSeconds <= 0 {
 		timeoutSeconds = 30
 	}
 
 	timeout := time.Duration(timeoutSeconds) * time.Second
+	if s.driver != nil && s.driver.adaptiveTimeouts != nil {
+		recommendation := s.driver.adaptiveTimeouts.Recommend(opennebula.NormalizeObservationKey("device_resolution", backend, sizeBytes), timeout)
+		s.driver.metrics.SetHotplugRecommendation("device_resolution", backend, recommendation.Key.SizeBucket, recommendation.Recommended, recommendation.SampleCount)
+		timeout = recommendation.Recommended
+	}
 	if hotplugTimeout > 0 && hotplugTimeout < timeout {
 		return hotplugTimeout
 	}
 	return timeout
+}
+
+func (s *ControllerServer) effectiveHotplugTimeout(operation, backend string, sizeBytes int64, staticFloor time.Duration) time.Duration {
+	if s == nil || s.driver == nil || s.driver.adaptiveTimeouts == nil {
+		return staticFloor
+	}
+	recommendation := s.driver.adaptiveTimeouts.Recommend(opennebula.NormalizeObservationKey(operation, backend, sizeBytes), staticFloor)
+	s.driver.metrics.SetHotplugRecommendation(operation, backend, recommendation.Key.SizeBucket, recommendation.Recommended, recommendation.SampleCount)
+	return recommendation.Recommended
+}
+
+func (s *ControllerServer) hotplugQueueEnabled() bool {
+	if s == nil || s.driver == nil || s.driver.hotplugQueue == nil {
+		return false
+	}
+	enabled, ok := s.driver.PluginConfig.GetBool(config.HotplugQueueEnabledVar)
+	if !ok {
+		return true
+	}
+	return enabled
+}
+
+func (s *ControllerServer) withQueuedHotplug(ctx context.Context, node, operation, volume string, priority HotplugQueuePriority, fn func(context.Context) error) error {
+	if !s.hotplugQueueEnabled() {
+		return fn(ctx)
+	}
+	return s.driver.hotplugQueue.Run(ctx, node, operation, volume, priority, fn)
 }
 
 func (s *ControllerServer) handleHotplugTimeout(ctx context.Context, node, volume string, params map[string]string, operation, backend string, err error) {
@@ -1490,32 +1554,35 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 	if !ok || current.ExpiresAt.After(time.Now()) {
 		return
 	}
+	_ = s.withQueuedHotplug(ctx, current.NodeID, "detach", current.VolumeID, hotplugQueuePriorityBackground, func(queueCtx context.Context) error {
+		nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(current.NodeID))
+		defer nodeRelease()
 
-	release, ok := s.driver.operationLocks.TryAcquire(controllerNodeLockKey(current.NodeID))
-	if !ok {
-		return
-	}
-	defer release()
+		volumeRelease := s.driver.operationLocks.Acquire(controllerVolumeLockKey(current.VolumeID))
+		defer volumeRelease()
 
-	volumeRelease := s.driver.operationLocks.Acquire(controllerVolumeLockKey(current.VolumeID))
-	defer volumeRelease()
+		confirmed, ok := s.driver.stickyAttachments.Get(current.VolumeID)
+		if !ok || confirmed.ExpiresAt.After(time.Now()) {
+			return nil
+		}
 
-	confirmed, ok := s.driver.stickyAttachments.Get(current.VolumeID)
-	if !ok || confirmed.ExpiresAt.After(time.Now()) {
-		return
-	}
-
-	if err := s.volumeProvider.DetachVolume(ctx, confirmed.VolumeID, confirmed.NodeID); err != nil {
-		klog.V(2).InfoS("Failed to detach sticky attachment after grace expiry", "volumeID", confirmed.VolumeID, "nodeID", confirmed.NodeID, "err", err)
-		return
-	}
-	if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
-		klog.V(2).InfoS("Failed to clear sticky attachment state after detach", "volumeID", confirmed.VolumeID, "err", err)
-		return
-	}
-	s.driver.metrics.RecordStickyDetach("expired", confirmed.Reason)
-	s.driver.metrics.RecordStickyDetachResidency("expired", time.Since(confirmed.StartedAt))
-	s.recordPVCEventFromStickyState(ctx, confirmed, eventReasonDetachGraceExpired, fmt.Sprintf("detach grace expired for volume %s on node %s; detached volume", confirmed.VolumeID, confirmed.NodeID))
+		detachStarted := time.Now()
+		if err := s.volumeProvider.DetachVolume(queueCtx, confirmed.VolumeID, confirmed.NodeID); err != nil {
+			klog.V(2).InfoS("Failed to detach sticky attachment after grace expiry", "volumeID", confirmed.VolumeID, "nodeID", confirmed.NodeID, "err", err)
+			return err
+		}
+		if sizeBytes, sizeErr := s.volumeProvider.ResolveVolumeSizeBytes(queueCtx, confirmed.VolumeID); sizeErr == nil {
+			s.driver.observeAdaptiveTimeout(queueCtx, "detach", "disk", sizeBytes, time.Since(detachStarted))
+		}
+		if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
+			klog.V(2).InfoS("Failed to clear sticky attachment state after detach", "volumeID", confirmed.VolumeID, "err", err)
+			return err
+		}
+		s.driver.metrics.RecordStickyDetach("expired", confirmed.Reason)
+		s.driver.metrics.RecordStickyDetachResidency("expired", time.Since(confirmed.StartedAt))
+		s.recordPVCEventFromStickyState(queueCtx, confirmed, eventReasonDetachGraceExpired, fmt.Sprintf("detach grace expired for volume %s on node %s; detached volume", confirmed.VolumeID, confirmed.NodeID))
+		return nil
+	})
 }
 
 func (s *ControllerServer) clearStickyReuseState(ctx context.Context, volumeID, nodeID, backend string) {
@@ -1587,6 +1654,17 @@ func (s *ControllerServer) recordPVCEventFromStickyState(ctx context.Context, st
 		paramPVCNamespace: state.PVCNamespace,
 		paramPVCName:      state.PVCName,
 	}, reason, message)
+}
+
+func (s *ControllerServer) recordPVCEventForVolumeHandle(ctx context.Context, volumeHandle, reason, message string) {
+	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
+		return
+	}
+	runtimeCtx, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeHandle)
+	if err != nil {
+		return
+	}
+	s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, reason, message)
 }
 
 func (s *ControllerServer) localRestartOptimizationEnabled() bool {
