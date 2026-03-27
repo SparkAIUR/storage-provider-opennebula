@@ -72,6 +72,7 @@ helm template "${RELEASE_NAME}" helm/opennebula-csi \
   --set "inventoryController.enabled=true" >/tmp/opennebula-csi-release-validation-render.yaml
 
 kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1 || kubectl create namespace "${NAMESPACE}"
+kubectl delete namespace "${VALIDATION_NAMESPACE}" --ignore-not-found=true --wait=true >/dev/null 2>&1 || true
 kubectl create namespace "${VALIDATION_NAMESPACE}" >/dev/null 2>&1 || true
 
 helm_args=(
@@ -118,6 +119,14 @@ echo "${node_output}" | head -1 | grep -Eq 'DISPLAY|Display'
 echo "${node_output}" | head -1 | grep -Eq 'SYSTEMDS|SystemDS'
 test -n "$(kubectl get opennebuladatastores -o jsonpath='{.items[0].metadata.name}')"
 test -n "$(kubectl get opennebulanodes -o jsonpath='{.items[0].metadata.name}')"
+
+kubectl get opennebuladatastores -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.maintenanceMode}{"\t"}{.spec.maintenanceMessage}{"\n"}{end}' \
+  | awk '$2=="true" && $3=="release validation maintenance mode" {print $1}' \
+  | while read -r stale_ds; do
+      [[ -n "${stale_ds}" ]] || continue
+      kubectl patch opennebuladatastore "${stale_ds}" --type merge -p '{"spec":{"maintenanceMode":false,"maintenanceMessage":""}}'
+      wait_for_datastore_phase "${stale_ds}" "Enabled" 120
+    done
 
 maint_ds="$(kubectl get opennebuladatastores -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.id}{"\t"}{.status.phase}{"\t"}{.status.backend}{"\n"}{end}' | awk '$3=="Enabled" && $4=="local" {print $1; exit}')"
 if [[ -n "${maint_ds}" ]]; then
