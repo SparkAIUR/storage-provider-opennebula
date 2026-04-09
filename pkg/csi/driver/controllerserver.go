@@ -56,6 +56,7 @@ var (
 
 const publishContextHotplugTimeoutSeconds = "hotplugTimeoutSeconds"
 const publishContextDeviceDiscoveryTimeoutSeconds = "deviceDiscoveryTimeoutSeconds"
+const volumeContextUUID = "uuid"
 const stickyDetachReaperInterval = 5 * time.Second
 
 type ControllerServer struct {
@@ -111,6 +112,7 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	}
 
 	rawParams := req.GetParameters()
+	requestedPVCUUID := strings.TrimSpace(rawParams[paramPVCUID])
 	selection, err := s.driver.GetDatastoreSelectionConfig(rawParams)
 	if err != nil {
 		s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
@@ -144,12 +146,13 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		},
 	}
 
+	volumeContext := buildVolumeContext(rawParams)
 	params := filterProvisioningParams(rawParams)
 	fsType := getRequestedFSType(rawParams, volumeCapabilities[0])
 	immutableVolume := accessMode.Mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
 	contentSource := req.GetVolumeContentSource()
 
-	response.Volume.VolumeContext = params
+	response.Volume.VolumeContext = volumeContext
 	if contentSource != nil {
 		response.Volume.ContentSource = contentSource
 	}
@@ -236,6 +239,8 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 				FallbackUsed:                result.FallbackUsed,
 				CompatibilityAwareSelection: s.driver.featureGates.CompatibilityAwareSelection,
 			})
+			setVolumeContextPlacement(response.Volume, result.Metadata.Backend, result.Datastore.ID, result.Datastore.Name, string(selection.Policy))
+			ensureVolumeContextUUID(response.Volume, requestedPVCUUID)
 			return response, nil
 		}
 
@@ -289,6 +294,8 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 			"selectedDatastoreID", result.Datastore.ID, "selectedDatastoreName", result.Datastore.Name,
 			"backend", result.Metadata.Backend, "mode", result.Metadata.Mode)
 
+		setVolumeContextPlacement(response.Volume, result.Metadata.Backend, result.Datastore.ID, result.Datastore.Name, string(selection.Policy))
+		ensureVolumeContextUUID(response.Volume, requestedPVCUUID)
 		return response, nil
 	}
 	backend = "disk"
@@ -332,6 +339,8 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 				FallbackUsed:                result.FallbackUsed,
 				CompatibilityAwareSelection: s.driver.featureGates.CompatibilityAwareSelection,
 			})
+			setVolumeContextPlacement(response.Volume, result.Datastore.Backend, result.Datastore.ID, result.Datastore.Name, string(selection.Policy))
+			ensureVolumeContextUUID(response.Volume, requestedPVCUUID)
 			return response, nil
 		case *csi.VolumeContentSource_Snapshot:
 			s.driver.metrics.RecordOperation("create_volume", backend, "unimplemented", time.Since(started))
@@ -348,6 +357,7 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 			s.driver.metrics.RecordOperation("create_volume", backend, "success", time.Since(started))
 			klog.V(3).InfoS("Volume already exists with the same size",
 				"method", "CreateVolume", "volumeID", volumeID, "requiredSize", requiredBytes)
+			ensureVolumeContextUUID(response.Volume, requestedPVCUUID)
 			return response, nil
 		}
 		s.driver.metrics.RecordOperation("create_volume", backend, "already_exists", time.Since(started))
@@ -405,7 +415,59 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		"selectedDatastoreID", result.Datastore.ID, "selectedDatastoreName", result.Datastore.Name,
 		"params", params)
 
+	setVolumeContextPlacement(response.Volume, result.Datastore.Backend, result.Datastore.ID, result.Datastore.Name, string(selection.Policy))
+	ensureVolumeContextUUID(response.Volume, requestedPVCUUID)
 	return response, nil
+}
+
+func buildVolumeContext(params map[string]string) map[string]string {
+	volumeContext := filterProvisioningParams(params)
+	for _, key := range []string{paramPVCUID, paramPVCName, paramPVCNamespace, paramPVName} {
+		if value := strings.TrimSpace(params[key]); value != "" {
+			volumeContext[key] = value
+		}
+	}
+	return volumeContext
+}
+
+func setVolumeContextPlacement(volume *csi.Volume, backend string, datastoreID int, datastoreName, selectionPolicy string) {
+	if volume == nil {
+		return
+	}
+	if volume.VolumeContext == nil {
+		volume.VolumeContext = make(map[string]string)
+	}
+	if normalizedBackend := strings.TrimSpace(backend); normalizedBackend != "" {
+		volume.VolumeContext[annotationBackend] = normalizedBackend
+	}
+	if datastoreID > 0 {
+		volume.VolumeContext[annotationDatastoreID] = strconv.Itoa(datastoreID)
+	}
+	if normalizedDatastoreName := strings.TrimSpace(datastoreName); normalizedDatastoreName != "" {
+		volume.VolumeContext[annotationDatastoreName] = normalizedDatastoreName
+	}
+	if normalizedSelectionPolicy := strings.TrimSpace(selectionPolicy); normalizedSelectionPolicy != "" {
+		volume.VolumeContext[annotationSelectionPolicy] = normalizedSelectionPolicy
+	}
+}
+
+func ensureVolumeContextUUID(volume *csi.Volume, requestedUUID string) {
+	if volume == nil {
+		return
+	}
+	if volume.VolumeContext == nil {
+		volume.VolumeContext = make(map[string]string)
+	}
+	if existing := strings.TrimSpace(volume.VolumeContext[volumeContextUUID]); existing != "" {
+		return
+	}
+	if requested := strings.TrimSpace(requestedUUID); requested != "" {
+		volume.VolumeContext[volumeContextUUID] = requested
+		return
+	}
+	if volumeID := strings.TrimSpace(volume.GetVolumeId()); volumeID != "" {
+		volume.VolumeContext[volumeContextUUID] = volumeID
+	}
 }
 
 func (s *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {

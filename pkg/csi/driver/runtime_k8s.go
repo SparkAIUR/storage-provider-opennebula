@@ -26,6 +26,7 @@ import (
 const (
 	paramPVCName      = "csi.storage.k8s.io/pvc/name"
 	paramPVCNamespace = "csi.storage.k8s.io/pvc/namespace"
+	paramPVCUID       = "csi.storage.k8s.io/pvc/uid"
 	paramPVName       = "csi.storage.k8s.io/pv/name"
 
 	annotationBackend           = "storage-provider.opennebula.sparkaiur.io/backend"

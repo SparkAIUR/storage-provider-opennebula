@@ -304,6 +304,67 @@ func TestCreateVolume(t *testing.T) {
 	}
 }
 
+func TestCreateVolumeAddsUUIDToVolumeContext(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	cs := getTestControllerServer(mockProvider)
+
+	mockProvider.On("VolumeExists", mock.Anything, "test-volume").Return(-1, -1, nil)
+	mockProvider.On(
+		"CreateVolume",
+		mock.Anything,
+		"test-volume",
+		int64(1024*1024*1024),
+		mock.Anything,
+		false,
+		"",
+		map[string]string{"type": "BLOCK"},
+		opennebula.DatastoreSelectionConfig{
+			Identifiers:  []string{"100"},
+			Policy:       opennebula.DatastoreSelectionPolicyLeastUsed,
+			AllowedTypes: []string{"local"},
+		},
+	).Return(&opennebula.VolumeCreateResult{Datastore: opennebula.Datastore{ID: 100, Name: "ds-100", Backend: "local"}}, nil)
+
+	resp, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name: "test-volume",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: int64(1024 * 1024 * 1024),
+		},
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessType: &csi.VolumeCapability_Mount{
+					Mount: &csi.VolumeCapability_MountVolume{},
+				},
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+		},
+		Parameters: map[string]string{
+			storageClassParamDatastoreIDs: "100",
+			"type":                        "BLOCK",
+			paramPVCUID:                   "20e586e1-da88-448a-a6ed-1c855822bc75",
+			paramPVCName:                  "data-pvc",
+			paramPVCNamespace:             "vela",
+			paramPVName:                   "pvc-20e586e1-da88-448a-a6ed-1c855822bc75",
+		},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp.GetVolume())
+	assert.Equal(t, "20e586e1-da88-448a-a6ed-1c855822bc75", resp.GetVolume().GetVolumeContext()[volumeContextUUID])
+	assert.Equal(t, "20e586e1-da88-448a-a6ed-1c855822bc75", resp.GetVolume().GetVolumeContext()[paramPVCUID])
+	assert.Equal(t, "data-pvc", resp.GetVolume().GetVolumeContext()[paramPVCName])
+	assert.Equal(t, "vela", resp.GetVolume().GetVolumeContext()[paramPVCNamespace])
+	assert.Equal(t, "pvc-20e586e1-da88-448a-a6ed-1c855822bc75", resp.GetVolume().GetVolumeContext()[paramPVName])
+	assert.Equal(t, "local", resp.GetVolume().GetVolumeContext()[annotationBackend])
+	assert.Equal(t, "100", resp.GetVolume().GetVolumeContext()[annotationDatastoreID])
+	assert.Equal(t, "ds-100", resp.GetVolume().GetVolumeContext()[annotationDatastoreName])
+	assert.Equal(t, "least-used", resp.GetVolume().GetVolumeContext()[annotationSelectionPolicy])
+	assert.Equal(t, "BLOCK", resp.GetVolume().GetVolumeContext()["type"])
+	mockProvider.AssertExpectations(t)
+}
+
 func TestPublishContextForVolumeIncludesDedicatedDeviceDiscoveryTimeout(t *testing.T) {
 	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
 	cs := getTestControllerServer(mockProvider)
@@ -390,6 +451,11 @@ func TestCreateVolumeCreatesSharedFilesystemVolumeForRWX(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Equal(t, "cephfs:eyJiYWNrZW5kIjoiY2VwaGZzIiwiZGF0YXN0b3JlSUQiOjEwMCwiZnNOYW1lIjoiY2VwaGZzIiwibW9kZSI6ImR5bmFtaWMiLCJzdWJ2b2x1bWVHcm91cCI6ImNzaSIsInN1YnBhdGgiOiIvdm9sdW1lcy9jc2ktcHZjIn0", resp.GetVolume().GetVolumeId())
+	assert.Equal(t, resp.GetVolume().GetVolumeId(), resp.GetVolume().GetVolumeContext()[volumeContextUUID])
+	assert.Equal(t, "cephfs", resp.GetVolume().GetVolumeContext()[annotationBackend])
+	assert.Equal(t, "100", resp.GetVolume().GetVolumeContext()[annotationDatastoreID])
+	assert.Equal(t, "cephfs-file", resp.GetVolume().GetVolumeContext()[annotationDatastoreName])
+	assert.Equal(t, "least-used", resp.GetVolume().GetVolumeContext()[annotationSelectionPolicy])
 	mockProvider.AssertExpectations(t)
 	sharedProvider.AssertExpectations(t)
 }
