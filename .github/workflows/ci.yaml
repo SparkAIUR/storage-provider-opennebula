@@ -25,6 +25,9 @@ jobs:
       - name: Set up Helm
         uses: azure/setup-helm@v4
 
+      - name: Validate chart/image version alignment
+        run: bash hack/validate-chart-version-alignment.sh
+
       - name: Run Go tests
         run: go test ./...
 
