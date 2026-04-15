@@ -136,6 +136,7 @@ spec:
             - "--vmodule=leaderelection=0"
             - "--csi-address=$(ADDRESS)"
             - "--timeout={{ .Values.controller.sidecarTimeoutSeconds }}s"
+            - "--leader-election"
             - "--default-fstype=ext4"
             - "--extra-create-metadata"
             {{- if .Values.metrics.enabled }}
@@ -161,6 +162,7 @@ spec:
             - "--vmodule=leaderelection=0"
             - "--csi-address=$(ADDRESS)"
             - "--timeout={{ .Values.controller.sidecarTimeoutSeconds }}s"
+            - "--leader-election"
             {{- if .Values.metrics.enabled }}
             - "--http-endpoint=:{{ .Values.metrics.ports.attacher }}"
             {{- end }}

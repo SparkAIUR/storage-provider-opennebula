@@ -114,7 +114,7 @@ func NewControllerLeadership(ctx context.Context, cfg config.CSIPluginConfig) (*
 		return nil, fmt.Errorf("failed to initialize controller leader election: %w", err)
 	}
 
-	go leaderElector.Run(ctx)
+	go runControllerLeaderElectionLoop(ctx, retryPeriod, leaderElector.Run)
 
 	return leadership, nil
 }
@@ -159,4 +159,34 @@ func configDuration(cfg config.CSIPluginConfig, key string, fallback int) time.D
 		value = fallback
 	}
 	return time.Duration(value) * time.Second
+}
+
+func runControllerLeaderElectionLoop(ctx context.Context, retryPeriod time.Duration, run func(context.Context)) {
+	if retryPeriod <= 0 {
+		retryPeriod = time.Second
+	}
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		run(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+
+		klog.InfoS("Controller leader election runner exited; restarting",
+			"retryPeriod", retryPeriod)
+
+		timer := time.NewTimer(retryPeriod)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+		}
+	}
 }
