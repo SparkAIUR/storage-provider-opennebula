@@ -308,7 +308,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
-| `image.tag` | Driver image tag. | `"v0.5.2"` | No |
+| `image.tag` | Driver image tag. | `"v0.5.3"` | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
 
 ### Driver
@@ -324,6 +324,9 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.vmHotplugTimeoutMaxSeconds` | Maximum timeout cap for a single VM hotplug operation. | `900` | No |
 | `driver.vmHotplugStuckVmCooldownSeconds` | Cooldown period applied after a VM stays stuck in hotplug through the full timeout. | `300` | No |
 | `driver.nodeDeviceDiscoveryTimeoutSeconds` | Dedicated node-side device discovery timeout. This stays shorter than the controller hotplug budget so healthy fast-path retries happen quickly. | `30` | No |
+| `driver.nodeExpand.verifyTimeoutSeconds` | Maximum time for node-side resize convergence before returning `DeadlineExceeded`. | `120` | No |
+| `driver.nodeExpand.retryIntervalSeconds` | Retry interval for node-side checks between device visibility, growfs execution, and filesystem size validation. | `2` | No |
+| `driver.nodeExpand.sizeToleranceBytes` | Allowed slack between requested and observed filesystem size to account for filesystem metadata overhead. | `134217728` | No |
 | `driver.nodeDeviceCache.enabled` | Enable node-local device cache and stable serial/by-id resolution. | `true` | No |
 | `driver.nodeDeviceCache.ttlSeconds` | Cache TTL for confirmed device paths. | `600` | No |
 | `driver.nodeDeviceCache.udevSettleTimeoutSeconds` | Timeout for `udevadm settle` before device rescan on miss. | `10` | No |

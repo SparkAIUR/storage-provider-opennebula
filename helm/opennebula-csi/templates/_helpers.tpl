@@ -89,6 +89,7 @@ Create chart name and version as used by the chart label.
 {{- $inventory := (get $root.Values "inventoryController") | default dict -}}
 {{- $inventoryResync := (get $inventory "resyncSeconds") | default dict -}}
 {{- $inventoryValidation := (get $inventory "validation") | default dict -}}
+{{- $nodeExpand := (get $root.Values.driver "nodeExpand") | default dict -}}
 {{- $nodeDeviceCache := (get $root.Values.driver "nodeDeviceCache") | default dict -}}
 {{- $hotplugQueue := (get $root.Values.driver "hotplugQueue") | default dict -}}
 {{- $localRestart := (get $root.Values.driver "localRestartOptimization") | default dict -}}
@@ -100,6 +101,9 @@ Create chart name and version as used by the chart label.
 {{- $nodeDeviceCacheTTLSeconds := (get $nodeDeviceCache "ttlSeconds") | default 600 -}}
 {{- $nodeDeviceUdevSettleTimeoutSeconds := (get $nodeDeviceCache "udevSettleTimeoutSeconds") | default 10 -}}
 {{- $nodeDeviceRescanOnMissEnabled := (get $nodeDeviceCache "rescanOnMissEnabled") | default true -}}
+{{- $nodeExpandVerifyTimeoutSeconds := (get $nodeExpand "verifyTimeoutSeconds") | default 120 -}}
+{{- $nodeExpandRetryIntervalSeconds := (get $nodeExpand "retryIntervalSeconds") | default 2 -}}
+{{- $nodeExpandSizeToleranceBytes := (get $nodeExpand "sizeToleranceBytes") | default 134217728 -}}
 {{- $hotplugQueueEnabled := (get $hotplugQueue "enabled") | default true -}}
 {{- $hotplugQueueMaxWaitSeconds := (get $hotplugQueue "maxWaitSeconds") | default 180 -}}
 {{- $hotplugQueueAgeBoostSeconds := (get $hotplugQueue "ageBoostSeconds") | default 30 -}}
@@ -170,6 +174,12 @@ Create chart name and version as used by the chart label.
   value: {{ $root.Values.driver.vmHotplugStuckVmCooldownSeconds | quote }}
 - name: ONE_CSI_NODE_DEVICE_DISCOVERY_TIMEOUT_SECONDS
   value: {{ $root.Values.driver.nodeDeviceDiscoveryTimeoutSeconds | quote }}
+- name: ONE_CSI_NODE_EXPAND_VERIFY_TIMEOUT_SECONDS
+  value: {{ $nodeExpandVerifyTimeoutSeconds | quote }}
+- name: ONE_CSI_NODE_EXPAND_RETRY_INTERVAL_SECONDS
+  value: {{ $nodeExpandRetryIntervalSeconds | quote }}
+- name: ONE_CSI_NODE_EXPAND_SIZE_TOLERANCE_BYTES
+  value: {{ $nodeExpandSizeToleranceBytes | int | quote }}
 - name: ONE_CSI_NODE_DEVICE_CACHE_ENABLED
   value: {{ $nodeDeviceCacheEnabled | quote }}
 - name: ONE_CSI_NODE_DEVICE_CACHE_TTL_SECONDS

@@ -290,6 +290,11 @@ fi
 
 kubectl -n "${VALIDATION_NAMESPACE}" patch pvc release-local-a --type merge -p '{"spec":{"resources":{"requests":{"storage":"2Gi"}}}}'
 kubectl -n "${VALIDATION_NAMESPACE}" wait --for=jsonpath='{.status.capacity.storage}'=2Gi pvc/release-local-a --timeout=10m || true
+inplace_size_bytes="$(kubectl -n "${VALIDATION_NAMESPACE}" exec release-local-smoke -- sh -c "df -B1 /data-a | tail -1 | awk '{print \\$2}'")"
+if [[ "${inplace_size_bytes}" -lt 1800000000 ]]; then
+  echo "in-place expanded filesystem size too small while pod is running: ${inplace_size_bytes}" >&2
+  exit 1
+fi
 non_opt_in_pv="$(kubectl -n "${VALIDATION_NAMESPACE}" get pvc release-local-a -o jsonpath='{.spec.volumeName}')"
 non_opt_in_handle="$(kubectl get pv "${non_opt_in_pv}" -o jsonpath='{.spec.csi.volumeHandle}')"
 kubectl -n "${VALIDATION_NAMESPACE}" delete pod release-local-smoke --wait=true
@@ -321,9 +326,9 @@ spec:
         claimName: release-local-b
 EOF
 kubectl -n "${VALIDATION_NAMESPACE}" wait --for=condition=Ready pod/release-local-smoke --timeout=10m
-size_bytes="$(kubectl -n "${VALIDATION_NAMESPACE}" exec release-local-smoke -- cat /tmp/size)"
-if [[ "${size_bytes}" -lt 1800000000 ]]; then
-  echo "expanded filesystem size too small: ${size_bytes}" >&2
+post_restart_size_bytes="$(kubectl -n "${VALIDATION_NAMESPACE}" exec release-local-smoke -- cat /tmp/size)"
+if [[ "${post_restart_size_bytes}" -lt 1800000000 ]]; then
+  echo "post-restart expanded filesystem size too small: ${post_restart_size_bytes}" >&2
   exit 1
 fi
 

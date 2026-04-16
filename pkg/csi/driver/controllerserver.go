@@ -1144,6 +1144,7 @@ func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 		s.driver.metrics.RecordOperation("controller_expand_volume", "unknown", "invalid_argument", time.Since(started))
 		return nil, status.Error(codes.InvalidArgument, "missing required capacity range")
 	}
+	requestedBytes := capacityRange.GetRequiredBytes()
 
 	if opennebula.IsSharedFilesystemVolumeID(req.GetVolumeId()) {
 		if s.sharedFilesystemProvider == nil {
@@ -1154,7 +1155,7 @@ func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 			return nil, status.Error(codes.Unimplemented, "CephFS shared filesystem expansion is disabled by feature gate")
 		}
 
-		newSize, err := s.sharedFilesystemProvider.ExpandSharedVolume(ctx, req.GetVolumeId(), capacityRange.GetRequiredBytes(), req.GetSecrets())
+		newSize, err := s.sharedFilesystemProvider.ExpandSharedVolume(ctx, req.GetVolumeId(), requestedBytes, req.GetSecrets())
 		if err != nil {
 			switch {
 			case opennebula.IsDatastoreConfigError(err):
@@ -1166,8 +1167,20 @@ func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 			}
 
 			s.driver.metrics.RecordOperation("controller_expand_volume", "cephfs", "internal", time.Since(started))
+			klog.V(0).ErrorS(err, "Failed to expand CephFS volume",
+				"method", "ControllerExpandVolume",
+				"volumeID", req.GetVolumeId(),
+				"requestedBytes", requestedBytes,
+				"returnedBytes", newSize,
+				"nodeExpansionRequired", false)
 			return nil, status.Error(codes.Internal, "failed to expand CephFS volume")
 		}
+		klog.V(1).InfoS("ControllerExpandVolume completed",
+			"method", "ControllerExpandVolume",
+			"volumeID", req.GetVolumeId(),
+			"requestedBytes", requestedBytes,
+			"returnedBytes", newSize,
+			"nodeExpansionRequired", false)
 
 		return &csi.ControllerExpandVolumeResponse{
 			CapacityBytes:         newSize,
@@ -1178,7 +1191,7 @@ func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 	release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.GetVolumeId()))
 	defer release()
 
-	newSize, err := s.volumeProvider.ExpandVolume(ctx, req.GetVolumeId(), capacityRange.GetRequiredBytes(), s.driver.featureGates.DetachedDiskExpansion)
+	newSize, err := s.volumeProvider.ExpandVolume(ctx, req.GetVolumeId(), requestedBytes, s.driver.featureGates.DetachedDiskExpansion)
 	if err != nil {
 		switch {
 		case opennebula.IsDatastoreConfigError(err):
@@ -1190,7 +1203,11 @@ func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 		}
 
 		s.driver.metrics.RecordOperation("controller_expand_volume", "disk", "internal", time.Since(started))
-		klog.V(0).ErrorS(err, "Failed to expand volume", "method", "ControllerExpandVolume", "volumeID", req.GetVolumeId())
+		klog.V(0).ErrorS(err, "Failed to expand volume",
+			"method", "ControllerExpandVolume",
+			"volumeID", req.GetVolumeId(),
+			"requestedBytes", requestedBytes,
+			"returnedBytes", newSize)
 		return nil, status.Error(codes.Internal, "failed to expand volume")
 	}
 
@@ -1200,6 +1217,12 @@ func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 			nodeExpansionRequired = false
 		}
 	}
+	klog.V(1).InfoS("ControllerExpandVolume completed",
+		"method", "ControllerExpandVolume",
+		"volumeID", req.GetVolumeId(),
+		"requestedBytes", requestedBytes,
+		"returnedBytes", newSize,
+		"nodeExpansionRequired", nodeExpansionRequired)
 
 	return &csi.ControllerExpandVolumeResponse{
 		CapacityBytes:         newSize,

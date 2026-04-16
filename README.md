@@ -337,12 +337,19 @@ The chart supports `allowVolumeExpansion`, and the controller deployment now inc
 Current behavior:
 
 - Controller expansion is supported for OpenNebula volumes that are attached to a VM.
-- Filesystem expansion is supported on the node for mounted filesystem volumes.
+- Filesystem expansion on the node for mounted filesystem volumes enforces a post-condition: `NodeExpandVolume` returns success only after the mounted filesystem reaches requested size (within a configured tolerance).
+- If device or filesystem growth does not converge before timeout, `NodeExpandVolume` returns retriable `DeadlineExceeded` with requested/device/filesystem byte context.
 - Block volumes do not require node-side filesystem expansion.
 - CephFS shared-filesystem volumes support expansion for dynamic subvolumes by default in `v0.4.3`.
 - Static CephFS paths created with `sharedFilesystemPath` are not expandable.
 - Detached-volume expansion is enabled by default in `v0.4.3` and uses image-level resize via `one.image.update`.
 - Shrinking remains unsupported for disk and CephFS paths.
+
+Node resize convergence can be tuned with:
+
+- `driver.nodeExpand.verifyTimeoutSeconds` (`ONE_CSI_NODE_EXPAND_VERIFY_TIMEOUT_SECONDS`, default `120`)
+- `driver.nodeExpand.retryIntervalSeconds` (`ONE_CSI_NODE_EXPAND_RETRY_INTERVAL_SECONDS`, default `2`)
+- `driver.nodeExpand.sizeToleranceBytes` (`ONE_CSI_NODE_EXPAND_SIZE_TOLERANCE_BYTES`, default `134217728`)
 
 ## Snapshots and clones
 
