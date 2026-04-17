@@ -15,13 +15,13 @@ This fork is focused on Omni deployments on OpenNebula and removes the old requi
 - Support `NodeGetVolumeStats`, driver-native Prometheus metrics, Kubernetes Events, and PV placement annotations.
 - Support preflight validation through the binary and an optional Helm Job.
 - Support CSI snapshots plus PVC-to-PVC clone for disk-backed OpenNebula volumes.
-- Support gated topology accessibility plus CephFS snapshot/clone and self-healing flows for staging validation.
+- Support gated topology accessibility plus CephFS snapshot/clone and self-healing flows.
 - Support `local`, OpenNebula Ceph RBD, and SparkAI CephFS datastores.
 - Keep the internal selection/provider structure ready for future `nfs` support.
 
-## Validated v0.4.3 matrix
+## Validated v0.5.3 matrix
 
-The `v0.4.3` release was validated on a live Omni + Talos + OpenNebula staging cluster with:
+The `v0.5.3` release was validated on a live Omni + Talos + OpenNebula staging cluster with:
 
 - local RWO volumes on an OpenNebula image datastore
 - Ceph RBD RWO volumes on a Ceph-backed image datastore with a Ceph system datastore
@@ -39,7 +39,7 @@ Staging-validated stable features:
 - `detachedDiskExpansion`
 - `cephfsExpansion`
 
-Features that remain gated in `v0.4.3`:
+Features that remain gated by default:
 
 - `cephfsSnapshots`
 - `cephfsClones`
@@ -51,6 +51,7 @@ Features that remain gated in `v0.4.3`:
 - Container images:
   `ghcr.io/sparkaiur/opennebula-csi:<tag>`
   `docker.io/nudevco/opennebula-csi:<tag>`
+- Latest release: `v0.5.3`
 - Helm repo: `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
 - Chart name: `opennebula-csi`
 - Source repo: `https://github.com/SparkAIUR/storage-provider-opennebula`
@@ -132,11 +133,11 @@ Important limitation:
 - hotplug attach and detach use a size-aware timeout budget derived from the actual OpenNebula disk size
 - node-side device discovery now uses a smaller dedicated timeout budget so healthy fast-path mounts fail and retry quickly instead of waiting through the full hotplug recovery budget
 - if a VM stays non-ready through the full hotplug timeout, the controller places that VM into a temporary recovery cooldown and rejects new hotplug work with retryable `Unavailable`
-- recreating a MinIO tenant with local-backed PVCs should still be treated as node-sticky; if the workload must move freely across nodes after recreation, use Ceph RBD or CephFS instead
+- recreating local-backed StatefulSet workloads should still be treated as node-sticky; if the workload must move freely across nodes after recreation, use Ceph RBD or CephFS instead
 
 ### Restart optimization for local StatefulSets
 
-The driver now supports an opt-in delayed-detach path for local-backed `ReadWriteOnce` PVCs. This is aimed at MinIO-like StatefulSet restarts where the replacement pod often lands back on the same node.
+The driver now supports an opt-in delayed-detach path for local-backed `ReadWriteOnce` PVCs. This is aimed at StatefulSet restarts where the replacement pod often lands back on the same node.
 
 Behavior:
 
@@ -172,9 +173,9 @@ Recommended workload-side guidance:
 - keep replica placement predictable with anti-affinity or topology spread when appropriate
 - do not use this as a substitute for portable storage; use Ceph RBD or CephFS if the workload must move freely across nodes
 
-### CSI fast-path improvements in `v0.4.7`
+### Additional CSI fast-path behavior
 
-`v0.4.7` extends the local restart path with a broader CSI performance and stability layer:
+The local restart path includes a broader CSI performance and stability layer:
 
 - the node plugin now prefers stable `/dev/disk/by-id` resolution using an explicit OpenNebula disk serial and keeps a short-lived in-memory device cache
 - same-node hotplug work is queued fairly instead of failing fast with `node_busy`
@@ -211,9 +212,9 @@ Routing is inferred from the requested access mode:
 
 - Databases and other single-writer application data should still use the OpenNebula `IMAGE` datastore path
 - Shared caches, model stores, and other multi-node RWX workloads can now use the CephFS shared-filesystem path
-- `ReadOnlyMany` remains on the disk path in `v0.4.3`
-- CephFS expansion is stable in `v0.4.3`
-- CephFS snapshots and clones remain implemented behind feature gates and stay alpha-off by default in `v0.4.3`
+- `ReadOnlyMany` remains on the disk path
+- CephFS expansion is enabled by default
+- CephFS snapshots and clones remain implemented behind feature gates and stay alpha-off by default
 
 ## Ceph RBD support
 
@@ -340,9 +341,9 @@ Current behavior:
 - Filesystem expansion on the node for mounted filesystem volumes enforces a post-condition: `NodeExpandVolume` returns success only after the mounted filesystem reaches requested size (within a configured tolerance).
 - If device or filesystem growth does not converge before timeout, `NodeExpandVolume` returns retriable `DeadlineExceeded` with requested/device/filesystem byte context.
 - Block volumes do not require node-side filesystem expansion.
-- CephFS shared-filesystem volumes support expansion for dynamic subvolumes by default in `v0.4.3`.
+- CephFS shared-filesystem volumes support expansion for dynamic subvolumes by default.
 - Static CephFS paths created with `sharedFilesystemPath` are not expandable.
-- Detached-volume expansion is enabled by default in `v0.4.3` and uses image-level resize via `one.image.update`.
+- Detached-volume expansion is enabled by default and uses image-level resize via `one.image.update`.
 - Shrinking remains unsupported for disk and CephFS paths.
 
 Node resize convergence can be tuned with:
@@ -353,7 +354,7 @@ Node resize convergence can be tuned with:
 
 ## Snapshots and clones
 
-Stable disk-path data-management features in `v0.4.3`:
+Stable disk-path data-management features:
 
 - CSI `CreateSnapshot`, `DeleteSnapshot`, and `ListSnapshots` for OpenNebula image-backed volumes
 - PVC-to-PVC clone through CSI `VolumeContentSource.volume`
@@ -664,7 +665,7 @@ For CephFS-backed Omni deployments:
 
 ## Staging validation gate
 
-`v0.4.3` was validated on a live Omni + Talos + OpenNebula staging cluster before release. The repo includes:
+The repo includes a staging validation gate used on a live Omni + Talos + OpenNebula cluster before release:
 
 - a local validation script: `hack/validate-staging-cephfs.sh`
 - a manual GitHub Actions workflow: `.github/workflows/staging-cephfs-validation.yaml`
@@ -739,9 +740,9 @@ At minimum, release validation should include:
 - `go test ./...`
 - `helm template opennebula-csi ./helm/opennebula-csi ...`
 - `bash hack/validate-release-lab.sh`
-- a live lab validation for the feature or hotfix being released, including local attach/mount, local expansion, inventory CRDs, and the CNPG-style bootstrap/init smoke path when touching fast-path mount behavior
+- a live lab validation for the feature or hotfix being released, including local attach/mount, local expansion, inventory CRDs, and workload bootstrap/init smoke checks when touching fast-path mount behavior
 
-Push a semantic tag such as `v0.1.0` only after that validation to trigger the release workflow.
+Push a semantic tag such as `v0.5.3` only after that validation to trigger the release workflow.
 
 The workflow will:
 
@@ -766,7 +767,7 @@ When the inventory controller is enabled, `kubectl get opennebuladatastores` is 
 - `Capacity` is rendered as `{available} / {total} ({usedPercent}%)`
 - `Metrics` shows a compact fio summary when validation succeeded, otherwise `-`
 
-Validation remains informational only in this release and does not by itself make a datastore unavailable.
+Validation remains informational only and does not by itself make a datastore unavailable.
 
 ## Inventory Operator Controls
 
