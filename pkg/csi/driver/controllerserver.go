@@ -126,6 +126,14 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
+	candidates, err := s.volumeProvider.ResolveProvisioningDatastores(ctx, selection)
+	if err != nil {
+		s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
+		s.recordPVCWarningFromParams(ctx, rawParams, eventReasonDatastoreRejected, err.Error())
+		klog.V(0).ErrorS(err, "Invalid datastore candidates", "method", "CreateVolume", "params", rawParams)
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
 	accessMode := volumeCapabilities[0].GetAccessMode()
 	if accessMode == nil {
 		s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
@@ -133,7 +141,7 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		return nil, status.Error(codes.InvalidArgument, "missing access mode")
 	}
 
-	volumeAccessModel, err := resolveVolumeAccessModel(volumeCapabilities[0], selection.AllowedTypes)
+	volumeAccessModel, err := resolveVolumeAccessModel(volumeCapabilities[0], selection.AllowedTypes, rawParams, candidates)
 	if err != nil {
 		s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
 		return nil, status.Error(codes.InvalidArgument, err.Error())

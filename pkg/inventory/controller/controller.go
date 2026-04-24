@@ -39,23 +39,24 @@ import (
 )
 
 const (
-	validationNamespace                                = "kube-system"
-	validationPVCPrefix                                = "one-ds-validate-pvc-"
-	validationJobPrefix                                = "one-ds-validate-job-"
-	benchmarkPVCPrefix                                 = "one-ds-bench-pvc-"
-	benchmarkJobPrefix                                 = "one-ds-bench-job-"
-	eventReasonValidationTriggered                     = "ValidationTriggered"
-	eventReasonValidationSucceeded                     = "ValidationSucceeded"
-	eventReasonValidationFailed                        = "ValidationFailed"
-	eventReasonProvisioningDisabled                    = "ProvisioningDisabled"
-	eventReasonDiscoveryMismatch                       = "DiscoveryMismatch"
-	eventReasonInventoryVMNotFound                     = "VMNotFound"
-	eventReasonInventoryNodeNotFound                   = "NodeNotFound"
-	annotationDatastoreID                              = "storage-provider.opennebula.sparkaiur.io/datastore-id"
-	topologySystemDSLabel                              = "topology.opennebula.sparkaiur.io/system-ds"
-	hotplugStateConfigMapName                          = "opennebula-csi-hotplug-state"
-	sharedBackendAttr                                  = "SPARKAI_CSI_SHARE_BACKEND"
-	defaultValidationImagePullPolicy corev1.PullPolicy = corev1.PullIfNotPresent
+	validationNamespace                                      = "kube-system"
+	validationPVCPrefix                                      = "one-ds-validate-pvc-"
+	validationJobPrefix                                      = "one-ds-validate-job-"
+	benchmarkPVCPrefix                                       = "one-ds-bench-pvc-"
+	benchmarkJobPrefix                                       = "one-ds-bench-job-"
+	defaultValidationActiveDeadlineSeconds int64             = 900
+	eventReasonValidationTriggered                           = "ValidationTriggered"
+	eventReasonValidationSucceeded                           = "ValidationSucceeded"
+	eventReasonValidationFailed                              = "ValidationFailed"
+	eventReasonProvisioningDisabled                          = "ProvisioningDisabled"
+	eventReasonDiscoveryMismatch                             = "DiscoveryMismatch"
+	eventReasonInventoryVMNotFound                           = "VMNotFound"
+	eventReasonInventoryNodeNotFound                         = "NodeNotFound"
+	annotationDatastoreID                                    = "storage-provider.opennebula.sparkaiur.io/datastore-id"
+	topologySystemDSLabel                                    = "topology.opennebula.sparkaiur.io/system-ds"
+	hotplugStateConfigMapName                                = "opennebula-csi-hotplug-state"
+	sharedBackendAttr                                        = "SPARKAI_CSI_SHARE_BACKEND"
+	defaultValidationImagePullPolicy       corev1.PullPolicy = corev1.PullIfNotPresent
 )
 
 type latestBenchmarkResult struct {
@@ -704,13 +705,40 @@ func (s *Syncer) reconcileBenchmarkRuns(ctx context.Context, discovered map[int]
 		}
 
 		resolved := s.resolveBenchmarkRun(item, ds, scs)
-		jobName := validationResourceName(benchmarkJobPrefix, resolved.Name, strconv.Itoa(resolved.Spec.DatastoreID))
-		pvcName := validationResourceName(benchmarkPVCPrefix, resolved.Name, strconv.Itoa(resolved.Spec.DatastoreID))
+		jobName := benchmarkResourceName(benchmarkJobPrefix, resolved)
+		pvcName := benchmarkResourceName(benchmarkPVCPrefix, resolved)
+
+		if isTerminalValidationPhase(current.Status.Phase) {
+			if current.Status.ObservedGeneration == resolved.Generation {
+				_ = s.cleanupValidationResources(ctx, jobName, pvcName)
+				continue
+			}
+			_ = s.cleanupValidationResources(ctx, current.Status.JobName, current.Status.PVCName)
+		}
 
 		pvc := &corev1.PersistentVolumeClaim{}
 		err := s.client.Get(ctx, types.NamespacedName{Namespace: s.namespace, Name: pvcName}, pvc)
 		if err != nil && apierrors.IsNotFound(err) {
-			if err := s.client.Create(ctx, s.buildBenchmarkPVC(&resolved, pvcName)); err != nil {
+			pvcObj, buildErr := s.buildBenchmarkPVC(&resolved, ds, pvcName)
+			if buildErr != nil {
+				now := metav1.Now()
+				current.Status = inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunStatus{
+					ObservedGeneration: resolved.Generation,
+					Phase:              inventoryv1alpha1.ValidationPhaseFailed,
+					DatastoreID:        resolved.Spec.DatastoreID,
+					DatastoreName:      ds.Name,
+					Backend:            normalizeDatastoreBackend(ds),
+					JobName:            jobName,
+					PVCName:            pvcName,
+					CompletedAt:        &now,
+					Message:            buildErr.Error(),
+				}
+				if err := s.client.Status().Patch(ctx, current, ctrlclient.MergeFrom(item.DeepCopy())); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := s.client.Create(ctx, pvcObj); err != nil {
 				return err
 			}
 		} else if err != nil {
@@ -774,7 +802,7 @@ func (s *Syncer) reconcileBenchmarkRuns(ctx context.Context, discovered map[int]
 			if err := s.client.Status().Patch(ctx, current, ctrlclient.MergeFrom(item.DeepCopy())); err != nil {
 				return err
 			}
-			_ = s.client.Delete(ctx, pvc)
+			_ = s.cleanupValidationResources(ctx, jobName, pvcName)
 			continue
 		}
 		if job.Status.Failed > 0 {
@@ -786,7 +814,7 @@ func (s *Syncer) reconcileBenchmarkRuns(ctx context.Context, discovered map[int]
 			if err := s.client.Status().Patch(ctx, current, ctrlclient.MergeFrom(item.DeepCopy())); err != nil {
 				return err
 			}
-			_ = s.client.Delete(ctx, pvc)
+			_ = s.cleanupValidationResources(ctx, jobName, pvcName)
 			continue
 		}
 
@@ -839,13 +867,18 @@ func (s *Syncer) resolveBenchmarkRun(item inventoryv1alpha1.OpenNebulaDatastoreB
 	if strings.TrimSpace(resolved.Spec.Size) == "" {
 		resolved.Spec.Size = "1Gi"
 	}
+	if len(resolved.Spec.AccessModes) == 0 {
+		resolved.Spec.AccessModes = defaultPVCAccessModes(normalizeDatastoreBackend(ds))
+	}
 	if strings.TrimSpace(resolved.Spec.Image) == "" {
 		resolved.Spec.Image = s.defaultValidationImage
 	}
 	if resolved.Spec.ImagePullPolicy == "" {
 		resolved.Spec.ImagePullPolicy = defaultValidationImagePullPolicy
 	}
-	_ = ds
+	if resolved.Spec.ActiveDeadlineSeconds == nil {
+		resolved.Spec.ActiveDeadlineSeconds = int64Ptr(defaultValidationActiveDeadlineSeconds)
+	}
 	return resolved
 }
 
@@ -885,10 +918,23 @@ func (s *Syncer) reconcileValidation(ctx context.Context, ds *inventoryv1alpha1.
 
 	jobName := validationResourceName(validationJobPrefix, ds.Name, ds.Spec.Validation.RunNonce)
 	pvcName := validationResourceName(validationPVCPrefix, ds.Name, ds.Spec.Validation.RunNonce)
+	if ds.Spec.Validation.RunNonce == ds.Status.Validation.LastRunNonce && isTerminalValidationPhase(ds.Status.Validation.Phase) {
+		return s.cleanupValidationResources(ctx, jobName, pvcName)
+	}
 	pvc := &corev1.PersistentVolumeClaim{}
 	err := s.client.Get(ctx, types.NamespacedName{Namespace: s.namespace, Name: pvcName}, pvc)
 	if err != nil && apierrors.IsNotFound(err) {
-		if err := s.client.Create(ctx, s.buildValidationPVC(ds, pvcName)); err != nil {
+		pvcObj, buildErr := s.buildValidationPVC(ds, pvcName)
+		if buildErr != nil {
+			now := metav1.Now()
+			ds.Status.Validation.LastCompletedTime = &now
+			ds.Status.Validation.LastRunNonce = ds.Spec.Validation.RunNonce
+			ds.Status.Validation.Phase = inventoryv1alpha1.ValidationPhaseFailed
+			ds.Status.Validation.JobName = jobName
+			ds.Status.Validation.Message = buildErr.Error()
+			return s.client.Status().Update(ctx, ds)
+		}
+		if err := s.client.Create(ctx, pvcObj); err != nil {
 			return err
 		}
 	} else if err != nil {
@@ -924,7 +970,7 @@ func (s *Syncer) reconcileValidation(ctx context.Context, ds *inventoryv1alpha1.
 		if err := s.client.Status().Update(ctx, ds); err != nil {
 			return err
 		}
-		return s.client.Delete(ctx, pvc)
+		return s.cleanupValidationResources(ctx, jobName, pvcName)
 	}
 	if job.Status.Failed > 0 {
 		now := metav1.Now()
@@ -935,7 +981,7 @@ func (s *Syncer) reconcileValidation(ctx context.Context, ds *inventoryv1alpha1.
 		if err := s.client.Status().Update(ctx, ds); err != nil {
 			return err
 		}
-		return s.client.Delete(ctx, pvc)
+		return s.cleanupValidationResources(ctx, jobName, pvcName)
 	}
 
 	ds.Status.Validation.Phase = inventoryv1alpha1.ValidationPhaseRunning
@@ -943,10 +989,14 @@ func (s *Syncer) reconcileValidation(ctx context.Context, ds *inventoryv1alpha1.
 	return s.client.Status().Update(ctx, ds)
 }
 
-func (s *Syncer) buildValidationPVC(ds *inventoryv1alpha1.OpenNebulaDatastore, pvcName string) *corev1.PersistentVolumeClaim {
+func (s *Syncer) buildValidationPVC(ds *inventoryv1alpha1.OpenNebulaDatastore, pvcName string) (*corev1.PersistentVolumeClaim, error) {
 	size := ds.Spec.Validation.JobTemplate.Size
 	if strings.TrimSpace(size) == "" {
 		size = "4Gi"
+	}
+	accessModes, err := normalizePVCAccessModes(ds.Spec.Validation.JobTemplate.AccessModes, validationBackend(ds))
+	if err != nil {
+		return nil, err
 	}
 	return &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
@@ -954,7 +1004,7 @@ func (s *Syncer) buildValidationPVC(ds *inventoryv1alpha1.OpenNebulaDatastore, p
 			Namespace: s.namespace,
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			AccessModes:      accessModes,
 			StorageClassName: stringPtr(ds.Spec.Validation.JobTemplate.StorageClassName),
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
@@ -962,13 +1012,17 @@ func (s *Syncer) buildValidationPVC(ds *inventoryv1alpha1.OpenNebulaDatastore, p
 				},
 			},
 		},
-	}
+	}, nil
 }
 
-func (s *Syncer) buildBenchmarkPVC(run *inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun, pvcName string) *corev1.PersistentVolumeClaim {
+func (s *Syncer) buildBenchmarkPVC(run *inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun, ds datastoreSchema.Datastore, pvcName string) (*corev1.PersistentVolumeClaim, error) {
 	size := run.Spec.Size
 	if strings.TrimSpace(size) == "" {
 		size = "1Gi"
+	}
+	accessModes, err := normalizePVCAccessModes(run.Spec.AccessModes, normalizeDatastoreBackend(ds))
+	if err != nil {
+		return nil, err
 	}
 	return &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
@@ -976,7 +1030,7 @@ func (s *Syncer) buildBenchmarkPVC(run *inventoryv1alpha1.OpenNebulaDatastoreBen
 			Namespace: s.namespace,
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			AccessModes:      accessModes,
 			StorageClassName: stringPtr(run.Spec.StorageClassName),
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
@@ -984,7 +1038,7 @@ func (s *Syncer) buildBenchmarkPVC(run *inventoryv1alpha1.OpenNebulaDatastoreBen
 				},
 			},
 		},
-	}
+	}, nil
 }
 
 func (s *Syncer) buildValidationJob(ds *inventoryv1alpha1.OpenNebulaDatastore, jobName, pvcName string) *batchv1.Job {
@@ -1005,6 +1059,7 @@ func (s *Syncer) buildValidationJob(ds *inventoryv1alpha1.OpenNebulaDatastore, j
 			Namespace: s.namespace,
 		},
 		Spec: batchv1.JobSpec{
+			ActiveDeadlineSeconds:   validationActiveDeadlineSeconds(ds.Spec.Validation.JobTemplate.ActiveDeadlineSeconds),
 			TTLSecondsAfterFinished: ttl,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
@@ -1055,6 +1110,7 @@ func (s *Syncer) buildBenchmarkJob(run *inventoryv1alpha1.OpenNebulaDatastoreBen
 			Namespace: s.namespace,
 		},
 		Spec: batchv1.JobSpec{
+			ActiveDeadlineSeconds:   validationActiveDeadlineSeconds(run.Spec.ActiveDeadlineSeconds),
 			TTLSecondsAfterFinished: ttl,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
@@ -1168,6 +1224,90 @@ func buildValidationCommand(args []string) string {
 		args = defaultArgs
 	}
 	return "set -eu; if ! command -v fio >/dev/null 2>&1; then if command -v apk >/dev/null 2>&1; then apk add --no-cache fio >/dev/null; else echo 'fio binary is unavailable and apk is not installed' >&2; exit 1; fi; fi; fio " + strings.Join(args, " ") + " --output-format=json"
+}
+
+func isTerminalValidationPhase(phase string) bool {
+	switch phase {
+	case inventoryv1alpha1.ValidationPhaseSucceeded, inventoryv1alpha1.ValidationPhaseFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func cleanupValidationResource(ctx context.Context, client ctrlclient.Client, obj ctrlclient.Object) error {
+	if err := client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+func (s *Syncer) cleanupValidationResources(ctx context.Context, jobName, pvcName string) error {
+	if err := cleanupValidationResource(ctx, s.client, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: s.namespace}}); err != nil {
+		return err
+	}
+	if err := cleanupValidationResource(ctx, s.client, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: s.namespace}}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validationBackend(ds *inventoryv1alpha1.OpenNebulaDatastore) string {
+	if ds == nil {
+		return ""
+	}
+	if trimmed := strings.TrimSpace(ds.Status.Backend); trimmed != "" {
+		return trimmed
+	}
+	return strings.TrimSpace(ds.Spec.Discovery.ExpectedBackend)
+}
+
+func defaultPVCAccessModes(backend string) []corev1.PersistentVolumeAccessMode {
+	if strings.EqualFold(strings.TrimSpace(backend), "cephfs") {
+		return []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+	}
+	return []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+}
+
+func normalizePVCAccessModes(modes []corev1.PersistentVolumeAccessMode, backend string) ([]corev1.PersistentVolumeAccessMode, error) {
+	if len(modes) == 0 {
+		return append([]corev1.PersistentVolumeAccessMode(nil), defaultPVCAccessModes(backend)...), nil
+	}
+
+	allowed := map[corev1.PersistentVolumeAccessMode]struct{}{
+		corev1.ReadWriteOnce: {},
+		corev1.ReadOnlyMany:  {},
+		corev1.ReadWriteMany: {},
+	}
+	normalized := make([]corev1.PersistentVolumeAccessMode, 0, len(modes))
+	seen := make(map[corev1.PersistentVolumeAccessMode]struct{}, len(modes))
+	for _, mode := range modes {
+		trimmed := corev1.PersistentVolumeAccessMode(strings.TrimSpace(string(mode)))
+		if _, ok := allowed[trimmed]; !ok {
+			return nil, fmt.Errorf("unsupported PVC access mode %q; allowed values are ReadWriteOnce, ReadOnlyMany, ReadWriteMany", mode)
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		normalized = append(normalized, trimmed)
+	}
+	return normalized, nil
+}
+
+func validationActiveDeadlineSeconds(value *int64) *int64 {
+	if value != nil {
+		return value
+	}
+	return int64Ptr(defaultValidationActiveDeadlineSeconds)
+}
+
+func benchmarkResourceName(prefix string, run inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun) string {
+	return validationResourceName(prefix, run.Name, fmt.Sprintf("%d-gen-%d", run.Spec.DatastoreID, run.Generation))
+}
+
+func int64Ptr(value int64) *int64 {
+	return &value
 }
 
 func datastoreObjectName(id int) string {
@@ -1323,7 +1463,7 @@ func benchmarkSummaryDisplay(status inventoryv1alpha1.OpenNebulaDatastoreBenchma
 }
 
 func validationEligible(ds inventoryv1alpha1.OpenNebulaDatastore, backend string) bool {
-	return ds.Spec.Validation.Mode == inventoryv1alpha1.DatastoreValidationModeManual && backend != "cephfs"
+	return ds.Spec.Validation.Mode == inventoryv1alpha1.DatastoreValidationModeManual
 }
 
 func validationLastOutcome(status inventoryv1alpha1.OpenNebulaDatastoreValidationStatus) string {
@@ -1588,8 +1728,16 @@ func buildStorageClassDetails(scs []storagev1.StorageClass, ds opennebula.Datast
 		if !allowExpansion {
 			detail.Warnings = append(detail.Warnings, "volume expansion is disabled")
 		}
-		if ds.Backend == "cephfs" && (strings.TrimSpace(sc.Parameters["provisionerSecretName"]) == "" || strings.TrimSpace(sc.Parameters["provisionerSecretNamespace"]) == "") {
-			detail.Warnings = append(detail.Warnings, "cephfs provisioner secret references are incomplete")
+		if ds.Backend == "cephfs" {
+			if !hasCompleteCSISecretRef(sc.Parameters, "csi.storage.k8s.io/provisioner-secret-name", "csi.storage.k8s.io/provisioner-secret-namespace") {
+				detail.Warnings = append(detail.Warnings, "cephfs provisioner secret references are incomplete")
+			}
+			if !hasCompleteCSISecretRef(sc.Parameters, "csi.storage.k8s.io/node-stage-secret-name", "csi.storage.k8s.io/node-stage-secret-namespace") {
+				detail.Warnings = append(detail.Warnings, "cephfs node-stage secret references are incomplete")
+			}
+			if allowExpansion && !hasCompleteCSISecretRef(sc.Parameters, "csi.storage.k8s.io/controller-expand-secret-name", "csi.storage.k8s.io/controller-expand-secret-namespace") {
+				detail.Warnings = append(detail.Warnings, "cephfs controller-expand secret references are incomplete")
+			}
 		}
 		if !detail.BackendCompatible {
 			detail.Warnings = append(detail.Warnings, "storage class backend does not match datastore backend")
@@ -1603,17 +1751,45 @@ func buildStorageClassDetails(scs []storagev1.StorageClass, ds opennebula.Datast
 }
 
 func storageClassBackendCompatible(sc storagev1.StorageClass, backend string) bool {
+	driver := strings.ToLower(strings.TrimSpace(sc.Parameters["driver"]))
 	switch backend {
 	case "cephfs":
-		if strings.EqualFold(sc.Parameters["driver"], "cephfs") || strings.Contains(strings.ToLower(sc.Provisioner), "cephfs") {
+		if driver == "ceph" || driver == "rbd" {
+			return false
+		}
+		if driver == "cephfs" || storageClassSignalsCephFS(sc) {
 			return true
 		}
+		return true
 	case "ceph-rbd":
-		if strings.EqualFold(sc.Parameters["driver"], "ceph") || strings.EqualFold(sc.Parameters["driver"], "rbd") {
+		if driver == "cephfs" || storageClassSignalsCephFS(sc) {
+			return false
+		}
+		if driver == "ceph" || driver == "rbd" {
 			return true
 		}
+		return true
+	case "local":
+		if driver == "cephfs" || storageClassSignalsCephFS(sc) {
+			return false
+		}
+		return true
 	}
 	return true
+}
+
+func storageClassSignalsCephFS(sc storagev1.StorageClass) bool {
+	if strings.TrimSpace(sc.Parameters["sharedFilesystemPath"]) != "" || strings.TrimSpace(sc.Parameters["sharedFilesystemSubvolumeGroup"]) != "" {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(sc.Parameters["driver"]), "cephfs") {
+		return true
+	}
+	return false
+}
+
+func hasCompleteCSISecretRef(params map[string]string, nameKey, namespaceKey string) bool {
+	return strings.TrimSpace(params[nameKey]) != "" && strings.TrimSpace(params[namespaceKey]) != ""
 }
 
 func nodeDisplayState(enabled, inCooldown, ready bool) string {

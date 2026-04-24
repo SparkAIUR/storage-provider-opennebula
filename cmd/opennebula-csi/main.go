@@ -27,6 +27,7 @@ import (
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/driver"
 	inventorycontroller "github.com/SparkAIUR/storage-provider-opennebula/pkg/inventory/controller"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
 	"k8s.io/utils/exec"
@@ -34,21 +35,22 @@ import (
 )
 
 var (
-	driverName                  = flag.String("drivername", driver.DefaultDriverName, "CSI driver name")
-	pluginEndpoint              = flag.String("endpoint", driver.DefaultGRPCServerEndpoint, "CSI plugin endpoint")
-	nodeID                      = flag.String("nodeid", "", "Node ID")
-	maxVolumesPerNode           = flag.Uint64("maxVolumesPerNode", 255, "Maximum number of volumes that can be attached to a node")
-	mode                        = flag.String("mode", "driver", "Execution mode: driver, preflight, or inventory-controller")
-	output                      = flag.String("output", "text", "Output format for preflight mode: text or json")
-	preflightDatastores         = flag.String("preflight-datastores", "", "Comma-separated datastore identifiers to validate during preflight")
-	preflightNodeStageSecrets   = flag.String("preflight-node-stage-secrets", "", "Comma-separated namespace/name secret references for CephFS node-stage validation")
-	preflightProvisionerSecrets = flag.String("preflight-provisioner-secrets", "", "Comma-separated namespace/name secret references for CephFS provisioner validation")
-	requireSnapshotCRDs         = flag.Bool("require-snapshot-crds", false, "Require snapshot.storage.k8s.io CRDs during preflight")
-	requireServiceMonitorCRDs   = flag.Bool("require-servicemonitor-crds", false, "Require monitoring.coreos.com ServiceMonitor CRD during preflight")
-	inventoryValidateDatastore  = flag.Int("datastore-id", 0, "OpenNebula datastore ID for inventory-validate mode")
-	inventoryValidateSC         = flag.String("storage-class", "", "StorageClass to use for inventory-validate mode")
-	inventoryValidateSize       = flag.String("size", "", "Validation PVC size for inventory-validate mode")
-	inventoryValidateFioArgs    = flag.String("fio-args", "", "Comma-separated fio args for inventory-validate mode")
+	driverName                   = flag.String("drivername", driver.DefaultDriverName, "CSI driver name")
+	pluginEndpoint               = flag.String("endpoint", driver.DefaultGRPCServerEndpoint, "CSI plugin endpoint")
+	nodeID                       = flag.String("nodeid", "", "Node ID")
+	maxVolumesPerNode            = flag.Uint64("maxVolumesPerNode", 255, "Maximum number of volumes that can be attached to a node")
+	mode                         = flag.String("mode", "driver", "Execution mode: driver, preflight, or inventory-controller")
+	output                       = flag.String("output", "text", "Output format for preflight mode: text or json")
+	preflightDatastores          = flag.String("preflight-datastores", "", "Comma-separated datastore identifiers to validate during preflight")
+	preflightNodeStageSecrets    = flag.String("preflight-node-stage-secrets", "", "Comma-separated namespace/name secret references for CephFS node-stage validation")
+	preflightProvisionerSecrets  = flag.String("preflight-provisioner-secrets", "", "Comma-separated namespace/name secret references for CephFS provisioner validation")
+	requireSnapshotCRDs          = flag.Bool("require-snapshot-crds", false, "Require snapshot.storage.k8s.io CRDs during preflight")
+	requireServiceMonitorCRDs    = flag.Bool("require-servicemonitor-crds", false, "Require monitoring.coreos.com ServiceMonitor CRD during preflight")
+	inventoryValidateDatastore   = flag.Int("datastore-id", 0, "OpenNebula datastore ID for inventory-validate mode")
+	inventoryValidateSC          = flag.String("storage-class", "", "StorageClass to use for inventory-validate mode")
+	inventoryValidateSize        = flag.String("size", "", "Validation PVC size for inventory-validate mode")
+	inventoryValidateAccessModes = flag.String("access-modes", "", "Comma-separated PVC access modes for inventory-validate mode")
+	inventoryValidateFioArgs     = flag.String("fio-args", "", "Comma-separated fio args for inventory-validate mode")
 )
 
 func main() {
@@ -135,6 +137,7 @@ func handle(cfg config.CSIPluginConfig) int {
 			DatastoreID:  *inventoryValidateDatastore,
 			StorageClass: *inventoryValidateSC,
 			Size:         *inventoryValidateSize,
+			AccessModes:  parsePersistentVolumeAccessModes(splitCSV(*inventoryValidateAccessModes)),
 			FioArgs:      splitCSV(*inventoryValidateFioArgs),
 		}, os.Stdout); err != nil {
 			klog.Errorf("Inventory validation failed: %v", err)
@@ -169,4 +172,19 @@ func splitCSV(value string) []string {
 	}
 
 	return normalized
+}
+
+func parsePersistentVolumeAccessModes(values []string) []corev1.PersistentVolumeAccessMode {
+	if len(values) == 0 {
+		return nil
+	}
+	modes := make([]corev1.PersistentVolumeAccessMode, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		modes = append(modes, corev1.PersistentVolumeAccessMode(trimmed))
+	}
+	return modes
 }

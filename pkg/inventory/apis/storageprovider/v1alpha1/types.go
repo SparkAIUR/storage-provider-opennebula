@@ -38,15 +38,17 @@ type ObjectRefSummary struct {
 }
 
 type ValidationJobTemplate struct {
-	Image                   string                      `json:"image,omitempty"`
-	ImagePullPolicy         corev1.PullPolicy           `json:"imagePullPolicy,omitempty"`
-	StorageClassName        string                      `json:"storageClassName,omitempty"`
-	Size                    string                      `json:"size,omitempty"`
-	FioArgs                 []string                    `json:"fioArgs,omitempty"`
-	NodeSelector            map[string]string           `json:"nodeSelector,omitempty"`
-	Tolerations             []corev1.Toleration         `json:"tolerations,omitempty"`
-	Resources               corev1.ResourceRequirements `json:"resources,omitempty"`
-	TTLSecondsAfterFinished *int32                      `json:"ttlSecondsAfterFinished,omitempty"`
+	Image                   string                              `json:"image,omitempty"`
+	ImagePullPolicy         corev1.PullPolicy                   `json:"imagePullPolicy,omitempty"`
+	StorageClassName        string                              `json:"storageClassName,omitempty"`
+	Size                    string                              `json:"size,omitempty"`
+	AccessModes             []corev1.PersistentVolumeAccessMode `json:"accessModes,omitempty"`
+	FioArgs                 []string                            `json:"fioArgs,omitempty"`
+	NodeSelector            map[string]string                   `json:"nodeSelector,omitempty"`
+	Tolerations             []corev1.Toleration                 `json:"tolerations,omitempty"`
+	Resources               corev1.ResourceRequirements         `json:"resources,omitempty"`
+	ActiveDeadlineSeconds   *int64                              `json:"activeDeadlineSeconds,omitempty"`
+	TTLSecondsAfterFinished *int32                              `json:"ttlSecondsAfterFinished,omitempty"`
 }
 
 type OpenNebulaDatastoreValidationSpec struct {
@@ -152,17 +154,19 @@ type OpenNebulaDatastoreStatus struct {
 }
 
 type OpenNebulaDatastoreBenchmarkRunSpec struct {
-	DatastoreID             int                         `json:"datastoreID"`
-	StorageClassName        string                      `json:"storageClassName,omitempty"`
-	Size                    string                      `json:"size,omitempty"`
-	FioArgs                 []string                    `json:"fioArgs,omitempty"`
-	Image                   string                      `json:"image,omitempty"`
-	ImagePullPolicy         corev1.PullPolicy           `json:"imagePullPolicy,omitempty"`
-	NodeSelector            map[string]string           `json:"nodeSelector,omitempty"`
-	Tolerations             []corev1.Toleration         `json:"tolerations,omitempty"`
-	Resources               corev1.ResourceRequirements `json:"resources,omitempty"`
-	TTLSecondsAfterFinished *int32                      `json:"ttlSecondsAfterFinished,omitempty"`
-	Notes                   string                      `json:"notes,omitempty"`
+	DatastoreID             int                                 `json:"datastoreID"`
+	StorageClassName        string                              `json:"storageClassName,omitempty"`
+	Size                    string                              `json:"size,omitempty"`
+	AccessModes             []corev1.PersistentVolumeAccessMode `json:"accessModes,omitempty"`
+	FioArgs                 []string                            `json:"fioArgs,omitempty"`
+	Image                   string                              `json:"image,omitempty"`
+	ImagePullPolicy         corev1.PullPolicy                   `json:"imagePullPolicy,omitempty"`
+	NodeSelector            map[string]string                   `json:"nodeSelector,omitempty"`
+	Tolerations             []corev1.Toleration                 `json:"tolerations,omitempty"`
+	Resources               corev1.ResourceRequirements         `json:"resources,omitempty"`
+	ActiveDeadlineSeconds   *int64                              `json:"activeDeadlineSeconds,omitempty"`
+	TTLSecondsAfterFinished *int32                              `json:"ttlSecondsAfterFinished,omitempty"`
+	Notes                   string                              `json:"notes,omitempty"`
 }
 
 type OpenNebulaDatastoreBenchmarkRunStatus struct {

@@ -21,6 +21,9 @@ func (in *ObjectRefSummary) DeepCopy() *ObjectRefSummary {
 
 func (in *ValidationJobTemplate) DeepCopyInto(out *ValidationJobTemplate) {
 	*out = *in
+	if in.AccessModes != nil {
+		out.AccessModes = append([]corev1.PersistentVolumeAccessMode(nil), in.AccessModes...)
+	}
 	if in.FioArgs != nil {
 		out.FioArgs = append([]string(nil), in.FioArgs...)
 	}
@@ -35,6 +38,10 @@ func (in *ValidationJobTemplate) DeepCopyInto(out *ValidationJobTemplate) {
 		copy(out.Tolerations, in.Tolerations)
 	}
 	in.Resources.DeepCopyInto(&out.Resources)
+	if in.ActiveDeadlineSeconds != nil {
+		value := *in.ActiveDeadlineSeconds
+		out.ActiveDeadlineSeconds = &value
+	}
 	if in.TTLSecondsAfterFinished != nil {
 		value := *in.TTLSecondsAfterFinished
 		out.TTLSecondsAfterFinished = &value
@@ -149,6 +156,9 @@ func (in *OpenNebulaDatastoreValidationStatus) DeepCopyInto(out *OpenNebulaDatas
 
 func (in *OpenNebulaDatastoreBenchmarkRunSpec) DeepCopyInto(out *OpenNebulaDatastoreBenchmarkRunSpec) {
 	*out = *in
+	if in.AccessModes != nil {
+		out.AccessModes = append([]corev1.PersistentVolumeAccessMode(nil), in.AccessModes...)
+	}
 	if in.FioArgs != nil {
 		out.FioArgs = append([]string(nil), in.FioArgs...)
 	}
@@ -163,6 +173,10 @@ func (in *OpenNebulaDatastoreBenchmarkRunSpec) DeepCopyInto(out *OpenNebulaDatas
 		copy(out.Tolerations, in.Tolerations)
 	}
 	in.Resources.DeepCopyInto(&out.Resources)
+	if in.ActiveDeadlineSeconds != nil {
+		value := *in.ActiveDeadlineSeconds
+		out.ActiveDeadlineSeconds = &value
+	}
 	if in.TTLSecondsAfterFinished != nil {
 		value := *in.TTLSecondsAfterFinished
 		out.TTLSecondsAfterFinished = &value

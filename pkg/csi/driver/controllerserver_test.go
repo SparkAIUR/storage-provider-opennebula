@@ -399,6 +399,16 @@ func TestCreateVolumeCreatesSharedFilesystemVolumeForRWX(t *testing.T) {
 	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
 	sharedProvider := &MockSharedFilesystemProviderTestify{}
 	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local,cephfs")
+	mockProvider.On("ResolveProvisioningDatastores", mock.Anything, opennebula.DatastoreSelectionConfig{
+		Identifiers:  []string{"100"},
+		Policy:       opennebula.DatastoreSelectionPolicyLeastUsed,
+		AllowedTypes: []string{"local", "cephfs"},
+	}).Return([]opennebula.Datastore{{
+		ID:      100,
+		Name:    "cephfs-file",
+		Backend: "cephfs",
+		Type:    "cephfs",
+	}}, nil)
 
 	sharedProvider.On("CreateSharedVolume", mock.Anything, opennebula.SharedVolumeRequest{
 		Name:      "rwx-volume",
@@ -456,6 +466,115 @@ func TestCreateVolumeCreatesSharedFilesystemVolumeForRWX(t *testing.T) {
 	assert.Equal(t, "100", resp.GetVolume().GetVolumeContext()[annotationDatastoreID])
 	assert.Equal(t, "cephfs-file", resp.GetVolume().GetVolumeContext()[annotationDatastoreName])
 	assert.Equal(t, "least-used", resp.GetVolume().GetVolumeContext()[annotationSelectionPolicy])
+	mockProvider.AssertExpectations(t)
+	sharedProvider.AssertExpectations(t)
+}
+
+func TestCreateVolumeCreatesSharedFilesystemVolumeForCephFSRWO(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	sharedProvider := &MockSharedFilesystemProviderTestify{}
+	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local,cephfs")
+	mockProvider.On("ResolveProvisioningDatastores", mock.Anything, opennebula.DatastoreSelectionConfig{
+		Identifiers:  []string{"100"},
+		Policy:       opennebula.DatastoreSelectionPolicyLeastUsed,
+		AllowedTypes: []string{"local", "cephfs"},
+	}).Return([]opennebula.Datastore{{
+		ID:      100,
+		Name:    "cephfs-file",
+		Backend: "cephfs",
+		Type:    "cephfs",
+	}}, nil)
+
+	sharedProvider.On("CreateSharedVolume", mock.Anything, opennebula.SharedVolumeRequest{
+		Name:      "rwo-cephfs",
+		SizeBytes: int64(1024 * 1024 * 1024),
+		Selection: opennebula.DatastoreSelectionConfig{
+			Identifiers:  []string{"100"},
+			Policy:       opennebula.DatastoreSelectionPolicyLeastUsed,
+			AllowedTypes: []string{"local", "cephfs"},
+		},
+		Parameters: map[string]string{
+			storageClassParamDatastoreIDs:          "100",
+			storageClassParamSharedFilesystemGroup: "csi",
+		},
+		Secrets: map[string]string{
+			"adminID":  "csi-admin",
+			"adminKey": "super-secret",
+		},
+	}).Return(&opennebula.SharedVolumeCreateResult{
+		VolumeID:      "cephfs:rwo",
+		CapacityBytes: int64(1024 * 1024 * 1024),
+		Datastore:     opennebula.Datastore{ID: 100, Name: "cephfs-file"},
+		Metadata: opennebula.SharedVolumeMetadata{
+			Backend: "cephfs",
+			Mode:    opennebula.SharedVolumeModeDynamic,
+		},
+	}, nil)
+
+	resp, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name: "rwo-cephfs",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: int64(1024 * 1024 * 1024),
+		},
+		VolumeCapabilities: []*csi.VolumeCapability{{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{FsType: "xfs"},
+			},
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+			},
+		}},
+		Parameters: map[string]string{
+			storageClassParamDatastoreIDs:          "100",
+			storageClassParamSharedFilesystemGroup: "csi",
+		},
+		Secrets: map[string]string{
+			"adminID":  "csi-admin",
+			"adminKey": "super-secret",
+		},
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, "cephfs:rwo", resp.GetVolume().GetVolumeId())
+	mockProvider.AssertExpectations(t)
+	sharedProvider.AssertExpectations(t)
+}
+
+func TestCreateVolumeRejectsMixedCephFSAndDiskDatastores(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	sharedProvider := &MockSharedFilesystemProviderTestify{}
+	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local,cephfs")
+	mockProvider.On("ResolveProvisioningDatastores", mock.Anything, opennebula.DatastoreSelectionConfig{
+		Identifiers:  []string{"100"},
+		Policy:       opennebula.DatastoreSelectionPolicyLeastUsed,
+		AllowedTypes: []string{"local", "cephfs"},
+	}).Return([]opennebula.Datastore{
+		{ID: 100, Name: "cephfs-file", Backend: "cephfs", Type: "cephfs"},
+		{ID: 101, Name: "lvm-local", Backend: "local", Type: "local"},
+	}, nil)
+
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name: "mixed-cephfs",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: int64(1024 * 1024 * 1024),
+		},
+		VolumeCapabilities: []*csi.VolumeCapability{{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{FsType: "xfs"},
+			},
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+			},
+		}},
+		Parameters: map[string]string{
+			storageClassParamDatastoreIDs:          "100",
+			storageClassParamSharedFilesystemGroup: "csi",
+		},
+	})
+
+	assert.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	assert.Contains(t, err.Error(), "mixes CephFS and disk datastores")
 	mockProvider.AssertExpectations(t)
 	sharedProvider.AssertExpectations(t)
 }
@@ -1199,6 +1318,16 @@ func TestCreateVolumeClonesSharedFilesystemVolumeWhenEnabled(t *testing.T) {
 	sharedProvider := &MockSharedFilesystemProviderTestify{}
 	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local,cephfs")
 	cs.driver.featureGates.CephFSClones = true
+	mockProvider.On("ResolveProvisioningDatastores", mock.Anything, opennebula.DatastoreSelectionConfig{
+		Identifiers:  []string{"100"},
+		Policy:       opennebula.DatastoreSelectionPolicyLeastUsed,
+		AllowedTypes: []string{"local", "cephfs"},
+	}).Return([]opennebula.Datastore{{
+		ID:      100,
+		Name:    "cephfs-file",
+		Backend: "cephfs",
+		Type:    "cephfs",
+	}}, nil)
 
 	sharedProvider.On("CloneSharedVolume", mock.Anything, opennebula.SharedVolumeCloneRequest{
 		Name:      "rwx-clone",
@@ -1263,6 +1392,16 @@ func TestCreateVolumeRestoresSharedFilesystemSnapshotWhenEnabled(t *testing.T) {
 	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local,cephfs")
 	cs.driver.featureGates.CephFSClones = true
 	cs.driver.featureGates.CephFSSnapshots = true
+	mockProvider.On("ResolveProvisioningDatastores", mock.Anything, opennebula.DatastoreSelectionConfig{
+		Identifiers:  []string{"100"},
+		Policy:       opennebula.DatastoreSelectionPolicyLeastUsed,
+		AllowedTypes: []string{"local", "cephfs"},
+	}).Return([]opennebula.Datastore{{
+		ID:      100,
+		Name:    "cephfs-file",
+		Backend: "cephfs",
+		Type:    "cephfs",
+	}}, nil)
 
 	sharedProvider.On("CloneSharedVolume", mock.Anything, opennebula.SharedVolumeCloneRequest{
 		Name:      "rwx-restore",
@@ -1688,6 +1827,19 @@ func (m *MockOpenNebulaVolumeProviderTestify) CreateVolume(ctx context.Context, 
 		return result.(*opennebula.VolumeCreateResult), args.Error(1)
 	}
 	return nil, args.Error(1)
+}
+
+func (m *MockOpenNebulaVolumeProviderTestify) ResolveProvisioningDatastores(ctx context.Context, selection opennebula.DatastoreSelectionConfig) ([]opennebula.Datastore, error) {
+	if !m.hasExpectation("ResolveProvisioningDatastores") {
+		return []opennebula.Datastore{{
+			ID:      100,
+			Name:    "ds-100",
+			Backend: "local",
+			Type:    "local",
+		}}, nil
+	}
+	args := m.Called(ctx, selection)
+	return args.Get(0).([]opennebula.Datastore), args.Error(1)
 }
 
 func (m *MockOpenNebulaVolumeProviderTestify) CloneVolume(ctx context.Context, name string, sourceVolume string, selection opennebula.DatastoreSelectionConfig) (*opennebula.VolumeCreateResult, error) {

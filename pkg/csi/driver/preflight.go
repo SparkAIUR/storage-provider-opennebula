@@ -498,33 +498,60 @@ func (r *PreflightRunner) inspectStorageClasses(ctx context.Context, client kube
 			AllowVolumeExpansion: allowExpansion,
 			ValidationSupport:    validationSupportForBackend(backend),
 		}
+		if backend == "mixed" {
+			summary.Warnings = append(summary.Warnings, "storage class mixes CephFS and disk datastores; use separate StorageClasses per backend")
+		}
 		if backend == "local" && volumeBindingMode(storageClass) != storagev1.VolumeBindingWaitForFirstConsumer {
 			summary.Warnings = append(summary.Warnings, "local datastore should use WaitForFirstConsumer")
 		}
 		if !allowExpansion {
 			summary.Warnings = append(summary.Warnings, "volume expansion disabled")
 		}
-		if backend == "cephfs" && (strings.TrimSpace(storageClass.Parameters["provisionerSecretName"]) == "" || strings.TrimSpace(storageClass.Parameters["provisionerSecretNamespace"]) == "") {
-			summary.Warnings = append(summary.Warnings, "cephfs provisioner secret refs incomplete")
+		if backend == "cephfs" {
+			if !hasCompleteCSISecretRef(storageClass.Parameters, "csi.storage.k8s.io/provisioner-secret-name", "csi.storage.k8s.io/provisioner-secret-namespace") {
+				summary.Warnings = append(summary.Warnings, "cephfs provisioner secret refs incomplete")
+			}
+			if !hasCompleteCSISecretRef(storageClass.Parameters, "csi.storage.k8s.io/node-stage-secret-name", "csi.storage.k8s.io/node-stage-secret-namespace") {
+				summary.Warnings = append(summary.Warnings, "cephfs node-stage secret refs incomplete")
+			}
+			if allowExpansion && !hasCompleteCSISecretRef(storageClass.Parameters, "csi.storage.k8s.io/controller-expand-secret-name", "csi.storage.k8s.io/controller-expand-secret-namespace") {
+				summary.Warnings = append(summary.Warnings, "cephfs controller-expand secret refs incomplete")
+			}
 		}
 		summaries = append(summaries, summary)
 	}
 	return summaries
 }
 
-func validationSupportForBackend(backend string) string {
-	if backend == "cephfs" {
-		return "manual-disabled"
-	}
+func validationSupportForBackend(_ string) string {
 	return "manual"
 }
 
 func storageClassBackendSummary(cfg config.CSIPluginConfig, pool []datastoreSchema.Datastore, storageClass storagev1.StorageClass) string {
+	driver := &Driver{PluginConfig: cfg}
+	selection, err := driver.GetDatastoreSelectionConfig(storageClass.Parameters)
+	if err == nil {
+		datastores, resolveErr := opennebula.ResolveDatastores(pool, selection)
+		if resolveErr == nil && len(datastores) > 0 {
+			backend := datastores[0].Backend
+			for _, datastore := range datastores[1:] {
+				if datastore.Backend != backend {
+					return "mixed"
+				}
+			}
+			switch backend {
+			case "ceph":
+				return "ceph-rbd"
+			default:
+				return backend
+			}
+		}
+	}
 	if storageClassUsesLocalBackend(cfg, pool, storageClass) {
 		return "local"
 	}
-	driver := strings.ToLower(strings.TrimSpace(storageClass.Parameters["driver"]))
-	switch driver {
+	driverName := strings.ToLower(strings.TrimSpace(storageClass.Parameters["driver"]))
+	switch driverName {
 	case "cephfs":
 		return "cephfs"
 	case "ceph", "rbd":
@@ -534,6 +561,10 @@ func storageClassBackendSummary(cfg config.CSIPluginConfig, pool []datastoreSche
 		return "cephfs"
 	}
 	return "unknown"
+}
+
+func hasCompleteCSISecretRef(params map[string]string, nameKey, namespaceKey string) bool {
+	return strings.TrimSpace(params[nameKey]) != "" && strings.TrimSpace(params[namespaceKey]) != ""
 }
 
 func normalizeLocalImmediateBindingPolicy(cfg config.CSIPluginConfig) string {

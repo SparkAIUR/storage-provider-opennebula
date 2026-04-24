@@ -64,7 +64,9 @@ func TestBenchmarkRunCRDExists(t *testing.T) {
 		"- name: Datastore",
 		"- name: Phase",
 		"datastoreID:",
+		"accessModes:",
 		"fioArgs:",
+		"activeDeadlineSeconds:",
 		"summary:",
 	}
 	for _, snippet := range requiredSnippets {

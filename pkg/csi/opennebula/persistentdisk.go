@@ -801,6 +801,10 @@ func (p *PersistentDiskVolumeProvider) GetCapacity(ctx context.Context, selectio
 	return SumDatastoreCapacity(candidates), nil
 }
 
+func (p *PersistentDiskVolumeProvider) ResolveProvisioningDatastores(ctx context.Context, selection DatastoreSelectionConfig) ([]Datastore, error) {
+	return p.resolveProvisioningDatastores(ctx, selection)
+}
+
 func (p *PersistentDiskVolumeProvider) resolveProvisioningDatastores(ctx context.Context, selection DatastoreSelectionConfig) ([]Datastore, error) {
 	datastores, err := p.ctrl.Datastores().Info()
 	if err != nil {

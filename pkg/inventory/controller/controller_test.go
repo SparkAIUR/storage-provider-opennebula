@@ -1,10 +1,12 @@
 package controller
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	datastoreSchema "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/datastore"
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	inventoryv1alpha1 "github.com/SparkAIUR/storage-provider-opennebula/pkg/inventory/apis/storageprovider/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -168,6 +170,55 @@ func TestBuildDatastoreStatusStorageClassDetails(t *testing.T) {
 	}
 }
 
+func TestBuildStorageClassDetailsDetectsBackendMismatch(t *testing.T) {
+	ds := opennebula.Datastore{ID: 111, Name: "local-a", Backend: "local"}
+	details := buildStorageClassDetails([]storagev1.StorageClass{{
+		ObjectMeta: metav1.ObjectMeta{Name: "cephfs-on-local"},
+		Parameters: map[string]string{
+			"datastoreIDs":                   "111",
+			"sharedFilesystemSubvolumeGroup": "csi",
+		},
+	}}, ds)
+
+	if len(details) != 1 {
+		t.Fatalf("expected one storage class detail, got %d", len(details))
+	}
+	if details[0].BackendCompatible {
+		t.Fatalf("expected backend compatibility to be false, got %#v", details[0])
+	}
+	if len(details[0].Warnings) == 0 || details[0].Warnings[len(details[0].Warnings)-1] != "storage class backend does not match datastore backend" {
+		t.Fatalf("expected backend mismatch warning, got %#v", details[0].Warnings)
+	}
+}
+
+func TestBuildStorageClassDetailsCephFSUsesStandardSecretRefs(t *testing.T) {
+	ds := opennebula.Datastore{ID: 300, Name: "cephfs-a", Backend: "cephfs"}
+	allowExpansion := true
+	details := buildStorageClassDetails([]storagev1.StorageClass{{
+		ObjectMeta: metav1.ObjectMeta{Name: "cephfs"},
+		Parameters: map[string]string{
+			"datastoreIDs":                                          "300",
+			"sharedFilesystemSubvolumeGroup":                        "csi",
+			"csi.storage.k8s.io/provisioner-secret-name":            "cephfs-provisioner",
+			"csi.storage.k8s.io/provisioner-secret-namespace":       "kube-system",
+			"csi.storage.k8s.io/node-stage-secret-name":             "cephfs-node-stage",
+			"csi.storage.k8s.io/node-stage-secret-namespace":        "kube-system",
+			"csi.storage.k8s.io/controller-expand-secret-name":      "cephfs-provisioner",
+			"csi.storage.k8s.io/controller-expand-secret-namespace": "kube-system",
+		},
+		AllowVolumeExpansion: &allowExpansion,
+	}}, ds)
+
+	if len(details) != 1 {
+		t.Fatalf("expected one storage class detail, got %d", len(details))
+	}
+	for _, warning := range details[0].Warnings {
+		if strings.Contains(warning, "secret references are incomplete") {
+			t.Fatalf("expected complete standard secret refs to suppress cephfs warnings, got %#v", details[0].Warnings)
+		}
+	}
+}
+
 func TestNormalizeDatastoreTypeAndBackend(t *testing.T) {
 	ds := datastoreSchema.Datastore{
 		ID:      104,
@@ -252,7 +303,7 @@ func TestBuildDatastoreStatusPrefersLatestBenchmarkMetrics(t *testing.T) {
 			Validation: inventoryv1alpha1.OpenNebulaDatastoreValidationStatus{
 				Phase: inventoryv1alpha1.ValidationPhaseSucceeded,
 				Result: inventoryv1alpha1.ValidationResult{
-					ReadIops: int64Ptr(1000),
+					ReadIops: int64PtrTest(1000),
 				},
 			},
 		},
@@ -263,9 +314,9 @@ func TestBuildDatastoreStatusPrefersLatestBenchmarkMetrics(t *testing.T) {
 		Status: inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunStatus{
 			Phase: inventoryv1alpha1.ValidationPhaseSucceeded,
 			Result: inventoryv1alpha1.ValidationResult{
-				ReadIops:         int64Ptr(12000),
-				WriteIops:        int64Ptr(8000),
-				LatencyP99Micros: int64Ptr(4000),
+				ReadIops:         int64PtrTest(12000),
+				WriteIops:        int64PtrTest(8000),
+				LatencyP99Micros: int64PtrTest(4000),
 			},
 		},
 	}
@@ -285,6 +336,53 @@ func TestBenchmarkHelpers(t *testing.T) {
 	}
 	if got := benchmarkRunObjectName(111, time.Date(2026, time.March, 26, 23, 30, 45, 0, time.UTC)); got != "ds-111-20260326-233045" {
 		t.Fatalf("unexpected benchmark object name: %q", got)
+	}
+	run := inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ds-111-20260326", Generation: 7},
+		Spec:       inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunSpec{DatastoreID: 111},
+	}
+	if got := benchmarkResourceName(benchmarkJobPrefix, run); got == benchmarkResourceName(benchmarkJobPrefix, inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ds-111-20260326", Generation: 8},
+		Spec:       inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunSpec{DatastoreID: 111},
+	}) {
+		t.Fatalf("expected benchmark resource names to vary by generation")
+	}
+}
+
+func TestResolveBenchmarkRunDefaultsCephFSAccessModesAndDeadline(t *testing.T) {
+	s := &Syncer{defaultValidationImage: "ghcr.io/sparkaiur/fio:latest"}
+	item := inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "bench", Generation: 2},
+		Spec: inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunSpec{
+			DatastoreID: 300,
+		},
+	}
+	ds := datastoreSchema.Datastore{ID: 300, Name: "cephfs-a", Type: "FILE", TMMad: "shared"}
+	ds.Template.AddPair(sharedBackendAttr, "cephfs")
+
+	resolved := s.resolveBenchmarkRun(item, ds, nil)
+	if len(resolved.Spec.AccessModes) != 1 || resolved.Spec.AccessModes[0] != corev1.ReadWriteMany {
+		t.Fatalf("expected cephfs default benchmark access mode RWX, got %#v", resolved.Spec.AccessModes)
+	}
+	if resolved.Spec.ActiveDeadlineSeconds == nil || *resolved.Spec.ActiveDeadlineSeconds != defaultValidationActiveDeadlineSeconds {
+		t.Fatalf("expected default benchmark activeDeadlineSeconds=%d, got %#v", defaultValidationActiveDeadlineSeconds, resolved.Spec.ActiveDeadlineSeconds)
+	}
+	if resolved.Spec.Image != "ghcr.io/sparkaiur/fio:latest" {
+		t.Fatalf("expected default validation image to be injected, got %q", resolved.Spec.Image)
+	}
+}
+
+func TestBuildBenchmarkPVCRejectsUnsupportedAccessMode(t *testing.T) {
+	s := &Syncer{}
+	run := &inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun{
+		Spec: inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{"ReadWriteOncePod"},
+		},
+	}
+	ds := datastoreSchema.Datastore{ID: 111, Name: "local-a", Type: "IMAGE", TMMad: "ssh"}
+
+	if _, err := s.buildBenchmarkPVC(run, ds, "pvc"); err == nil {
+		t.Fatal("expected unsupported access mode to fail")
 	}
 }
 
@@ -394,6 +492,6 @@ func boolPtr(value bool) *bool {
 	return &value
 }
 
-func int64Ptr(value int64) *int64 {
+func int64PtrTest(value int64) *int64 {
 	return &value
 }

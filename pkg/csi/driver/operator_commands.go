@@ -28,6 +28,7 @@ type InventoryValidateOptions struct {
 	DatastoreID  int
 	StorageClass string
 	Size         string
+	AccessModes  []corev1.PersistentVolumeAccessMode
 	FioArgs      []string
 	Timeout      time.Duration
 }
@@ -37,7 +38,8 @@ type inventoryValidateResult struct {
 	Name        string `json:"name"`
 	Phase       string `json:"phase"`
 	Summary     string `json:"summary"`
-	RunNonce    string `json:"runNonce"`
+	RunName     string `json:"runName"`
+	RunNonce    string `json:"runNonce,omitempty"`
 }
 
 type SupportBundle struct {
@@ -79,7 +81,6 @@ func RunInventoryValidateCommand(ctx context.Context, cfg config.CSIPluginConfig
 		return err
 	}
 
-	runNonce := fmt.Sprintf("manual-%d", time.Now().UnixNano())
 	runName := fmt.Sprintf("ds-%d-%d", opts.DatastoreID, time.Now().Unix())
 	benchmarkRun := &inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun{
 		TypeMeta: metav1.TypeMeta{
@@ -91,6 +92,7 @@ func RunInventoryValidateCommand(ctx context.Context, cfg config.CSIPluginConfig
 			DatastoreID:      opts.DatastoreID,
 			StorageClassName: opts.StorageClass,
 			Size:             opts.Size,
+			AccessModes:      append([]corev1.PersistentVolumeAccessMode(nil), opts.AccessModes...),
 			FioArgs:          append([]string(nil), opts.FioArgs...),
 		},
 	}
@@ -113,7 +115,8 @@ func RunInventoryValidateCommand(ctx context.Context, cfg config.CSIPluginConfig
 				Name:        ds.Status.Name,
 				Phase:       current.Status.Phase,
 				Summary:     benchmarkSummaryForCommand(current.Status),
-				RunNonce:    runNonce,
+				RunName:     runName,
+				RunNonce:    runName,
 			}
 			enc := json.NewEncoder(w)
 			enc.SetIndent("", "  ")
@@ -121,7 +124,7 @@ func RunInventoryValidateCommand(ctx context.Context, cfg config.CSIPluginConfig
 		}
 		select {
 		case <-deadlineCtx.Done():
-			return fmt.Errorf("timed out waiting for validation run %s on datastore %d", runNonce, opts.DatastoreID)
+			return fmt.Errorf("timed out waiting for validation run %s on datastore %d", runName, opts.DatastoreID)
 		case <-time.After(5 * time.Second):
 		}
 	}

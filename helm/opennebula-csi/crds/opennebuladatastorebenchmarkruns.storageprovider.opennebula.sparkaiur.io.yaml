@@ -47,6 +47,10 @@ spec:
                   type: string
                 size:
                   type: string
+                accessModes:
+                  type: array
+                  items:
+                    type: string
                 fioArgs:
                   type: array
                   items:
@@ -65,6 +69,9 @@ spec:
                     x-kubernetes-preserve-unknown-fields: true
                 resources:
                   x-kubernetes-preserve-unknown-fields: true
+                activeDeadlineSeconds:
+                  type: integer
+                  format: int64
                 ttlSecondsAfterFinished:
                   type: integer
                 notes:
