@@ -25,7 +25,7 @@ Chart repo:
 - OpenNebula disk-backed PVC provisioning on explicitly configured datastores
 - datastore selection policies: `least-used`, `ordered`, `autopilot`
 - local, Ceph RBD, and SparkAI CephFS datastore backends
-- `ReadWriteOnce`, `ReadOnlyMany`, and CephFS-backed `ReadWriteMany`
+- `ReadWriteOnce`, `ReadOnlyMany`, and CephFS-backed filesystem volumes for `ReadWriteOnce`, `ReadOnlyMany`, and `ReadWriteMany`
 - CSI resize, metrics, preflight checks, snapshots, and clone workflows
 - stable detached-disk expansion and dynamic CephFS expansion
 - gated alpha features for CephFS snapshot/clone, CephFS self-healing, and topology accessibility
@@ -114,7 +114,7 @@ driver:
   datastoreSelectionPolicy: least-used
 ```
 
-### CephFS RWX
+### CephFS Filesystem StorageClass
 
 ```yaml
 driver:
@@ -139,6 +139,14 @@ storageClasses:
       csi.storage.k8s.io/node-stage-secret-name: cephfs-node-stage
       csi.storage.k8s.io/node-stage-secret-namespace: kube-system
 ```
+
+CephFS-backed filesystem volumes can now be provisioned for single-node and multi-node filesystem access:
+
+- `ReadWriteOnce`
+- `ReadOnlyMany`
+- `ReadWriteMany`
+
+The driver uses the CephFS shared-filesystem path when the StorageClass resolves exclusively to CephFS datastores or explicitly uses `sharedFilesystemPath` / `sharedFilesystemSubvolumeGroup`. Do not mix CephFS and image-backed datastore IDs in the same StorageClass.
 
 Recommended secret split for dynamic CephFS:
 
@@ -178,7 +186,7 @@ parameters:
   csi.storage.k8s.io/controller-expand-secret-namespace: kube-system
 ```
 
-For static CephFS RWX, `sharedFilesystemPath` must already exist in the filesystem. The driver will mount that path, but it does not create the directory for you.
+For static CephFS filesystem volumes, `sharedFilesystemPath` must already exist in the filesystem. The driver will mount that path, but it does not create the directory for you.
 
 ### Alpha Feature Gates
 
@@ -205,7 +213,7 @@ For local-backed StorageClasses:
 - node-side device discovery uses the same per-volume timeout budget that the controller computed during publish
 - if a VM stays non-ready through the full timeout, the driver puts that VM into a temporary hotplug cooldown and rejects further hotplug work with retryable `Unavailable`
 - recreating MinIO tenants with local-backed PVCs should still be treated as node-sticky; use Ceph RBD or CephFS if the workload must remain portable across nodes
-- use Ceph RBD for portable RWO and CephFS for portable RWX
+- use Ceph RBD for portable attached-disk RWO and CephFS for portable filesystem RWO or RWX
 
 ### Restart-optimized local StatefulSets
 
@@ -308,7 +316,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
-| `image.tag` | Driver image tag. | `"v0.5.3"` | No |
+| `image.tag` | Driver image tag. | `"v0.5.4"` | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
 
 ### Driver
@@ -459,6 +467,13 @@ These are defaults for manual runs. They do not enable scheduled validation.
 
 To trigger a one-shot datastore benchmark run directly, create an `OpenNebulaDatastoreBenchmarkRun`. If you use `metadata.name: auto`, the inventory controller replaces it with a concrete object named `ds-<id>-<timestamp>` and starts the fio Job for you.
 
+Benchmark defaults:
+
+- CephFS datastores default PVC access mode to `ReadWriteMany`
+- all other datastores default PVC access mode to `ReadWriteOnce`
+- benchmark Jobs default `activeDeadlineSeconds` to `900`
+- terminal benchmark runs clean up their Job and PVC resources
+
 ```bash
 kubectl apply -f - <<EOF
 apiVersion: storageprovider.opennebula.sparkaiur.io/v1alpha1
@@ -469,6 +484,9 @@ spec:
   datastoreID: 1
   storageClassName: opennebula-default-rwo
   size: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  activeDeadlineSeconds: 900
   fioArgs:
     - --name=smoke
     - --rw=randrw
@@ -492,6 +510,7 @@ The driver image includes two cluster-operator modes that work well with a kubec
 
 - `--mode=inventory-validate`
   - triggers a manual datastore validation run and waits for the result
+  - accepts `--access-modes=ReadWriteOnce` or `--access-modes=ReadWriteMany` when the benchmark PVC mode must be explicit
 - `--mode=support-bundle`
   - emits a JSON support bundle with inventory, hotplug, StorageClass, VolumeAttachment, and event data
 
@@ -554,7 +573,7 @@ Common `storageClasses[].parameters` used by this driver:
 | Basic disk-backed install | `oneApiEndpoint` plus either `credentials.existingSecret.name` or `credentials.inlineAuth` |
 | Default provisioning without StorageClass overrides | `driver.defaultDatastores` |
 | StorageClass-managed provisioning | `storageClasses[].name` plus `storageClasses[].parameters.datastoreIDs` or `driver.defaultDatastores` |
-| CephFS RWX | CephFS datastore IDs, StorageClass secret refs, Kubernetes Secrets with `adminID/adminKey` and `userID/userKey` |
+| CephFS filesystem provisioning | CephFS datastore IDs, StorageClass secret refs, Kubernetes Secrets with `adminID/adminKey` and `userID/userKey` |
 | Topology accessibility alpha | `featureGates.topologyAccessibility=true` plus node labels `topology.opennebula.sparkaiur.io/system-ds=<id>` |
 | Detached disk expansion | Enabled by default |
 | CephFS expansion | Enabled by default |

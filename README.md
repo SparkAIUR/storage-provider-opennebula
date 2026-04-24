@@ -10,7 +10,7 @@ This fork is focused on Omni deployments on OpenNebula and removes the old requi
 - Support global driver datastore defaults and per-StorageClass overrides.
 - Support `least-used`, `ordered`, and `autopilot` datastore selection policies.
 - Support `Filesystem` and `Block` volume modes.
-- Support `ReadWriteOnce`, `ReadOnlyMany`, and CephFS-backed `ReadWriteMany` filesystem volumes.
+- Support `ReadWriteOnce`, `ReadOnlyMany`, and CephFS-backed filesystem volumes for `ReadWriteOnce`, `ReadOnlyMany`, and `ReadWriteMany`.
 - Support CSI volume expansion for attached volumes, detached persistent disks, and dynamic CephFS subvolumes.
 - Support `NodeGetVolumeStats`, driver-native Prometheus metrics, Kubernetes Events, and PV placement annotations.
 - Support preflight validation through the binary and an optional Helm Job.
@@ -19,9 +19,9 @@ This fork is focused on Omni deployments on OpenNebula and removes the old requi
 - Support `local`, OpenNebula Ceph RBD, and SparkAI CephFS datastores.
 - Keep the internal selection/provider structure ready for future `nfs` support.
 
-## Validated v0.5.3 matrix
+## Validated Staging Matrix
 
-The `v0.5.3` release was validated on a live Omni + Talos + OpenNebula staging cluster with:
+The staging lab has validated the following matrix across recent releases:
 
 - local RWO volumes on an OpenNebula image datastore
 - Ceph RBD RWO volumes on a Ceph-backed image datastore with a Ceph system datastore
@@ -51,7 +51,7 @@ Features that remain gated by default:
 - Container images:
   `ghcr.io/sparkaiur/opennebula-csi:<tag>`
   `docker.io/nudevco/opennebula-csi:<tag>`
-- Latest release: `v0.5.3`
+- Latest release: `v0.5.4`
 - Helm repo: `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
 - Chart name: `opennebula-csi`
 - Source repo: `https://github.com/SparkAIUR/storage-provider-opennebula`
@@ -108,7 +108,7 @@ Provisioning targets must be OpenNebula datastore categories that can accept ima
 Current rules:
 
 - `IMAGE`: supported for PVC provisioning
-- `FILE`: supported for SparkAI CephFS RWX datastores when the datastore template exposes the required CephFS attributes
+- `FILE`: supported for SparkAI CephFS filesystem datastores when the datastore template exposes the required CephFS attributes
 - `SYSTEM`: rejected for `CreateVolume`
 
 For OpenNebula local-style datastores, the driver treats `local`, `fs`, `fs_lvm`, and `fs_lvm_ssh` as local-compatible backends.
@@ -197,21 +197,23 @@ New support signals:
 
 Current access mode matrix:
 
-- `ReadWriteOnce`: supported
-- `ReadOnlyMany`: supported
+- `ReadWriteOnce`: supported on the disk path and on the CephFS shared-filesystem path for `Filesystem` volumes
+- `ReadOnlyMany`: supported on the disk path and on the CephFS shared-filesystem path for `Filesystem` volumes
 - `ReadWriteMany`: supported for `Filesystem` volumes on the CephFS shared-filesystem path
 - `MULTI_NODE_SINGLE_WRITER`: supported for `Filesystem` volumes on the CephFS shared-filesystem path
 - `Block` + multi-node write: not supported
 
-Routing is inferred from the requested access mode:
+Routing is determined by the requested volume capability plus the selected datastore backend:
 
-- `SINGLE_NODE_WRITER`, `SINGLE_NODE_READER_ONLY`, and `MULTI_NODE_READER_ONLY` stay on the OpenNebula disk/image path
-- `MULTI_NODE_MULTI_WRITER` and `MULTI_NODE_SINGLE_WRITER` route to the CephFS shared-filesystem path
+- `Filesystem` volumes route to the CephFS shared-filesystem path when the StorageClass resolves exclusively to CephFS datastores or explicitly uses `sharedFilesystemPath` / `sharedFilesystemSubvolumeGroup`
+- disk-backed and block-backed volumes stay on the OpenNebula disk/image path
+- StorageClasses must not mix CephFS and disk/image datastore IDs
 
 ### Disk path vs shared-fs path
 
 - Databases and other single-writer application data should still use the OpenNebula `IMAGE` datastore path
-- Shared caches, model stores, and other multi-node RWX workloads can now use the CephFS shared-filesystem path
+- Shared caches, model stores, and other multi-node RWX workloads can use the CephFS shared-filesystem path
+- Single-node filesystem workloads can also use CephFS when portable filesystem semantics are preferred over attached-disk semantics
 - `ReadOnlyMany` remains on the disk path
 - CephFS expansion is enabled by default
 - CephFS snapshots and clones remain implemented behind feature gates and stay alpha-off by default
@@ -269,15 +271,15 @@ Optional Ceph datastore attributes supported by the driver and documentation:
 - `EC_POOL_NAME`
 - `CEPH_TRASH`
 
-## CephFS RWX support
+## CephFS Filesystem Support
 
 CephFS support in this fork is a SparkAI shared-filesystem path. It is separate from the existing OpenNebula image-backed disk path.
 
 CephFS routing requirements:
 
-- requested access mode must be `ReadWriteMany` or `MULTI_NODE_SINGLE_WRITER`
 - volume capability must be `Filesystem`
-- the selected datastore must resolve as `cephfs`
+- the selected datastore set must resolve exclusively as `cephfs`, or the StorageClass must explicitly use `sharedFilesystemPath` / `sharedFilesystemSubvolumeGroup`
+- StorageClasses must not mix CephFS and disk/image datastore IDs
 
 Required OpenNebula datastore template attributes for CephFS:
 
@@ -645,7 +647,7 @@ The driver currently validates configured provisioning datastores against the al
 For OpenNebula local-style datastores, the driver treats `local`, `fs`, `fs_lvm`, and `fs_lvm_ssh` as local-compatible.
 Provisioning targets still need to be OpenNebula `IMAGE` or `FILE` datastores. `SYSTEM` datastores cannot be used for `CreateVolume`.
 If you want PVC resizing in Omni, set `allowVolumeExpansion: true` on the relevant StorageClasses and ensure workloads are using attached volumes when expansion is requested.
-If you need `ReadWriteMany`, use a CephFS-enabled StorageClass with node-stage and provisioner secrets wired in.
+If you need CephFS-backed filesystem semantics, use a CephFS-enabled StorageClass with node-stage and provisioner secrets wired in.
 
 For Ceph-backed Omni deployments:
 
@@ -660,8 +662,9 @@ For CephFS-backed Omni deployments:
 1. Create a `FILE` datastore in OpenNebula and add the SparkAI CephFS attributes to its template.
 2. Set `driver.defaultDatastores` or StorageClass `datastoreIDs` to the CephFS datastore IDs.
 3. Add node-stage and provisioner secret refs to the StorageClass parameters.
-4. Use `ReadWriteMany` on the PVC to trigger the shared-filesystem path.
-5. Validate the resulting deployment with [examples/demo-busybox-cephfs-rwx.yaml](examples/demo-busybox-cephfs-rwx.yaml).
+4. Use `sharedFilesystemSubvolumeGroup` for dynamic CephFS provisioning or `sharedFilesystemPath` for static CephFS provisioning.
+5. Use `ReadWriteOnce`, `ReadOnlyMany`, or `ReadWriteMany` on the PVC as needed.
+6. Validate the resulting deployment with [examples/demo-busybox-cephfs-rwx.yaml](examples/demo-busybox-cephfs-rwx.yaml).
 
 ## Staging validation gate
 
@@ -742,7 +745,7 @@ At minimum, release validation should include:
 - `bash hack/validate-release-lab.sh`
 - a live lab validation for the feature or hotfix being released, including local attach/mount, local expansion, inventory CRDs, and workload bootstrap/init smoke checks when touching fast-path mount behavior
 
-Push a semantic tag such as `v0.5.3` only after that validation to trigger the release workflow.
+Push the semantic tag for the release being cut, for example `v0.5.4`, only after that validation to trigger the release workflow.
 
 The workflow will:
 
@@ -782,7 +785,7 @@ Validation remains informational only and does not by itself make a datastore un
 The binary now includes two operator-oriented modes in addition to the CSI and inventory-controller modes:
 
 - `inventory-validate`
-  - patches a datastore validation run nonce, waits for completion, and prints a compact JSON summary
+  - creates a datastore benchmark run, waits for completion, and prints a compact JSON summary
   - example:
 
 ```bash
@@ -790,6 +793,7 @@ go run ./cmd/opennebula-csi \
   --mode=inventory-validate \
   --datastore-id=111 \
   --storage-class=opennebula-default-rwo \
+  --access-modes=ReadWriteOnce \
   --size=1Gi
 ```
 
