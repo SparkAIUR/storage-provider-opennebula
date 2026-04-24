@@ -435,6 +435,9 @@ func buildVolumeContext(params map[string]string) map[string]string {
 			volumeContext[key] = value
 		}
 	}
+	if value := strings.TrimSpace(params[storageClassParamCephFSMounter]); value != "" {
+		volumeContext[storageClassParamCephFSMounter] = value
+	}
 	return volumeContext
 }
 
@@ -741,6 +744,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 		s.driver.metrics.RecordOperation("controller_publish_volume", "cephfs", "success", time.Since(started))
 		_ = nodeID
+		if requestedMounter := strings.TrimSpace(req.GetVolumeContext()[storageClassParamCephFSMounter]); requestedMounter != "" {
+			publishContext[sharedPublishContextCephFSMounter] = requestedMounter
+		}
 		return &csi.ControllerPublishVolumeResponse{PublishContext: publishContext}, nil
 	}
 

@@ -3,6 +3,8 @@ package driver
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -12,6 +14,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	testingexec "k8s.io/utils/exec/testing"
 )
 
 func TestParseSecretRefsCSV(t *testing.T) {
@@ -62,7 +65,11 @@ func TestCheckLocalImmediateBindingWarnsForLocalImmediate(t *testing.T) {
 		},
 	})
 
-	runner := NewPreflightRunner(cfg, nil, PreflightOptions{})
+	runner := NewPreflightRunner(cfg, &testingexec.FakeExec{
+		LookPathFunc: func(path string) (string, error) {
+			return path, nil
+		},
+	}, PreflightOptions{})
 	outcome, message := runner.checkLocalImmediateBinding(context.Background(), client, []datastoreSchema.Datastore{
 		{ID: 100, Name: "local-ds", DSMad: "fs", TMMad: "local", StateRaw: 0, Type: "IMAGE"},
 	})
@@ -197,6 +204,47 @@ func TestInspectStorageClassesUsesStandardCephFSSecretRefs(t *testing.T) {
 	assert.NotContains(t, summaries[0].Warnings, "cephfs provisioner secret refs incomplete")
 	assert.NotContains(t, summaries[0].Warnings, "cephfs node-stage secret refs incomplete")
 	assert.NotContains(t, summaries[0].Warnings, "cephfs controller-expand secret refs incomplete")
+}
+
+func TestInspectStorageClassesWarnsWhenKernelCephFSMounterIsUnsupported(t *testing.T) {
+	cfg := config.LoadConfiguration()
+	client := fake.NewSimpleClientset(&storagev1.StorageClass{
+		ObjectMeta:  metav1.ObjectMeta{Name: "cephfs-kernel"},
+		Provisioner: DefaultDriverName,
+		Parameters: map[string]string{
+			storageClassParamDatastoreIDs:                     "300",
+			storageClassParamCephFSMounter:                    "kernel",
+			"sharedFilesystemSubvolumeGroup":                  "csi",
+			"csi.storage.k8s.io/provisioner-secret-name":      "cephfs-provisioner",
+			"csi.storage.k8s.io/provisioner-secret-namespace": "kube-system",
+			"csi.storage.k8s.io/node-stage-secret-name":       "cephfs-node-stage",
+			"csi.storage.k8s.io/node-stage-secret-namespace":  "kube-system",
+		},
+	})
+
+	originalProcFilesystems := sharedFilesystemProcFilesystemsPath
+	tempProc := filepath.Join(t.TempDir(), "filesystems")
+	assert.NoError(t, os.WriteFile(tempProc, []byte("nodev\text4\n"), 0o644))
+	sharedFilesystemProcFilesystemsPath = tempProc
+	t.Cleanup(func() {
+		sharedFilesystemProcFilesystemsPath = originalProcFilesystems
+	})
+
+	runner := NewPreflightRunner(cfg, nil, PreflightOptions{})
+	summaries := runner.inspectStorageClasses(context.Background(), client, []datastoreSchema.Datastore{
+		newPreflightDatastore(300, "cephfs-a", "fs", "shared", "FILE", map[string]string{
+			"SPARKAI_CSI_SHARE_BACKEND":          "cephfs",
+			"SPARKAI_CSI_CEPHFS_FS_NAME":         "cephfs-prod",
+			"SPARKAI_CSI_CEPHFS_ROOT_PATH":       "/kubernetes",
+			"SPARKAI_CSI_CEPHFS_SUBVOLUME_GROUP": "csi",
+			"CEPH_HOST":                          "mon1,mon2",
+		}),
+	})
+
+	assert.Len(t, summaries, 1)
+	assert.Equal(t, "kernel", summaries[0].Mounter)
+	assert.Contains(t, summaries[0].Warnings, "cephfs kernel mounts requested but feature gate cephfsKernelMounts is disabled")
+	assert.NotEmpty(t, summaries[0].Warnings)
 }
 
 func boolPtrPreflight(value bool) *bool {

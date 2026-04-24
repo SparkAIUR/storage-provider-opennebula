@@ -15,6 +15,7 @@ const (
 	storageClassParamFSType                   = "fsType"
 	storageClassParamSharedFilesystemPath     = "sharedFilesystemPath"
 	storageClassParamSharedFilesystemGroup    = "sharedFilesystemSubvolumeGroup"
+	storageClassParamCephFSMounter            = "cephfsMounter"
 )
 
 func (d *Driver) GetDatastoreSelectionConfig(params map[string]string) (opennebula.DatastoreSelectionConfig, error) {
@@ -55,7 +56,7 @@ func filterProvisioningParams(params map[string]string) map[string]string {
 	filtered := make(map[string]string, len(params))
 	for key, value := range params {
 		switch key {
-		case storageClassParamDatastoreIDs, storageClassParamDatastoreSelectionPolicy, storageClassParamFSType, storageClassParamSharedFilesystemPath, storageClassParamSharedFilesystemGroup:
+		case storageClassParamDatastoreIDs, storageClassParamDatastoreSelectionPolicy, storageClassParamFSType, storageClassParamSharedFilesystemPath, storageClassParamSharedFilesystemGroup, storageClassParamCephFSMounter:
 			continue
 		default:
 			if strings.HasPrefix(key, "csi.storage.k8s.io/") {

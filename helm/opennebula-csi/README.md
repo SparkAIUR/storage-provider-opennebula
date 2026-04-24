@@ -154,7 +154,7 @@ Recommended secret split for dynamic CephFS:
   - used by the controller for `ceph fs subvolume create`, `rm`, `getpath`, and later resize/snapshot/clone flows
   - should use a stronger Ceph identity with monitor, MDS, OSD, and `mgr` caps sufficient for CephFS subvolume lifecycle
 - `cephfs-node-stage`
-  - used by the node plugin for `ceph-fuse` mounts
+  - used by the node plugin for `ceph-fuse` mounts and the opt-in kernel CephFS mount path
   - should use a narrower mount-oriented Ceph identity
 
 For the staging lab, the working split is:
@@ -188,6 +188,8 @@ parameters:
 
 For static CephFS filesystem volumes, `sharedFilesystemPath` must already exist in the filesystem. The driver will mount that path, but it does not create the directory for you.
 
+`cephfsMounter` defaults to `fuse`. Set `cephfsMounter: kernel` only when `featureGates.cephfsKernelMounts=true` and the host kernel already exposes CephFS client support. On Omni/Talos that support must come from the node image or system extensions on every worker that may mount the volume.
+
 ### Alpha Feature Gates
 
 ```yaml
@@ -195,6 +197,8 @@ featureGates:
   cephfsSnapshots: true
   cephfsClones: true
   cephfsSelfHealing: true
+  cephfsPersistentRecovery: true
+  cephfsKernelMounts: true
   topologyAccessibility: true
 ```
 
@@ -316,7 +320,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
-| `image.tag` | Driver image tag. | `"v0.5.4"` | No |
+| `image.tag` | Driver image tag. | `"v0.5.5"` | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
 
 ### Driver
@@ -376,6 +380,8 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | `featureGates.cephfsSnapshots` | Enable CephFS snapshot RPC flows. | `false` | No |
 | `featureGates.cephfsClones` | Enable CephFS PVC clone and snapshot restore flows. | `false` | No |
 | `featureGates.cephfsSelfHealing` | Enable stale CephFS mount lazy-unmount/remount recovery in node stage. `NodeGetVolumeStats` still reports disconnected CephFS mounts as restage-needed errors because kubelet stats calls do not include remount credentials. | `false` | No |
+| `featureGates.cephfsPersistentRecovery` | Persist node-local CephFS session state, scan for stale mounts after node-plugin restart, and enqueue async recovery when volume stats detect a stale CephFS mount. | `true` | No |
+| `featureGates.cephfsKernelMounts` | Allow CephFS StorageClasses to request `cephfsMounter=kernel`. Host kernel CephFS client support is still required. | `false` | No |
 | `featureGates.topologyAccessibility` | Enable topology capability advertisement and `accessible_topology` handling. | `false` | No |
 
 ### Controller
@@ -560,6 +566,7 @@ Common `storageClasses[].parameters` used by this driver:
 - `fsType`
 - `sharedFilesystemPath`
 - `sharedFilesystemSubvolumeGroup`
+- `cephfsMounter`
 - `csi.storage.k8s.io/provisioner-secret-name`
 - `csi.storage.k8s.io/provisioner-secret-namespace`
 - `csi.storage.k8s.io/node-stage-secret-name`

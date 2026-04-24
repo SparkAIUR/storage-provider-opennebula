@@ -249,7 +249,7 @@ Create chart name and version as used by the chart label.
 - name: ONE_CSI_INVENTORY_VALIDATION_DEFAULT_IMAGE
   value: {{ $inventoryValidationDefaultImage | quote }}
 - name: ONE_CSI_FEATURE_GATES
-  value: "compatibilityAwareSelection={{ $root.Values.featureGates.compatibilityAwareSelection }},detachedDiskExpansion={{ $root.Values.featureGates.detachedDiskExpansion }},cephfsExpansion={{ $root.Values.featureGates.cephfsExpansion }},cephfsSnapshots={{ $root.Values.featureGates.cephfsSnapshots }},cephfsClones={{ $root.Values.featureGates.cephfsClones }},cephfsSelfHealing={{ $root.Values.featureGates.cephfsSelfHealing }},topologyAccessibility={{ $root.Values.featureGates.topologyAccessibility }}"
+  value: "compatibilityAwareSelection={{ $root.Values.featureGates.compatibilityAwareSelection }},detachedDiskExpansion={{ $root.Values.featureGates.detachedDiskExpansion }},cephfsExpansion={{ $root.Values.featureGates.cephfsExpansion }},cephfsSnapshots={{ $root.Values.featureGates.cephfsSnapshots }},cephfsClones={{ $root.Values.featureGates.cephfsClones }},cephfsSelfHealing={{ $root.Values.featureGates.cephfsSelfHealing }},cephfsPersistentRecovery={{ $root.Values.featureGates.cephfsPersistentRecovery }},cephfsKernelMounts={{ $root.Values.featureGates.cephfsKernelMounts }},topologyAccessibility={{ $root.Values.featureGates.topologyAccessibility }}"
 {{- with $root.Values.driver.env }}
 {{ toYaml . }}
 {{- end }}

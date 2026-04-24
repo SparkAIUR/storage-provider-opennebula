@@ -181,13 +181,15 @@ func (d *Driver) Run(ctx context.Context) error {
 	}
 
 	controllerServer := NewControllerServer(d, volumeProvider, sharedFilesystemProvider)
+	nodeServer := NewNodeServer(d, d.mounter)
 	grpcServer.Start(
 		d.grpcServerEndpoint,
 		NewIdentityServer(d),
-		NewNodeServer(d, d.mounter),
+		nodeServer,
 		controllerServer,
 		d.controllerLeadership,
 	)
+	nodeServer.StartBackgroundWorkers(ctx)
 	controllerServer.StartBackgroundWorkers(ctx)
 	d.maybeStartWebhookServer(ctx)
 

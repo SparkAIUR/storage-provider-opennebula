@@ -48,6 +48,7 @@ type PreflightCheckResult struct {
 type PreflightStorageClassSummary struct {
 	Name                 string   `json:"name"`
 	Backend              string   `json:"backend"`
+	Mounter              string   `json:"mounter,omitempty"`
 	VolumeBindingMode    string   `json:"volumeBindingMode"`
 	AllowVolumeExpansion bool     `json:"allowVolumeExpansion"`
 	ValidationSupport    string   `json:"validationSupport"`
@@ -168,6 +169,7 @@ func (r *PreflightRunner) Run(ctx context.Context) PreflightReport {
 		} else {
 			appendResult("kubernetes_api", "skip", "Kubernetes client not available; skipping cluster-scoped preflight checks")
 		}
+		appendResult("cephfs_kernel_mount_prereqs", "skip", "Kubernetes client not available; skipping CephFS kernel StorageClass audit")
 	} else {
 		appendResult("kubernetes_api", "pass", "connected to Kubernetes API for cluster-scoped preflight checks")
 
@@ -200,6 +202,17 @@ func (r *PreflightRunner) Run(ctx context.Context) PreflightReport {
 		}
 
 		storageClassSummaries := r.inspectStorageClasses(ctx, kubeClient, datastorePool.Datastores)
+		if anyCephFSKernelMounter(storageClassSummaries) {
+			switch err := r.validateCephFSKernelMounterRuntime(); {
+			case err == nil:
+				appendResult("cephfs_kernel_mount_prereqs", "pass", "kernel CephFS StorageClasses have local runtime prerequisites available")
+			default:
+				appendResult("cephfs_kernel_mount_prereqs", "fail", err.Error())
+			}
+		} else {
+			appendResult("cephfs_kernel_mount_prereqs", "skip", "no CephFS StorageClasses request kernel mounts")
+		}
+
 		outcome, message := r.checkLocalImmediateBinding(ctx, kubeClient, datastorePool.Datastores)
 		appendResult("local_immediate_binding", outcome, message)
 		results = append(results, PreflightCheckResult{
@@ -236,8 +249,8 @@ func RunPreflightCommand(ctx context.Context, cfg config.CSIPluginConfig, exec u
 				if len(summary.Warnings) > 0 {
 					warnings = strings.Join(summary.Warnings, "; ")
 				}
-				fmt.Fprintf(w, "- %s backend=%s binding=%s expansion=%t validation=%s warnings=%s\n",
-					summary.Name, summary.Backend, summary.VolumeBindingMode, summary.AllowVolumeExpansion, summary.ValidationSupport, warnings)
+				fmt.Fprintf(w, "- %s backend=%s mounter=%s binding=%s expansion=%t validation=%s warnings=%s\n",
+					summary.Name, summary.Backend, summary.Mounter, summary.VolumeBindingMode, summary.AllowVolumeExpansion, summary.ValidationSupport, warnings)
 			}
 		}
 	case "json":
@@ -486,6 +499,15 @@ func (r *PreflightRunner) inspectStorageClasses(ctx context.Context, client kube
 			continue
 		}
 		backend := storageClassBackendSummary(r.Config, pool, storageClass)
+		mounter := ""
+		if backend == "cephfs" {
+			normalized, err := normalizeSharedFilesystemMounter(storageClass.Parameters[storageClassParamCephFSMounter])
+			if err != nil {
+				mounter = strings.TrimSpace(storageClass.Parameters[storageClassParamCephFSMounter])
+			} else {
+				mounter = string(normalized)
+			}
+		}
 		mode := string(volumeBindingMode(storageClass))
 		allowExpansion := false
 		if storageClass.AllowVolumeExpansion != nil {
@@ -494,6 +516,7 @@ func (r *PreflightRunner) inspectStorageClasses(ctx context.Context, client kube
 		summary := PreflightStorageClassSummary{
 			Name:                 storageClass.Name,
 			Backend:              backend,
+			Mounter:              mounter,
 			VolumeBindingMode:    mode,
 			AllowVolumeExpansion: allowExpansion,
 			ValidationSupport:    validationSupportForBackend(backend),
@@ -508,6 +531,11 @@ func (r *PreflightRunner) inspectStorageClasses(ctx context.Context, client kube
 			summary.Warnings = append(summary.Warnings, "volume expansion disabled")
 		}
 		if backend == "cephfs" {
+			if rawMounter := strings.TrimSpace(storageClass.Parameters[storageClassParamCephFSMounter]); rawMounter != "" {
+				if _, err := normalizeSharedFilesystemMounter(rawMounter); err != nil {
+					summary.Warnings = append(summary.Warnings, err.Error())
+				}
+			}
 			if !hasCompleteCSISecretRef(storageClass.Parameters, "csi.storage.k8s.io/provisioner-secret-name", "csi.storage.k8s.io/provisioner-secret-namespace") {
 				summary.Warnings = append(summary.Warnings, "cephfs provisioner secret refs incomplete")
 			}
@@ -517,10 +545,37 @@ func (r *PreflightRunner) inspectStorageClasses(ctx context.Context, client kube
 			if allowExpansion && !hasCompleteCSISecretRef(storageClass.Parameters, "csi.storage.k8s.io/controller-expand-secret-name", "csi.storage.k8s.io/controller-expand-secret-namespace") {
 				summary.Warnings = append(summary.Warnings, "cephfs controller-expand secret refs incomplete")
 			}
+			if mounter == string(sharedFilesystemMounterKernel) {
+				if !loadFeatureGates(r.Config).CephFSKernelMounts {
+					summary.Warnings = append(summary.Warnings, "cephfs kernel mounts requested but feature gate cephfsKernelMounts is disabled")
+				}
+				if err := r.validateCephFSKernelMounterRuntime(); err != nil {
+					summary.Warnings = append(summary.Warnings, err.Error())
+				}
+			}
 		}
 		summaries = append(summaries, summary)
 	}
 	return summaries
+}
+
+func anyCephFSKernelMounter(summaries []PreflightStorageClassSummary) bool {
+	for _, summary := range summaries {
+		if summary.Backend == "cephfs" && summary.Mounter == string(sharedFilesystemMounterKernel) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *PreflightRunner) validateCephFSKernelMounterRuntime() error {
+	if err := r.requireBinary("mount.ceph"); err != nil {
+		return err
+	}
+	if err := sharedFilesystemKernelSupported(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func validationSupportForBackend(_ string) string {

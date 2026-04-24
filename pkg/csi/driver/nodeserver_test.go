@@ -44,6 +44,8 @@ func getTestNodeServerWithMountPoints(mountPointList []mount.MountPoint) *NodeSe
 		nodeID:             "test-node-id",
 		maxVolumesPerNode:  30,
 		PluginConfig:       pluginConfig,
+		featureGates:       defaultFeatureGates(),
+		metrics:            NewDriverMetrics(driverVersion, "test"),
 	}
 	commandScriptArray := []testingexec.FakeCommandAction{}
 	//TODO: Simulate real commands
@@ -62,6 +64,9 @@ func getTestNodeServerWithMountPoints(mountPointList []mount.MountPoint) *NodeSe
 		mount.NewFakeMounter(mountPointList), // using fake mounter implementation
 		&testingexec.FakeExec{
 			CommandScript: commandScriptArray,
+			LookPathFunc: func(path string) (string, error) {
+				return path, nil
+			},
 		}, // using fake exec implementation
 	)
 	return NewNodeServer(driver, mounter)

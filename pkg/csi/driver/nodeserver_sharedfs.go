@@ -1,8 +1,8 @@
 package driver
 
 import (
+	"fmt"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 
@@ -34,6 +34,9 @@ func isSharedFilesystemRequest(volumeID string, publishContext map[string]string
 }
 
 func (ns *NodeServer) handleSharedFilesystemStage(req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+	release := ns.acquireSharedFilesystemOperationLock(req.GetVolumeId())
+	defer release()
+
 	volumeCapability := req.GetVolumeCapability()
 	if volumeCapability == nil {
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
@@ -53,9 +56,33 @@ func (ns *NodeServer) handleSharedFilesystemStage(req *csi.NodeStageVolumeReques
 		return nil, status.Error(codes.InvalidArgument, "staging target path is required")
 	}
 
+	if err := os.MkdirAll(stagingTargetPath, 0775); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to create staging target path %s: %v", stagingTargetPath, err)
+	}
+
+	session, err := sharedFilesystemSessionFromStageRequest(req)
+	if err != nil {
+		return nil, err
+	}
+
+	secrets := req.GetSecrets()
+	userID := strings.TrimSpace(secrets[sharedNodeStageSecretUserIDKey])
+	userKey := strings.TrimSpace(secrets[sharedNodeStageSecretUserKeyKey])
+	if userID == "" || userKey == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "CephFS node staging requires secret keys %q and %q", sharedNodeStageSecretUserIDKey, sharedNodeStageSecretUserKeyKey)
+	}
+
+	keyringPath, secretFilePath, err := ensureSharedFilesystemCredentials(stagingTargetPath, userID, userKey)
+	if err != nil {
+		return nil, err
+	}
+	session.KeyringPath = keyringPath
+	session.SecretFilePath = secretFilePath
+
 	notMountPoint, err := ns.mounter.Interface.IsLikelyNotMountPoint(stagingTargetPath)
 	if err == nil && !notMountPoint {
 		if staleErr := detectStaleSharedFilesystemMount(stagingTargetPath); staleErr == nil {
+			ns.recordSharedFilesystemSession(session)
 			return &csi.NodeStageVolumeResponse{}, nil
 		} else {
 			ns.Driver.metrics.RecordCephFSSubvolume("stale_mount_detected", "failure")
@@ -66,73 +93,23 @@ func (ns *NodeServer) handleSharedFilesystemStage(req *csi.NodeStageVolumeReques
 			if err := mountCleanup(stagingTargetPath, ns); err != nil {
 				return nil, err
 			}
-			_ = os.RemoveAll(sharedCephFSKeyringDir(stagingTargetPath))
 			ns.Driver.metrics.RecordCephFSSubvolume("self_heal_remount", "attempted")
 		}
 	}
 
-	if err := os.MkdirAll(stagingTargetPath, 0775); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to create staging target path %s: %v", stagingTargetPath, err)
-	}
-
-	secrets := req.GetSecrets()
-	userID := strings.TrimSpace(secrets[sharedNodeStageSecretUserIDKey])
-	userKey := strings.TrimSpace(secrets[sharedNodeStageSecretUserKeyKey])
-	if userID == "" || userKey == "" {
-		return nil, status.Errorf(codes.InvalidArgument, "CephFS node staging requires secret keys %q and %q", sharedNodeStageSecretUserIDKey, sharedNodeStageSecretUserKeyKey)
-	}
-
-	keyringDir := sharedCephFSKeyringDir(stagingTargetPath)
-	if err := os.MkdirAll(keyringDir, 0700); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to create CephFS keyring directory: %v", err)
-	}
-	keyringPath := filepath.Join(keyringDir, sharedCephFSKeyringFile)
-	keyringContents := []byte("[client." + userID + "]\n\tkey = " + userKey + "\n")
-	if err := os.WriteFile(keyringPath, keyringContents, 0600); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to write CephFS keyring file: %v", err)
-	}
-
-	monitors := strings.TrimSpace(publishContext[sharedPublishContextCephFSMonitors])
-	fsName := strings.TrimSpace(publishContext[sharedPublishContextCephFSFSName])
-	subpath := strings.TrimSpace(publishContext[sharedPublishContextCephFSSubpath])
-	if monitors == "" || fsName == "" || subpath == "" {
-		return nil, status.Error(codes.InvalidArgument, "CephFS publish context is incomplete")
-	}
-
-	mountOptions := splitCSV(publishContext[sharedPublishContextCephFSMounts])
-	if volumeCapability.GetMount() != nil {
-		mountOptions = append(mountOptions, volumeCapability.GetMount().GetMountFlags()...)
-	}
-	if strings.EqualFold(strings.TrimSpace(publishContext[sharedPublishContextCephFSReadonly]), "true") {
-		mountOptions = append(mountOptions, "ro")
-	}
-
-	args := []string{
-		stagingTargetPath,
-		"-m", monitors,
-		"--id", userID,
-		"-k", keyringPath,
-		"--client_mountpoint", subpath,
-		"--client_fs", fsName,
-	}
-	if len(mountOptions) > 0 {
-		args = append(args, "-o", strings.Join(uniqueStrings(mountOptions), ","))
-	}
-
-	output, err := ns.mounter.Exec.Command("ceph-fuse", args...).CombinedOutput()
-	if err != nil {
+	if err := ns.mountSharedFilesystemSession(session); err != nil {
 		ns.Driver.metrics.RecordCephFSSubvolume("mount", "failure")
-		_ = os.RemoveAll(keyringDir)
-		klog.V(0).ErrorS(err, "Failed to mount CephFS volume",
-			"method", "handleSharedFilesystemStage", "stagingTargetPath", stagingTargetPath, "output", string(output))
-		return nil, status.Errorf(codes.Internal, "failed to mount CephFS volume: %s", strings.TrimSpace(string(output)))
+		return nil, err
 	}
-	ns.Driver.metrics.RecordCephFSSubvolume("mount", "success")
+	ns.recordSharedFilesystemSession(session)
 
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
 func (ns *NodeServer) handleSharedFilesystemUnstage(req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+	release := ns.acquireSharedFilesystemOperationLock(req.GetVolumeId())
+	defer release()
+
 	stagingTargetPath := req.GetStagingTargetPath()
 	if stagingTargetPath == "" {
 		return nil, status.Error(codes.InvalidArgument, "staging target path is required")
@@ -144,10 +121,14 @@ func (ns *NodeServer) handleSharedFilesystemUnstage(req *csi.NodeUnstageVolumeRe
 	}
 
 	_ = os.RemoveAll(sharedCephFSKeyringDir(stagingTargetPath))
+	ns.deleteSharedFilesystemSession(req.GetVolumeId())
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
 func (ns *NodeServer) handleSharedFilesystemPublish(req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+	release := ns.acquireSharedFilesystemOperationLock(req.GetVolumeId())
+	defer release()
+
 	volumeCapability := req.GetVolumeCapability()
 	if volumeCapability == nil {
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
@@ -162,26 +143,15 @@ func (ns *NodeServer) handleSharedFilesystemPublish(req *csi.NodePublishVolumeRe
 		return nil, status.Error(codes.InvalidArgument, "staging target path and target path are required")
 	}
 
-	targetDir := targetPath
-	if _, err := os.Stat(targetDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(targetDir, 0750); err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to create target path %s: %v", targetDir, err)
-		}
-	}
-
-	options := []string{"bind"}
-	if req.GetReadonly() {
-		options = append(options, "ro")
-	}
-
-	resp, err := ns.handleMountVolumePublish(stagingTargetPath, targetPath, volumeCapability, options)
-	if err != nil {
+	target := sharedFilesystemTargetFromPublishRequest(req)
+	if err := ns.publishSharedFilesystemTarget(stagingTargetPath, target); err != nil {
 		klog.V(0).ErrorS(err, "Failed to publish shared filesystem volume",
 			"method", "handleSharedFilesystemPublish", "stagingTargetPath", stagingTargetPath, "targetPath", targetPath, "accessType", reflect.TypeOf(volumeCapability.GetAccessType()).String())
 		return nil, status.Error(codes.Internal, "failed to publish volume")
 	}
+	ns.updateSharedFilesystemPublishedTarget(req.GetVolumeId(), target)
 
-	return resp, nil
+	return &csi.NodePublishVolumeResponse{}, nil
 }
 
 func mountCleanup(stagingTargetPath string, ns *NodeServer) error {
@@ -211,6 +181,124 @@ func uniqueStrings(values []string) []string {
 	}
 
 	return unique
+}
+
+func (ns *NodeServer) publishSharedFilesystemTarget(stagingTargetPath string, target sharedFilesystemPublishedTarget) error {
+	targetPath := strings.TrimSpace(target.TargetPath)
+	if stagingTargetPath == "" || targetPath == "" {
+		return status.Error(codes.InvalidArgument, "staging target path and target path are required")
+	}
+
+	if _, err := os.Stat(targetPath); os.IsNotExist(err) {
+		if err := os.MkdirAll(targetPath, 0750); err != nil {
+			return status.Errorf(codes.Internal, "failed to create target path %s: %v", targetPath, err)
+		}
+	}
+
+	mountCheck, err := ns.checkMountPoint(stagingTargetPath, targetPath, nil)
+	if err != nil {
+		return err
+	}
+	if mountCheck.targetIsMountPoint {
+		return nil
+	}
+
+	options := append([]string{"bind"}, uniqueStrings(target.MountOptions)...)
+	if err := ns.mounter.Interface.Mount(stagingTargetPath, targetPath, "", options); err != nil {
+		return fmt.Errorf("failed to bind shared filesystem target %s: %w", targetPath, err)
+	}
+
+	return nil
+}
+
+func (ns *NodeServer) mountSharedFilesystemSession(session sharedFilesystemSession) error {
+	switch session.Mounter {
+	case sharedFilesystemMounterKernel:
+		return ns.mountSharedFilesystemKernel(session)
+	case sharedFilesystemMounterFuse:
+		return ns.mountSharedFilesystemFuse(session)
+	default:
+		return status.Errorf(codes.InvalidArgument, "unsupported CephFS mounter %q", session.Mounter)
+	}
+}
+
+func (ns *NodeServer) mountSharedFilesystemFuse(session sharedFilesystemSession) error {
+	args := []string{
+		session.StagingTargetPath,
+		"-m", strings.Join(session.Monitors, ","),
+		"--id", session.UserID,
+		"-k", session.KeyringPath,
+		"--client_mountpoint", session.Subpath,
+		"--client_fs", session.FSName,
+	}
+	if len(session.StageMountOptions) > 0 {
+		args = append(args, "-o", strings.Join(uniqueStrings(session.StageMountOptions), ","))
+	}
+
+	output, err := ns.mounter.Exec.Command("ceph-fuse", args...).CombinedOutput()
+	if err != nil {
+		klog.V(0).ErrorS(err, "Failed to mount CephFS volume",
+			"method", "mountSharedFilesystemFuse", "stagingTargetPath", session.StagingTargetPath, "output", string(output))
+		return status.Errorf(codes.Internal, "failed to mount CephFS volume: %s", strings.TrimSpace(string(output)))
+	}
+	ns.Driver.metrics.RecordCephFSSubvolume("mount", "success")
+	ns.recordSharedFilesystemTestStageMount(session)
+	return nil
+}
+
+func (ns *NodeServer) mountSharedFilesystemKernel(session sharedFilesystemSession) error {
+	if !ns.Driver.featureGates.CephFSKernelMounts {
+		return status.Error(codes.FailedPrecondition, "CephFS kernel mounts require feature gate cephfsKernelMounts=true")
+	}
+	if err := sharedFilesystemKernelSupported(); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "CephFS kernel mount prerequisites failed: %v", err)
+	}
+	if _, err := ns.mounter.Exec.LookPath("mount.ceph"); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "mount.ceph helper is not available in PATH: %v", err)
+	}
+	if strings.TrimSpace(session.SecretFilePath) == "" {
+		return status.Error(codes.FailedPrecondition, "CephFS kernel mounts require a secretfile path")
+	}
+
+	device := fmt.Sprintf("%s@.%s=%s", session.UserID, session.FSName, session.Subpath)
+	options := []string{
+		"mon_addr=" + sharedFilesystemKernelMonitorOption(session.Monitors),
+		"secretfile=" + session.SecretFilePath,
+	}
+	options = append(options, uniqueStrings(session.StageMountOptions)...)
+	args := []string{"-t", "ceph", device, session.StagingTargetPath, "-o", strings.Join(options, ",")}
+
+	output, err := ns.mounter.Exec.Command("mount", args...).CombinedOutput()
+	if err != nil {
+		klog.V(0).ErrorS(err, "Failed to mount CephFS volume with kernel client",
+			"method", "mountSharedFilesystemKernel", "stagingTargetPath", session.StagingTargetPath, "output", string(output))
+		return status.Errorf(codes.Internal, "failed to mount CephFS volume with kernel client: %s", strings.TrimSpace(string(output)))
+	}
+	ns.Driver.metrics.RecordCephFSSubvolume("mount", "success")
+	ns.recordSharedFilesystemTestStageMount(session)
+	return nil
+}
+
+func (ns *NodeServer) recordSharedFilesystemTestStageMount(session sharedFilesystemSession) {
+	fake, ok := ns.mounter.Interface.(*mount.FakeMounter)
+	if !ok {
+		return
+	}
+	for _, mountPoint := range fake.MountPoints {
+		if mountPoint.Path == session.StagingTargetPath {
+			return
+		}
+	}
+	fsType := "fuse.ceph-fuse"
+	if session.Mounter == sharedFilesystemMounterKernel {
+		fsType = "ceph"
+	}
+	fake.MountPoints = append(fake.MountPoints, mount.MountPoint{
+		Device: strings.Join(session.Monitors, ","),
+		Path:   session.StagingTargetPath,
+		Type:   fsType,
+		Opts:   uniqueStrings(session.StageMountOptions),
+	})
 }
 
 func sharedCephFSKeyringDir(stagingTargetPath string) string {

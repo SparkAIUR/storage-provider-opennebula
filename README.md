@@ -44,6 +44,7 @@ Features that remain gated by default:
 - `cephfsSnapshots`
 - `cephfsClones`
 - `cephfsSelfHealing`
+- `cephfsKernelMounts`
 - `topologyAccessibility`
 
 ## Release artifacts
@@ -51,7 +52,7 @@ Features that remain gated by default:
 - Container images:
   `ghcr.io/sparkaiur/opennebula-csi:<tag>`
   `docker.io/nudevco/opennebula-csi:<tag>`
-- Latest release: `v0.5.4`
+- Latest release: `v0.5.5`
 - Helm repo: `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
 - Chart name: `opennebula-csi`
 - Source repo: `https://github.com/SparkAIUR/storage-provider-opennebula`
@@ -301,6 +302,10 @@ CephFS StorageClass parameters:
   - if unset, the driver dynamically provisions a CephFS subvolume
 - `sharedFilesystemSubvolumeGroup`
   - optional override for the datastore default
+- `cephfsMounter`
+  - optional, defaults to `fuse`
+  - accepts `fuse` or `kernel`
+  - `kernel` requires `cephfsKernelMounts=true` plus host kernel CephFS client support
 
 CephFS secret references:
 
@@ -324,12 +329,17 @@ Expected CephFS secret keys:
 - dynamic CephFS provisioning requires a Ceph user with permission to create, getpath, and remove subvolumes in the configured filesystem and subvolume group
 - dynamic CephFS expansion also requires `csi.storage.k8s.io/controller-expand-secret-name` and `csi.storage.k8s.io/controller-expand-secret-namespace` on the StorageClass, typically pointing at the same secret used for the provisioner path
 - CephFS expansion, snapshot, and clone flows require the corresponding feature gates to be enabled before use
+- `cephfsPersistentRecovery=true` is enabled by default and persists node-local CephFS session state for startup and periodic recovery scans
+- the default CephFS node mount path remains `ceph-fuse`; `cephfsMounter=kernel` is opt-in
+- on Omni/Talos, `cephfsMounter=kernel` requires CephFS kernel client support in the node image or system extensions on every worker that may mount the volume
 
 ### CephFS alpha feature gates
 
 - `cephfsSnapshots=true` enables `CreateSnapshot`, `DeleteSnapshot`, and snapshot listing for dynamic CephFS subvolumes
 - `cephfsClones=true` enables PVC clone from CephFS volumes and restore from CephFS snapshots
 - `cephfsSelfHealing=true` enables one lazy-unmount/remount recovery attempt when node stage detects a stale CephFS mount during staging
+- `cephfsPersistentRecovery=true` enables persistent node-local CephFS session recovery after node-plugin restarts and async repair on stale volume stats
+- `cephfsKernelMounts=true` allows StorageClasses to request `cephfsMounter=kernel`
 - `NodeGetVolumeStats` reports stale or disconnected CephFS mounts as `FailedPrecondition` so kubelet surfaces a precise restage-needed error instead of a generic internal stat failure
 - static CephFS paths created with `sharedFilesystemPath` still reject expansion
 
@@ -515,6 +525,8 @@ Current gates:
 - `cephfsSnapshots=false`
 - `cephfsClones=false`
 - `cephfsSelfHealing=false`
+- `cephfsPersistentRecovery=true`
+- `cephfsKernelMounts=false`
 - `topologyAccessibility=false`
 
 The chart renders these into `ONE_CSI_FEATURE_GATES`.
@@ -524,6 +536,8 @@ The chart renders these into `ONE_CSI_FEATURE_GATES`.
 - `cephfsSnapshots` enables CephFS snapshot RPCs
 - `cephfsClones` enables CephFS PVC clone and snapshot restore flows
 - `cephfsSelfHealing` controls stale CephFS remount attempts after a stale mount is detected during node stage
+- `cephfsPersistentRecovery` controls node-local CephFS session persistence, startup recovery scans, and async stale-mount repair attempts
+- `cephfsKernelMounts` allows StorageClasses to request `cephfsMounter=kernel`
 - `topologyAccessibility` enables node topology lookup and `accessible_topology` responses
 
 ## Helm installation
@@ -663,8 +677,9 @@ For CephFS-backed Omni deployments:
 2. Set `driver.defaultDatastores` or StorageClass `datastoreIDs` to the CephFS datastore IDs.
 3. Add node-stage and provisioner secret refs to the StorageClass parameters.
 4. Use `sharedFilesystemSubvolumeGroup` for dynamic CephFS provisioning or `sharedFilesystemPath` for static CephFS provisioning.
-5. Use `ReadWriteOnce`, `ReadOnlyMany`, or `ReadWriteMany` on the PVC as needed.
-6. Validate the resulting deployment with [examples/demo-busybox-cephfs-rwx.yaml](examples/demo-busybox-cephfs-rwx.yaml).
+5. Keep the default `cephfsMounter=fuse` unless the Omni/Talos node image already exposes kernel CephFS client support. Only then enable `cephfsKernelMounts=true` and set `cephfsMounter=kernel`.
+6. Use `ReadWriteOnce`, `ReadOnlyMany`, or `ReadWriteMany` on the PVC as needed.
+7. Validate the resulting deployment with [examples/demo-busybox-cephfs-rwx.yaml](examples/demo-busybox-cephfs-rwx.yaml).
 
 ## Staging validation gate
 
@@ -695,7 +710,7 @@ Sanitized staging-derived operator notes:
 - Ceph RBD volumes require the target VM to run on a compatible Ceph system datastore; a local `TM_MAD=local` system datastore is not a valid Ceph RBD attach target
 - static CephFS paths must already exist before the claim is created
 - dynamic CephFS expansion requires the standard CSI controller-expand secret refs on the StorageClass
-- stale CephFS mounts surface as restage-needed errors in volume stats until the workload is restaged
+- stale CephFS mounts surface as restage-needed errors in volume stats; with `cephfsPersistentRecovery=true` the node plugin now also queues an async remount/rebind attempt so most pods recover after the next kubelet retry instead of waiting for manual restage
 
 ## Local development
 
@@ -745,7 +760,7 @@ At minimum, release validation should include:
 - `bash hack/validate-release-lab.sh`
 - a live lab validation for the feature or hotfix being released, including local attach/mount, local expansion, inventory CRDs, and workload bootstrap/init smoke checks when touching fast-path mount behavior
 
-Push the semantic tag for the release being cut, for example `v0.5.4`, only after that validation to trigger the release workflow.
+Push the semantic tag for the release being cut, for example `v0.5.5`, only after that validation to trigger the release workflow.
 
 The workflow will:
 

@@ -74,20 +74,32 @@ type mountPointMatch struct {
 }
 
 type NodeServer struct {
-	Driver         *Driver
-	mounter        *mount.SafeFormatAndMount
-	deviceResolver *NodeDeviceResolver
+	Driver                   *Driver
+	mounter                  *mount.SafeFormatAndMount
+	deviceResolver           *NodeDeviceResolver
+	sharedFilesystemRecovery *sharedFilesystemRecoveryManager
 	csi.UnimplementedNodeServer
 }
 
 func NewNodeServer(d *Driver, mounter *mount.SafeFormatAndMount) *NodeServer {
+	if d.operationLocks == nil {
+		d.operationLocks = NewOperationLocks()
+	}
 	ns := &NodeServer{
 		Driver:         d,
 		mounter:        mounter,
 		deviceResolver: NewNodeDeviceResolver(d.PluginConfig, mounter.Exec, nil),
 	}
 	ns.deviceResolver.deviceCandidatesFn = ns.deviceCandidates
+	ns.sharedFilesystemRecovery = newSharedFilesystemRecoveryManager(ns)
 	return ns
+}
+
+func (ns *NodeServer) StartBackgroundWorkers(ctx context.Context) {
+	if ns == nil || ns.sharedFilesystemRecovery == nil {
+		return
+	}
+	ns.sharedFilesystemRecovery.Start(ctx)
 }
 
 //Following functions are RPC implementations defined in
@@ -495,6 +507,9 @@ func (ns *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubl
 
 	klog.V(1).InfoS("Volume successfully unpublished from target path",
 		"method", "NodeUnpublishVolume", "volumeID", volumeID, "targetPath", targetPath)
+	if opennebula.IsSharedFilesystemVolumeID(volumeID) {
+		ns.removeSharedFilesystemPublishedTarget(volumeID, targetPath)
+	}
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
@@ -516,8 +531,7 @@ func (ns *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolu
 			return nil, status.Errorf(codes.NotFound, "volume path %s was not found", volumePath)
 		}
 		if opennebula.IsSharedFilesystemVolumeID(volumeID) && isDisconnectedSharedFilesystemError(err) {
-			ns.Driver.metrics.RecordCephFSSubvolume("stale_mount_detected", "failure")
-			return nil, status.Errorf(codes.FailedPrecondition, "stale CephFS mount detected at %s: %v; restage the volume to recover", volumePath, err)
+			return nil, ns.handleDisconnectedSharedFilesystemPath(volumeID, volumePath, err)
 		}
 		return nil, status.Errorf(codes.Internal, "failed to stat volume path %s: %v", volumePath, err)
 	}
@@ -526,8 +540,7 @@ func (ns *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolu
 		var fs unix.Statfs_t
 		if err := nodeVolumePathFS(volumePath, &fs); err != nil {
 			if opennebula.IsSharedFilesystemVolumeID(volumeID) && isDisconnectedSharedFilesystemError(err) {
-				ns.Driver.metrics.RecordCephFSSubvolume("stale_mount_detected", "failure")
-				return nil, status.Errorf(codes.FailedPrecondition, "stale CephFS mount detected at %s: %v; restage the volume to recover", volumePath, err)
+				return nil, ns.handleDisconnectedSharedFilesystemPath(volumeID, volumePath, err)
 			}
 			return nil, status.Errorf(codes.Internal, "failed to collect filesystem stats for %s: %v", volumePath, err)
 		}
