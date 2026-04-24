@@ -320,7 +320,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
-| `image.tag` | Driver image tag. | `"v0.5.5"` | No |
+| `image.tag` | Driver image tag. | `"v0.5.6"` | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
 
 ### Driver
@@ -479,6 +479,7 @@ Benchmark defaults:
 - all other datastores default PVC access mode to `ReadWriteOnce`
 - benchmark Jobs default `activeDeadlineSeconds` to `900`
 - terminal benchmark runs clean up their Job and PVC resources
+- `spec.fioArgs` is additive: required fio defaults stay in place unless you override them explicitly
 
 ```bash
 kubectl apply -f - <<EOF

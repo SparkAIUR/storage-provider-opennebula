@@ -127,6 +127,32 @@ func TestSharedFilesystemRecoveryRebindsMissingTarget(t *testing.T) {
 	assert.True(t, check.targetIsMountPoint)
 }
 
+func TestMountSharedFilesystemSessionRecreatesMissingStagePath(t *testing.T) {
+	withSharedFilesystemTestPaths(t)
+
+	stagePath := filepath.Join(t.TempDir(), "globalmount")
+	volumeID := "cephfs:test-missing-stage-path"
+	ns := getTestNodeServer(nil)
+
+	_, err := ns.NodeStageVolume(context.Background(), newSharedFilesystemStageRequest(volumeID, stagePath, "fuse"))
+	require.NoError(t, err)
+
+	require.NoError(t, os.RemoveAll(stagePath))
+	_, err = os.Stat(stagePath)
+	require.Error(t, err)
+	require.True(t, os.IsNotExist(err))
+
+	session, exists, err := ns.sharedFilesystemRecovery.store.Load(volumeID)
+	require.NoError(t, err)
+	require.True(t, exists)
+
+	require.NoError(t, ns.mountSharedFilesystemSession(session))
+
+	info, err := os.Stat(stagePath)
+	require.NoError(t, err)
+	assert.True(t, info.IsDir())
+}
+
 func TestStageSharedFilesystemKernelMounterRequiresFeatureGate(t *testing.T) {
 	withSharedFilesystemTestPaths(t)
 

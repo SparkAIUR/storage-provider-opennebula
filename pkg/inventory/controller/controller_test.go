@@ -386,6 +386,69 @@ func TestBuildBenchmarkPVCRejectsUnsupportedAccessMode(t *testing.T) {
 	}
 }
 
+func TestBuildValidationCommandMergesPartialOverrides(t *testing.T) {
+	command := buildValidationCommand([]string{
+		"--name=smoke",
+		"--iodepth=8",
+		"--runtime=15",
+		"--time_based=1",
+	})
+
+	for _, expected := range []string{
+		"fio",
+		"--name=smoke",
+		"--filename=/data/validation.bin",
+		"--rw=randrw",
+		"--bs=4k",
+		"--size=256Mi",
+		"--iodepth=8",
+		"--runtime=15",
+		"--time_based=1",
+		"--output-format=json",
+	} {
+		if !strings.Contains(command, expected) {
+			t.Fatalf("expected command %q to contain %q", command, expected)
+		}
+	}
+	for _, unexpected := range []string{
+		"--name=validate",
+		"--iodepth=16",
+		"--runtime=30",
+		" --time_based ",
+	} {
+		if strings.Contains(command, unexpected) {
+			t.Fatalf("expected command %q not to contain %q", command, unexpected)
+		}
+	}
+}
+
+func TestBuildValidationCommandSupportsSeparateValueOverrides(t *testing.T) {
+	command := buildValidationCommand([]string{
+		"--size", "1Gi",
+		"--filename", "/data/custom.bin",
+		"--name", "bench",
+	})
+
+	for _, expected := range []string{
+		"--size 1Gi",
+		"--filename /data/custom.bin",
+		"--name bench",
+	} {
+		if !strings.Contains(command, expected) {
+			t.Fatalf("expected command %q to contain %q", command, expected)
+		}
+	}
+	for _, unexpected := range []string{
+		"--size=256Mi",
+		"--filename=/data/validation.bin",
+		"--name=validate",
+	} {
+		if strings.Contains(command, unexpected) {
+			t.Fatalf("expected command %q not to contain %q", command, unexpected)
+		}
+	}
+}
+
 func TestParseFIOResultSkipsLeadingNoise(t *testing.T) {
 	payload := []byte("note: queue depth will be capped at 1\n{\"jobs\":[{\"read\":{\"iops\":12000,\"bw_bytes\":4096,\"clat_ns\":{\"percentile\":{\"50.000000\":4000000,\"99.000000\":5000000}}},\"write\":{\"iops\":8000,\"bw_bytes\":2048,\"clat_ns\":{\"percentile\":{\"99.000000\":6000000}}}}]}")
 	result, err := parseFIOResult(payload)

@@ -1220,10 +1220,77 @@ func buildValidationCommand(args []string) string {
 		"--runtime=30",
 		"--time_based",
 	}
-	if len(args) == 0 {
-		args = defaultArgs
-	}
+	args = mergeValidationArgs(defaultArgs, args)
 	return "set -eu; if ! command -v fio >/dev/null 2>&1; then if command -v apk >/dev/null 2>&1; then apk add --no-cache fio >/dev/null; else echo 'fio binary is unavailable and apk is not installed' >&2; exit 1; fi; fi; fio " + strings.Join(args, " ") + " --output-format=json"
+}
+
+type validationArgEntry struct {
+	key    string
+	tokens []string
+}
+
+func mergeValidationArgs(defaultArgs, overrideArgs []string) []string {
+	if len(overrideArgs) == 0 {
+		return append([]string(nil), defaultArgs...)
+	}
+
+	entries := parseValidationArgs(defaultArgs)
+	for _, entry := range parseValidationArgs(overrideArgs) {
+		if entry.key == "" {
+			entries = append(entries, entry)
+			continue
+		}
+
+		replaced := false
+		for i := range entries {
+			if entries[i].key == entry.key {
+				entries[i] = entry
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			entries = append(entries, entry)
+		}
+	}
+
+	merged := make([]string, 0, len(defaultArgs)+len(overrideArgs))
+	for _, entry := range entries {
+		merged = append(merged, entry.tokens...)
+	}
+	return merged
+}
+
+func parseValidationArgs(args []string) []validationArgEntry {
+	entries := make([]validationArgEntry, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		current := strings.TrimSpace(args[i])
+		if current == "" {
+			continue
+		}
+
+		entry := validationArgEntry{tokens: []string{current}}
+		if strings.HasPrefix(current, "--") {
+			entry.key = validationArgKey(current)
+			if !strings.Contains(current, "=") && i+1 < len(args) {
+				next := strings.TrimSpace(args[i+1])
+				if next != "" && !strings.HasPrefix(next, "--") {
+					entry.tokens = append(entry.tokens, next)
+					i++
+				}
+			}
+		}
+
+		entries = append(entries, entry)
+	}
+	return entries
+}
+
+func validationArgKey(arg string) string {
+	if idx := strings.Index(arg, "="); idx >= 0 {
+		return arg[:idx]
+	}
+	return arg
 }
 
 func isTerminalValidationPhase(phase string) bool {

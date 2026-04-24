@@ -212,6 +212,10 @@ func (ns *NodeServer) publishSharedFilesystemTarget(stagingTargetPath string, ta
 }
 
 func (ns *NodeServer) mountSharedFilesystemSession(session sharedFilesystemSession) error {
+	if err := ensureSharedFilesystemStagePath(session.StagingTargetPath); err != nil {
+		return err
+	}
+
 	switch session.Mounter {
 	case sharedFilesystemMounterKernel:
 		return ns.mountSharedFilesystemKernel(session)
@@ -220,6 +224,17 @@ func (ns *NodeServer) mountSharedFilesystemSession(session sharedFilesystemSessi
 	default:
 		return status.Errorf(codes.InvalidArgument, "unsupported CephFS mounter %q", session.Mounter)
 	}
+}
+
+func ensureSharedFilesystemStagePath(stagingTargetPath string) error {
+	stagingTargetPath = strings.TrimSpace(stagingTargetPath)
+	if stagingTargetPath == "" {
+		return status.Error(codes.InvalidArgument, "staging target path is required")
+	}
+	if err := os.MkdirAll(stagingTargetPath, 0o775); err != nil {
+		return status.Errorf(codes.Internal, "failed to create staging target path %s: %v", stagingTargetPath, err)
+	}
+	return nil
 }
 
 func (ns *NodeServer) mountSharedFilesystemFuse(session sharedFilesystemSession) error {
