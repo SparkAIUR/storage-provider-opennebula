@@ -16,4 +16,5 @@ featureGates:
   cephfsSnapshots: true
   cephfsClones: true
   cephfsSelfHealing: true
+  localRWOStaleMountRecovery: true
   topologyAccessibility: true

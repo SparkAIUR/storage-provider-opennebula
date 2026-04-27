@@ -14,7 +14,7 @@ credentials:
 
 image:
   repository: "nudevco/opennebula-csi"
-  tag: "v0.5.6"
+  tag: "v0.5.7"
   pullPolicy: "IfNotPresent"
 
 imagePullSecrets: []
@@ -48,6 +48,10 @@ driver:
     detachGraceSeconds: 90
     maxDetachGraceSeconds: 300
     requireNodeReady: true
+  localRWOStaleMountRecovery:
+    activePodRecovery: false
+    maxAttempts: 3
+    backoffSeconds: 10
   lastNodePreference:
     enabled: true
     policy: "local-single-writer"
@@ -82,6 +86,7 @@ featureGates:
   cephfsSelfHealing: false
   cephfsPersistentRecovery: true
   cephfsKernelMounts: false
+  localRWOStaleMountRecovery: false
   topologyAccessibility: false
 
 controller:

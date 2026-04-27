@@ -52,7 +52,7 @@ Features that remain gated by default:
 - Container images:
   `ghcr.io/sparkaiur/opennebula-csi:<tag>`
   `docker.io/nudevco/opennebula-csi:<tag>`
-- Latest release: `v0.5.6`
+- Latest release: `v0.5.7`
 - Helm repo: `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
 - Chart name: `opennebula-csi`
 - Source repo: `https://github.com/SparkAIUR/storage-provider-opennebula`
@@ -760,7 +760,7 @@ At minimum, release validation should include:
 - `bash hack/validate-release-lab.sh`
 - a live lab validation for the feature or hotfix being released, including local attach/mount, local expansion, inventory CRDs, and workload bootstrap/init smoke checks when touching fast-path mount behavior
 
-Push the semantic tag for the release being cut, for example `v0.5.6`, only after that validation to trigger the release workflow.
+Push the semantic tag for the release being cut, for example `v0.5.7`, only after that validation to trigger the release workflow.
 
 The workflow will:
 
@@ -797,7 +797,7 @@ Validation remains informational only and does not by itself make a datastore un
 
 ## Inventory Commands
 
-The binary now includes two operator-oriented modes in addition to the CSI and inventory-controller modes:
+The binary now includes operator-oriented modes in addition to the CSI and inventory-controller modes:
 
 - `inventory-validate`
   - creates a datastore benchmark run, waits for completion, and prints a compact JSON summary
@@ -813,11 +813,21 @@ go run ./cmd/opennebula-csi \
 ```
 
 - `support-bundle`
-  - prints a JSON support snapshot including effective config, feature gates, leadership settings, hotplug cooldown snapshots, datastore/node inventory, StorageClass audit data, VolumeAttachments, and recent Events
+  - prints a JSON support snapshot including effective config, feature gates, leadership settings, hotplug cooldown snapshots, datastore/node inventory, StorageClass audit data, volume-health diagnostics, VolumeAttachments, and recent Events
   - example:
 
 ```bash
 go run ./cmd/opennebula-csi --mode=support-bundle > support-bundle.json
+```
+
+- `volume-health`
+  - prints focused JSON diagnostics for PV/PVC/VolumeAttachment plus any node-local disk or CephFS session state visible from the container
+  - example:
+
+```bash
+go run ./cmd/opennebula-csi \
+  --mode=volume-health \
+  --pvc=s3/data1-minio-pool-0
 ```
 
 ## Upstream

@@ -320,7 +320,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
-| `image.tag` | Driver image tag. | `"v0.5.6"` | No |
+| `image.tag` | Driver image tag. | `"v0.5.7"` | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
 
 ### Driver
@@ -350,6 +350,9 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.localRestartOptimization.detachGraceSeconds` | Default delayed-detach grace used for opted-in local PVCs. | `90` | No |
 | `driver.localRestartOptimization.maxDetachGraceSeconds` | Upper bound for per-PVC delayed-detach overrides. | `300` | No |
 | `driver.localRestartOptimization.requireNodeReady` | Require Kubernetes node and OpenNebula VM readiness before starting delayed detach. | `true` | No |
+| `driver.localRWOStaleMountRecovery.activePodRecovery` | Allow experimental recovery of stale local RWO mounts while a pod target is still active. Requires `featureGates.localRWOStaleMountRecovery=true`. | `false` | No |
+| `driver.localRWOStaleMountRecovery.maxAttempts` | Maximum recovery attempts persisted per local RWO volume session. | `3` | No |
+| `driver.localRWOStaleMountRecovery.backoffSeconds` | Backoff after a failed local RWO stale-mount recovery attempt. | `10` | No |
 | `driver.lastNodePreference.enabled` | Enable soft last-node preference injection for eligible local single-writer pods. | `true` | No |
 | `driver.lastNodePreference.policy` | Last-node preference policy. `local-single-writer` is the supported `v0.4.7` policy. | `"local-single-writer"` | No |
 | `driver.lastNodePreference.webhook.enabled` | Enable the mutating admission webhook service and configuration. | `true` | No |
@@ -382,6 +385,7 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | `featureGates.cephfsSelfHealing` | Enable stale CephFS mount lazy-unmount/remount recovery in node stage. `NodeGetVolumeStats` still reports disconnected CephFS mounts as restage-needed errors because kubelet stats calls do not include remount credentials. | `false` | No |
 | `featureGates.cephfsPersistentRecovery` | Persist node-local CephFS session state, scan for stale mounts after node-plugin restart, and enqueue async recovery when volume stats detect a stale CephFS mount. | `true` | No |
 | `featureGates.cephfsKernelMounts` | Allow CephFS StorageClasses to request `cephfsMounter=kernel`. Host kernel CephFS client support is still required. | `false` | No |
+| `featureGates.localRWOStaleMountRecovery` | Enable local RWO stale mount detection and recovery from persisted node-side disk sessions. Active-pod recovery also requires `driver.localRWOStaleMountRecovery.activePodRecovery=true`. | `false` | No |
 | `featureGates.topologyAccessibility` | Enable topology capability advertisement and `accessible_topology` handling. | `false` | No |
 
 ### Controller
@@ -513,13 +517,15 @@ kubectl get opennebuladatastores -o wide
 
 ### Operator Commands
 
-The driver image includes two cluster-operator modes that work well with a kubeconfig or in-cluster execution:
+The driver image includes cluster-operator modes that work well with a kubeconfig or in-cluster execution:
 
 - `--mode=inventory-validate`
   - triggers a manual datastore validation run and waits for the result
   - accepts `--access-modes=ReadWriteOnce` or `--access-modes=ReadWriteMany` when the benchmark PVC mode must be explicit
 - `--mode=support-bundle`
-  - emits a JSON support bundle with inventory, hotplug, StorageClass, VolumeAttachment, and event data
+  - emits a JSON support bundle with inventory, hotplug, StorageClass, volume-health, VolumeAttachment, and event data
+- `--mode=volume-health`
+  - emits focused JSON diagnostics for a volume selected by `--volume-id`, `--pv`, or `--pvc namespace/name`
 
 ### Preflight
 

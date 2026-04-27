@@ -93,6 +93,7 @@ Create chart name and version as used by the chart label.
 {{- $nodeDeviceCache := (get $root.Values.driver "nodeDeviceCache") | default dict -}}
 {{- $hotplugQueue := (get $root.Values.driver "hotplugQueue") | default dict -}}
 {{- $localRestart := (get $root.Values.driver "localRestartOptimization") | default dict -}}
+{{- $localRWORecovery := (get $root.Values.driver "localRWOStaleMountRecovery") | default dict -}}
 {{- $lastNodePreference := (get $root.Values.driver "lastNodePreference") | default dict -}}
 {{- $lastNodePreferenceWebhook := (get $lastNodePreference "webhook") | default dict -}}
 {{- $stuckAttachmentReconciler := (get $root.Values.driver "stuckAttachmentReconciler") | default dict -}}
@@ -111,6 +112,9 @@ Create chart name and version as used by the chart label.
 {{- $localRestartDetachGrace := (get $localRestart "detachGraceSeconds") | default 90 -}}
 {{- $localRestartDetachGraceMax := (get $localRestart "maxDetachGraceSeconds") | default 300 -}}
 {{- $localRestartRequireNodeReady := (get $localRestart "requireNodeReady") | default true -}}
+{{- $localRWORecoveryActivePod := (get $localRWORecovery "activePodRecovery") | default false -}}
+{{- $localRWORecoveryMaxAttempts := (get $localRWORecovery "maxAttempts") | default 3 -}}
+{{- $localRWORecoveryBackoffSeconds := (get $localRWORecovery "backoffSeconds") | default 10 -}}
 {{- $lastNodePreferenceEnabled := (get $lastNodePreference "enabled") | default true -}}
 {{- $lastNodePreferencePolicy := (get $lastNodePreference "policy") | default "local-single-writer" -}}
 {{- $lastNodePreferenceWebhookEnabled := (get $lastNodePreferenceWebhook "enabled") | default true -}}
@@ -202,6 +206,12 @@ Create chart name and version as used by the chart label.
   value: {{ $localRestartDetachGraceMax | quote }}
 - name: ONE_CSI_LOCAL_RESTART_REQUIRE_NODE_READY
   value: {{ $localRestartRequireNodeReady | quote }}
+- name: ONE_CSI_LOCAL_RWO_STALE_MOUNT_ACTIVE_POD_RECOVERY
+  value: {{ $localRWORecoveryActivePod | quote }}
+- name: ONE_CSI_LOCAL_RWO_STALE_MOUNT_MAX_ATTEMPTS
+  value: {{ $localRWORecoveryMaxAttempts | quote }}
+- name: ONE_CSI_LOCAL_RWO_STALE_MOUNT_BACKOFF_SECONDS
+  value: {{ $localRWORecoveryBackoffSeconds | quote }}
 - name: ONE_CSI_LAST_NODE_PREFERENCE_ENABLED
   value: {{ $lastNodePreferenceEnabled | quote }}
 - name: ONE_CSI_LAST_NODE_PREFERENCE_POLICY
@@ -249,7 +259,7 @@ Create chart name and version as used by the chart label.
 - name: ONE_CSI_INVENTORY_VALIDATION_DEFAULT_IMAGE
   value: {{ $inventoryValidationDefaultImage | quote }}
 - name: ONE_CSI_FEATURE_GATES
-  value: "compatibilityAwareSelection={{ $root.Values.featureGates.compatibilityAwareSelection }},detachedDiskExpansion={{ $root.Values.featureGates.detachedDiskExpansion }},cephfsExpansion={{ $root.Values.featureGates.cephfsExpansion }},cephfsSnapshots={{ $root.Values.featureGates.cephfsSnapshots }},cephfsClones={{ $root.Values.featureGates.cephfsClones }},cephfsSelfHealing={{ $root.Values.featureGates.cephfsSelfHealing }},cephfsPersistentRecovery={{ $root.Values.featureGates.cephfsPersistentRecovery }},cephfsKernelMounts={{ $root.Values.featureGates.cephfsKernelMounts }},topologyAccessibility={{ $root.Values.featureGates.topologyAccessibility }}"
+  value: "compatibilityAwareSelection={{ $root.Values.featureGates.compatibilityAwareSelection }},detachedDiskExpansion={{ $root.Values.featureGates.detachedDiskExpansion }},cephfsExpansion={{ $root.Values.featureGates.cephfsExpansion }},cephfsSnapshots={{ $root.Values.featureGates.cephfsSnapshots }},cephfsClones={{ $root.Values.featureGates.cephfsClones }},cephfsSelfHealing={{ $root.Values.featureGates.cephfsSelfHealing }},cephfsPersistentRecovery={{ $root.Values.featureGates.cephfsPersistentRecovery }},cephfsKernelMounts={{ $root.Values.featureGates.cephfsKernelMounts }},localRWOStaleMountRecovery={{ $root.Values.featureGates.localRWOStaleMountRecovery }},topologyAccessibility={{ $root.Values.featureGates.topologyAccessibility }}"
 {{- with $root.Values.driver.env }}
 {{ toYaml . }}
 {{- end }}
