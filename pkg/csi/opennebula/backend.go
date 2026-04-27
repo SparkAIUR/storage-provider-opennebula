@@ -272,6 +272,9 @@ func resolveDeploymentMode(ds datastoreSchema.Datastore) DeploymentMode {
 	case "ssh":
 		return DeploymentModeSSH
 	default:
+		if strings.HasSuffix(strings.ToLower(strings.TrimSpace(ds.TMMad)), "_ssh") {
+			return DeploymentModeSSH
+		}
 		return DeploymentModeUnknown
 	}
 }

@@ -25,6 +25,7 @@ type DriverMetrics struct {
 	datastoreSelectionTotal      *prometheus.CounterVec
 	attachValidationTotal        *prometheus.CounterVec
 	cephFSSubvolumeTotal         *prometheus.CounterVec
+	localVolumeHealthTotal       *prometheus.CounterVec
 	snapshotTotal                *prometheus.CounterVec
 	preflightTotal               *prometheus.CounterVec
 	hotplugGuardTotal            *prometheus.CounterVec
@@ -79,6 +80,10 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 		cephFSSubvolumeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "opennebula_csi_cephfs_subvolume_total",
 			Help: "Total number of CephFS subvolume operations by operation and outcome.",
+		}, []string{"operation", "outcome"}),
+		localVolumeHealthTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_local_volume_health_total",
+			Help: "Total number of local RWO mount health and recovery outcomes by operation and outcome.",
 		}, []string{"operation", "outcome"}),
 		snapshotTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "opennebula_csi_snapshot_total",
@@ -185,6 +190,7 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 		metrics.datastoreSelectionTotal,
 		metrics.attachValidationTotal,
 		metrics.cephFSSubvolumeTotal,
+		metrics.localVolumeHealthTotal,
 		metrics.snapshotTotal,
 		metrics.preflightTotal,
 		metrics.hotplugGuardTotal,
@@ -242,6 +248,13 @@ func (m *DriverMetrics) RecordCephFSSubvolume(operation, outcome string) {
 		return
 	}
 	m.cephFSSubvolumeTotal.WithLabelValues(operation, outcome).Inc()
+}
+
+func (m *DriverMetrics) RecordLocalVolumeHealth(operation, outcome string) {
+	if m == nil {
+		return
+	}
+	m.localVolumeHealthTotal.WithLabelValues(operation, outcome).Inc()
 }
 
 func (m *DriverMetrics) RecordSnapshot(backend, operation, outcome string) {

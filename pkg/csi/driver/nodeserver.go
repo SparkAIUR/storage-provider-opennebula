@@ -78,6 +78,7 @@ type NodeServer struct {
 	mounter                  *mount.SafeFormatAndMount
 	deviceResolver           *NodeDeviceResolver
 	sharedFilesystemRecovery *sharedFilesystemRecoveryManager
+	localDiskSessions        *localDiskSessionStore
 	csi.UnimplementedNodeServer
 }
 
@@ -92,6 +93,7 @@ func NewNodeServer(d *Driver, mounter *mount.SafeFormatAndMount) *NodeServer {
 	}
 	ns.deviceResolver.deviceCandidatesFn = ns.deviceCandidates
 	ns.sharedFilesystemRecovery = newSharedFilesystemRecoveryManager(ns)
+	ns.localDiskSessions = newLocalDiskSessionStore(localDiskSessionRootPath)
 	return ns
 }
 
@@ -187,6 +189,32 @@ func (ns *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 			"method", "NodeStageVolume", "devicePath", devicePath, "stagingTargetPath", stagingTargetPath)
 		return nil, status.Error(codes.Internal, "failed to check mount point")
 	}
+	if mountCheck.targetIsMountPoint {
+		health, healthErr := ns.evaluateLocalDiskPath(volumeID, stagingTargetPath)
+		if healthErr != nil {
+			klog.V(0).ErrorS(healthErr, "Failed to evaluate local disk stage mount health",
+				"method", "NodeStageVolume", "volumeID", volumeID, "stagingTargetPath", stagingTargetPath)
+			return nil, status.Error(codes.Internal, "failed to evaluate local disk stage mount health")
+		}
+		if health.Stale || !mountCheck.deviceIsMounted {
+			message := health.Message
+			if message == "" {
+				message = fmt.Sprintf("stage is mounted from unexpected source %q", health.MountSource)
+			}
+			ns.recordPVCWarningFromPublishContext(context.Background(), volumeContext, eventReasonLocalVolumeStaleMount, message)
+			ns.recordLocalVolumeHealth("stage_stale_mount_detected", "observed")
+			if !ns.localRWOStaleMountRecoveryEnabled() {
+				return nil, status.Errorf(codes.FailedPrecondition, "stale local disk stage detected at %s: %s", stagingTargetPath, message)
+			}
+			if err := mount.CleanupMountPoint(stagingTargetPath, ns.mounter.Interface, true); err != nil {
+				ns.recordLocalVolumeHealth("stage_cleanup", "failed")
+				return nil, status.Errorf(codes.FailedPrecondition, "failed to cleanup stale local disk stage %s: %v", stagingTargetPath, err)
+			}
+			ns.recordLocalVolumeHealth("stage_cleanup", "succeeded")
+			mountCheck.targetIsMountPoint = false
+			mountCheck.deviceIsMounted = false
+		}
+	}
 
 	//If the volume capability are not supported by the volume
 	// return 9 FAILED_PRECONDITION error
@@ -217,6 +245,7 @@ func (ns *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 
 		//Check if volume_id is already staged in stagingTargetPath and is identical
 		// to the volumeCapability provided in the request, then return 0 OK response
+		ns.recordLocalDiskStageSession(req, devicePath, fsType, mountFlags)
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
@@ -246,6 +275,7 @@ func (ns *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 		"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath,
 		"stagingTargetPath", stagingTargetPath, "fsType", fsType)
 
+	ns.recordLocalDiskStageSession(req, devicePath, fsType, mountFlags)
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
@@ -272,6 +302,7 @@ func (ns *NodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageV
 	if ns.deviceResolver != nil {
 		ns.deviceResolver.Invalidate(volumeID)
 	}
+	ns.deleteLocalDiskSession(volumeID)
 
 	err := mount.CleanupMountPoint(stagingTargetPath, ns.mounter.Interface, true)
 	if err != nil {
@@ -382,12 +413,18 @@ func (ns *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 		klog.V(0).ErrorS(err, "Failed to publish volume",
 			"method", "NodePublishVolume", "volumeID", volumeID, "stagingTargetPath", stagingTargetPath,
 			"targetPath", targetPath, "accessType", reflect.TypeOf(accessType).String())
+		if _, ok := status.FromError(err); ok {
+			return nil, err
+		}
 		return nil, status.Error(codes.Internal, "failed to publish volume")
 	}
 
 	klog.V(1).InfoS("Volume published successfully",
 		"method", "NodePublishVolume", "volumeID", volumeID, "stagingTargetPath", stagingTargetPath, "targetPath", targetPath)
 
+	if _, ok := accessType.(*csi.VolumeCapability_Mount); ok {
+		ns.updateLocalDiskPublishedTarget(volumeID, targetPath, options)
+	}
 	return resp, nil
 }
 
@@ -445,6 +482,9 @@ func (ns NodeServer) handleMountVolumePublish(stagingPath, targetPath string, vo
 
 	//volume is already mounted at targetPath
 	if checkMountPoint.targetIsMountPoint {
+		if health, healthErr := ns.evaluateLocalDiskPath("", targetPath); healthErr == nil && health.Stale {
+			return nil, status.Errorf(codes.FailedPrecondition, "stale local disk target detected at %s: %s", targetPath, health.Message)
+		}
 		klog.V(3).InfoS("Volume is already mounted at target path",
 			"method", "handleMountVolumePublish", "stagingPath", stagingPath, "targetPath", targetPath)
 		return &csi.NodePublishVolumeResponse{}, nil
@@ -500,6 +540,9 @@ func (ns *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubl
 
 	err := mount.CleanupMountPoint(targetPath, ns.mounter.Interface, true)
 	if err != nil {
+		if opennebula.IsSharedFilesystemVolumeID(volumeID) && ns.cleanupOrphanedSharedFilesystemTargetOnUnpublish(context.Background(), volumeID, targetPath, err) {
+			return &csi.NodeUnpublishVolumeResponse{}, nil
+		}
 		klog.V(0).ErrorS(err, "Failed to unmount volume at target path",
 			"method", "NodeUnpublishVolume", "volumeID", volumeID, "targetPath", targetPath)
 		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to unmount volume at target path %s: %v", targetPath, err))
@@ -509,6 +552,8 @@ func (ns *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubl
 		"method", "NodeUnpublishVolume", "volumeID", volumeID, "targetPath", targetPath)
 	if opennebula.IsSharedFilesystemVolumeID(volumeID) {
 		ns.removeSharedFilesystemPublishedTarget(volumeID, targetPath)
+	} else {
+		ns.removeLocalDiskPublishedTarget(volumeID, targetPath)
 	}
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
@@ -533,6 +578,9 @@ func (ns *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolu
 		if opennebula.IsSharedFilesystemVolumeID(volumeID) && isDisconnectedSharedFilesystemError(err) {
 			return nil, ns.handleDisconnectedSharedFilesystemPath(volumeID, volumePath, err)
 		}
+		if isStaleLocalDiskPathError(err) {
+			return nil, ns.handleStaleLocalDiskPath(volumeID, volumePath, err)
+		}
 		return nil, status.Errorf(codes.Internal, "failed to stat volume path %s: %v", volumePath, err)
 	}
 
@@ -541,6 +589,9 @@ func (ns *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolu
 		if err := nodeVolumePathFS(volumePath, &fs); err != nil {
 			if opennebula.IsSharedFilesystemVolumeID(volumeID) && isDisconnectedSharedFilesystemError(err) {
 				return nil, ns.handleDisconnectedSharedFilesystemPath(volumeID, volumePath, err)
+			}
+			if isStaleLocalDiskPathError(err) {
+				return nil, ns.handleStaleLocalDiskPath(volumeID, volumePath, err)
 			}
 			return nil, status.Errorf(codes.Internal, "failed to collect filesystem stats for %s: %v", volumePath, err)
 		}

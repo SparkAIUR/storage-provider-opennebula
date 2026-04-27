@@ -147,6 +147,9 @@ func (ns *NodeServer) handleSharedFilesystemPublish(req *csi.NodePublishVolumeRe
 	if err := ns.publishSharedFilesystemTarget(stagingTargetPath, target); err != nil {
 		klog.V(0).ErrorS(err, "Failed to publish shared filesystem volume",
 			"method", "handleSharedFilesystemPublish", "stagingTargetPath", stagingTargetPath, "targetPath", targetPath, "accessType", reflect.TypeOf(volumeCapability.GetAccessType()).String())
+		if _, ok := status.FromError(err); ok {
+			return nil, err
+		}
 		return nil, status.Error(codes.Internal, "failed to publish volume")
 	}
 	ns.updateSharedFilesystemPublishedTarget(req.GetVolumeId(), target)
@@ -200,6 +203,12 @@ func (ns *NodeServer) publishSharedFilesystemTarget(stagingTargetPath string, ta
 		return err
 	}
 	if mountCheck.targetIsMountPoint {
+		if _, err := nodeVolumePathStat(targetPath); err != nil && isDisconnectedSharedFilesystemError(err) {
+			if ns.Driver != nil && ns.Driver.metrics != nil {
+				ns.Driver.metrics.RecordCephFSSubvolume("stale_mount_detected", "failure")
+			}
+			return status.Errorf(codes.FailedPrecondition, "stale CephFS target detected at %s: %v", targetPath, err)
+		}
 		return nil
 	}
 
@@ -238,8 +247,13 @@ func ensureSharedFilesystemStagePath(stagingTargetPath string) error {
 }
 
 func (ns *NodeServer) mountSharedFilesystemFuse(session sharedFilesystemSession) error {
+	confPath, err := ensureSharedFilesystemCephConf(session.StagingTargetPath)
+	if err != nil {
+		return err
+	}
 	args := []string{
 		session.StagingTargetPath,
+		"-c", confPath,
 		"-m", strings.Join(session.Monitors, ","),
 		"--id", session.UserID,
 		"-k", session.KeyringPath,

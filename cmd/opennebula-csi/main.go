@@ -51,6 +51,9 @@ var (
 	inventoryValidateSize        = flag.String("size", "", "Validation PVC size for inventory-validate mode")
 	inventoryValidateAccessModes = flag.String("access-modes", "", "Comma-separated PVC access modes for inventory-validate mode")
 	inventoryValidateFioArgs     = flag.String("fio-args", "", "Comma-separated fio args for inventory-validate mode")
+	volumeHealthVolumeID         = flag.String("volume-id", "", "CSI volume ID for volume-health mode")
+	volumeHealthPV               = flag.String("pv", "", "PersistentVolume name for volume-health mode")
+	volumeHealthPVC              = flag.String("pvc", "", "namespace/name PersistentVolumeClaim for volume-health mode")
 )
 
 func main() {
@@ -147,6 +150,16 @@ func handle(cfg config.CSIPluginConfig) int {
 	case "support-bundle":
 		if err := driver.RunSupportBundleCommand(ctx, cfg, os.Stdout); err != nil {
 			klog.Errorf("Support bundle failed: %v", err)
+			return 1
+		}
+		return 0
+	case "volume-health":
+		if err := driver.RunVolumeHealthCommand(ctx, cfg, driver.VolumeHealthOptions{
+			VolumeID: *volumeHealthVolumeID,
+			PVName:   *volumeHealthPV,
+			PVC:      *volumeHealthPVC,
+		}, os.Stdout); err != nil {
+			klog.Errorf("Volume health inspection failed: %v", err)
 			return 1
 		}
 		return 0

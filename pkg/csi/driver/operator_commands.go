@@ -21,6 +21,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	mount "k8s.io/mount-utils"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -33,6 +34,12 @@ type InventoryValidateOptions struct {
 	Timeout      time.Duration
 }
 
+type VolumeHealthOptions struct {
+	VolumeID string
+	PVName   string
+	PVC      string
+}
+
 type inventoryValidateResult struct {
 	DatastoreID int    `json:"datastoreID"`
 	Name        string `json:"name"`
@@ -40,6 +47,25 @@ type inventoryValidateResult struct {
 	Summary     string `json:"summary"`
 	RunName     string `json:"runName"`
 	RunNonce    string `json:"runNonce,omitempty"`
+}
+
+type VolumeHealthReport struct {
+	PVName             string `json:"pvName,omitempty"`
+	PVCNamespace       string `json:"pvcNamespace,omitempty"`
+	PVCName            string `json:"pvcName,omitempty"`
+	VolumeID           string `json:"volumeID,omitempty"`
+	VolumeAttachment   string `json:"volumeAttachment,omitempty"`
+	NodeName           string `json:"nodeName,omitempty"`
+	OpenNebulaImageID  string `json:"opennebulaImageID,omitempty"`
+	ExpectedSerial     string `json:"expectedSerial,omitempty"`
+	ByIDPath           string `json:"byIDPath,omitempty"`
+	ResolvedDevicePath string `json:"resolvedDevicePath,omitempty"`
+	StagePath          string `json:"stagePath,omitempty"`
+	MountPath          string `json:"mountPath,omitempty"`
+	MountSource        string `json:"mountSource,omitempty"`
+	Status             string `json:"status"`
+	Reason             string `json:"reason,omitempty"`
+	Message            string `json:"message,omitempty"`
 }
 
 type SupportBundle struct {
@@ -56,6 +82,7 @@ type SupportBundle struct {
 	BenchmarkRuns           []inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun `json:"benchmarkRuns"`
 	Nodes                   []inventoryv1alpha1.OpenNebulaNode                  `json:"nodes"`
 	StorageClassAudit       []inventoryv1alpha1.StorageClassDetail              `json:"storageClassAudit"`
+	VolumeHealth            []VolumeHealthReport                                `json:"volumeHealth,omitempty"`
 	VolumeAttachments       []storagev1.VolumeAttachment                        `json:"volumeAttachments"`
 	Events                  []corev1.Event                                      `json:"events"`
 }
@@ -130,6 +157,20 @@ func RunInventoryValidateCommand(ctx context.Context, cfg config.CSIPluginConfig
 	}
 }
 
+func RunVolumeHealthCommand(ctx context.Context, cfg config.CSIPluginConfig, opts VolumeHealthOptions, w io.Writer) error {
+	kubeClient, _, err := preflightKubeClients()
+	if err != nil {
+		return err
+	}
+	reports, err := collectVolumeHealthReports(ctx, kubeClient, opts)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(reports)
+}
+
 func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w io.Writer) error {
 	kubeClient, _, err := preflightKubeClients()
 	if err != nil {
@@ -161,6 +202,7 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 	if err != nil {
 		return err
 	}
+	volumeHealth, _ := collectVolumeHealthReports(ctx, kubeClient, VolumeHealthOptions{})
 	eventList, err := kubeClient.CoreV1().Events("").List(ctx, metav1.ListOptions{Limit: 50})
 	if err != nil {
 		return err
@@ -202,6 +244,7 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 		BenchmarkRuns:           benchmarkList.Items,
 		Nodes:                   nodeList.Items,
 		StorageClassAudit:       flattenStorageClassDetails(dsList.Items, scList.Items),
+		VolumeHealth:            volumeHealth,
 		VolumeAttachments:       vaList.Items,
 		Events:                  eventList.Items,
 	}
@@ -256,6 +299,168 @@ func findDatastoreByID(ctx context.Context, client ctrlclient.Client, datastoreI
 		}
 	}
 	return nil, fmt.Errorf("opennebuladatastore with ID %d was not found", datastoreID)
+}
+
+func collectVolumeHealthReports(ctx context.Context, kubeClient kubernetes.Interface, opts VolumeHealthOptions) ([]VolumeHealthReport, error) {
+	pvs, err := kubeClient.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	vas, err := kubeClient.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	localSessions, _ := newLocalDiskSessionStore(localDiskSessionRootPath).List()
+	sharedSessions, _ := newSharedFilesystemSessionStore(sharedFilesystemSessionRootPath).List()
+	mountSources := currentMountSources()
+
+	reports := make([]VolumeHealthReport, 0)
+	for _, pv := range pvs.Items {
+		if pv.Spec.CSI == nil || !volumeHealthMatches(pv, opts) {
+			continue
+		}
+		report := VolumeHealthReport{
+			PVName:   pv.Name,
+			VolumeID: pv.Spec.CSI.VolumeHandle,
+			Status:   "unknown",
+		}
+		if pv.Spec.ClaimRef != nil {
+			report.PVCNamespace = pv.Spec.ClaimRef.Namespace
+			report.PVCName = pv.Spec.ClaimRef.Name
+		}
+		for _, va := range vas.Items {
+			if va.Spec.Source.PersistentVolumeName == nil || *va.Spec.Source.PersistentVolumeName != pv.Name {
+				continue
+			}
+			report.VolumeAttachment = va.Name
+			report.NodeName = va.Spec.NodeName
+			break
+		}
+		if session, ok := localSessionForVolume(localSessions, report.VolumeID); ok {
+			report.StagePath = session.StagingTargetPath
+			report.ExpectedSerial = session.DeviceSerial
+			report.OpenNebulaImageID = firstNonEmpty(session.OpenNebulaImageID, report.OpenNebulaImageID)
+			report.ResolvedDevicePath = session.DevicePath
+			report.ByIDPath, report.ResolvedDevicePath = resolveByIDForReport(session.DeviceSerial, report.ResolvedDevicePath)
+			report.MountSource = mountSources[session.StagingTargetPath]
+			report.MountPath = session.StagingTargetPath
+			report.Status, report.Reason, report.Message = classifyVolumeHealthReport(report)
+			reports = append(reports, report)
+			for _, target := range session.PublishedTargets {
+				targetReport := report
+				targetReport.MountPath = target.TargetPath
+				targetReport.MountSource = mountSources[target.TargetPath]
+				targetReport.Status, targetReport.Reason, targetReport.Message = classifyVolumeHealthReport(targetReport)
+				reports = append(reports, targetReport)
+			}
+			continue
+		}
+		if session, ok := sharedSessionForVolume(sharedSessions, report.VolumeID); ok {
+			report.StagePath = session.StagingTargetPath
+			report.MountPath = session.StagingTargetPath
+			report.MountSource = mountSources[session.StagingTargetPath]
+			report.Status = "cephfs-session"
+			report.Reason = "CephFSSessionPresent"
+			reports = append(reports, report)
+			for _, target := range session.PublishedTargets {
+				targetReport := report
+				targetReport.MountPath = target.TargetPath
+				targetReport.MountSource = mountSources[target.TargetPath]
+				reports = append(reports, targetReport)
+			}
+			continue
+		}
+		report.Status = "no-node-session"
+		report.Reason = "SessionNotFound"
+		report.Message = "No local node session was found in this container"
+		reports = append(reports, report)
+	}
+	return reports, nil
+}
+
+func volumeHealthMatches(pv corev1.PersistentVolume, opts VolumeHealthOptions) bool {
+	if strings.TrimSpace(opts.VolumeID) != "" && pv.Spec.CSI.VolumeHandle != strings.TrimSpace(opts.VolumeID) {
+		return false
+	}
+	if strings.TrimSpace(opts.PVName) != "" && pv.Name != strings.TrimSpace(opts.PVName) {
+		return false
+	}
+	if strings.TrimSpace(opts.PVC) != "" {
+		namespace, name, ok := strings.Cut(strings.TrimSpace(opts.PVC), "/")
+		if !ok || pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.Namespace != namespace || pv.Spec.ClaimRef.Name != name {
+			return false
+		}
+	}
+	return true
+}
+
+func currentMountSources() map[string]string {
+	result := map[string]string{}
+	mountPoints, err := mount.New("").List()
+	if err != nil {
+		return result
+	}
+	for _, mountPoint := range mountPoints {
+		result[mountPoint.Path] = mountPoint.Device
+	}
+	return result
+}
+
+func localSessionForVolume(sessions []localDiskSession, volumeID string) (localDiskSession, bool) {
+	for _, session := range sessions {
+		if session.VolumeID == volumeID {
+			return session, true
+		}
+	}
+	return localDiskSession{}, false
+}
+
+func sharedSessionForVolume(sessions []sharedFilesystemSession, volumeID string) (sharedFilesystemSession, bool) {
+	for _, session := range sessions {
+		if session.VolumeID == volumeID {
+			return session, true
+		}
+	}
+	return sharedFilesystemSession{}, false
+}
+
+func resolveByIDForReport(serial, fallback string) (string, string) {
+	if strings.TrimSpace(serial) == "" {
+		return "", fallback
+	}
+	candidates, err := nodeByIDGlob(filepath.Join(defaultDiskPath, "disk", "by-id", "*"))
+	if err != nil {
+		return "", fallback
+	}
+	for _, candidate := range candidates {
+		if !strings.Contains(strings.ToLower(filepath.Base(candidate)), strings.ToLower(serial)) {
+			continue
+		}
+		resolved, err := nodeEvalSymlinks(candidate)
+		if err != nil {
+			return candidate, fallback
+		}
+		return candidate, resolved
+	}
+	return "", fallback
+}
+
+func classifyVolumeHealthReport(report VolumeHealthReport) (string, string, string) {
+	if strings.TrimSpace(report.MountPath) == "" {
+		return "unknown", "MountPathMissing", "No node mount path was available"
+	}
+	if strings.TrimSpace(report.MountSource) == "" {
+		return "stale", "MountSourceMissing", "Mount path is not present in the current mount table"
+	}
+	if strings.HasPrefix(report.MountSource, "/dev/") {
+		if _, err := os.Stat(report.MountSource); err != nil {
+			return "stale", "MountSourceDeviceMissing", err.Error()
+		}
+		if report.ExpectedSerial != "" && !strings.Contains(strings.ToLower(report.MountSource), strings.ToLower(report.ExpectedSerial)) && report.ByIDPath != "" && report.ResolvedDevicePath != report.MountSource {
+			return "stale", "DeviceSerialMoved", fmt.Sprintf("expected serial %s resolves to %s but mount source is %s", report.ExpectedSerial, report.ResolvedDevicePath, report.MountSource)
+		}
+	}
+	return "healthy", "MountPresent", "Mount source is present"
 }
 
 func validationSummaryForCommand(status inventoryv1alpha1.OpenNebulaDatastoreStatus) string {
@@ -379,6 +584,9 @@ func supportBundleConfig(cfg config.CSIPluginConfig) map[string]any {
 		"localRestartDetachGraceSeconds":       getInt(cfg, config.LocalRestartDetachGraceSecondsVar),
 		"localRestartDetachGraceMaxSeconds":    getInt(cfg, config.LocalRestartDetachGraceMaxSecondsVar),
 		"localRestartRequireNodeReady":         getBool(cfg, config.LocalRestartRequireNodeReadyVar),
+		"localRWOStaleMountActivePodRecovery":  getBool(cfg, config.LocalRWOStaleMountActivePodRecoveryVar),
+		"localRWOStaleMountMaxAttempts":        getInt(cfg, config.LocalRWOStaleMountMaxAttemptsVar),
+		"localRWOStaleMountBackoffSeconds":     getInt(cfg, config.LocalRWOStaleMountBackoffSecondsVar),
 		"inventoryControllerEnabled":           getBool(cfg, config.InventoryControllerEnabledVar),
 		"inventoryAuthorityMode":               getString(cfg, config.InventoryDatastoreAuthorityModeVar),
 		"inventoryValidationEnabled":           getBool(cfg, config.InventoryValidationEnabledVar),

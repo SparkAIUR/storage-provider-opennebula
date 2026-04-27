@@ -27,6 +27,7 @@ const (
 	sharedPublishContextCephFSMounter = "cephfsMounter"
 
 	sharedCephFSSecretFile = "ceph.secret"
+	sharedCephFSConfFile   = "ceph.conf"
 
 	defaultSharedFilesystemSessionDir           = "/var/lib/kubelet/plugins/csi.opennebula.io/cephfs-sessions"
 	defaultSharedFilesystemRecoveryStartupDelay = 10 * time.Second
@@ -78,11 +79,12 @@ type sharedFilesystemSessionStore struct {
 }
 
 type sharedFilesystemRecoveryManager struct {
-	ns     *NodeServer
-	store  *sharedFilesystemSessionStore
-	queue  chan string
-	mu     sync.Mutex
-	queued map[string]struct{}
+	ns           *NodeServer
+	store        *sharedFilesystemSessionStore
+	queue        chan string
+	mu           sync.Mutex
+	queued       map[string]struct{}
+	lastFailures map[string]time.Time
 }
 
 func newSharedFilesystemRecoveryManager(ns *NodeServer) *sharedFilesystemRecoveryManager {
@@ -90,10 +92,11 @@ func newSharedFilesystemRecoveryManager(ns *NodeServer) *sharedFilesystemRecover
 		return nil
 	}
 	return &sharedFilesystemRecoveryManager{
-		ns:     ns,
-		store:  newSharedFilesystemSessionStore(sharedFilesystemSessionRootPath),
-		queue:  make(chan string, 128),
-		queued: make(map[string]struct{}),
+		ns:           ns,
+		store:        newSharedFilesystemSessionStore(sharedFilesystemSessionRootPath),
+		queue:        make(chan string, 128),
+		queued:       make(map[string]struct{}),
+		lastFailures: make(map[string]time.Time),
 	}
 }
 
@@ -274,7 +277,15 @@ func (m *sharedFilesystemRecoveryManager) recoverQueuedVolume(ctx context.Contex
 	}()
 
 	if err := m.recoverVolume(ctx, volumeID); err != nil {
-		klog.ErrorS(err, "Shared filesystem recovery failed", "volumeID", volumeID)
+		m.mu.Lock()
+		lastFailure := m.lastFailures[volumeID]
+		if time.Since(lastFailure) > 10*time.Minute {
+			klog.ErrorS(err, "Shared filesystem recovery failed", "volumeID", volumeID)
+			m.lastFailures[volumeID] = time.Now()
+		} else {
+			klog.V(3).InfoS("Shared filesystem recovery still failing", "volumeID", volumeID, "err", err)
+		}
+		m.mu.Unlock()
 	}
 }
 
@@ -285,6 +296,9 @@ func (m *sharedFilesystemRecoveryManager) enqueueUnhealthySessions(ctx context.C
 		return
 	}
 	for _, session := range sessions {
+		if m.garbageCollectOrphanedSession(ctx, session) {
+			continue
+		}
 		health, err := m.ns.evaluateSharedFilesystemSession(session)
 		if err != nil {
 			klog.ErrorS(err, "Failed to evaluate shared filesystem session health", "volumeID", session.VolumeID)
@@ -297,6 +311,51 @@ func (m *sharedFilesystemRecoveryManager) enqueueUnhealthySessions(ctx context.C
 	}
 
 	m.seedSessionsFromMounts(ctx)
+}
+
+func (m *sharedFilesystemRecoveryManager) garbageCollectOrphanedSession(ctx context.Context, session sharedFilesystemSession) bool {
+	if m == nil || m.ns == nil || strings.TrimSpace(session.VolumeID) == "" || len(session.PublishedTargets) == 0 {
+		return false
+	}
+	allPodsGone := true
+	for _, target := range session.PublishedTargets {
+		podUID := podUIDFromKubeletPath(target.TargetPath)
+		if podUID == "" {
+			allPodsGone = false
+			break
+		}
+		if m.ns.podUIDExists(ctx, podUID) {
+			allPodsGone = false
+			break
+		}
+	}
+	if !allPodsGone {
+		return false
+	}
+	if m.ns.Driver != nil && m.ns.Driver.kubeRuntime != nil {
+		if _, err := m.ns.Driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, session.VolumeID); err == nil {
+			return false
+		}
+	}
+	for _, target := range session.PublishedTargets {
+		if mp, mounted, err := m.ns.mountPointForPath(target.TargetPath); err == nil && mounted {
+			if _, statErr := nodeVolumePathStat(target.TargetPath); statErr == nil {
+				klog.V(2).InfoS("Skipping CephFS session GC because target still appears mounted", "volumeID", session.VolumeID, "target", target.TargetPath, "source", mp.Device)
+				return false
+			}
+		}
+		_ = mount.CleanupMountPoint(target.TargetPath, m.ns.mounter.Interface, true)
+		_ = os.RemoveAll(target.TargetPath)
+	}
+	if err := m.store.Delete(session.VolumeID); err != nil {
+		klog.ErrorS(err, "Failed to delete orphaned CephFS session", "volumeID", session.VolumeID)
+		return false
+	}
+	if m.ns.Driver != nil && m.ns.Driver.metrics != nil {
+		m.ns.Driver.metrics.RecordCephFSSubvolume("session_gc", "succeeded")
+	}
+	klog.InfoS("Garbage collected orphaned CephFS session", "volumeID", session.VolumeID)
+	return true
 }
 
 func (m *sharedFilesystemRecoveryManager) recoverVolume(ctx context.Context, volumeID string) error {
@@ -319,6 +378,9 @@ func (m *sharedFilesystemRecoveryManager) recoverVolume(ctx context.Context, vol
 		return err
 	}
 	if !exists {
+		return nil
+	}
+	if m.garbageCollectOrphanedSession(ctx, session) {
 		return nil
 	}
 
@@ -617,6 +679,29 @@ func (ns *NodeServer) removeSharedFilesystemPublishedTarget(volumeID, targetPath
 	ns.recordSharedFilesystemSession(session)
 }
 
+func (ns *NodeServer) cleanupOrphanedSharedFilesystemTargetOnUnpublish(ctx context.Context, volumeID, targetPath string, cause error) bool {
+	if ns == nil || ns.sharedFilesystemRecovery == nil {
+		return false
+	}
+	podUID := podUIDFromKubeletPath(targetPath)
+	if podUID == "" || ns.podUIDExists(ctx, podUID) {
+		return false
+	}
+	if mountPoint, mounted, err := ns.mountPointForPath(targetPath); err == nil && mounted {
+		if _, statErr := nodeVolumePathStat(targetPath); statErr == nil {
+			klog.V(2).InfoS("Skipping orphaned CephFS target cleanup because target still appears usable", "volumeID", volumeID, "targetPath", targetPath, "source", mountPoint.Device)
+			return false
+		}
+	}
+	ns.removeSharedFilesystemPublishedTarget(volumeID, targetPath)
+	_ = os.RemoveAll(targetPath)
+	if ns.Driver != nil && ns.Driver.metrics != nil {
+		ns.Driver.metrics.RecordCephFSSubvolume("target_gc", "succeeded")
+	}
+	klog.InfoS("Cleaned orphaned CephFS target during unpublish", "volumeID", volumeID, "targetPath", targetPath, "cause", cause)
+	return true
+}
+
 func normalizeSharedFilesystemPublishedTargets(targets []sharedFilesystemPublishedTarget) []sharedFilesystemPublishedTarget {
 	if len(targets) == 0 {
 		return nil
@@ -778,6 +863,26 @@ func sharedCephFSKeyringPath(stagingTargetPath string) string {
 
 func sharedCephFSSecretPath(stagingTargetPath string) string {
 	return filepath.Join(sharedCephFSKeyringDir(stagingTargetPath), sharedCephFSSecretFile)
+}
+
+func sharedCephFSConfPath(stagingTargetPath string) string {
+	return filepath.Join(sharedCephFSKeyringDir(stagingTargetPath), sharedCephFSConfFile)
+}
+
+func ensureSharedFilesystemCephConf(stagingTargetPath string) (string, error) {
+	keyringDir := sharedCephFSKeyringDir(stagingTargetPath)
+	if err := os.MkdirAll(keyringDir, 0o700); err != nil {
+		return "", status.Errorf(codes.Internal, "failed to create CephFS config directory: %v", err)
+	}
+	confPath := sharedCephFSConfPath(stagingTargetPath)
+	if _, err := os.Stat(confPath); err == nil {
+		return confPath, nil
+	}
+	contents := []byte("[global]\n")
+	if err := os.WriteFile(confPath, contents, 0o600); err != nil {
+		return "", status.Errorf(codes.Internal, "failed to write CephFS config file: %v", err)
+	}
+	return confPath, nil
 }
 
 func ensureSharedFilesystemCredentials(stagingTargetPath, userID, userKey string) (string, string, error) {

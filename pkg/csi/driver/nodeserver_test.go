@@ -480,6 +480,42 @@ func TestNodeGetVolumeStats(t *testing.T) {
 		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 		assert.Contains(t, err.Error(), "stale CephFS mount detected")
 	})
+
+	t.Run("maps stale local disk statfs to failed precondition", func(t *testing.T) {
+		tempDir := t.TempDir()
+		ns := getTestNodeServer([]string{tempDir})
+		ns.localDiskSessions = newLocalDiskSessionStore(t.TempDir())
+		ns.recordLocalDiskSession(localDiskSession{
+			VolumeID:          "test-volume-id",
+			StagingTargetPath: tempDir,
+			PVCNamespace:      "default",
+			PVCName:           "claim",
+		})
+
+		originalStat := nodeVolumePathStat
+		originalStatfs := nodeVolumePathFS
+		t.Cleanup(func() {
+			nodeVolumePathStat = originalStat
+			nodeVolumePathFS = originalStatfs
+		})
+
+		nodeVolumePathStat = func(name string) (os.FileInfo, error) {
+			return originalStat(name)
+		}
+		nodeVolumePathFS = func(path string, buf *unix.Statfs_t) error {
+			return unix.EIO
+		}
+
+		response, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+			VolumeId:   "test-volume-id",
+			VolumePath: tempDir,
+		})
+
+		assert.Nil(t, response)
+		assert.Error(t, err)
+		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+		assert.Contains(t, err.Error(), "stale local disk mount detected")
+	})
 }
 
 func TestNodeExpandVolume(t *testing.T) {

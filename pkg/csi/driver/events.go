@@ -30,4 +30,8 @@ const (
 	eventReasonStuckAttachmentRepublish     = "StuckAttachmentRepublishRequested"
 	eventReasonLocalImmediateBindingWarning = "LocalImmediateBindingWarning"
 	eventReasonPreflightFailed              = "PreflightFailed"
+	eventReasonLocalVolumeStaleMount        = "LocalVolumeStaleMountDetected"
+	eventReasonLocalVolumeRecoveryAttempted = "LocalVolumeRecoveryAttempted"
+	eventReasonLocalVolumeRecoverySucceeded = "LocalVolumeRecoverySucceeded"
+	eventReasonLocalVolumeRecoveryFailed    = "LocalVolumeRecoveryFailed"
 )

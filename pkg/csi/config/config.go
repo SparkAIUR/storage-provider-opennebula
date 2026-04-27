@@ -53,6 +53,9 @@ const (
 	LocalRestartDetachGraceSecondsVar         = "ONE_CSI_LOCAL_RESTART_DETACH_GRACE_SECONDS"
 	LocalRestartDetachGraceMaxSecondsVar      = "ONE_CSI_LOCAL_RESTART_DETACH_GRACE_MAX_SECONDS"
 	LocalRestartRequireNodeReadyVar           = "ONE_CSI_LOCAL_RESTART_REQUIRE_NODE_READY"
+	LocalRWOStaleMountActivePodRecoveryVar    = "ONE_CSI_LOCAL_RWO_STALE_MOUNT_ACTIVE_POD_RECOVERY"
+	LocalRWOStaleMountMaxAttemptsVar          = "ONE_CSI_LOCAL_RWO_STALE_MOUNT_MAX_ATTEMPTS"
+	LocalRWOStaleMountBackoffSecondsVar       = "ONE_CSI_LOCAL_RWO_STALE_MOUNT_BACKOFF_SECONDS"
 	LastNodePreferenceEnabledVar              = "ONE_CSI_LAST_NODE_PREFERENCE_ENABLED"
 	LastNodePreferencePolicyVar               = "ONE_CSI_LAST_NODE_PREFERENCE_POLICY"
 	LastNodePreferenceWebhookEnabledVar       = "ONE_CSI_LAST_NODE_PREFERENCE_WEBHOOK_ENABLED"
@@ -87,7 +90,7 @@ const (
 	defaultOpenNebulaRPCEndpoint                  = "http://localhost:2633/RPC2"
 	defaultDatastorePolicy                        = "least-used"
 	defaultAllowedDatastoreTypes                  = "local,ceph,cephfs"
-	defaultFeatureGates                           = "compatibilityAwareSelection=true,detachedDiskExpansion=false,cephfsExpansion=false,cephfsSnapshots=false,cephfsClones=false,cephfsSelfHealing=false,topologyAccessibility=false"
+	defaultFeatureGates                           = "compatibilityAwareSelection=true,detachedDiskExpansion=false,cephfsExpansion=false,cephfsSnapshots=false,cephfsClones=false,cephfsSelfHealing=false,localRWOStaleMountRecovery=false,topologyAccessibility=false"
 	defaultMetricsEndpoint                        = ":9810"
 	defaultVMHotplugTimeout                       = 60
 	defaultVMHotplugTimeoutBase                   = 120
@@ -109,6 +112,9 @@ const (
 	defaultLocalRestartDetachGraceSeconds         = 90
 	defaultLocalRestartDetachGraceMaxSeconds      = 300
 	defaultLocalRestartRequireNodeReady           = true
+	defaultLocalRWOStaleMountActivePodRecovery    = false
+	defaultLocalRWOStaleMountMaxAttempts          = 3
+	defaultLocalRWOStaleMountBackoffSeconds       = 10
 	defaultLastNodePreferenceEnabled              = true
 	defaultLastNodePreferencePolicy               = "local-single-writer"
 	defaultLastNodePreferenceWebhookEnabled       = true
@@ -193,6 +199,9 @@ func initViper() *viper.Viper {
 	viper.SetDefault(LocalRestartDetachGraceSecondsVar, defaultLocalRestartDetachGraceSeconds)
 	viper.SetDefault(LocalRestartDetachGraceMaxSecondsVar, defaultLocalRestartDetachGraceMaxSeconds)
 	viper.SetDefault(LocalRestartRequireNodeReadyVar, defaultLocalRestartRequireNodeReady)
+	viper.SetDefault(LocalRWOStaleMountActivePodRecoveryVar, defaultLocalRWOStaleMountActivePodRecovery)
+	viper.SetDefault(LocalRWOStaleMountMaxAttemptsVar, defaultLocalRWOStaleMountMaxAttempts)
+	viper.SetDefault(LocalRWOStaleMountBackoffSecondsVar, defaultLocalRWOStaleMountBackoffSeconds)
 	viper.SetDefault(LastNodePreferenceEnabledVar, defaultLastNodePreferenceEnabled)
 	viper.SetDefault(LastNodePreferencePolicyVar, defaultLastNodePreferencePolicy)
 	viper.SetDefault(LastNodePreferenceWebhookEnabledVar, defaultLastNodePreferenceWebhookEnabled)

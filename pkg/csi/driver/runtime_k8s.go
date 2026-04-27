@@ -330,6 +330,26 @@ func (r *KubeRuntime) ResolveVolumeRuntimeContext(ctx context.Context, volumeHan
 	return nil, fmt.Errorf("persistent volume for handle %s not found", volumeHandle)
 }
 
+func (r *KubeRuntime) PodUIDExists(ctx context.Context, uid string) (bool, error) {
+	if r == nil || !r.enabled {
+		return false, fmt.Errorf("kubernetes runtime is not enabled")
+	}
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return false, fmt.Errorf("pod UID is required")
+	}
+	pods, err := r.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, err
+	}
+	for _, pod := range pods.Items {
+		if string(pod.UID) == uid {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (r *KubeRuntime) IsNodeReady(ctx context.Context, nodeName string) (bool, error) {
 	if r == nil || !r.enabled {
 		return false, fmt.Errorf("kubernetes runtime is not enabled")

@@ -322,7 +322,8 @@ func TestCompareCephConnectionIdentityRejectsMismatch(t *testing.T) {
 func TestResolveDeploymentMode(t *testing.T) {
 	assert.Equal(t, DeploymentModeCeph, resolveDeploymentMode(newTestDatastore(200, "ceph-system", "", "ceph", nil)))
 	assert.Equal(t, DeploymentModeSSH, resolveDeploymentMode(newTestDatastore(201, "ssh-system", "", "ssh", nil)))
-	assert.Equal(t, DeploymentModeUnknown, resolveDeploymentMode(newTestDatastore(202, "other", "", "shared", nil)))
+	assert.Equal(t, DeploymentModeSSH, resolveDeploymentMode(newTestDatastore(202, "lvm-ssh-system", "", "fs_lvm_ssh", nil)))
+	assert.Equal(t, DeploymentModeUnknown, resolveDeploymentMode(newTestDatastore(203, "other", "", "shared", nil)))
 }
 
 func TestGetBackendCapabilityProfileReportsNoFilesystemRWXForCurrentBackends(t *testing.T) {
