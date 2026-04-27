@@ -372,6 +372,36 @@ func TestResolveBenchmarkRunDefaultsCephFSAccessModesAndDeadline(t *testing.T) {
 	}
 }
 
+func TestResolveBenchmarkRunAppliesRWXContentionProfile(t *testing.T) {
+	s := &Syncer{}
+	item := inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "bench", Generation: 2},
+		Spec: inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunSpec{
+			DatastoreID: 300,
+			Profile:     "rwx-contention",
+		},
+	}
+	ds := datastoreSchema.Datastore{ID: 300, Name: "cephfs-a", Type: "FILE", TMMad: "shared"}
+	ds.Template.AddPair(sharedBackendAttr, "cephfs")
+
+	resolved := s.resolveBenchmarkRun(item, ds, nil)
+	if len(resolved.Spec.AccessModes) != 1 || resolved.Spec.AccessModes[0] != corev1.ReadWriteMany {
+		t.Fatalf("expected RWX profile access mode, got %#v", resolved.Spec.AccessModes)
+	}
+	if strings.TrimSpace(resolved.Spec.Size) == "" || len(resolved.Spec.FioArgs) == 0 {
+		t.Fatalf("expected profile defaults to populate size and fio args, got size=%q args=%#v", resolved.Spec.Size, resolved.Spec.FioArgs)
+	}
+}
+
+func TestBenchmarkThresholdFailure(t *testing.T) {
+	readIops := int64(10)
+	minReadIops := int64(20)
+	message := benchmarkThresholdFailure(inventoryv1alpha1.ValidationResult{ReadIops: &readIops}, inventoryv1alpha1.BenchmarkThresholds{MinReadIops: &minReadIops})
+	if !strings.Contains(message, "read IOPS below threshold") {
+		t.Fatalf("expected read threshold failure, got %q", message)
+	}
+}
+
 func TestBuildBenchmarkPVCRejectsUnsupportedAccessMode(t *testing.T) {
 	s := &Syncer{}
 	run := &inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun{

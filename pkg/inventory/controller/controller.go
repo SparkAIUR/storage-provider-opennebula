@@ -44,6 +44,11 @@ const (
 	validationJobPrefix                                      = "one-ds-validate-job-"
 	benchmarkPVCPrefix                                       = "one-ds-bench-pvc-"
 	benchmarkJobPrefix                                       = "one-ds-bench-job-"
+	benchmarkFinalizer                                       = "storage-provider.opennebula.sparkaiur.io/benchmark-cleanup"
+	benchmarkLabelComponent                                  = "app.kubernetes.io/component"
+	benchmarkLabelRun                                        = "storage-provider.opennebula.sparkaiur.io/benchmark-run"
+	benchmarkLabelDatastoreID                                = "storage-provider.opennebula.sparkaiur.io/datastore-id"
+	benchmarkComponentValue                                  = "datastore-benchmark"
 	defaultValidationActiveDeadlineSeconds int64             = 900
 	eventReasonValidationTriggered                           = "ValidationTriggered"
 	eventReasonValidationSucceeded                           = "ValidationSucceeded"
@@ -541,7 +546,7 @@ func (s *Syncer) buildDatastoreStatus(item inventoryv1alpha1.OpenNebulaDatastore
 	status.LastValidationPhase = validationPhaseDisplay(status.Validation)
 	status.LastValidationSummary = validationSummaryDisplay(status.Validation)
 	status.StorageClassDetails = buildStorageClassDetails(scs, normalized)
-	status.Conditions = datastoreConditions(item, normalized, status)
+	status.Conditions = datastoreConditions(item, normalized, status, benchmark)
 	return status
 }
 
@@ -672,6 +677,7 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 		newCondition("VMReady", boolCondition(status.Hotplug.Ready), "VMReadinessEvaluated", "OpenNebula VM readiness evaluated"),
 		newCondition("TopologyResolved", boolCondition(status.Storage.TopologySystemDatastore != ""), "TopologyEvaluated", "Topology label evaluated"),
 		newCondition("HotplugCooldown", boolCondition(status.Hotplug.InCooldown), boolReason(status.Hotplug.InCooldown, "CooldownActive", "CooldownClear"), "Controller hotplug cooldown state evaluated"),
+		newCondition("HotplugPressureAcceptable", boolCondition(status.ActiveHotplugPressure < 8), boolReason(status.ActiveHotplugPressure < 8, "HotplugPressureNormal", "HotplugPressureHigh"), fmt.Sprintf("Node has %d active CSI attachment(s)", status.ActiveHotplugPressure)),
 	}
 	return status
 }
@@ -690,6 +696,24 @@ func (s *Syncer) reconcileBenchmarkRuns(ctx context.Context, discovered map[int]
 		}
 
 		current := item.DeepCopy()
+		if !item.DeletionTimestamp.IsZero() {
+			_ = s.cleanupValidationResources(ctx, current.Status.JobName, current.Status.PVCName)
+			if hasString(current.Finalizers, benchmarkFinalizer) {
+				before := current.DeepCopy()
+				current.Finalizers = removeString(current.Finalizers, benchmarkFinalizer)
+				if err := s.client.Patch(ctx, current, ctrlclient.MergeFrom(before)); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if !hasString(current.Finalizers, benchmarkFinalizer) {
+			before := current.DeepCopy()
+			current.Finalizers = append(current.Finalizers, benchmarkFinalizer)
+			if err := s.client.Patch(ctx, current, ctrlclient.MergeFrom(before)); err != nil {
+				return err
+			}
+		}
 		ds, ok := discovered[item.Spec.DatastoreID]
 		if !ok {
 			current.Status = inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunStatus{
@@ -797,6 +821,12 @@ func (s *Syncer) reconcileBenchmarkRuns(ctx context.Context, discovered map[int]
 					Phase:  inventoryv1alpha1.ValidationPhaseSucceeded,
 					Result: result,
 				})
+				if thresholdErr := benchmarkThresholdFailure(result, resolved.Spec.Thresholds); thresholdErr != "" {
+					nextStatus.Phase = inventoryv1alpha1.ValidationPhaseFailed
+					nextStatus.Message = thresholdErr
+				}
+			} else {
+				nextStatus.FailureLog = s.validationJobLogExcerpt(ctx, job)
 			}
 			current.Status = nextStatus
 			if err := s.client.Status().Patch(ctx, current, ctrlclient.MergeFrom(item.DeepCopy())); err != nil {
@@ -810,6 +840,7 @@ func (s *Syncer) reconcileBenchmarkRuns(ctx context.Context, discovered map[int]
 			nextStatus.CompletedAt = &now
 			nextStatus.Phase = inventoryv1alpha1.ValidationPhaseFailed
 			nextStatus.Message = "benchmark failed"
+			nextStatus.FailureLog = s.validationJobLogExcerpt(ctx, job)
 			current.Status = nextStatus
 			if err := s.client.Status().Patch(ctx, current, ctrlclient.MergeFrom(item.DeepCopy())); err != nil {
 				return err
@@ -861,6 +892,7 @@ func (s *Syncer) expandAutoBenchmarkRun(ctx context.Context, item *inventoryv1al
 
 func (s *Syncer) resolveBenchmarkRun(item inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun, ds datastoreSchema.Datastore, scs []storagev1.StorageClass) inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun {
 	resolved := *item.DeepCopy()
+	applyBenchmarkProfileDefaults(&resolved)
 	if strings.TrimSpace(resolved.Spec.StorageClassName) == "" {
 		resolved.Spec.StorageClassName = defaultBenchmarkStorageClassName(scs, resolved.Spec.DatastoreID)
 	}
@@ -880,6 +912,49 @@ func (s *Syncer) resolveBenchmarkRun(item inventoryv1alpha1.OpenNebulaDatastoreB
 		resolved.Spec.ActiveDeadlineSeconds = int64Ptr(defaultValidationActiveDeadlineSeconds)
 	}
 	return resolved
+}
+
+func applyBenchmarkProfileDefaults(run *inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun) {
+	if run == nil {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(run.Spec.Profile)) {
+	case "latency":
+		if strings.TrimSpace(run.Spec.Size) == "" {
+			run.Spec.Size = "4Gi"
+		}
+		if len(run.Spec.FioArgs) == 0 {
+			run.Spec.FioArgs = []string{"--name=latency", "--filename=/data/validation.bin", "--rw=randread", "--bs=4k", "--size=256Mi", "--iodepth=1", "--runtime=60", "--time_based"}
+		}
+	case "throughput":
+		if strings.TrimSpace(run.Spec.Size) == "" {
+			run.Spec.Size = "8Gi"
+		}
+		if len(run.Spec.FioArgs) == 0 {
+			run.Spec.FioArgs = []string{"--name=throughput", "--filename=/data/validation.bin", "--rw=read", "--bs=1M", "--size=1Gi", "--iodepth=32", "--runtime=60", "--time_based"}
+		}
+	case "metadata":
+		if strings.TrimSpace(run.Spec.Size) == "" {
+			run.Spec.Size = "4Gi"
+		}
+		if len(run.Spec.FioArgs) == 0 {
+			run.Spec.FioArgs = []string{"--name=metadata", "--directory=/data", "--rw=randrw", "--bs=4k", "--nrfiles=1024", "--filesize=64k", "--iodepth=16", "--runtime=60", "--time_based"}
+		}
+	case "rwx-contention":
+		if strings.TrimSpace(run.Spec.Size) == "" {
+			run.Spec.Size = "4Gi"
+		}
+		if len(run.Spec.AccessModes) == 0 {
+			run.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+		}
+		if len(run.Spec.FioArgs) == 0 {
+			run.Spec.FioArgs = []string{"--name=rwx-contention", "--filename=/data/validation.bin", "--rw=randrw", "--bs=4k", "--size=512Mi", "--iodepth=16", "--runtime=60", "--time_based"}
+		}
+	case "smoke":
+		if strings.TrimSpace(run.Spec.Size) == "" {
+			run.Spec.Size = "1Gi"
+		}
+	}
 }
 
 func (s *Syncer) loadLatestBenchmarkResults(ctx context.Context) (map[int]*latestBenchmarkResult, error) {
@@ -1028,6 +1103,7 @@ func (s *Syncer) buildBenchmarkPVC(run *inventoryv1alpha1.OpenNebulaDatastoreBen
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pvcName,
 			Namespace: s.namespace,
+			Labels:    benchmarkResourceLabels(run),
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes:      accessModes,
@@ -1108,11 +1184,15 @@ func (s *Syncer) buildBenchmarkJob(run *inventoryv1alpha1.OpenNebulaDatastoreBen
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      jobName,
 			Namespace: s.namespace,
+			Labels:    benchmarkResourceLabels(run),
 		},
 		Spec: batchv1.JobSpec{
 			ActiveDeadlineSeconds:   validationActiveDeadlineSeconds(run.Spec.ActiveDeadlineSeconds),
 			TTLSecondsAfterFinished: ttl,
 			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: benchmarkResourceLabels(run),
+				},
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
 					NodeSelector:  run.Spec.NodeSelector,
@@ -1161,6 +1241,56 @@ func (s *Syncer) parseValidationJobLogs(ctx context.Context, job *batchv1.Job) (
 		return inventoryv1alpha1.ValidationResult{}, err
 	}
 	return parseFIOResult(body)
+}
+
+func (s *Syncer) validationJobLogExcerpt(ctx context.Context, job *batchv1.Job) string {
+	pods, err := s.kube.CoreV1().Pods(job.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "job-name=" + job.Name,
+	})
+	if err != nil || len(pods.Items) == 0 {
+		return ""
+	}
+	req := s.kube.CoreV1().Pods(job.Namespace).GetLogs(pods.Items[0].Name, &corev1.PodLogOptions{Container: "fio", TailLines: int64Ptr(80)})
+	stream, err := req.Stream(ctx)
+	if err != nil {
+		return ""
+	}
+	defer stream.Close()
+	body, err := io.ReadAll(stream)
+	if err != nil {
+		return ""
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if len(trimmed) > 4000 {
+		return trimmed[len(trimmed)-4000:]
+	}
+	return trimmed
+}
+
+func benchmarkThresholdFailure(result inventoryv1alpha1.ValidationResult, thresholds inventoryv1alpha1.BenchmarkThresholds) string {
+	if thresholds.MinReadIops != nil && (result.ReadIops == nil || *result.ReadIops < *thresholds.MinReadIops) {
+		return fmt.Sprintf("read IOPS below threshold: got %s, want >= %d", pointerInt64Display(result.ReadIops), *thresholds.MinReadIops)
+	}
+	if thresholds.MinWriteIops != nil && (result.WriteIops == nil || *result.WriteIops < *thresholds.MinWriteIops) {
+		return fmt.Sprintf("write IOPS below threshold: got %s, want >= %d", pointerInt64Display(result.WriteIops), *thresholds.MinWriteIops)
+	}
+	if thresholds.MinReadBwBytes != nil && (result.ReadBwBytes == nil || *result.ReadBwBytes < *thresholds.MinReadBwBytes) {
+		return fmt.Sprintf("read bandwidth below threshold: got %s, want >= %d", pointerInt64Display(result.ReadBwBytes), *thresholds.MinReadBwBytes)
+	}
+	if thresholds.MinWriteBwBytes != nil && (result.WriteBwBytes == nil || *result.WriteBwBytes < *thresholds.MinWriteBwBytes) {
+		return fmt.Sprintf("write bandwidth below threshold: got %s, want >= %d", pointerInt64Display(result.WriteBwBytes), *thresholds.MinWriteBwBytes)
+	}
+	if thresholds.MaxLatencyP99Micros != nil && (result.LatencyP99Micros == nil || *result.LatencyP99Micros > *thresholds.MaxLatencyP99Micros) {
+		return fmt.Sprintf("p99 latency above threshold: got %s, want <= %d", pointerInt64Display(result.LatencyP99Micros), *thresholds.MaxLatencyP99Micros)
+	}
+	return ""
+}
+
+func pointerInt64Display(value *int64) string {
+	if value == nil {
+		return "<missing>"
+	}
+	return strconv.FormatInt(*value, 10)
 }
 
 func parseFIOResult(payload []byte) (inventoryv1alpha1.ValidationResult, error) {
@@ -1303,10 +1433,47 @@ func isTerminalValidationPhase(phase string) bool {
 }
 
 func cleanupValidationResource(ctx context.Context, client ctrlclient.Client, obj ctrlclient.Object) error {
-	if err := client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
+	opts := []ctrlclient.DeleteOption{}
+	if _, ok := obj.(*batchv1.Job); ok {
+		opts = append(opts, ctrlclient.PropagationPolicy(metav1.DeletePropagationBackground))
+	}
+	if err := client.Delete(ctx, obj, opts...); err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
 	return nil
+}
+
+func benchmarkResourceLabels(run *inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun) map[string]string {
+	labels := map[string]string{
+		benchmarkLabelComponent: benchmarkComponentValue,
+	}
+	if run != nil {
+		labels[benchmarkLabelRun] = run.Name
+		if run.Spec.DatastoreID > 0 {
+			labels[benchmarkLabelDatastoreID] = strconv.Itoa(run.Spec.DatastoreID)
+		}
+	}
+	return labels
+}
+
+func hasString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func removeString(values []string, target string) []string {
+	filtered := values[:0]
+	for _, value := range values {
+		if value == target {
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	return filtered
 }
 
 func (s *Syncer) cleanupValidationResources(ctx context.Context, jobName, pvcName string) error {
@@ -1703,7 +1870,7 @@ func storageClassUsesDatastore(sc storagev1.StorageClass, datastoreID int) bool 
 	return false
 }
 
-func datastoreConditions(item inventoryv1alpha1.OpenNebulaDatastore, normalized opennebula.Datastore, status inventoryv1alpha1.OpenNebulaDatastoreStatus) []metav1.Condition {
+func datastoreConditions(item inventoryv1alpha1.OpenNebulaDatastore, normalized opennebula.Datastore, status inventoryv1alpha1.OpenNebulaDatastoreStatus, benchmark *latestBenchmarkResult) []metav1.Condition {
 	provisioningAllowed := item.Spec.Enabled && item.Spec.Discovery.Allowed && !item.Spec.MaintenanceMode
 	provisioningReason := "ProvisioningEnabled"
 	provisioningMessage := "Datastore accepts new provisioning requests"
@@ -1752,12 +1919,65 @@ func datastoreConditions(item inventoryv1alpha1.OpenNebulaDatastore, normalized 
 		referenceMessage = fmt.Sprintf("%d StorageClass reference(s) found", status.ReferenceCount)
 	}
 
+	provisioningFeasible := provisioningAllowed && backendMatch && capacityValid
+	provisioningFeasibleReason := boolReason(provisioningFeasible, "ProvisioningFeasible", "ProvisioningBlocked")
+	provisioningFeasibleMessage := "Datastore is eligible for provisioning"
+	if !provisioningFeasible {
+		provisioningFeasibleMessage = "Datastore is not currently eligible for provisioning; inspect ProvisioningEnabled, BackendMatch, and CapacityReported"
+	}
+
+	attachFeasible := true
+	attachReason := "AttachFeasible"
+	attachMessage := "Attach feasibility checks passed"
+	if normalized.Backend == "ceph-rbd" || normalized.Backend == "ceph" {
+		if len(normalized.CompatibleSystemDatastores) == 0 {
+			attachFeasible = false
+			attachReason = "NoCompatibleSystemDatastores"
+			attachMessage = "Ceph RBD datastore does not report compatible system datastores"
+		} else {
+			attachMessage = fmt.Sprintf("Ceph RBD datastore reports compatible system datastores %v", normalized.CompatibleSystemDatastores)
+		}
+	}
+
+	secretValid := true
+	secretReason := "SecretsNotRequired"
+	secretMessage := "No datastore-level secret references are required"
+	if normalized.Backend == "cephfs" {
+		secretReason = "StorageClassSecretsEvaluated"
+		secretMessage = "CephFS StorageClass secret references were evaluated"
+		for _, detail := range status.StorageClassDetails {
+			for _, warning := range detail.Warnings {
+				if strings.Contains(strings.ToLower(warning), "secret") {
+					secretValid = false
+					secretReason = "SecretReferencesIncomplete"
+					secretMessage = warning
+					break
+				}
+			}
+			if !secretValid {
+				break
+			}
+		}
+	}
+
+	benchmarkSucceeded := benchmark != nil && benchmark.Status.Phase == inventoryv1alpha1.ValidationPhaseSucceeded
+	benchmarkReason := boolReason(benchmarkSucceeded, "BenchmarkSucceeded", "BenchmarkMissing")
+	benchmarkMessage := "No successful benchmark result recorded"
+	if benchmarkSucceeded {
+		benchmarkMessage = benchmarkSummaryDisplay(benchmark.Status)
+	}
+
 	return []metav1.Condition{
 		newCondition("Discovered", metav1.ConditionTrue, "DatastoreFound", "Datastore was discovered in OpenNebula"),
 		newCondition("ProvisioningEnabled", boolCondition(provisioningAllowed), provisioningReason, provisioningMessage),
+		newCondition("ProvisioningFeasible", boolCondition(provisioningFeasible), provisioningFeasibleReason, provisioningFeasibleMessage),
 		newCondition("BackendMatch", boolCondition(backendMatch), backendReason, backendMessage),
 		newCondition("CapacityReported", boolCondition(capacityValid), boolReason(capacityValid, "CapacityObserved", "CapacityInvalid"), boolMessage(capacityValid, "Datastore capacity reported from OpenNebula", "Datastore capacity is invalid or unavailable")),
+		newCondition("AttachFeasible", boolCondition(attachFeasible), attachReason, attachMessage),
+		newCondition("NodeSystemDatastoreCompatible", boolCondition(attachFeasible), attachReason, attachMessage),
+		newCondition("CephSecretsValid", boolCondition(secretValid), secretReason, secretMessage),
 		newCondition("ValidationHealthy", boolCondition(validationHealthy), validationReason, validationMessage),
+		newCondition("RecentBenchmarkSucceeded", boolCondition(benchmarkSucceeded), benchmarkReason, benchmarkMessage),
 		newCondition("ReferencedByStorageClass", boolCondition(status.ReferencedByStorageClass), referenceReason, referenceMessage),
 	}
 }

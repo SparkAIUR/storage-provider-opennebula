@@ -141,6 +141,39 @@ func (in *ValidationResult) DeepCopyInto(out *ValidationResult) {
 	}
 }
 
+func (in *BenchmarkThresholds) DeepCopyInto(out *BenchmarkThresholds) {
+	*out = *in
+	if in.MinReadIops != nil {
+		value := *in.MinReadIops
+		out.MinReadIops = &value
+	}
+	if in.MinWriteIops != nil {
+		value := *in.MinWriteIops
+		out.MinWriteIops = &value
+	}
+	if in.MinReadBwBytes != nil {
+		value := *in.MinReadBwBytes
+		out.MinReadBwBytes = &value
+	}
+	if in.MinWriteBwBytes != nil {
+		value := *in.MinWriteBwBytes
+		out.MinWriteBwBytes = &value
+	}
+	if in.MaxLatencyP99Micros != nil {
+		value := *in.MaxLatencyP99Micros
+		out.MaxLatencyP99Micros = &value
+	}
+}
+
+func (in *BenchmarkThresholds) DeepCopy() *BenchmarkThresholds {
+	if in == nil {
+		return nil
+	}
+	out := new(BenchmarkThresholds)
+	in.DeepCopyInto(out)
+	return out
+}
+
 func (in *OpenNebulaDatastoreValidationStatus) DeepCopyInto(out *OpenNebulaDatastoreValidationStatus) {
 	*out = *in
 	if in.LastRunTime != nil {
@@ -162,6 +195,7 @@ func (in *OpenNebulaDatastoreBenchmarkRunSpec) DeepCopyInto(out *OpenNebulaDatas
 	if in.FioArgs != nil {
 		out.FioArgs = append([]string(nil), in.FioArgs...)
 	}
+	in.Thresholds.DeepCopyInto(&out.Thresholds)
 	if in.NodeSelector != nil {
 		out.NodeSelector = make(map[string]string, len(in.NodeSelector))
 		for key, value := range in.NodeSelector {

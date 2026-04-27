@@ -117,6 +117,14 @@ type ValidationResult struct {
 	LatencyP99Micros *int64 `json:"latencyP99Micros,omitempty"`
 }
 
+type BenchmarkThresholds struct {
+	MinReadIops         *int64 `json:"minReadIops,omitempty"`
+	MinWriteIops        *int64 `json:"minWriteIops,omitempty"`
+	MinReadBwBytes      *int64 `json:"minReadBwBytes,omitempty"`
+	MinWriteBwBytes     *int64 `json:"minWriteBwBytes,omitempty"`
+	MaxLatencyP99Micros *int64 `json:"maxLatencyP99Micros,omitempty"`
+}
+
 type OpenNebulaDatastoreValidationStatus struct {
 	LastRunTime       *metav1.Time     `json:"lastRunTime,omitempty"`
 	LastCompletedTime *metav1.Time     `json:"lastCompletedTime,omitempty"`
@@ -156,9 +164,11 @@ type OpenNebulaDatastoreStatus struct {
 type OpenNebulaDatastoreBenchmarkRunSpec struct {
 	DatastoreID             int                                 `json:"datastoreID"`
 	StorageClassName        string                              `json:"storageClassName,omitempty"`
+	Profile                 string                              `json:"profile,omitempty"`
 	Size                    string                              `json:"size,omitempty"`
 	AccessModes             []corev1.PersistentVolumeAccessMode `json:"accessModes,omitempty"`
 	FioArgs                 []string                            `json:"fioArgs,omitempty"`
+	Thresholds              BenchmarkThresholds                 `json:"thresholds,omitempty"`
 	Image                   string                              `json:"image,omitempty"`
 	ImagePullPolicy         corev1.PullPolicy                   `json:"imagePullPolicy,omitempty"`
 	NodeSelector            map[string]string                   `json:"nodeSelector,omitempty"`
@@ -181,6 +191,7 @@ type OpenNebulaDatastoreBenchmarkRunStatus struct {
 	CompletedAt        *metav1.Time     `json:"completedAt,omitempty"`
 	Summary            string           `json:"summary,omitempty"`
 	Message            string           `json:"message,omitempty"`
+	FailureLog         string           `json:"failureLog,omitempty"`
 	Result             ValidationResult `json:"result,omitempty"`
 }
 

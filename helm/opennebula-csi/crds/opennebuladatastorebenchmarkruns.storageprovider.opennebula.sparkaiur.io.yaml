@@ -45,6 +45,8 @@ spec:
                   type: integer
                 storageClassName:
                   type: string
+                profile:
+                  type: string
                 size:
                   type: string
                 accessModes:
@@ -55,6 +57,24 @@ spec:
                   type: array
                   items:
                     type: string
+                thresholds:
+                  type: object
+                  properties:
+                    minReadIops:
+                      type: integer
+                      format: int64
+                    minWriteIops:
+                      type: integer
+                      format: int64
+                    minReadBwBytes:
+                      type: integer
+                      format: int64
+                    minWriteBwBytes:
+                      type: integer
+                      format: int64
+                    maxLatencyP99Micros:
+                      type: integer
+                      format: int64
                 image:
                   type: string
                 imagePullPolicy:
@@ -104,6 +124,8 @@ spec:
                 summary:
                   type: string
                 message:
+                  type: string
+                failureLog:
                   type: string
                 result:
                   type: object
