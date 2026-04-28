@@ -6,6 +6,40 @@ metadata:
   namespace: {{ include "opennebula-csi.namespace" . }}
 
 ---
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: {{ printf "%s-node-runtime-state-role" (include "opennebula-csi.fullname" .) }}
+  namespace: {{ include "opennebula-csi.namespace" . }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["opennebula-csi-hotplug-observations", "opennebula-csi-sticky-attachment-state"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["opennebula-csi-hotplug-observations"]
+    verbs: ["update", "patch"]
+
+---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: {{ printf "%s-node-runtime-state-binding" (include "opennebula-csi.fullname" .) }}
+  namespace: {{ include "opennebula-csi.namespace" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "opennebula-csi.nodeServiceAccountName" . }}
+    namespace: {{ include "opennebula-csi.namespace" . }}
+roleRef:
+  kind: Role
+  name: {{ printf "%s-node-runtime-state-role" (include "opennebula-csi.fullname" .) }}
+  apiGroup: rbac.authorization.k8s.io
+
+---
 kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:

@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -28,6 +29,41 @@ func (e *HotplugQueueTimeoutError) Error() string {
 	return fmt.Sprintf("timed out after %s waiting for hotplug queue on node %s for %s of volume %s", e.Timeout, e.Node, e.Operation, e.Volume)
 }
 
+type HotplugQueueActiveTimeoutError struct {
+	Node      string
+	Operation string
+	Volume    string
+	Timeout   time.Duration
+}
+
+func (e *HotplugQueueActiveTimeoutError) Error() string {
+	if e == nil {
+		return "hotplug queue active timeout"
+	}
+	return fmt.Sprintf("timed out after %s executing hotplug queue request on node %s for %s of volume %s", e.Timeout, e.Node, e.Operation, e.Volume)
+}
+
+type HotplugQueueStaleRequestError struct {
+	Node      string
+	Operation string
+	Volume    string
+	Reason    string
+	Message   string
+}
+
+func (e *HotplugQueueStaleRequestError) Error() string {
+	if e == nil {
+		return "stale hotplug queue request"
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.Reason != "" {
+		return fmt.Sprintf("stale hotplug queue request for %s of volume %s on node %s: %s", e.Operation, e.Volume, e.Node, e.Reason)
+	}
+	return fmt.Sprintf("stale hotplug queue request for %s of volume %s on node %s", e.Operation, e.Volume, e.Node)
+}
+
 type HotplugQueuePriority string
 
 const (
@@ -36,6 +72,22 @@ const (
 	hotplugQueuePriorityBackground HotplugQueuePriority = "background"
 )
 
+type HotplugQueueValidationDecision string
+
+const (
+	HotplugQueueValidationValid     HotplugQueueValidationDecision = "valid"
+	HotplugQueueValidationCompleted HotplugQueueValidationDecision = "completed"
+	HotplugQueueValidationStale     HotplugQueueValidationDecision = "stale"
+)
+
+type HotplugQueueValidation struct {
+	Decision HotplugQueueValidationDecision
+	Reason   string
+	Message  string
+}
+
+type HotplugQueueValidator func(ctx context.Context, node, operation, volume string) HotplugQueueValidation
+
 type HotplugQueueItemSnapshot struct {
 	ID         uint64               `json:"id"`
 	Node       string               `json:"node"`
@@ -43,6 +95,8 @@ type HotplugQueueItemSnapshot struct {
 	Volume     string               `json:"volume"`
 	Priority   HotplugQueuePriority `json:"priority"`
 	EnqueuedAt time.Time            `json:"enqueuedAt"`
+	StartedAt  *time.Time           `json:"startedAt,omitempty"`
+	Coalesced  int                  `json:"coalesced,omitempty"`
 }
 
 type HotplugQueueNodeSnapshot struct {
@@ -51,6 +105,7 @@ type HotplugQueueNodeSnapshot struct {
 	Queued           []HotplugQueueItemSnapshot `json:"queued,omitempty"`
 	QueuedCount      int                        `json:"queuedCount"`
 	OldestAgeSeconds int64                      `json:"oldestAgeSeconds"`
+	ActiveAgeSeconds int64                      `json:"activeAgeSeconds,omitempty"`
 }
 
 type hotplugQueueRequest struct {
@@ -60,10 +115,15 @@ type hotplugQueueRequest struct {
 	volume     string
 	priority   HotplugQueuePriority
 	enqueuedAt time.Time
+	startedAt  time.Time
+	waitLimit  time.Duration
+	coalesced  int
 	ctx        context.Context
 	fn         func(context.Context) error
 	started    chan struct{}
-	done       chan error
+	done       chan struct{}
+	once       sync.Once
+	err        error
 }
 
 type hotplugNodeQueue struct {
@@ -73,14 +133,19 @@ type hotplugNodeQueue struct {
 }
 
 type HotplugQueueManager struct {
-	mu        sync.Mutex
-	runtime   *KubeRuntime
-	namespace string
-	metrics   *DriverMetrics
-	maxWait   time.Duration
-	ageBoost  time.Duration
-	seq       atomic.Uint64
-	nodes     map[string]*hotplugNodeQueue
+	mu          sync.Mutex
+	runtime     *KubeRuntime
+	namespace   string
+	metrics     *DriverMetrics
+	maxWait     time.Duration
+	ageBoost    time.Duration
+	dedupe      bool
+	perItemWait time.Duration
+	maxWaitCap  time.Duration
+	maxActive   time.Duration
+	validator   HotplugQueueValidator
+	seq         atomic.Uint64
+	nodes       map[string]*hotplugNodeQueue
 }
 
 func NewHotplugQueueManager(runtime *KubeRuntime, namespace string, metrics *DriverMetrics, maxWait, ageBoost time.Duration) *HotplugQueueManager {
@@ -90,8 +155,22 @@ func NewHotplugQueueManager(runtime *KubeRuntime, namespace string, metrics *Dri
 		metrics:   metrics,
 		maxWait:   maxWait,
 		ageBoost:  ageBoost,
+		dedupe:    true,
 		nodes:     map[string]*hotplugNodeQueue{},
 	}
+}
+
+func (m *HotplugQueueManager) Configure(dedupe bool, perItemWait, maxWaitCap, maxActive time.Duration, validator HotplugQueueValidator) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dedupe = dedupe
+	m.perItemWait = perItemWait
+	m.maxWaitCap = maxWaitCap
+	m.maxActive = maxActive
+	m.validator = validator
 }
 
 func (m *HotplugQueueManager) Run(ctx context.Context, node, operation, volume string, priority HotplugQueuePriority, fn func(context.Context) error) error {
@@ -108,19 +187,44 @@ func (m *HotplugQueueManager) Run(ctx context.Context, node, operation, volume s
 		ctx:        ctx,
 		fn:         fn,
 		started:    make(chan struct{}),
-		done:       make(chan error, 1),
+		done:       make(chan struct{}),
 	}
 
+	req, coalesced := m.enqueue(req)
+	waitLimit := req.waitLimit
 	waitCtx := ctx
 	var cancel context.CancelFunc
-	if m.maxWait > 0 {
-		waitCtx, cancel = context.WithTimeout(ctx, m.maxWait)
+	if waitLimit > 0 {
+		waitCtx, cancel = context.WithTimeout(ctx, waitLimit)
 		defer cancel()
 	}
 
-	m.enqueue(req)
+	if coalesced {
+		select {
+		case <-req.done:
+			outcome := "coalesced_success"
+			if req.err != nil {
+				outcome = "coalesced_error"
+			}
+			m.metrics.RecordHotplugQueueWait(operation, outcome, time.Since(req.enqueuedAt))
+			m.metrics.RecordHotplugQueueDispatch(operation, string(priority), outcome)
+			return req.err
+		case <-waitCtx.Done():
+			m.metrics.RecordHotplugQueueWait(operation, "coalesced_timeout", time.Since(req.enqueuedAt))
+			m.metrics.RecordHotplugQueueDispatch(operation, string(priority), "coalesced_timeout")
+			return &HotplugQueueTimeoutError{
+				Node:      node,
+				Operation: operation,
+				Volume:    volume,
+				Timeout:   waitLimit,
+			}
+		}
+	}
+
 	select {
 	case <-req.started:
+	case <-req.done:
+		return req.err
 	case <-waitCtx.Done():
 		if m.cancel(req.id, node) {
 			m.metrics.RecordHotplugQueueWait(operation, "timeout", time.Since(req.enqueuedAt))
@@ -129,12 +233,13 @@ func (m *HotplugQueueManager) Run(ctx context.Context, node, operation, volume s
 				Node:      node,
 				Operation: operation,
 				Volume:    volume,
-				Timeout:   m.maxWait,
+				Timeout:   waitLimit,
 			}
 		}
 	}
 
-	err := <-req.done
+	<-req.done
+	err := req.err
 	outcome := "success"
 	if err != nil {
 		outcome = "error"
@@ -179,25 +284,39 @@ func (m *HotplugQueueManager) HasVolume(volume string) bool {
 	return false
 }
 
-func (m *HotplugQueueManager) enqueue(req *hotplugQueueRequest) {
+func (m *HotplugQueueManager) enqueue(req *hotplugQueueRequest) (*hotplugQueueRequest, bool) {
 	m.mu.Lock()
 	nodeQueue := m.nodes[req.node]
 	if nodeQueue == nil {
 		nodeQueue = &hotplugNodeQueue{}
 		m.nodes[req.node] = nodeQueue
 	}
+	if m.dedupe {
+		if existing := findDuplicateRequest(nodeQueue, req); existing != nil {
+			existing.coalesced++
+			snapshot := m.snapshotLocked(req.node)
+			m.mu.Unlock()
+			m.metrics.RecordHotplugQueueDispatch(req.operation, string(req.priority), "coalesced")
+			m.metrics.RecordHotplugQueueCoalesced(req.operation, "joined")
+			m.persistSnapshot(snapshot)
+			return existing, true
+		}
+	}
+	req.waitLimit = m.effectiveWaitLimitLocked(nodeQueue)
 	nodeQueue.pending = append(nodeQueue.pending, req)
 	shouldStart := !nodeQueue.running
 	if shouldStart {
 		nodeQueue.running = true
 	}
 	snapshot := m.snapshotLocked(req.node)
+	m.recordDepthMetricsLocked()
 	m.mu.Unlock()
 
 	m.persistSnapshot(snapshot)
 	if shouldStart {
 		go m.runNodeQueue(req.node)
 	}
+	return req, false
 }
 
 func (m *HotplugQueueManager) cancel(id uint64, node string) bool {
@@ -213,7 +332,14 @@ func (m *HotplugQueueManager) cancel(id uint64, node string) bool {
 		}
 		nodeQueue.pending = slices.Delete(nodeQueue.pending, idx, idx+1)
 		snapshot := m.snapshotLocked(node)
+		m.recordDepthMetricsLocked()
 		go m.persistSnapshot(snapshot)
+		req.complete(&HotplugQueueTimeoutError{
+			Node:      node,
+			Operation: req.operation,
+			Volume:    req.volume,
+			Timeout:   req.waitLimit,
+		})
 		return true
 	}
 	return false
@@ -226,10 +352,61 @@ func (m *HotplugQueueManager) runNodeQueue(node string) {
 			return
 		}
 		close(req.started)
-		err := req.fn(req.ctx)
-		req.done <- err
-		m.finish(node)
+		err := m.runRequest(req)
+		req.complete(err)
+		m.finish(node, req.id)
 	}
+}
+
+func (m *HotplugQueueManager) runRequest(req *hotplugQueueRequest) error {
+	if m == nil || req == nil {
+		return nil
+	}
+	if m.validator != nil {
+		validation := m.validator(req.ctx, req.node, req.operation, req.volume)
+		switch validation.Decision {
+		case HotplugQueueValidationCompleted:
+			m.metrics.RecordHotplugQueueDispatch(req.operation, string(req.priority), "completed")
+			return nil
+		case HotplugQueueValidationStale:
+			m.metrics.RecordHotplugQueueDispatch(req.operation, string(req.priority), "stale")
+			return &HotplugQueueStaleRequestError{
+				Node:      req.node,
+				Operation: req.operation,
+				Volume:    req.volume,
+				Reason:    validation.Reason,
+				Message:   validation.Message,
+			}
+		}
+	}
+
+	runCtx := req.ctx
+	var cancel context.CancelFunc
+	if m.maxActive > 0 {
+		runCtx, cancel = context.WithTimeout(req.ctx, m.maxActive)
+		defer cancel()
+	}
+	err := req.fn(runCtx)
+	if err != nil {
+		if m.maxActive > 0 && errors.Is(err, context.DeadlineExceeded) {
+			return &HotplugQueueActiveTimeoutError{
+				Node:      req.node,
+				Operation: req.operation,
+				Volume:    req.volume,
+				Timeout:   m.maxActive,
+			}
+		}
+		return err
+	}
+	if runCtx.Err() == context.DeadlineExceeded {
+		return &HotplugQueueActiveTimeoutError{
+			Node:      req.node,
+			Operation: req.operation,
+			Volume:    req.volume,
+			Timeout:   m.maxActive,
+		}
+	}
+	return nil
 }
 
 func (m *HotplugQueueManager) next(node string) *hotplugQueueRequest {
@@ -240,6 +417,7 @@ func (m *HotplugQueueManager) next(node string) *hotplugQueueRequest {
 		if nodeQueue != nil {
 			nodeQueue.running = false
 			delete(m.nodes, node)
+			m.recordDepthMetricsLocked()
 			go m.persistSnapshot(HotplugQueueNodeSnapshot{Node: node})
 		}
 		return nil
@@ -258,18 +436,21 @@ func (m *HotplugQueueManager) next(node string) *hotplugQueueRequest {
 	req := nodeQueue.pending[selectedIdx]
 	nodeQueue.pending = slices.Delete(nodeQueue.pending, selectedIdx, selectedIdx+1)
 	nodeQueue.active = req
+	req.startedAt = time.Now().UTC()
 	snapshot := m.snapshotLocked(node)
+	m.recordDepthMetricsLocked()
 	go m.persistSnapshot(snapshot)
 	return req
 }
 
-func (m *HotplugQueueManager) finish(node string) {
+func (m *HotplugQueueManager) finish(node string, id uint64) {
 	m.mu.Lock()
 	nodeQueue := m.nodes[node]
-	if nodeQueue != nil {
+	if nodeQueue != nil && nodeQueue.active != nil && nodeQueue.active.id == id {
 		nodeQueue.active = nil
 	}
 	snapshot := m.snapshotLocked(node)
+	m.recordDepthMetricsLocked()
 	m.mu.Unlock()
 	m.persistSnapshot(snapshot)
 }
@@ -292,6 +473,24 @@ func (m *HotplugQueueManager) effectivePriority(req *hotplugQueueRequest, now ti
 	return base - boosts
 }
 
+func (m *HotplugQueueManager) effectiveWaitLimitLocked(nodeQueue *hotplugNodeQueue) time.Duration {
+	wait := m.maxWait
+	if wait <= 0 {
+		return 0
+	}
+	if m.perItemWait > 0 && nodeQueue != nil {
+		depthAhead := len(nodeQueue.pending)
+		if nodeQueue.active != nil {
+			depthAhead++
+		}
+		wait += time.Duration(depthAhead) * m.perItemWait
+	}
+	if m.maxWaitCap > 0 && wait > m.maxWaitCap {
+		return m.maxWaitCap
+	}
+	return wait
+}
+
 func (m *HotplugQueueManager) snapshotLocked(node string) HotplugQueueNodeSnapshot {
 	snapshot := HotplugQueueNodeSnapshot{Node: node}
 	nodeQueue := m.nodes[node]
@@ -301,6 +500,9 @@ func (m *HotplugQueueManager) snapshotLocked(node string) HotplugQueueNodeSnapsh
 	if nodeQueue.active != nil {
 		active := requestSnapshot(nodeQueue.active)
 		snapshot.Active = &active
+		if !nodeQueue.active.startedAt.IsZero() {
+			snapshot.ActiveAgeSeconds = int64(time.Since(nodeQueue.active.startedAt).Seconds())
+		}
 	}
 	if len(nodeQueue.pending) > 0 {
 		snapshot.Queued = make([]HotplugQueueItemSnapshot, 0, len(nodeQueue.pending))
@@ -320,35 +522,42 @@ func (m *HotplugQueueManager) snapshotLocked(node string) HotplugQueueNodeSnapsh
 	return snapshot
 }
 
-func (m *HotplugQueueManager) persistSnapshot(snapshot HotplugQueueNodeSnapshot) {
-	if m != nil && m.metrics != nil {
-		critical, normal, background := 0, 0, 0
-		if snapshot.Node != "" {
-			for _, item := range snapshot.Queued {
-				switch item.Priority {
-				case hotplugQueuePriorityCritical:
-					critical++
-				case hotplugQueuePriorityNormal:
-					normal++
-				default:
-					background++
-				}
-			}
-			if snapshot.Active != nil {
-				switch snapshot.Active.Priority {
-				case hotplugQueuePriorityCritical:
-					critical++
-				case hotplugQueuePriorityNormal:
-					normal++
-				default:
-					background++
-				}
+func (m *HotplugQueueManager) recordDepthMetricsLocked() {
+	if m == nil || m.metrics == nil {
+		return
+	}
+	critical, normal, background := 0, 0, 0
+	for _, nodeQueue := range m.nodes {
+		if nodeQueue == nil {
+			continue
+		}
+		if nodeQueue.active != nil {
+			switch nodeQueue.active.priority {
+			case hotplugQueuePriorityCritical:
+				critical++
+			case hotplugQueuePriorityNormal:
+				normal++
+			default:
+				background++
 			}
 		}
-		m.metrics.SetHotplugQueueDepth(string(hotplugQueuePriorityCritical), critical)
-		m.metrics.SetHotplugQueueDepth(string(hotplugQueuePriorityNormal), normal)
-		m.metrics.SetHotplugQueueDepth(string(hotplugQueuePriorityBackground), background)
+		for _, req := range nodeQueue.pending {
+			switch req.priority {
+			case hotplugQueuePriorityCritical:
+				critical++
+			case hotplugQueuePriorityNormal:
+				normal++
+			default:
+				background++
+			}
+		}
 	}
+	m.metrics.SetHotplugQueueDepth(string(hotplugQueuePriorityCritical), critical)
+	m.metrics.SetHotplugQueueDepth(string(hotplugQueuePriorityNormal), normal)
+	m.metrics.SetHotplugQueueDepth(string(hotplugQueuePriorityBackground), background)
+}
+
+func (m *HotplugQueueManager) persistSnapshot(snapshot HotplugQueueNodeSnapshot) {
 	if m == nil || m.runtime == nil || !m.runtime.enabled || snapshot.Node == "" {
 		return
 	}
@@ -371,12 +580,51 @@ func (m *HotplugQueueManager) persistSnapshot(snapshot HotplugQueueNodeSnapshot)
 }
 
 func requestSnapshot(req *hotplugQueueRequest) HotplugQueueItemSnapshot {
-	return HotplugQueueItemSnapshot{
+	item := HotplugQueueItemSnapshot{
 		ID:         req.id,
 		Node:       req.node,
 		Operation:  req.operation,
 		Volume:     req.volume,
 		Priority:   req.priority,
 		EnqueuedAt: req.enqueuedAt,
+		Coalesced:  req.coalesced,
 	}
+	if !req.startedAt.IsZero() {
+		started := req.startedAt
+		item.StartedAt = &started
+	}
+	return item
+}
+
+func (req *hotplugQueueRequest) complete(err error) {
+	if req == nil {
+		return
+	}
+	req.once.Do(func() {
+		req.err = err
+		close(req.done)
+	})
+}
+
+func findDuplicateRequest(queue *hotplugNodeQueue, req *hotplugQueueRequest) *hotplugQueueRequest {
+	if queue == nil || req == nil {
+		return nil
+	}
+	if queue.active != nil && sameQueueRequest(queue.active, req) {
+		return queue.active
+	}
+	for _, pending := range queue.pending {
+		if sameQueueRequest(pending, req) {
+			return pending
+		}
+	}
+	return nil
+}
+
+func sameQueueRequest(a, b *hotplugQueueRequest) bool {
+	return a != nil &&
+		b != nil &&
+		a.node == b.node &&
+		a.operation == b.operation &&
+		a.volume == b.volume
 }

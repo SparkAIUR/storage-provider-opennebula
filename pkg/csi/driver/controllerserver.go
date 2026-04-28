@@ -33,6 +33,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 )
 
@@ -874,6 +876,19 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonHotplugQueueTimeout, queueTimeoutErr.Error())
 			return nil, status.Error(codes.DeadlineExceeded, queueTimeoutErr.Error())
 		}
+		var activeTimeoutErr *HotplugQueueActiveTimeoutError
+		if errors.As(queueErr, &activeTimeoutErr) {
+			if diagnosis, ok := s.diagnoseAndPersistHotplug(ctx, req.NodeId); ok {
+				s.driver.metrics.RecordHotplugRecovery("attach", strings.ToLower(diagnosis.Classification), "queue_active_timeout")
+			}
+			s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonHotplugQueueTimeout, activeTimeoutErr.Error())
+			return nil, status.Error(codes.DeadlineExceeded, activeTimeoutErr.Error())
+		}
+		var staleQueueErr *HotplugQueueStaleRequestError
+		if errors.As(queueErr, &staleQueueErr) {
+			s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonHotplugQueueStale, staleQueueErr.Error())
+			return nil, status.Error(codes.Aborted, staleQueueErr.Error())
+		}
 		if status.Code(queueErr) == codes.Unknown {
 			return nil, status.Error(codes.Aborted, queueErr.Error())
 		}
@@ -1006,6 +1021,19 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		if errors.As(queueErr, &queueTimeoutErr) {
 			s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReasonHotplugQueueTimeout, queueTimeoutErr.Error())
 			return nil, status.Error(codes.DeadlineExceeded, queueTimeoutErr.Error())
+		}
+		var activeTimeoutErr *HotplugQueueActiveTimeoutError
+		if errors.As(queueErr, &activeTimeoutErr) {
+			if diagnosis, ok := s.diagnoseAndPersistHotplug(ctx, req.NodeId); ok {
+				s.driver.metrics.RecordHotplugRecovery("detach", strings.ToLower(diagnosis.Classification), "queue_active_timeout")
+			}
+			s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReasonHotplugQueueTimeout, activeTimeoutErr.Error())
+			return nil, status.Error(codes.DeadlineExceeded, activeTimeoutErr.Error())
+		}
+		var staleQueueErr *HotplugQueueStaleRequestError
+		if errors.As(queueErr, &staleQueueErr) {
+			s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReasonHotplugQueueStale, staleQueueErr.Error())
+			return nil, status.Error(codes.Aborted, staleQueueErr.Error())
 		}
 		if status.Code(queueErr) == codes.Unknown {
 			return nil, status.Error(codes.Aborted, queueErr.Error())
@@ -1350,6 +1378,104 @@ func (s *ControllerServer) withQueuedHotplug(ctx context.Context, node, operatio
 	return s.driver.hotplugQueue.Run(ctx, node, operation, volume, priority, fn)
 }
 
+func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node, operation, volume string) HotplugQueueValidation {
+	if s == nil || s.volumeProvider == nil || strings.TrimSpace(node) == "" || strings.TrimSpace(volume) == "" {
+		return HotplugQueueValidation{Decision: HotplugQueueValidationValid}
+	}
+
+	volumeID, _, err := s.volumeProvider.VolumeExists(ctx, volume)
+	if err != nil {
+		return HotplugQueueValidation{Decision: HotplugQueueValidationValid}
+	}
+	if volumeID == -1 {
+		return HotplugQueueValidation{
+			Decision: HotplugQueueValidationStale,
+			Reason:   "volume_not_found",
+			Message:  fmt.Sprintf("volume %s no longer exists; dropping queued %s for node %s", volume, operation, node),
+		}
+	}
+	nodeID, err := s.volumeProvider.NodeExists(ctx, node)
+	if err != nil {
+		return HotplugQueueValidation{Decision: HotplugQueueValidationValid}
+	}
+	if nodeID == -1 {
+		return HotplugQueueValidation{
+			Decision: HotplugQueueValidationStale,
+			Reason:   "node_not_found",
+			Message:  fmt.Sprintf("node %s no longer exists; dropping queued %s for volume %s", node, operation, volume),
+		}
+	}
+
+	_, attachedErr := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
+	attached := attachedErr == nil
+	switch strings.ToLower(strings.TrimSpace(operation)) {
+	case "attach":
+		if attached {
+			return HotplugQueueValidation{
+				Decision: HotplugQueueValidationCompleted,
+				Reason:   "already_attached",
+				Message:  fmt.Sprintf("volume %s is already attached to node %s", volume, node),
+			}
+		}
+		if stale, reason := s.attachRequestStale(ctx, node, volume); stale {
+			return HotplugQueueValidation{
+				Decision: HotplugQueueValidationStale,
+				Reason:   reason,
+				Message:  fmt.Sprintf("queued attach for volume %s on node %s is stale: %s", volume, node, reason),
+			}
+		}
+	case "detach":
+		if !attached {
+			return HotplugQueueValidation{
+				Decision: HotplugQueueValidationCompleted,
+				Reason:   "already_detached",
+				Message:  fmt.Sprintf("volume %s is already detached from node %s", volume, node),
+			}
+		}
+	}
+	return HotplugQueueValidation{Decision: HotplugQueueValidationValid}
+}
+
+func (s *ControllerServer) attachRequestStale(ctx context.Context, node, volume string) (bool, string) {
+	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
+		return false, ""
+	}
+	runtimeCtx, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volume)
+	if err != nil {
+		if strings.Contains(err.Error(), "persistent volume for handle") {
+			return true, "persistent_volume_not_found"
+		}
+		return false, ""
+	}
+	pv, err := s.driver.kubeRuntime.client.CoreV1().PersistentVolumes().Get(ctx, runtimeCtx.PVName, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, "persistent_volume_not_found"
+		}
+		return false, ""
+	}
+	if !pv.DeletionTimestamp.IsZero() {
+		return true, "persistent_volume_deleting"
+	}
+	if pv.Status.Phase == corev1.VolumeReleased || pv.Status.Phase == corev1.VolumeFailed {
+		return true, "persistent_volume_" + strings.ToLower(string(pv.Status.Phase))
+	}
+
+	vas, err := s.driver.kubeRuntime.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, ""
+	}
+	for _, va := range vas.Items {
+		if va.Spec.Source.PersistentVolumeName == nil || *va.Spec.Source.PersistentVolumeName != runtimeCtx.PVName {
+			continue
+		}
+		if va.Spec.NodeName == node && va.DeletionTimestamp.IsZero() {
+			return false, ""
+		}
+	}
+	return true, "volume_attachment_not_found"
+}
+
 func (s *ControllerServer) handleHotplugTimeout(ctx context.Context, node, volume string, params map[string]string, operation, backend string, err error) {
 	var timeoutErr *opennebula.HotplugTimeoutError
 	if !errors.As(err, &timeoutErr) {
@@ -1358,6 +1484,12 @@ func (s *ControllerServer) handleHotplugTimeout(ctx context.Context, node, volum
 
 	s.driver.metrics.RecordHotplugTimeout(operation, backend, "timeout_exhausted")
 	s.driver.metrics.RecordHotplugRecovery(operation, "timeout_exhausted", "observed")
+	if diagnosis, ok := s.diagnoseAndPersistHotplug(ctx, node); ok {
+		s.driver.metrics.RecordHotplugRecovery(operation, strings.ToLower(diagnosis.Classification), "observed")
+		if diagnosis.Classification == opennebula.HotplugClassificationStuck {
+			s.recordPVCWarningFromParams(ctx, params, eventReasonHotplugCooldown, diagnosis.Message)
+		}
+	}
 	if timeoutErr.LastObservedReady {
 		return
 	}

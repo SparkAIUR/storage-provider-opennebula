@@ -111,9 +111,11 @@ func (d *Driver) Run(ctx context.Context) error {
 
 	d.metrics = NewDriverMetrics(d.version, d.commit)
 	d.kubeRuntime = NewKubeRuntime(d.name)
-	d.stickyAttachments = NewStickyAttachmentManager(d.kubeRuntime, "")
-	if err := d.stickyAttachments.LoadFromConfigMap(ctx); err != nil {
-		klog.V(2).InfoS("Failed to load sticky attachment state", "err", err)
+	if strings.TrimSpace(d.nodeID) == "" {
+		d.stickyAttachments = NewStickyAttachmentManager(d.kubeRuntime, "")
+		if err := d.stickyAttachments.LoadFromConfigMap(ctx); err != nil {
+			klog.V(2).InfoS("Failed to load sticky attachment state", "err", err)
+		}
 	}
 	d.hotplugQueue = NewHotplugQueueManager(d.kubeRuntime, "", d.metrics, loadHotplugQueueMaxWait(d.PluginConfig), loadHotplugQueueAgeBoost(d.PluginConfig))
 	d.adaptiveTimeouts = opennebula.NewAdaptiveTimeoutTracker(loadAdaptiveTimeoutConfig(d.PluginConfig))
@@ -181,6 +183,15 @@ func (d *Driver) Run(ctx context.Context) error {
 	}
 
 	controllerServer := NewControllerServer(d, volumeProvider, sharedFilesystemProvider)
+	if d.hotplugQueue != nil {
+		d.hotplugQueue.Configure(
+			loadHotplugQueueDedupe(d.PluginConfig),
+			loadHotplugQueuePerItemWait(d.PluginConfig),
+			loadHotplugQueueMaxWaitCap(d.PluginConfig),
+			loadHotplugQueueMaxActive(d.PluginConfig),
+			controllerServer.validateHotplugQueueRequest,
+		)
+	}
 	nodeServer := NewNodeServer(d, d.mounter)
 	grpcServer.Start(
 		d.grpcServerEndpoint,
@@ -264,6 +275,50 @@ func loadHotplugQueueAgeBoost(cfg config.CSIPluginConfig) time.Duration {
 		seconds = 30
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+func loadHotplugQueueDedupe(cfg config.CSIPluginConfig) bool {
+	enabled, ok := cfg.GetBool(config.HotplugQueueDedupeEnabledVar)
+	return !ok || enabled
+}
+
+func loadHotplugQueuePerItemWait(cfg config.CSIPluginConfig) time.Duration {
+	seconds, ok := cfg.GetInt(config.HotplugQueuePerItemWaitSecondsVar)
+	if !ok || seconds < 0 {
+		seconds = 60
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func loadHotplugQueueMaxWaitCap(cfg config.CSIPluginConfig) time.Duration {
+	seconds, ok := cfg.GetInt(config.HotplugQueueMaxWaitCapSecondsVar)
+	if !ok || seconds <= 0 {
+		seconds = 900
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func loadHotplugQueueMaxActive(cfg config.CSIPluginConfig) time.Duration {
+	seconds, ok := cfg.GetInt(config.HotplugQueueMaxActiveSecondsVar)
+	if !ok || seconds <= 0 {
+		seconds = 900
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func loadHotplugDiagnosisConfig(cfg config.CSIPluginConfig) opennebula.HotplugDiagnosisConfig {
+	stuckAfter, ok := cfg.GetInt(config.HotplugDiagnosticsStuckAfterSecondsVar)
+	if !ok || stuckAfter <= 0 {
+		stuckAfter = 300
+	}
+	progressWindow, ok := cfg.GetInt(config.HotplugDiagnosticsProgressWindowSecondsVar)
+	if !ok || progressWindow <= 0 {
+		progressWindow = 60
+	}
+	return opennebula.HotplugDiagnosisConfig{
+		StuckAfter:     time.Duration(stuckAfter) * time.Second,
+		ProgressWindow: time.Duration(progressWindow) * time.Second,
+	}
 }
 
 func loadAdaptiveTimeoutConfig(cfg config.CSIPluginConfig) opennebula.AdaptiveTimeoutConfig {

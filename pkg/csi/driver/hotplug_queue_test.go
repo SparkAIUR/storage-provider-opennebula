@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -126,4 +127,73 @@ func TestHotplugQueueReturnsTimeout(t *testing.T) {
 	var timeoutErr *HotplugQueueTimeoutError
 	assert.True(t, errors.As(err, &timeoutErr))
 	assert.Equal(t, "node-a", timeoutErr.Node)
+}
+
+func TestHotplugQueueCoalescesDuplicateRequests(t *testing.T) {
+	manager := NewHotplugQueueManager(nil, "", NewDriverMetrics("test", "test"), time.Second, 0)
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var runCount int32
+	errCh := make(chan error, 2)
+	run := func(ctx context.Context) error {
+		atomic.AddInt32(&runCount, 1)
+		close(firstStarted)
+		<-releaseFirst
+		return nil
+	}
+
+	go func() {
+		errCh <- manager.Run(context.Background(), "node-a", "attach", "vol-1", hotplugQueuePriorityNormal, run)
+	}()
+	<-firstStarted
+	go func() {
+		errCh <- manager.Run(context.Background(), "node-a", "attach", "vol-1", hotplugQueuePriorityNormal, func(context.Context) error {
+			atomic.AddInt32(&runCount, 1)
+			return nil
+		})
+	}()
+
+	time.Sleep(25 * time.Millisecond)
+	close(releaseFirst)
+	require.NoError(t, <-errCh)
+	require.NoError(t, <-errCh)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&runCount))
+}
+
+func TestHotplugQueueReturnsActiveTimeout(t *testing.T) {
+	manager := NewHotplugQueueManager(nil, "", NewDriverMetrics("test", "test"), time.Second, 0)
+	manager.Configure(true, 0, 0, 25*time.Millisecond, nil)
+
+	err := manager.Run(context.Background(), "node-a", "attach", "vol-1", hotplugQueuePriorityNormal, func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	require.Error(t, err)
+	var timeoutErr *HotplugQueueActiveTimeoutError
+	assert.True(t, errors.As(err, &timeoutErr))
+	assert.Equal(t, "node-a", timeoutErr.Node)
+}
+
+func TestHotplugQueueDropsStaleRequestBeforeDispatch(t *testing.T) {
+	manager := NewHotplugQueueManager(nil, "", NewDriverMetrics("test", "test"), time.Second, 0)
+	manager.Configure(true, 0, 0, 0, func(context.Context, string, string, string) HotplugQueueValidation {
+		return HotplugQueueValidation{
+			Decision: HotplugQueueValidationStale,
+			Reason:   "persistent_volume_released",
+		}
+	})
+
+	called := false
+	err := manager.Run(context.Background(), "node-a", "attach", "vol-1", hotplugQueuePriorityNormal, func(context.Context) error {
+		called = true
+		return nil
+	})
+
+	require.Error(t, err)
+	var staleErr *HotplugQueueStaleRequestError
+	assert.True(t, errors.As(err, &staleErr))
+	assert.False(t, called)
+	assert.Equal(t, "persistent_volume_released", staleErr.Reason)
 }

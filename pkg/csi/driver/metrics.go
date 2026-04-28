@@ -42,6 +42,9 @@ type DriverMetrics struct {
 	hotplugQueueDepth            *prometheus.GaugeVec
 	hotplugQueueWait             *prometheus.HistogramVec
 	hotplugQueueDispatchTotal    *prometheus.CounterVec
+	hotplugQueueCoalescedTotal   *prometheus.CounterVec
+	hotplugDiagnosisTotal        *prometheus.CounterVec
+	hotplugStateAge              *prometheus.GaugeVec
 	lastNodePreferenceTotal      *prometheus.CounterVec
 	attachmentReconcilerTotal    *prometheus.CounterVec
 	hotplugRecommendedTimeout    *prometheus.GaugeVec
@@ -154,6 +157,18 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 			Name: "opennebula_csi_hotplug_queue_dispatch_total",
 			Help: "Total number of hotplug queue dispatch decisions by operation, priority, and outcome.",
 		}, []string{"operation", "priority", "outcome"}),
+		hotplugQueueCoalescedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_hotplug_queue_coalesced_total",
+			Help: "Total number of duplicate hotplug queue requests coalesced by operation and outcome.",
+		}, []string{"operation", "outcome"}),
+		hotplugDiagnosisTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_hotplug_diagnosis_total",
+			Help: "Total number of OpenNebula hotplug diagnosis observations by classification and reason.",
+		}, []string{"classification", "reason"}),
+		hotplugStateAge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "opennebula_csi_hotplug_state_age_seconds",
+			Help: "Observed age of a node hotplug state by node, LCM state, and classification.",
+		}, []string{"node", "lcm_state", "classification"}),
 		lastNodePreferenceTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "opennebula_csi_last_node_preference_total",
 			Help: "Total number of soft last-node preference webhook outcomes by outcome and reason.",
@@ -207,6 +222,9 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 		metrics.hotplugQueueDepth,
 		metrics.hotplugQueueWait,
 		metrics.hotplugQueueDispatchTotal,
+		metrics.hotplugQueueCoalescedTotal,
+		metrics.hotplugDiagnosisTotal,
+		metrics.hotplugStateAge,
 		metrics.lastNodePreferenceTotal,
 		metrics.attachmentReconcilerTotal,
 		metrics.hotplugRecommendedTimeout,
@@ -367,6 +385,27 @@ func (m *DriverMetrics) RecordHotplugQueueDispatch(operation, priority, outcome 
 		return
 	}
 	m.hotplugQueueDispatchTotal.WithLabelValues(operation, priority, outcome).Inc()
+}
+
+func (m *DriverMetrics) RecordHotplugQueueCoalesced(operation, outcome string) {
+	if m == nil {
+		return
+	}
+	m.hotplugQueueCoalescedTotal.WithLabelValues(operation, outcome).Inc()
+}
+
+func (m *DriverMetrics) RecordHotplugDiagnosis(classification, reason string) {
+	if m == nil {
+		return
+	}
+	m.hotplugDiagnosisTotal.WithLabelValues(classification, reason).Inc()
+}
+
+func (m *DriverMetrics) SetHotplugStateAge(node, lcmState, classification string, ageSeconds int64) {
+	if m == nil {
+		return
+	}
+	m.hotplugStateAge.WithLabelValues(node, lcmState, classification).Set(float64(ageSeconds))
 }
 
 func (m *DriverMetrics) RecordLastNodePreference(outcome, reason string) {

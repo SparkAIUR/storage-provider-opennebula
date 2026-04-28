@@ -14,6 +14,7 @@ const (
 	eventReasonHotplugNodeBusy              = "HotplugNodeBusy"
 	eventReasonHotplugQueued                = "HotplugQueued"
 	eventReasonHotplugQueueTimeout          = "HotplugQueueTimeout"
+	eventReasonHotplugQueueStale            = "HotplugQueueStale"
 	eventReasonHotplugCooldown              = "HotplugCooldown"
 	eventReasonDeviceDiscoverySlow          = "DeviceDiscoverySlow"
 	eventReasonDeviceDiscoveryTimeout       = "DeviceDiscoveryTimeout"
