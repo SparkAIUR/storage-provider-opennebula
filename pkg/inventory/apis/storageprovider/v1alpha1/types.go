@@ -283,13 +283,32 @@ type OpenNebulaNodeStorageStatus struct {
 }
 
 type OpenNebulaNodeHotplugStatus struct {
-	Ready                 bool         `json:"ready,omitempty"`
-	InCooldown            bool         `json:"inCooldown,omitempty"`
-	CooldownExpiresAt     *metav1.Time `json:"cooldownExpiresAt,omitempty"`
-	LastCooldownOperation string       `json:"lastCooldownOperation,omitempty"`
-	LastCooldownVolume    string       `json:"lastCooldownVolume,omitempty"`
-	LastObservedAttached  *bool        `json:"lastObservedAttached,omitempty"`
-	LastObservedReady     *bool        `json:"lastObservedReady,omitempty"`
+	Ready                 bool                                 `json:"ready,omitempty"`
+	InCooldown            bool                                 `json:"inCooldown,omitempty"`
+	CooldownExpiresAt     *metav1.Time                         `json:"cooldownExpiresAt,omitempty"`
+	LastCooldownOperation string                               `json:"lastCooldownOperation,omitempty"`
+	LastCooldownVolume    string                               `json:"lastCooldownVolume,omitempty"`
+	LastObservedAttached  *bool                                `json:"lastObservedAttached,omitempty"`
+	LastObservedReady     *bool                                `json:"lastObservedReady,omitempty"`
+	Diagnosis             OpenNebulaNodeHotplugDiagnosisStatus `json:"diagnosis,omitempty"`
+}
+
+type OpenNebulaNodeHotplugDiagnosisStatus struct {
+	Classification    string       `json:"classification,omitempty"`
+	Operation         string       `json:"operation,omitempty"`
+	VolumeHandle      string       `json:"volumeHandle,omitempty"`
+	PersistentDiskID  int          `json:"persistentDiskID,omitempty"`
+	VMDiskID          int          `json:"vmDiskID,omitempty"`
+	DiskTarget        string       `json:"diskTarget,omitempty"`
+	DiskAttachFlag    string       `json:"diskAttachFlag,omitempty"`
+	FirstObservedAt   *metav1.Time `json:"firstObservedAt,omitempty"`
+	LastObservedAt    *metav1.Time `json:"lastObservedAt,omitempty"`
+	LastChangedAt     *metav1.Time `json:"lastChangedAt,omitempty"`
+	AgeSeconds        int64        `json:"ageSeconds,omitempty"`
+	StuckAfterSeconds int64        `json:"stuckAfterSeconds,omitempty"`
+	Reason            string       `json:"reason,omitempty"`
+	Message           string       `json:"message,omitempty"`
+	RecommendedAction string       `json:"recommendedAction,omitempty"`
 }
 
 type OpenNebulaNodeStatus struct {

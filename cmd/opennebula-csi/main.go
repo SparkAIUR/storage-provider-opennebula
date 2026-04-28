@@ -39,7 +39,7 @@ var (
 	pluginEndpoint               = flag.String("endpoint", driver.DefaultGRPCServerEndpoint, "CSI plugin endpoint")
 	nodeID                       = flag.String("nodeid", "", "Node ID")
 	maxVolumesPerNode            = flag.Uint64("maxVolumesPerNode", 255, "Maximum number of volumes that can be attached to a node")
-	mode                         = flag.String("mode", "driver", "Execution mode: driver, preflight, or inventory-controller")
+	mode                         = flag.String("mode", "driver", "Execution mode: driver, preflight, inventory-controller, inventory-validate, support-bundle, volume-health, or hotplug-diagnose")
 	output                       = flag.String("output", "text", "Output format for preflight mode: text or json")
 	preflightDatastores          = flag.String("preflight-datastores", "", "Comma-separated datastore identifiers to validate during preflight")
 	preflightNodeStageSecrets    = flag.String("preflight-node-stage-secrets", "", "Comma-separated namespace/name secret references for CephFS node-stage validation")
@@ -54,6 +54,7 @@ var (
 	volumeHealthVolumeID         = flag.String("volume-id", "", "CSI volume ID for volume-health mode")
 	volumeHealthPV               = flag.String("pv", "", "PersistentVolume name for volume-health mode")
 	volumeHealthPVC              = flag.String("pvc", "", "namespace/name PersistentVolumeClaim for volume-health mode")
+	hotplugDiagnoseNode          = flag.String("hotplug-node", "", "Optional Kubernetes node name for hotplug-diagnose mode")
 )
 
 func main() {
@@ -160,6 +161,14 @@ func handle(cfg config.CSIPluginConfig) int {
 			PVC:      *volumeHealthPVC,
 		}, os.Stdout); err != nil {
 			klog.Errorf("Volume health inspection failed: %v", err)
+			return 1
+		}
+		return 0
+	case "hotplug-diagnose":
+		if err := driver.RunHotplugDiagnoseCommand(ctx, cfg, driver.HotplugDiagnoseOptions{
+			Node: *hotplugDiagnoseNode,
+		}, os.Stdout); err != nil {
+			klog.Errorf("Hotplug diagnosis failed: %v", err)
 			return 1
 		}
 		return 0

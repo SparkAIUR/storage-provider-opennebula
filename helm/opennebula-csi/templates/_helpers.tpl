@@ -92,6 +92,7 @@ Create chart name and version as used by the chart label.
 {{- $nodeExpand := (get $root.Values.driver "nodeExpand") | default dict -}}
 {{- $nodeDeviceCache := (get $root.Values.driver "nodeDeviceCache") | default dict -}}
 {{- $hotplugQueue := (get $root.Values.driver "hotplugQueue") | default dict -}}
+{{- $hotplugDiagnostics := (get $root.Values.driver "hotplugDiagnostics") | default dict -}}
 {{- $localRestart := (get $root.Values.driver "localRestartOptimization") | default dict -}}
 {{- $localRWORecovery := (get $root.Values.driver "localRWOStaleMountRecovery") | default dict -}}
 {{- $lastNodePreference := (get $root.Values.driver "lastNodePreference") | default dict -}}
@@ -108,6 +109,14 @@ Create chart name and version as used by the chart label.
 {{- $hotplugQueueEnabled := (get $hotplugQueue "enabled") | default true -}}
 {{- $hotplugQueueMaxWaitSeconds := (get $hotplugQueue "maxWaitSeconds") | default 180 -}}
 {{- $hotplugQueueAgeBoostSeconds := (get $hotplugQueue "ageBoostSeconds") | default 30 -}}
+{{- $hotplugQueueDedupeEnabled := (get $hotplugQueue "dedupeEnabled") | default true -}}
+{{- $hotplugQueuePerItemWaitSeconds := (get $hotplugQueue "perItemWaitSeconds") | default 60 -}}
+{{- $hotplugQueueMaxWaitCapSeconds := (get $hotplugQueue "maxWaitCapSeconds") | default 900 -}}
+{{- $hotplugQueueMaxActiveSeconds := (get $hotplugQueue "maxActiveSeconds") | default 900 -}}
+{{- $hotplugDiagnosticsEnabled := (get $hotplugDiagnostics "enabled") | default true -}}
+{{- $hotplugDiagnosticsStuckAfterSeconds := (get $hotplugDiagnostics "stuckAfterSeconds") | default 300 -}}
+{{- $hotplugDiagnosticsProgressWindowSeconds := (get $hotplugDiagnostics "progressWindowSeconds") | default 60 -}}
+{{- $hotplugDiagnosticsRecoveryMode := (get $hotplugDiagnostics "recoveryMode") | default "readOnly" -}}
 {{- $localRestartEnabled := (get $localRestart "enabled") | default true -}}
 {{- $localRestartDetachGrace := (get $localRestart "detachGraceSeconds") | default 90 -}}
 {{- $localRestartDetachGraceMax := (get $localRestart "maxDetachGraceSeconds") | default 300 -}}
@@ -198,6 +207,22 @@ Create chart name and version as used by the chart label.
   value: {{ $hotplugQueueMaxWaitSeconds | quote }}
 - name: ONE_CSI_HOTPLUG_QUEUE_AGE_BOOST_SECONDS
   value: {{ $hotplugQueueAgeBoostSeconds | quote }}
+- name: ONE_CSI_HOTPLUG_QUEUE_DEDUPE_ENABLED
+  value: {{ $hotplugQueueDedupeEnabled | quote }}
+- name: ONE_CSI_HOTPLUG_QUEUE_PER_ITEM_WAIT_SECONDS
+  value: {{ $hotplugQueuePerItemWaitSeconds | quote }}
+- name: ONE_CSI_HOTPLUG_QUEUE_MAX_WAIT_CAP_SECONDS
+  value: {{ $hotplugQueueMaxWaitCapSeconds | quote }}
+- name: ONE_CSI_HOTPLUG_QUEUE_MAX_ACTIVE_SECONDS
+  value: {{ $hotplugQueueMaxActiveSeconds | quote }}
+- name: ONE_CSI_HOTPLUG_DIAGNOSTICS_ENABLED
+  value: {{ $hotplugDiagnosticsEnabled | quote }}
+- name: ONE_CSI_HOTPLUG_DIAGNOSTICS_STUCK_AFTER_SECONDS
+  value: {{ $hotplugDiagnosticsStuckAfterSeconds | quote }}
+- name: ONE_CSI_HOTPLUG_DIAGNOSTICS_PROGRESS_WINDOW_SECONDS
+  value: {{ $hotplugDiagnosticsProgressWindowSeconds | quote }}
+- name: ONE_CSI_HOTPLUG_DIAGNOSTICS_RECOVERY_MODE
+  value: {{ $hotplugDiagnosticsRecoveryMode | quote }}
 - name: ONE_CSI_LOCAL_RESTART_OPTIMIZATION_ENABLED
   value: {{ $localRestartEnabled | quote }}
 - name: ONE_CSI_LOCAL_RESTART_DETACH_GRACE_SECONDS

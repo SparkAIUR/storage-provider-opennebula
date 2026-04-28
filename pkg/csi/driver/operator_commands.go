@@ -2,12 +2,15 @@ package driver
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -40,6 +43,10 @@ type VolumeHealthOptions struct {
 	PVC      string
 }
 
+type HotplugDiagnoseOptions struct {
+	Node string
+}
+
 type inventoryValidateResult struct {
 	DatastoreID int    `json:"datastoreID"`
 	Name        string `json:"name"`
@@ -68,6 +75,38 @@ type VolumeHealthReport struct {
 	Message            string `json:"message,omitempty"`
 }
 
+type HotplugQueueRisk struct {
+	Node             string `json:"node"`
+	Reason           string `json:"reason"`
+	Classification   string `json:"classification,omitempty"`
+	Operation        string `json:"operation,omitempty"`
+	Volume           string `json:"volume,omitempty"`
+	ActiveAgeSeconds int64  `json:"activeAgeSeconds,omitempty"`
+	QueuedCount      int    `json:"queuedCount,omitempty"`
+	OldestAgeSeconds int64  `json:"oldestAgeSeconds,omitempty"`
+	Message          string `json:"message"`
+}
+
+type StorageClassImmutableFieldSnapshot struct {
+	Name                 string            `json:"name"`
+	Provisioner          string            `json:"provisioner"`
+	ReclaimPolicy        string            `json:"reclaimPolicy,omitempty"`
+	VolumeBindingMode    string            `json:"volumeBindingMode,omitempty"`
+	AllowVolumeExpansion bool              `json:"allowVolumeExpansion,omitempty"`
+	Parameters           map[string]string `json:"parameters,omitempty"`
+	ParametersHash       string            `json:"parametersHash,omitempty"`
+}
+
+type HotplugDiagnoseReport struct {
+	Timestamp          time.Time                              `json:"timestamp"`
+	Node               string                                 `json:"node,omitempty"`
+	Diagnostics        map[string]opennebula.HotplugDiagnosis `json:"diagnostics"`
+	Queue              map[string]HotplugQueueNodeSnapshot    `json:"queue"`
+	Risks              []HotplugQueueRisk                     `json:"risks,omitempty"`
+	RecoveryMode       string                                 `json:"recoveryMode"`
+	RecoveryActionMode string                                 `json:"recoveryActionMode"`
+}
+
 type SupportBundle struct {
 	Timestamp               time.Time                                           `json:"timestamp"`
 	Config                  map[string]any                                      `json:"config"`
@@ -76,12 +115,15 @@ type SupportBundle struct {
 	HotplugCooldowns        map[string]any                                      `json:"hotplugCooldowns"`
 	StickyAttachments       map[string]any                                      `json:"stickyAttachments"`
 	HotplugQueue            map[string]any                                      `json:"hotplugQueue"`
+	HotplugDiagnostics      map[string]opennebula.HotplugDiagnosis              `json:"hotplugDiagnostics"`
+	HotplugQueueRisks       []HotplugQueueRisk                                  `json:"hotplugQueueRisks,omitempty"`
 	AdaptiveTimeouts        map[string]any                                      `json:"adaptiveTimeouts"`
 	AdaptiveRecommendations map[string]any                                      `json:"adaptiveRecommendations"`
 	Datastores              []inventoryv1alpha1.OpenNebulaDatastore             `json:"datastores"`
 	BenchmarkRuns           []inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun `json:"benchmarkRuns"`
 	Nodes                   []inventoryv1alpha1.OpenNebulaNode                  `json:"nodes"`
 	StorageClassAudit       []inventoryv1alpha1.StorageClassDetail              `json:"storageClassAudit"`
+	StorageClassImmutables  []StorageClassImmutableFieldSnapshot                `json:"storageClassImmutables"`
 	VolumeHealth            []VolumeHealthReport                                `json:"volumeHealth,omitempty"`
 	VolumeAttachments       []storagev1.VolumeAttachment                        `json:"volumeAttachments"`
 	Events                  []corev1.Event                                      `json:"events"`
@@ -171,6 +213,39 @@ func RunVolumeHealthCommand(ctx context.Context, cfg config.CSIPluginConfig, opt
 	return enc.Encode(reports)
 }
 
+func RunHotplugDiagnoseCommand(ctx context.Context, cfg config.CSIPluginConfig, opts HotplugDiagnoseOptions, w io.Writer) error {
+	kubeClient, _, err := preflightKubeClients()
+	if err != nil {
+		return err
+	}
+	queue := typedHotplugQueueSnapshot(ctx, kubeClient)
+	diagnostics := hotplugDiagnosticSnapshot(ctx, kubeClient, cfg)
+	if node := strings.TrimSpace(opts.Node); node != "" {
+		filteredQueue := map[string]HotplugQueueNodeSnapshot{}
+		if snapshot, ok := queue[node]; ok {
+			filteredQueue[node] = snapshot
+		}
+		filteredDiagnostics := map[string]opennebula.HotplugDiagnosis{}
+		if diagnosis, ok := diagnostics[node]; ok {
+			filteredDiagnostics[node] = diagnosis
+		}
+		queue = filteredQueue
+		diagnostics = filteredDiagnostics
+	}
+	report := HotplugDiagnoseReport{
+		Timestamp:          time.Now().UTC(),
+		Node:               strings.TrimSpace(opts.Node),
+		Diagnostics:        diagnostics,
+		Queue:              queue,
+		Risks:              buildHotplugQueueRisks(queue, diagnostics, cfg),
+		RecoveryMode:       getString(cfg, config.HotplugDiagnosticsRecoveryModeVar),
+		RecoveryActionMode: "read-only",
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(report)
+}
+
 func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w io.Writer) error {
 	kubeClient, _, err := preflightKubeClients()
 	if err != nil {
@@ -220,6 +295,8 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 	}
 	stickySnapshot := configMapJSONSnapshot(ctx, kubeClient, stickyAttachmentStateConfigMapName)
 	queueSnapshot := configMapJSONSnapshot(ctx, kubeClient, hotplugQueueStateConfigMapName)
+	typedQueueSnapshot := typedHotplugQueueSnapshot(ctx, kubeClient)
+	hotplugDiagnostics := hotplugDiagnosticSnapshot(ctx, kubeClient, cfg)
 	adaptiveSnapshot := configMapJSONSnapshot(ctx, kubeClient, adaptiveTimeoutObservationsConfigMapName)
 	adaptiveRecommendations := adaptiveRecommendationSnapshot(cfg, adaptiveSnapshot)
 
@@ -238,12 +315,15 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 		HotplugCooldowns:        hotplugSnapshot,
 		StickyAttachments:       stickySnapshot,
 		HotplugQueue:            queueSnapshot,
+		HotplugDiagnostics:      hotplugDiagnostics,
+		HotplugQueueRisks:       buildHotplugQueueRisks(typedQueueSnapshot, hotplugDiagnostics, cfg),
 		AdaptiveTimeouts:        adaptiveSnapshot,
 		AdaptiveRecommendations: adaptiveRecommendations,
 		Datastores:              dsList.Items,
 		BenchmarkRuns:           benchmarkList.Items,
 		Nodes:                   nodeList.Items,
 		StorageClassAudit:       flattenStorageClassDetails(dsList.Items, scList.Items),
+		StorageClassImmutables:  storageClassImmutableFieldSnapshots(scList.Items),
 		VolumeHealth:            volumeHealth,
 		VolumeAttachments:       vaList.Items,
 		Events:                  eventList.Items,
@@ -500,6 +580,180 @@ func configMapJSONSnapshot(ctx context.Context, kubeClient kubernetes.Interface,
 	return snapshot
 }
 
+func typedHotplugQueueSnapshot(ctx context.Context, kubeClient kubernetes.Interface) map[string]HotplugQueueNodeSnapshot {
+	snapshot := map[string]HotplugQueueNodeSnapshot{}
+	cm, err := kubeClient.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(ctx, hotplugQueueStateConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		return snapshot
+	}
+	for node, raw := range cm.Data {
+		var parsed HotplugQueueNodeSnapshot
+		if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+			continue
+		}
+		if parsed.Node == "" {
+			parsed.Node = node
+		}
+		snapshot[node] = parsed
+	}
+	return snapshot
+}
+
+func hotplugDiagnosticSnapshot(ctx context.Context, kubeClient kubernetes.Interface, cfg config.CSIPluginConfig) map[string]opennebula.HotplugDiagnosis {
+	snapshot := map[string]opennebula.HotplugDiagnosis{}
+	cm, err := kubeClient.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(ctx, hotplugDiagnosticsConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		return snapshot
+	}
+	diagnosisConfig := loadHotplugDiagnosisConfig(cfg)
+	now := time.Now().UTC()
+	for node, raw := range cm.Data {
+		var observation opennebula.HotplugObservation
+		if err := json.Unmarshal([]byte(raw), &observation); err != nil {
+			continue
+		}
+		if observation.Node == "" {
+			observation.Node = node
+		}
+		current := observation
+		current.LastObservedAt = now
+		diagnosis, _ := opennebula.ClassifyHotplugObservation(current, &observation, diagnosisConfig)
+		snapshot[node] = diagnosis
+	}
+	return snapshot
+}
+
+func buildHotplugQueueRisks(queue map[string]HotplugQueueNodeSnapshot, diagnostics map[string]opennebula.HotplugDiagnosis, cfg config.CSIPluginConfig) []HotplugQueueRisk {
+	risks := make([]HotplugQueueRisk, 0)
+	activeLimit := int64(loadHotplugQueueMaxActive(cfg).Seconds())
+	stuckAfter := int64(loadHotplugDiagnosisConfig(cfg).StuckAfter.Seconds())
+	if activeLimit <= 0 {
+		activeLimit = 900
+	}
+	if stuckAfter <= 0 {
+		stuckAfter = 300
+	}
+	maxWait := int64(loadHotplugQueueMaxWaitCap(cfg).Seconds())
+	if maxWait <= 0 {
+		maxWait = int64(loadHotplugQueueMaxWait(cfg).Seconds())
+	}
+	for node, snapshot := range queue {
+		diagnosis := diagnostics[node]
+		if snapshot.Active != nil && diagnosis.Classification == opennebula.HotplugClassificationStuck {
+			risks = append(risks, HotplugQueueRisk{
+				Node:             node,
+				Reason:           "opennebula_hotplug_stuck",
+				Classification:   diagnosis.Classification,
+				Operation:        snapshot.Active.Operation,
+				Volume:           snapshot.Active.Volume,
+				ActiveAgeSeconds: snapshot.ActiveAgeSeconds,
+				QueuedCount:      snapshot.QueuedCount,
+				OldestAgeSeconds: snapshot.OldestAgeSeconds,
+				Message:          diagnosis.Message,
+			})
+			continue
+		}
+		if snapshot.Active != nil && snapshot.ActiveAgeSeconds >= activeLimit {
+			risks = append(risks, HotplugQueueRisk{
+				Node:             node,
+				Reason:           "active_request_exceeded_timeout",
+				Classification:   diagnosis.Classification,
+				Operation:        snapshot.Active.Operation,
+				Volume:           snapshot.Active.Volume,
+				ActiveAgeSeconds: snapshot.ActiveAgeSeconds,
+				QueuedCount:      snapshot.QueuedCount,
+				OldestAgeSeconds: snapshot.OldestAgeSeconds,
+				Message:          fmt.Sprintf("active hotplug request has been running for %ds, beyond configured max active time %ds", snapshot.ActiveAgeSeconds, activeLimit),
+			})
+			continue
+		}
+		if snapshot.Active != nil && snapshot.ActiveAgeSeconds >= stuckAfter && snapshot.QueuedCount > 0 {
+			risks = append(risks, HotplugQueueRisk{
+				Node:             node,
+				Reason:           "queue_blocked_by_long_active_request",
+				Classification:   diagnosis.Classification,
+				Operation:        snapshot.Active.Operation,
+				Volume:           snapshot.Active.Volume,
+				ActiveAgeSeconds: snapshot.ActiveAgeSeconds,
+				QueuedCount:      snapshot.QueuedCount,
+				OldestAgeSeconds: snapshot.OldestAgeSeconds,
+				Message:          fmt.Sprintf("%d queued request(s) are waiting behind an active hotplug request that has run for %ds", snapshot.QueuedCount, snapshot.ActiveAgeSeconds),
+			})
+			continue
+		}
+		if snapshot.QueuedCount > 0 && maxWait > 0 && snapshot.OldestAgeSeconds >= maxWait {
+			risks = append(risks, HotplugQueueRisk{
+				Node:             node,
+				Reason:           "queued_request_wait_exceeded",
+				Classification:   diagnosis.Classification,
+				QueuedCount:      snapshot.QueuedCount,
+				OldestAgeSeconds: snapshot.OldestAgeSeconds,
+				Message:          fmt.Sprintf("oldest queued hotplug request has waited for %ds, beyond configured wait cap %ds", snapshot.OldestAgeSeconds, maxWait),
+			})
+		}
+	}
+	sort.Slice(risks, func(i, j int) bool {
+		if risks[i].Reason == risks[j].Reason {
+			return risks[i].Node < risks[j].Node
+		}
+		return risks[i].Reason < risks[j].Reason
+	})
+	return risks
+}
+
+func storageClassImmutableFieldSnapshots(classes []storagev1.StorageClass) []StorageClassImmutableFieldSnapshot {
+	snapshots := make([]StorageClassImmutableFieldSnapshot, 0, len(classes))
+	for _, class := range classes {
+		mode := ""
+		if class.VolumeBindingMode != nil {
+			mode = string(*class.VolumeBindingMode)
+		}
+		reclaimPolicy := ""
+		if class.ReclaimPolicy != nil {
+			reclaimPolicy = string(*class.ReclaimPolicy)
+		}
+		allowExpansion := false
+		if class.AllowVolumeExpansion != nil {
+			allowExpansion = *class.AllowVolumeExpansion
+		}
+		params := cloneStringMap(class.Parameters)
+		snapshots = append(snapshots, StorageClassImmutableFieldSnapshot{
+			Name:                 class.Name,
+			Provisioner:          class.Provisioner,
+			ReclaimPolicy:        reclaimPolicy,
+			VolumeBindingMode:    mode,
+			AllowVolumeExpansion: allowExpansion,
+			Parameters:           params,
+			ParametersHash:       storageClassParametersHash(params),
+		})
+	}
+	sort.Slice(snapshots, func(i, j int) bool {
+		return snapshots[i].Name < snapshots[j].Name
+	})
+	return snapshots
+}
+
+func storageClassParametersHash(params map[string]string) string {
+	if len(params) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(params))
+	for key := range params {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	canonical := make(map[string]string, len(params))
+	for _, key := range keys {
+		canonical[key] = params[key]
+	}
+	payload, err := json.Marshal(canonical)
+	if err != nil {
+		return ""
+	}
+	sum := sha1.Sum(payload)
+	return hex.EncodeToString(sum[:])
+}
+
 func adaptiveRecommendationSnapshot(cfg config.CSIPluginConfig, observations map[string]any) map[string]any {
 	recommendations := map[string]any{}
 	trackerCfg := loadAdaptiveTimeoutConfig(cfg)
@@ -570,28 +824,39 @@ func adaptiveRepresentativeSizeBytes(bucket string) int64 {
 
 func supportBundleConfig(cfg config.CSIPluginConfig) map[string]any {
 	return map[string]any{
-		"endpoint":                             getString(cfg, config.OpenNebulaRPCEndpointVar),
-		"defaultDatastores":                    getString(cfg, config.DefaultDatastoresVar),
-		"datastoreSelectionPolicy":             getString(cfg, config.DatastorePolicyVar),
-		"allowedDatastoreTypes":                getString(cfg, config.AllowedDatastoreTypesVar),
-		"metricsEndpoint":                      getString(cfg, config.MetricsEndpointVar),
-		"vmHotplugTimeoutBaseSeconds":          getInt(cfg, config.VMHotplugTimeoutBaseVar),
-		"vmHotplugTimeoutPer100GiSeconds":      getInt(cfg, config.VMHotplugTimeoutPer100GiVar),
-		"vmHotplugTimeoutMaxSeconds":           getInt(cfg, config.VMHotplugTimeoutMaxVar),
-		"vmHotplugCooldownSeconds":             getInt(cfg, config.VMHotplugStuckCooldownSecondsVar),
-		"nodeDeviceDiscoveryTimeoutSeconds":    getInt(cfg, config.NodeDeviceDiscoveryTimeoutVar),
-		"localRestartOptimizationEnabled":      getBool(cfg, config.LocalRestartOptimizationEnabledVar),
-		"localRestartDetachGraceSeconds":       getInt(cfg, config.LocalRestartDetachGraceSecondsVar),
-		"localRestartDetachGraceMaxSeconds":    getInt(cfg, config.LocalRestartDetachGraceMaxSecondsVar),
-		"localRestartRequireNodeReady":         getBool(cfg, config.LocalRestartRequireNodeReadyVar),
-		"localRWOStaleMountActivePodRecovery":  getBool(cfg, config.LocalRWOStaleMountActivePodRecoveryVar),
-		"localRWOStaleMountMaxAttempts":        getInt(cfg, config.LocalRWOStaleMountMaxAttemptsVar),
-		"localRWOStaleMountBackoffSeconds":     getInt(cfg, config.LocalRWOStaleMountBackoffSecondsVar),
-		"inventoryControllerEnabled":           getBool(cfg, config.InventoryControllerEnabledVar),
-		"inventoryAuthorityMode":               getString(cfg, config.InventoryDatastoreAuthorityModeVar),
-		"inventoryValidationEnabled":           getBool(cfg, config.InventoryValidationEnabledVar),
-		"inventoryValidationDefaultImage":      getString(cfg, config.InventoryValidationDefaultImageVar),
-		"preflightLocalImmediateBindingPolicy": getString(cfg, config.PreflightLocalImmediateBindingPolicyVar),
+		"endpoint":                                getString(cfg, config.OpenNebulaRPCEndpointVar),
+		"defaultDatastores":                       getString(cfg, config.DefaultDatastoresVar),
+		"datastoreSelectionPolicy":                getString(cfg, config.DatastorePolicyVar),
+		"allowedDatastoreTypes":                   getString(cfg, config.AllowedDatastoreTypesVar),
+		"metricsEndpoint":                         getString(cfg, config.MetricsEndpointVar),
+		"vmHotplugTimeoutBaseSeconds":             getInt(cfg, config.VMHotplugTimeoutBaseVar),
+		"vmHotplugTimeoutPer100GiSeconds":         getInt(cfg, config.VMHotplugTimeoutPer100GiVar),
+		"vmHotplugTimeoutMaxSeconds":              getInt(cfg, config.VMHotplugTimeoutMaxVar),
+		"vmHotplugCooldownSeconds":                getInt(cfg, config.VMHotplugStuckCooldownSecondsVar),
+		"nodeDeviceDiscoveryTimeoutSeconds":       getInt(cfg, config.NodeDeviceDiscoveryTimeoutVar),
+		"hotplugQueueEnabled":                     getBool(cfg, config.HotplugQueueEnabledVar),
+		"hotplugQueueMaxWaitSeconds":              getInt(cfg, config.HotplugQueueMaxWaitSecondsVar),
+		"hotplugQueueAgeBoostSeconds":             getInt(cfg, config.HotplugQueueAgeBoostSecondsVar),
+		"hotplugQueueDedupeEnabled":               getBool(cfg, config.HotplugQueueDedupeEnabledVar),
+		"hotplugQueuePerItemWaitSeconds":          getInt(cfg, config.HotplugQueuePerItemWaitSecondsVar),
+		"hotplugQueueMaxWaitCapSeconds":           getInt(cfg, config.HotplugQueueMaxWaitCapSecondsVar),
+		"hotplugQueueMaxActiveSeconds":            getInt(cfg, config.HotplugQueueMaxActiveSecondsVar),
+		"hotplugDiagnosticsEnabled":               getBool(cfg, config.HotplugDiagnosticsEnabledVar),
+		"hotplugDiagnosticsStuckAfterSeconds":     getInt(cfg, config.HotplugDiagnosticsStuckAfterSecondsVar),
+		"hotplugDiagnosticsProgressWindowSeconds": getInt(cfg, config.HotplugDiagnosticsProgressWindowSecondsVar),
+		"hotplugDiagnosticsRecoveryMode":          getString(cfg, config.HotplugDiagnosticsRecoveryModeVar),
+		"localRestartOptimizationEnabled":         getBool(cfg, config.LocalRestartOptimizationEnabledVar),
+		"localRestartDetachGraceSeconds":          getInt(cfg, config.LocalRestartDetachGraceSecondsVar),
+		"localRestartDetachGraceMaxSeconds":       getInt(cfg, config.LocalRestartDetachGraceMaxSecondsVar),
+		"localRestartRequireNodeReady":            getBool(cfg, config.LocalRestartRequireNodeReadyVar),
+		"localRWOStaleMountActivePodRecovery":     getBool(cfg, config.LocalRWOStaleMountActivePodRecoveryVar),
+		"localRWOStaleMountMaxAttempts":           getInt(cfg, config.LocalRWOStaleMountMaxAttemptsVar),
+		"localRWOStaleMountBackoffSeconds":        getInt(cfg, config.LocalRWOStaleMountBackoffSecondsVar),
+		"inventoryControllerEnabled":              getBool(cfg, config.InventoryControllerEnabledVar),
+		"inventoryAuthorityMode":                  getString(cfg, config.InventoryDatastoreAuthorityModeVar),
+		"inventoryValidationEnabled":              getBool(cfg, config.InventoryValidationEnabledVar),
+		"inventoryValidationDefaultImage":         getString(cfg, config.InventoryValidationDefaultImageVar),
+		"preflightLocalImmediateBindingPolicy":    getString(cfg, config.PreflightLocalImmediateBindingPolicyVar),
 	}
 }
 

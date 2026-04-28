@@ -402,6 +402,29 @@ func (in *OpenNebulaNodeHotplugStatus) DeepCopyInto(out *OpenNebulaNodeHotplugSt
 		value := *in.LastObservedReady
 		out.LastObservedReady = &value
 	}
+	in.Diagnosis.DeepCopyInto(&out.Diagnosis)
+}
+
+func (in *OpenNebulaNodeHotplugDiagnosisStatus) DeepCopyInto(out *OpenNebulaNodeHotplugDiagnosisStatus) {
+	*out = *in
+	if in.FirstObservedAt != nil {
+		out.FirstObservedAt = in.FirstObservedAt.DeepCopy()
+	}
+	if in.LastObservedAt != nil {
+		out.LastObservedAt = in.LastObservedAt.DeepCopy()
+	}
+	if in.LastChangedAt != nil {
+		out.LastChangedAt = in.LastChangedAt.DeepCopy()
+	}
+}
+
+func (in *OpenNebulaNodeHotplugDiagnosisStatus) DeepCopy() *OpenNebulaNodeHotplugDiagnosisStatus {
+	if in == nil {
+		return nil
+	}
+	out := new(OpenNebulaNodeHotplugDiagnosisStatus)
+	in.DeepCopyInto(out)
+	return out
 }
 
 func (in *OpenNebulaNodeStatus) DeepCopyInto(out *OpenNebulaNodeStatus) {

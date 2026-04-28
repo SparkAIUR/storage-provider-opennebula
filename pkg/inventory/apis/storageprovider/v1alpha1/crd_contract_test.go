@@ -75,3 +75,30 @@ func TestBenchmarkRunCRDExists(t *testing.T) {
 		}
 	}
 }
+
+func TestNodeCRDIncludesHotplugDiagnosisStatus(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to resolve current file path")
+	}
+	crdPath := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "../../../../../helm/opennebula-csi/crds/opennebulaNodes.storageprovider.opennebula.sparkaiur.io.yaml"))
+	payload, err := os.ReadFile(crdPath)
+	if err != nil {
+		t.Fatalf("failed reading node CRD: %v", err)
+	}
+	text := string(payload)
+	requiredSnippets := []string{
+		"- name: Hotplug",
+		"jsonPath: .status.hotplug.diagnosis.classification",
+		"diagnosis:",
+		"classification:",
+		"volumeHandle:",
+		"stuckAfterSeconds:",
+		"recommendedAction:",
+	}
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(text, snippet) {
+			t.Fatalf("expected node CRD to contain %q", snippet)
+		}
+	}
+}

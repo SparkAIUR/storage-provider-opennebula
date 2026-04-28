@@ -346,6 +346,14 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.hotplugQueue.enabled` | Queue same-node hotplug work instead of failing fast on lock contention. | `true` | No |
 | `driver.hotplugQueue.maxWaitSeconds` | Maximum time a queued hotplug request waits before failing. | `180` | No |
 | `driver.hotplugQueue.ageBoostSeconds` | Time after which older queued work is promoted one priority class. | `30` | No |
+| `driver.hotplugQueue.dedupeEnabled` | Coalesce duplicate queued hotplug requests for the same node, operation, and volume. | `true` | No |
+| `driver.hotplugQueue.perItemWaitSeconds` | Extra wait budget added per active or queued request ahead of a new request. | `60` | No |
+| `driver.hotplugQueue.maxWaitCapSeconds` | Upper bound for dynamic queue wait budgets. | `900` | No |
+| `driver.hotplugQueue.maxActiveSeconds` | Maximum execution time for an active queued hotplug request before it is classified as timed out. | `900` | No |
+| `driver.hotplugDiagnostics.enabled` | Persist read-only OpenNebula HOTPLUG observations for support bundles, inventory status, and timeout diagnosis. | `true` | No |
+| `driver.hotplugDiagnostics.stuckAfterSeconds` | HOTPLUG age after which an unchanged observation is classified as stuck. | `300` | No |
+| `driver.hotplugDiagnostics.progressWindowSeconds` | Required unchanged observation window before a HOTPLUG VM is classified as stuck. | `60` | No |
+| `driver.hotplugDiagnostics.recoveryMode` | Reserved recovery mode selector. Current implementation is read-only and never mutates OpenNebula state. | `"readOnly"` | No |
 | `driver.localRestartOptimization.enabled` | Enable best-effort same-node restart reuse for opted-in local PVCs. | `true` | No |
 | `driver.localRestartOptimization.detachGraceSeconds` | Default delayed-detach grace used for opted-in local PVCs. | `90` | No |
 | `driver.localRestartOptimization.maxDetachGraceSeconds` | Upper bound for per-PVC delayed-detach overrides. | `300` | No |

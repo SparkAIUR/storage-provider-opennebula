@@ -60,6 +60,7 @@ const (
 	annotationDatastoreID                                    = "storage-provider.opennebula.sparkaiur.io/datastore-id"
 	topologySystemDSLabel                                    = "topology.opennebula.sparkaiur.io/system-ds"
 	hotplugStateConfigMapName                                = "opennebula-csi-hotplug-state"
+	hotplugDiagnosticsConfigMapName                          = "opennebula-csi-hotplug-diagnostics"
 	sharedBackendAttr                                        = "SPARKAI_CSI_SHARE_BACKEND"
 	defaultValidationImagePullPolicy       corev1.PullPolicy = corev1.PullIfNotPresent
 )
@@ -86,6 +87,7 @@ type Syncer struct {
 	resyncNodes            time.Duration
 	validationEnabled      bool
 	defaultValidationImage string
+	hotplugDiagnosisConfig opennebula.HotplugDiagnosisConfig
 }
 
 func Run(ctx context.Context, cfg config.CSIPluginConfig, options Options) error {
@@ -145,6 +147,7 @@ func Run(ctx context.Context, cfg config.CSIPluginConfig, options Options) error
 		resyncNodes:            time.Duration(loadResync(cfg, config.InventoryControllerResyncNodesVar, 30)) * time.Second,
 		validationEnabled:      options.ValidationEnabled,
 		defaultValidationImage: options.DefaultImage,
+		hotplugDiagnosisConfig: loadInventoryHotplugDiagnosisConfig(cfg),
 	}
 
 	if err := mgr.Add(syncer); err != nil {
@@ -360,6 +363,7 @@ func (s *Syncer) syncNodes(ctx context.Context) error {
 		dsNames = datastoreNameMap(datastores)
 	}
 	hotplugStates, _ := s.loadHotplugStateMap(ctx)
+	hotplugObservations, _ := s.loadHotplugObservationMap(ctx)
 
 	nodeByName := make(map[string]corev1.Node, len(nodes.Items))
 	for _, node := range nodes.Items {
@@ -383,7 +387,7 @@ func (s *Syncer) syncNodes(ctx context.Context) error {
 			}
 			continue
 		}
-		nextStatus := s.buildNodeStatus(ctx, item, node, vas.Items, pvByName, dsNames, hotplugStates)
+		nextStatus := s.buildNodeStatus(ctx, item, node, vas.Items, pvByName, dsNames, hotplugStates, hotplugObservations)
 		status.Status = nextStatus
 		if err := s.client.Status().Update(ctx, status); err != nil {
 			return err
@@ -550,7 +554,7 @@ func (s *Syncer) buildDatastoreStatus(item inventoryv1alpha1.OpenNebulaDatastore
 	return status
 }
 
-func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.OpenNebulaNode, node corev1.Node, vas []storagev1.VolumeAttachment, pvByName map[string]corev1.PersistentVolume, datastoreNames map[int]string, hotplugStates map[string]opennebula.HotplugCooldownState) inventoryv1alpha1.OpenNebulaNodeStatus {
+func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.OpenNebulaNode, node corev1.Node, vas []storagev1.VolumeAttachment, pvByName map[string]corev1.PersistentVolume, datastoreNames map[int]string, hotplugStates map[string]opennebula.HotplugCooldownState, hotplugObservations map[string]opennebula.HotplugObservation) inventoryv1alpha1.OpenNebulaNodeStatus {
 	log := crlog.FromContext(ctx).WithName("inventory-node-status")
 	status := inventoryv1alpha1.OpenNebulaNodeStatus{
 		ObservedGeneration: item.Generation,
@@ -623,6 +627,13 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 	}
 	status.Hotplug.Ready = vmLCM == vmSchema.Running
 	status.Hotplug.InCooldown = false
+	diagnosis, observation := opennebula.ClassifyHotplugObservation(
+		opennebula.BuildHotplugObservation(node.Name, vmInfo, nil),
+		hotplugObservationPtr(hotplugObservations, node.Name),
+		s.hotplugDiagnosisConfig,
+	)
+	status.Hotplug.Diagnosis = convertHotplugDiagnosisStatus(diagnosis)
+	s.persistHotplugObservation(ctx, observation)
 	if systemDSID != 0 || status.OpenNebula.SystemDatastoreName != "" {
 		status.SystemDatastoreDisplay = fmt.Sprintf("%d:%s", systemDSID, status.OpenNebula.SystemDatastoreName)
 	}
@@ -668,15 +679,25 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 		phase = inventoryv1alpha1.NodePhaseDisabled
 	} else if !status.Hotplug.Ready {
 		phase = inventoryv1alpha1.NodePhaseDegraded
+	} else if status.Hotplug.Diagnosis.Classification == opennebula.HotplugClassificationStuck {
+		phase = inventoryv1alpha1.NodePhaseDegraded
 	}
 	status.Phase = phase
 	status.DisplayState = nodeDisplayState(item.Spec.Enabled, status.Hotplug.InCooldown, status.Hotplug.Ready)
+	switch status.Hotplug.Diagnosis.Classification {
+	case opennebula.HotplugClassificationStuck:
+		status.DisplayState = "HotplugStuck"
+	case opennebula.HotplugClassificationProgressing:
+		status.DisplayState = "HotplugProgressing"
+	}
 	status.Conditions = []metav1.Condition{
 		newCondition("KubernetesNodeFound", metav1.ConditionTrue, "NodeFound", "Kubernetes node was found"),
 		newCondition("OpenNebulaVMFound", metav1.ConditionTrue, "VMFound", "OpenNebula VM was found"),
 		newCondition("VMReady", boolCondition(status.Hotplug.Ready), "VMReadinessEvaluated", "OpenNebula VM readiness evaluated"),
 		newCondition("TopologyResolved", boolCondition(status.Storage.TopologySystemDatastore != ""), "TopologyEvaluated", "Topology label evaluated"),
 		newCondition("HotplugCooldown", boolCondition(status.Hotplug.InCooldown), boolReason(status.Hotplug.InCooldown, "CooldownActive", "CooldownClear"), "Controller hotplug cooldown state evaluated"),
+		newCondition("HotplugProgressing", boolCondition(status.Hotplug.Diagnosis.Classification == opennebula.HotplugClassificationProgressing), boolReason(status.Hotplug.Diagnosis.Classification == opennebula.HotplugClassificationProgressing, "HotplugProgressing", "HotplugNotProgressing"), status.Hotplug.Diagnosis.Message),
+		newCondition("HotplugStuck", boolCondition(status.Hotplug.Diagnosis.Classification == opennebula.HotplugClassificationStuck), boolReason(status.Hotplug.Diagnosis.Classification == opennebula.HotplugClassificationStuck, "HotplugStuck", "HotplugNotStuck"), status.Hotplug.Diagnosis.Message),
 		newCondition("HotplugPressureAcceptable", boolCondition(status.ActiveHotplugPressure < 8), boolReason(status.ActiveHotplugPressure < 8, "HotplugPressureNormal", "HotplugPressureHigh"), fmt.Sprintf("Node has %d active CSI attachment(s)", status.ActiveHotplugPressure)),
 	}
 	return status
@@ -2255,6 +2276,102 @@ func (s *Syncer) loadHotplugStateMap(ctx context.Context) (map[string]opennebula
 		result[node] = state
 	}
 	return result, nil
+}
+
+func (s *Syncer) loadHotplugObservationMap(ctx context.Context) (map[string]opennebula.HotplugObservation, error) {
+	cm, err := s.kube.CoreV1().ConfigMaps(s.namespace).Get(ctx, hotplugDiagnosticsConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return map[string]opennebula.HotplugObservation{}, nil
+		}
+		return nil, err
+	}
+	result := make(map[string]opennebula.HotplugObservation, len(cm.Data))
+	for node, raw := range cm.Data {
+		var observation opennebula.HotplugObservation
+		if err := json.Unmarshal([]byte(raw), &observation); err != nil {
+			continue
+		}
+		result[node] = observation
+	}
+	return result, nil
+}
+
+func (s *Syncer) persistHotplugObservation(ctx context.Context, observation opennebula.HotplugObservation) {
+	if s == nil || s.kube == nil || strings.TrimSpace(observation.Node) == "" {
+		return
+	}
+	payload, err := json.Marshal(observation)
+	if err != nil {
+		return
+	}
+	cmClient := s.kube.CoreV1().ConfigMaps(s.namespace)
+	current, err := cmClient.Get(ctx, hotplugDiagnosticsConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			return
+		}
+		_, _ = cmClient.Create(ctx, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: hotplugDiagnosticsConfigMapName, Namespace: s.namespace},
+			Data:       map[string]string{observation.Node: string(payload)},
+		}, metav1.CreateOptions{})
+		return
+	}
+	if current.Data == nil {
+		current.Data = map[string]string{}
+	}
+	current.Data[observation.Node] = string(payload)
+	_, _ = cmClient.Update(ctx, current, metav1.UpdateOptions{})
+}
+
+func hotplugObservationPtr(values map[string]opennebula.HotplugObservation, node string) *opennebula.HotplugObservation {
+	if len(values) == 0 {
+		return nil
+	}
+	value, ok := values[node]
+	if !ok {
+		return nil
+	}
+	return &value
+}
+
+func convertHotplugDiagnosisStatus(diagnosis opennebula.HotplugDiagnosis) inventoryv1alpha1.OpenNebulaNodeHotplugDiagnosisStatus {
+	status := inventoryv1alpha1.OpenNebulaNodeHotplugDiagnosisStatus{
+		Classification:    diagnosis.Classification,
+		Operation:         diagnosis.Operation,
+		VolumeHandle:      diagnosis.VolumeHandle,
+		PersistentDiskID:  diagnosis.PersistentDiskID,
+		VMDiskID:          diagnosis.VMDiskID,
+		DiskTarget:        diagnosis.DiskTarget,
+		DiskAttachFlag:    diagnosis.DiskAttachFlag,
+		AgeSeconds:        diagnosis.AgeSeconds,
+		StuckAfterSeconds: diagnosis.StuckAfterSeconds,
+		Reason:            diagnosis.Reason,
+		Message:           diagnosis.Message,
+		RecommendedAction: diagnosis.RecommendedAction,
+	}
+	if !diagnosis.FirstObservedAt.IsZero() {
+		value := metav1.NewTime(diagnosis.FirstObservedAt)
+		status.FirstObservedAt = &value
+	}
+	if !diagnosis.LastObservedAt.IsZero() {
+		value := metav1.NewTime(diagnosis.LastObservedAt)
+		status.LastObservedAt = &value
+	}
+	if !diagnosis.LastChangedAt.IsZero() {
+		value := metav1.NewTime(diagnosis.LastChangedAt)
+		status.LastChangedAt = &value
+	}
+	return status
+}
+
+func loadInventoryHotplugDiagnosisConfig(cfg config.CSIPluginConfig) opennebula.HotplugDiagnosisConfig {
+	stuckAfter := loadResync(cfg, config.HotplugDiagnosticsStuckAfterSecondsVar, 300)
+	progressWindow := loadResync(cfg, config.HotplugDiagnosticsProgressWindowSecondsVar, 60)
+	return opennebula.HotplugDiagnosisConfig{
+		StuckAfter:     time.Duration(stuckAfter) * time.Second,
+		ProgressWindow: time.Duration(progressWindow) * time.Second,
+	}
 }
 
 func loadInventoryLeaderElectionID(cfg config.CSIPluginConfig) string {

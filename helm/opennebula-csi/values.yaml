@@ -43,6 +43,15 @@ driver:
     enabled: true
     maxWaitSeconds: 180
     ageBoostSeconds: 30
+    dedupeEnabled: true
+    perItemWaitSeconds: 60
+    maxWaitCapSeconds: 900
+    maxActiveSeconds: 900
+  hotplugDiagnostics:
+    enabled: true
+    stuckAfterSeconds: 300
+    progressWindowSeconds: 60
+    recoveryMode: "readOnly"
   localRestartOptimization:
     enabled: true
     detachGraceSeconds: 90

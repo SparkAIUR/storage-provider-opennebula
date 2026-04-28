@@ -27,6 +27,9 @@ spec:
         - name: State
           type: string
           jsonPath: .status.opennebula.state
+        - name: Hotplug
+          type: string
+          jsonPath: .status.hotplug.diagnosis.classification
         - name: SystemDS
           type: string
           jsonPath: .status.systemDatastoreDisplay
@@ -171,6 +174,44 @@ spec:
                       type: boolean
                     lastObservedReady:
                       type: boolean
+                    diagnosis:
+                      type: object
+                      properties:
+                        classification:
+                          type: string
+                        operation:
+                          type: string
+                        volumeHandle:
+                          type: string
+                        persistentDiskID:
+                          type: integer
+                        vmDiskID:
+                          type: integer
+                        diskTarget:
+                          type: string
+                        diskAttachFlag:
+                          type: string
+                        firstObservedAt:
+                          type: string
+                          format: date-time
+                        lastObservedAt:
+                          type: string
+                          format: date-time
+                        lastChangedAt:
+                          type: string
+                          format: date-time
+                        ageSeconds:
+                          type: integer
+                          format: int64
+                        stuckAfterSeconds:
+                          type: integer
+                          format: int64
+                        reason:
+                          type: string
+                        message:
+                          type: string
+                        recommendedAction:
+                          type: string
                 conditions:
                   type: array
                   items:
