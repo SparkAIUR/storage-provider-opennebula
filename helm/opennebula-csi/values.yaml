@@ -66,6 +66,13 @@ driver:
   maintenanceMode:
     releaseMinSeconds: 300
     releaseMaxSeconds: 1800
+  localDeviceRecovery:
+    enabled: true
+    minAttempts: 3
+    minAgeSeconds: 60
+    intervalSeconds: 15
+    cooldownSeconds: 300
+    maxAttemptsPerVolume: 2
   localRWOStaleMountRecovery:
     activePodRecovery: false
     maxAttempts: 3

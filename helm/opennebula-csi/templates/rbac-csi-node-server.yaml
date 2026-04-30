@@ -17,11 +17,11 @@ rules:
     verbs: ["create"]
   - apiGroups: [""]
     resources: ["configmaps"]
-    resourceNames: ["opennebula-csi-hotplug-observations", "opennebula-csi-sticky-attachment-state"]
+    resourceNames: ["opennebula-csi-hotplug-observations", "opennebula-csi-sticky-attachment-state", "opennebula-csi-node-device-state"]
     verbs: ["get"]
   - apiGroups: [""]
     resources: ["configmaps"]
-    resourceNames: ["opennebula-csi-hotplug-observations"]
+    resourceNames: ["opennebula-csi-hotplug-observations", "opennebula-csi-node-device-state"]
     verbs: ["update", "patch"]
 
 ---

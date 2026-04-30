@@ -2,8 +2,10 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	osexec "os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -46,6 +48,7 @@ type NodeDeviceResolver struct {
 	deviceCandidatesFn func(volumeName string) []string
 	mu                 sync.RWMutex
 	cache              map[string]nodeDeviceCacheEntry
+	udevadmMissingLog  bool
 }
 
 func NewNodeDeviceResolver(cfg config.CSIPluginConfig, exec utilexec.Interface, candidatesFn func(volumeName string) []string) *NodeDeviceResolver {
@@ -248,7 +251,13 @@ func (r *NodeDeviceResolver) runRecoverySequence(ctx context.Context) {
 			timeoutSeconds = 1
 		}
 		if output, err := r.exec.CommandContext(ctx, "udevadm", "settle", fmt.Sprintf("--timeout=%d", timeoutSeconds)).CombinedOutput(); err != nil {
-			klog.V(4).InfoS("udevadm settle failed during device recovery", "err", err, "output", strings.TrimSpace(string(output)))
+			if errors.Is(err, osexec.ErrNotFound) || strings.Contains(err.Error(), "executable file not found") {
+				if r.markUdevadmMissingLogged() {
+					klog.V(2).InfoS("udevadm is unavailable; device recovery will continue with SCSI rescan only", "err", err)
+				}
+			} else {
+				klog.V(4).InfoS("udevadm settle failed during device recovery", "err", err, "output", strings.TrimSpace(string(output)))
+			}
 		}
 	}
 	if !r.rescanOnMiss {
@@ -263,6 +272,19 @@ func (r *NodeDeviceResolver) runRecoverySequence(ctx context.Context) {
 			klog.V(5).InfoS("SCSI rescan write failed", "path", hostPath, "err", err)
 		}
 	}
+}
+
+func (r *NodeDeviceResolver) markUdevadmMissingLogged() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.udevadmMissingLog {
+		return false
+	}
+	r.udevadmMissingLog = true
+	return true
 }
 
 func (r *NodeDeviceResolver) remember(volumeID, imageID, serial, devicePath, byIDPath string) {

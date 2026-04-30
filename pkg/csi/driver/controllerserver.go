@@ -90,6 +90,9 @@ func (s *ControllerServer) StartBackgroundWorkers(ctx context.Context) {
 	if enabled, ok := s.driver.PluginConfig.GetBool(config.StuckAttachmentReconcilerEnabledVar); !ok || enabled {
 		go NewAttachmentReconciler(s).Run(ctx)
 	}
+	if s.localDeviceRecoveryEnabled() {
+		go s.runLocalDeviceRecovery(ctx)
+	}
 }
 
 func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
@@ -2103,7 +2106,9 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 	}
 
 	if err := s.volumeProvider.DetachVolume(ctx, req.VolumeId, state.NodeID); err != nil {
-		return true, nil, status.Error(codes.Internal, "failed to detach stale same-volume attachment before moving to a different node")
+		message := fmt.Sprintf("failed to detach stale attachment for local RWO volume %s from old node %s before publishing to requested node %s: %v", req.VolumeId, state.NodeID, req.NodeId, err)
+		s.recordPVCEventFromStickyState(ctx, state, eventReasonDetachGraceBypassed, message)
+		return true, nil, status.Error(codes.Internal, message)
 	}
 	s.clearHotplugGuardState(ctx, state.NodeID)
 	if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {

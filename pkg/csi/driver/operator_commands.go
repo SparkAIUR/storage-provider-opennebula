@@ -114,6 +114,7 @@ type SupportBundle struct {
 	ControllerLeadership    map[string]any                                      `json:"controllerLeadership"`
 	HotplugCooldowns        map[string]any                                      `json:"hotplugCooldowns"`
 	StickyAttachments       map[string]any                                      `json:"stickyAttachments"`
+	LocalDeviceReports      map[string]any                                      `json:"localDeviceReports"`
 	HotplugQueue            map[string]any                                      `json:"hotplugQueue"`
 	HotplugDiagnostics      map[string]opennebula.HotplugDiagnosis              `json:"hotplugDiagnostics"`
 	HotplugQueueRisks       []HotplugQueueRisk                                  `json:"hotplugQueueRisks,omitempty"`
@@ -294,6 +295,7 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 		}
 	}
 	stickySnapshot := configMapJSONSnapshot(ctx, kubeClient, stickyAttachmentStateConfigMapName)
+	localDeviceSnapshot := configMapJSONSnapshot(ctx, kubeClient, localDeviceStateConfigMapName)
 	queueSnapshot := configMapJSONSnapshot(ctx, kubeClient, hotplugQueueStateConfigMapName)
 	typedQueueSnapshot := typedHotplugQueueSnapshot(ctx, kubeClient)
 	hotplugDiagnostics := hotplugDiagnosticSnapshot(ctx, kubeClient, cfg)
@@ -314,6 +316,7 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 		},
 		HotplugCooldowns:        hotplugSnapshot,
 		StickyAttachments:       stickySnapshot,
+		LocalDeviceReports:      localDeviceSnapshot,
 		HotplugQueue:            queueSnapshot,
 		HotplugDiagnostics:      hotplugDiagnostics,
 		HotplugQueueRisks:       buildHotplugQueueRisks(typedQueueSnapshot, hotplugDiagnostics, cfg),
@@ -854,6 +857,12 @@ func supportBundleConfig(cfg config.CSIPluginConfig) map[string]any {
 		"localRestartDetachGraceSeconds":          getInt(cfg, config.LocalRestartDetachGraceSecondsVar),
 		"localRestartDetachGraceMaxSeconds":       getInt(cfg, config.LocalRestartDetachGraceMaxSecondsVar),
 		"localRestartRequireNodeReady":            getBool(cfg, config.LocalRestartRequireNodeReadyVar),
+		"localDeviceRecoveryEnabled":              getBool(cfg, config.LocalDeviceRecoveryEnabledVar),
+		"localDeviceRecoveryMinAttempts":          getInt(cfg, config.LocalDeviceRecoveryMinAttemptsVar),
+		"localDeviceRecoveryMinAgeSeconds":        getInt(cfg, config.LocalDeviceRecoveryMinAgeSecondsVar),
+		"localDeviceRecoveryIntervalSeconds":      getInt(cfg, config.LocalDeviceRecoveryIntervalSecondsVar),
+		"localDeviceRecoveryCooldownSeconds":      getInt(cfg, config.LocalDeviceRecoveryCooldownSecondsVar),
+		"localDeviceRecoveryMaxAttemptsPerVolume": getInt(cfg, config.LocalDeviceRecoveryMaxAttemptsVar),
 		"localRWOStaleMountActivePodRecovery":     getBool(cfg, config.LocalRWOStaleMountActivePodRecoveryVar),
 		"localRWOStaleMountMaxAttempts":           getInt(cfg, config.LocalRWOStaleMountMaxAttemptsVar),
 		"localRWOStaleMountBackoffSeconds":        getInt(cfg, config.LocalRWOStaleMountBackoffSecondsVar),

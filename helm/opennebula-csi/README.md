@@ -279,6 +279,12 @@ When maintenance ends, set the mode key to `false`. The controller removes both 
 
 This is best-effort same-node reuse only. The CSI driver does not pin scheduling to the previous node.
 
+### Local Device Recovery
+
+When an OpenNebula VM reports a disk attached but the node plugin cannot discover the device inside the guest, the node records a missing-device report in `opennebula-csi-node-device-state`. The controller leader watches those reports and, after the configured threshold, performs a same-node recovery for eligible local non-CephFS `ReadWriteOnce` volumes: detach from the reporting node, attach back to that same node, confirm the OpenNebula attachment, and clear the report once the node can retry staging.
+
+This recovery path never moves a volume to a different node. It skips CephFS, RWX, non-local backends, missing desired state, NotReady Kubernetes nodes, and non-running OpenNebula VMs. Failed recovery attempts are rate-limited with `driver.localDeviceRecovery.cooldownSeconds` and capped with `driver.localDeviceRecovery.maxAttemptsPerVolume`.
+
 `v0.4.7` adds four supporting behaviors on top of that restart fast path:
 
 - node-side device discovery prefers `/dev/disk/by-id` with a cache-backed serial lookup
@@ -373,6 +379,12 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.localRestartOptimization.requireNodeReady` | Require Kubernetes node and OpenNebula VM readiness before starting delayed detach. | `true` | No |
 | `driver.maintenanceMode.releaseMinSeconds` | Minimum delay used when releasing ConfigMap-driven maintenance attachment holds after mode exit. | `300` | No |
 | `driver.maintenanceMode.releaseMaxSeconds` | Maximum stagger delay used when releasing ConfigMap-driven maintenance attachment holds after mode exit. | `1800` | No |
+| `driver.localDeviceRecovery.enabled` | Enable controller-driven same-node detach/reattach recovery after node-side local device discovery repeatedly fails. | `true` | No |
+| `driver.localDeviceRecovery.minAttempts` | Missing-device reports required from a node before recovery is eligible. | `3` | No |
+| `driver.localDeviceRecovery.minAgeSeconds` | Minimum age of the first missing-device report before recovery is eligible. | `60` | No |
+| `driver.localDeviceRecovery.intervalSeconds` | Controller leader scan interval for `opennebula-csi-node-device-state`. | `15` | No |
+| `driver.localDeviceRecovery.cooldownSeconds` | Cooldown between failed recovery attempts for the same volume/node report. | `300` | No |
+| `driver.localDeviceRecovery.maxAttemptsPerVolume` | Maximum same-node recovery attempts recorded per report before operator intervention is required. | `2` | No |
 | `driver.localRWOStaleMountRecovery.activePodRecovery` | Allow experimental recovery of stale local RWO mounts while a pod target is still active. Requires `featureGates.localRWOStaleMountRecovery=true`. | `false` | No |
 | `driver.localRWOStaleMountRecovery.maxAttempts` | Maximum recovery attempts persisted per local RWO volume session. | `3` | No |
 | `driver.localRWOStaleMountRecovery.backoffSeconds` | Backoff after a failed local RWO stale-mount recovery attempt. | `10` | No |
@@ -546,7 +558,7 @@ The driver image includes cluster-operator modes that work well with a kubeconfi
   - triggers a manual datastore validation run and waits for the result
   - accepts `--access-modes=ReadWriteOnce` or `--access-modes=ReadWriteMany` when the benchmark PVC mode must be explicit
 - `--mode=support-bundle`
-  - emits a JSON support bundle with inventory, hotplug, StorageClass, volume-health, VolumeAttachment, and event data
+  - emits a JSON support bundle with inventory, hotplug, local-device recovery, StorageClass, volume-health, VolumeAttachment, and event data
 - `--mode=volume-health`
   - emits focused JSON diagnostics for a volume selected by `--volume-id`, `--pv`, or `--pvc namespace/name`
 

@@ -68,6 +68,12 @@ const (
 	LocalRestartRequireNodeReadyVar            = "ONE_CSI_LOCAL_RESTART_REQUIRE_NODE_READY"
 	MaintenanceReleaseMinSecondsVar            = "ONE_CSI_MAINTENANCE_RELEASE_MIN_SECONDS"
 	MaintenanceReleaseMaxSecondsVar            = "ONE_CSI_MAINTENANCE_RELEASE_MAX_SECONDS"
+	LocalDeviceRecoveryEnabledVar              = "ONE_CSI_LOCAL_DEVICE_RECOVERY_ENABLED"
+	LocalDeviceRecoveryMinAttemptsVar          = "ONE_CSI_LOCAL_DEVICE_RECOVERY_MIN_ATTEMPTS"
+	LocalDeviceRecoveryMinAgeSecondsVar        = "ONE_CSI_LOCAL_DEVICE_RECOVERY_MIN_AGE_SECONDS"
+	LocalDeviceRecoveryIntervalSecondsVar      = "ONE_CSI_LOCAL_DEVICE_RECOVERY_INTERVAL_SECONDS"
+	LocalDeviceRecoveryCooldownSecondsVar      = "ONE_CSI_LOCAL_DEVICE_RECOVERY_COOLDOWN_SECONDS"
+	LocalDeviceRecoveryMaxAttemptsVar          = "ONE_CSI_LOCAL_DEVICE_RECOVERY_MAX_ATTEMPTS_PER_VOLUME"
 	LocalRWOStaleMountActivePodRecoveryVar     = "ONE_CSI_LOCAL_RWO_STALE_MOUNT_ACTIVE_POD_RECOVERY"
 	LocalRWOStaleMountMaxAttemptsVar           = "ONE_CSI_LOCAL_RWO_STALE_MOUNT_MAX_ATTEMPTS"
 	LocalRWOStaleMountBackoffSecondsVar        = "ONE_CSI_LOCAL_RWO_STALE_MOUNT_BACKOFF_SECONDS"
@@ -142,6 +148,12 @@ const (
 	defaultLocalRestartRequireNodeReady            = true
 	defaultMaintenanceReleaseMinSeconds            = 300
 	defaultMaintenanceReleaseMaxSeconds            = 1800
+	defaultLocalDeviceRecoveryEnabled              = true
+	defaultLocalDeviceRecoveryMinAttempts          = 3
+	defaultLocalDeviceRecoveryMinAgeSeconds        = 60
+	defaultLocalDeviceRecoveryIntervalSeconds      = 15
+	defaultLocalDeviceRecoveryCooldownSeconds      = 300
+	defaultLocalDeviceRecoveryMaxAttempts          = 2
 	defaultLocalRWOStaleMountActivePodRecovery     = false
 	defaultLocalRWOStaleMountMaxAttempts           = 3
 	defaultLocalRWOStaleMountBackoffSeconds        = 10
@@ -244,6 +256,12 @@ func initViper() *viper.Viper {
 	viper.SetDefault(LocalRestartRequireNodeReadyVar, defaultLocalRestartRequireNodeReady)
 	viper.SetDefault(MaintenanceReleaseMinSecondsVar, defaultMaintenanceReleaseMinSeconds)
 	viper.SetDefault(MaintenanceReleaseMaxSecondsVar, defaultMaintenanceReleaseMaxSeconds)
+	viper.SetDefault(LocalDeviceRecoveryEnabledVar, defaultLocalDeviceRecoveryEnabled)
+	viper.SetDefault(LocalDeviceRecoveryMinAttemptsVar, defaultLocalDeviceRecoveryMinAttempts)
+	viper.SetDefault(LocalDeviceRecoveryMinAgeSecondsVar, defaultLocalDeviceRecoveryMinAgeSeconds)
+	viper.SetDefault(LocalDeviceRecoveryIntervalSecondsVar, defaultLocalDeviceRecoveryIntervalSeconds)
+	viper.SetDefault(LocalDeviceRecoveryCooldownSecondsVar, defaultLocalDeviceRecoveryCooldownSeconds)
+	viper.SetDefault(LocalDeviceRecoveryMaxAttemptsVar, defaultLocalDeviceRecoveryMaxAttempts)
 	viper.SetDefault(LocalRWOStaleMountActivePodRecoveryVar, defaultLocalRWOStaleMountActivePodRecovery)
 	viper.SetDefault(LocalRWOStaleMountMaxAttemptsVar, defaultLocalRWOStaleMountMaxAttempts)
 	viper.SetDefault(LocalRWOStaleMountBackoffSecondsVar, defaultLocalRWOStaleMountBackoffSeconds)

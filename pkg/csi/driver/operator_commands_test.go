@@ -60,6 +60,8 @@ func TestSupportBundleConfigIncludesInventorySettings(t *testing.T) {
 	cfg.OverrideVal(config.InventoryControllerEnabledVar, true)
 	cfg.OverrideVal(config.InventoryDatastoreAuthorityModeVar, "strict")
 	cfg.OverrideVal(config.PreflightLocalImmediateBindingPolicyVar, "warn")
+	cfg.OverrideVal(config.LocalDeviceRecoveryEnabledVar, true)
+	cfg.OverrideVal(config.LocalDeviceRecoveryMinAttemptsVar, 3)
 
 	bundleCfg := supportBundleConfig(cfg)
 	if enabled, ok := bundleCfg["inventoryControllerEnabled"].(bool); !ok || !enabled {
@@ -67,5 +69,11 @@ func TestSupportBundleConfigIncludesInventorySettings(t *testing.T) {
 	}
 	if bundleCfg["inventoryAuthorityMode"] != "strict" {
 		t.Fatalf("unexpected authority mode: %#v", bundleCfg["inventoryAuthorityMode"])
+	}
+	if enabled, ok := bundleCfg["localDeviceRecoveryEnabled"].(bool); !ok || !enabled {
+		t.Fatalf("expected local device recovery enabled in support bundle config, got %#v", bundleCfg["localDeviceRecoveryEnabled"])
+	}
+	if bundleCfg["localDeviceRecoveryMinAttempts"] != 3 {
+		t.Fatalf("unexpected local device recovery min attempts: %#v", bundleCfg["localDeviceRecoveryMinAttempts"])
 	}
 }

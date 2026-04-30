@@ -40,4 +40,9 @@ const (
 	eventReasonLocalVolumeRecoveryAttempted = "LocalVolumeRecoveryAttempted"
 	eventReasonLocalVolumeRecoverySucceeded = "LocalVolumeRecoverySucceeded"
 	eventReasonLocalVolumeRecoveryFailed    = "LocalVolumeRecoveryFailed"
+	eventReasonLocalDeviceMissingReported   = "LocalDeviceMissingReported"
+	eventReasonLocalDeviceRecoveryAttempted = "LocalDeviceRecoveryAttempted"
+	eventReasonLocalDeviceRecoverySucceeded = "LocalDeviceRecoverySucceeded"
+	eventReasonLocalDeviceRecoveryFailed    = "LocalDeviceRecoveryFailed"
+	eventReasonLocalDeviceRecoverySkipped   = "LocalDeviceRecoverySkipped"
 )

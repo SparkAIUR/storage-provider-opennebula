@@ -96,6 +96,7 @@ Create chart name and version as used by the chart label.
 {{- $nodeHotplugGuard := (get $root.Values.driver "nodeHotplugGuard") | default dict -}}
 {{- $localRestart := (get $root.Values.driver "localRestartOptimization") | default dict -}}
 {{- $maintenanceMode := (get $root.Values.driver "maintenanceMode") | default dict -}}
+{{- $localDeviceRecovery := (get $root.Values.driver "localDeviceRecovery") | default dict -}}
 {{- $localRWORecovery := (get $root.Values.driver "localRWOStaleMountRecovery") | default dict -}}
 {{- $lastNodePreference := (get $root.Values.driver "lastNodePreference") | default dict -}}
 {{- $lastNodePreferenceWebhook := (get $lastNodePreference "webhook") | default dict -}}
@@ -130,6 +131,12 @@ Create chart name and version as used by the chart label.
 {{- $localRestartRequireNodeReady := (get $localRestart "requireNodeReady") | default true -}}
 {{- $maintenanceReleaseMinSeconds := (get $maintenanceMode "releaseMinSeconds") | default 300 -}}
 {{- $maintenanceReleaseMaxSeconds := (get $maintenanceMode "releaseMaxSeconds") | default 1800 -}}
+{{- $localDeviceRecoveryEnabled := (get $localDeviceRecovery "enabled") | default true -}}
+{{- $localDeviceRecoveryMinAttempts := (get $localDeviceRecovery "minAttempts") | default 3 -}}
+{{- $localDeviceRecoveryMinAgeSeconds := (get $localDeviceRecovery "minAgeSeconds") | default 60 -}}
+{{- $localDeviceRecoveryIntervalSeconds := (get $localDeviceRecovery "intervalSeconds") | default 15 -}}
+{{- $localDeviceRecoveryCooldownSeconds := (get $localDeviceRecovery "cooldownSeconds") | default 300 -}}
+{{- $localDeviceRecoveryMaxAttempts := (get $localDeviceRecovery "maxAttemptsPerVolume") | default 2 -}}
 {{- $localRWORecoveryActivePod := (get $localRWORecovery "activePodRecovery") | default false -}}
 {{- $localRWORecoveryMaxAttempts := (get $localRWORecovery "maxAttempts") | default 3 -}}
 {{- $localRWORecoveryBackoffSeconds := (get $localRWORecovery "backoffSeconds") | default 10 -}}
@@ -254,6 +261,18 @@ Create chart name and version as used by the chart label.
   value: {{ $maintenanceReleaseMinSeconds | quote }}
 - name: ONE_CSI_MAINTENANCE_RELEASE_MAX_SECONDS
   value: {{ $maintenanceReleaseMaxSeconds | quote }}
+- name: ONE_CSI_LOCAL_DEVICE_RECOVERY_ENABLED
+  value: {{ $localDeviceRecoveryEnabled | quote }}
+- name: ONE_CSI_LOCAL_DEVICE_RECOVERY_MIN_ATTEMPTS
+  value: {{ $localDeviceRecoveryMinAttempts | quote }}
+- name: ONE_CSI_LOCAL_DEVICE_RECOVERY_MIN_AGE_SECONDS
+  value: {{ $localDeviceRecoveryMinAgeSeconds | quote }}
+- name: ONE_CSI_LOCAL_DEVICE_RECOVERY_INTERVAL_SECONDS
+  value: {{ $localDeviceRecoveryIntervalSeconds | quote }}
+- name: ONE_CSI_LOCAL_DEVICE_RECOVERY_COOLDOWN_SECONDS
+  value: {{ $localDeviceRecoveryCooldownSeconds | quote }}
+- name: ONE_CSI_LOCAL_DEVICE_RECOVERY_MAX_ATTEMPTS_PER_VOLUME
+  value: {{ $localDeviceRecoveryMaxAttempts | quote }}
 - name: ONE_CSI_LOCAL_RWO_STALE_MOUNT_ACTIVE_POD_RECOVERY
   value: {{ $localRWORecoveryActivePod | quote }}
 - name: ONE_CSI_LOCAL_RWO_STALE_MOUNT_MAX_ATTEMPTS

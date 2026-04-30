@@ -112,7 +112,7 @@ func (ns *NodeServer) StartBackgroundWorkers(ctx context.Context) {
 // For block access type, it skips mounting and formatting, while for mount access type, it
 // performs the necessary operations to prepare the volume for use, like formatting and mounting
 // the volume at the staging target path.
-func (ns *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 	started := time.Now()
 
 	klog.V(1).InfoS("NodeStageVolume called", "req", protosanitizer.StripSecrets(req).String())
@@ -152,16 +152,18 @@ func (ns *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 	devicePath, resolution, err := ns.resolveDevicePathWithContext(volumeID, volName, volumeContext, deviceTimeout)
 	if err != nil {
 		ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "timeout", time.Since(started))
-		ns.recordPVCWarningFromPublishContext(context.Background(), volumeContext, eventReasonDeviceDiscoveryTimeout, err.Error())
+		ns.recordLocalDeviceMissing(ctx, volumeID, volName, stagingTargetPath, volumeContext, err)
+		ns.recordPVCWarningFromPublishContext(ctx, volumeContext, eventReasonDeviceDiscoveryTimeout, err.Error())
 		klog.V(0).ErrorS(err, "Failed to resolve device path",
 			"method", "NodeStageVolume", "volumeID", volumeID, "volumeName", volName, "deviceDiscoveryTimeout", deviceTimeout)
 		return nil, status.Error(codes.DeadlineExceeded, err.Error())
 	}
-	ns.recordDeviceResolutionFromPublishContext(context.Background(), volumeContext, resolution)
+	ns.clearLocalDeviceMissing(ctx, volumeID)
+	ns.recordDeviceResolutionFromPublishContext(ctx, volumeContext, resolution)
 	ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "success", resolution.Latency)
-	ns.Driver.observeAdaptiveTimeout(context.Background(), "device_resolution", ns.publishContextBackend(volumeContext), 0, resolution.Latency)
+	ns.Driver.observeAdaptiveTimeout(ctx, "device_resolution", ns.publishContextBackend(volumeContext), 0, resolution.Latency)
 	if resolution.Latency > 10*time.Second {
-		ns.recordPVCWarningFromPublishContext(context.Background(), volumeContext, eventReasonDeviceDiscoverySlow, fmt.Sprintf("device discovery for volume %s took %s", volumeID, resolution.Latency))
+		ns.recordPVCWarningFromPublishContext(ctx, volumeContext, eventReasonDeviceDiscoverySlow, fmt.Sprintf("device discovery for volume %s took %s", volumeID, resolution.Latency))
 	}
 	klog.V(2).InfoS("Resolved staged device path",
 		"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath, "deviceDiscoveryTimeout", deviceTimeout,
@@ -317,7 +319,7 @@ func (ns *NodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageV
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
-func (ns *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 
 	klog.V(1).InfoS("NodePublishVolume called", "req", protosanitizer.StripSecrets(req).String())
 
@@ -389,14 +391,16 @@ func (ns *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 		devicePath, resolution, resolveErr := ns.resolveDevicePathWithContext(volumeID, volName, volumeContext, deviceTimeout)
 		if resolveErr != nil {
 			ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "timeout", deviceTimeout)
-			ns.recordPVCWarningFromPublishContext(context.Background(), volumeContext, eventReasonDeviceDiscoveryTimeout, resolveErr.Error())
+			ns.recordLocalDeviceMissing(ctx, volumeID, volName, stagingTargetPath, volumeContext, resolveErr)
+			ns.recordPVCWarningFromPublishContext(ctx, volumeContext, eventReasonDeviceDiscoveryTimeout, resolveErr.Error())
 			klog.V(0).ErrorS(resolveErr, "Failed to resolve device path for block volume publish",
 				"method", "NodePublishVolume", "volumeID", volumeID, "volumeName", volName, "deviceDiscoveryTimeout", deviceTimeout)
 			return nil, status.Error(codes.DeadlineExceeded, resolveErr.Error())
 		}
-		ns.recordDeviceResolutionFromPublishContext(context.Background(), volumeContext, resolution)
+		ns.clearLocalDeviceMissing(ctx, volumeID)
+		ns.recordDeviceResolutionFromPublishContext(ctx, volumeContext, resolution)
 		ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "success", resolution.Latency)
-		ns.Driver.observeAdaptiveTimeout(context.Background(), "device_resolution", ns.publishContextBackend(volumeContext), 0, resolution.Latency)
+		ns.Driver.observeAdaptiveTimeout(ctx, "device_resolution", ns.publishContextBackend(volumeContext), 0, resolution.Latency)
 		klog.V(2).InfoS("Resolved block device path",
 			"method", "NodePublishVolume", "volumeID", volumeID, "devicePath", devicePath, "deviceDiscoveryTimeout", deviceTimeout,
 			"resolvedBy", resolution.ResolvedBy, "resolutionLatency", resolution.Latency)
