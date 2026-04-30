@@ -52,7 +52,7 @@ Features that remain gated by default:
 - Container images:
   `ghcr.io/sparkaiur/opennebula-csi:<tag>`
   `docker.io/nudevco/opennebula-csi:<tag>`
-- Latest release: `v0.5.13`
+- Latest release: `v0.5.14`
 - Helm repo: `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
 - Chart name: `opennebula-csi`
 - Source repo: `https://github.com/SparkAIUR/storage-provider-opennebula`
@@ -808,7 +808,7 @@ At minimum, release validation should include:
 - `bash hack/validate-release-lab.sh`
 - a live lab validation for the feature or hotfix being released, including local attach/mount, local expansion, inventory CRDs, and workload bootstrap/init smoke checks when touching fast-path mount behavior
 
-Push the semantic tag for the release being cut, for example `v0.5.13`, only after that validation to trigger the release workflow.
+Push the semantic tag for the release being cut, for example `v0.5.14`, only after that validation to trigger the release workflow.
 
 The workflow will:
 
