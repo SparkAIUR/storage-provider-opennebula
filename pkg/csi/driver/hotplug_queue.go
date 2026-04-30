@@ -64,6 +64,27 @@ func (e *HotplugQueueStaleRequestError) Error() string {
 	return fmt.Sprintf("stale hotplug queue request for %s of volume %s on node %s", e.Operation, e.Volume, e.Node)
 }
 
+type HotplugQueuePausedError struct {
+	Node      string
+	Operation string
+	Volume    string
+	Reason    string
+	Message   string
+}
+
+func (e *HotplugQueuePausedError) Error() string {
+	if e == nil {
+		return "hotplug queue request paused"
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.Reason != "" {
+		return fmt.Sprintf("hotplug queue request for %s of volume %s on node %s is paused: %s", e.Operation, e.Volume, e.Node, e.Reason)
+	}
+	return fmt.Sprintf("hotplug queue request for %s of volume %s on node %s is paused", e.Operation, e.Volume, e.Node)
+}
+
 type HotplugQueuePriority string
 
 const (
@@ -78,6 +99,7 @@ const (
 	HotplugQueueValidationValid     HotplugQueueValidationDecision = "valid"
 	HotplugQueueValidationCompleted HotplugQueueValidationDecision = "completed"
 	HotplugQueueValidationStale     HotplugQueueValidationDecision = "stale"
+	HotplugQueueValidationPaused    HotplugQueueValidationDecision = "paused"
 )
 
 type HotplugQueueValidation struct {
@@ -371,6 +393,15 @@ func (m *HotplugQueueManager) runRequest(req *hotplugQueueRequest) error {
 		case HotplugQueueValidationStale:
 			m.metrics.RecordHotplugQueueDispatch(req.operation, string(req.priority), "stale")
 			return &HotplugQueueStaleRequestError{
+				Node:      req.node,
+				Operation: req.operation,
+				Volume:    req.volume,
+				Reason:    validation.Reason,
+				Message:   validation.Message,
+			}
+		case HotplugQueueValidationPaused:
+			m.metrics.RecordHotplugQueueDispatch(req.operation, string(req.priority), "paused")
+			return &HotplugQueuePausedError{
 				Node:      req.node,
 				Operation: req.operation,
 				Volume:    req.volume,

@@ -284,8 +284,10 @@ func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, att
 		}
 		detachStarted := time.Now()
 		if err := r.server.volumeProvider.DetachVolume(queueCtx, attachment.VolumeHandle, attachment.NodeName); err != nil {
+			r.server.handleHotplugTimeout(queueCtx, attachment.NodeName, attachment.VolumeHandle, nil, "detach", observedAttachmentBackend(attachment), err)
 			return err
 		}
+		r.server.clearHotplugGuardState(queueCtx, attachment.NodeName)
 		if sizeBytes, sizeErr := r.server.volumeProvider.ResolveVolumeSizeBytes(queueCtx, attachment.VolumeHandle); sizeErr == nil {
 			r.server.driver.observeAdaptiveTimeout(queueCtx, "detach", observedAttachmentBackend(attachment), sizeBytes, time.Since(detachStarted))
 		}

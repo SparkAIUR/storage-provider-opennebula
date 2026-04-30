@@ -17,6 +17,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -115,6 +116,9 @@ func (d *Driver) Run(ctx context.Context) error {
 		d.stickyAttachments = NewStickyAttachmentManager(d.kubeRuntime, "")
 		if err := d.stickyAttachments.LoadFromConfigMap(ctx); err != nil {
 			klog.V(2).InfoS("Failed to load sticky attachment state", "err", err)
+		}
+		if err := d.loadHotplugGuardState(ctx); err != nil {
+			klog.V(2).InfoS("Failed to load hotplug guard state", "err", err)
 		}
 	}
 	d.hotplugQueue = NewHotplugQueueManager(d.kubeRuntime, "", d.metrics, loadHotplugQueueMaxWait(d.PluginConfig), loadHotplugQueueAgeBoost(d.PluginConfig))
@@ -218,6 +222,37 @@ func (d *Driver) Run(ctx context.Context) error {
 
 	grpcServer.Wait()
 
+	return nil
+}
+
+func (d *Driver) loadHotplugGuardState(ctx context.Context) error {
+	if d == nil || d.kubeRuntime == nil || d.hotplugGuard == nil {
+		return nil
+	}
+	cm, err := d.kubeRuntime.GetConfigMap(ctx, namespaceFromServiceAccount(), hotplugStateConfigMapName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	states := make(map[string]opennebula.HotplugCooldownState, len(cm.Data))
+	now := time.Now().UTC()
+	for node, raw := range cm.Data {
+		var state opennebula.HotplugCooldownState
+		if err := json.Unmarshal([]byte(raw), &state); err != nil {
+			klog.V(2).InfoS("Skipping invalid hotplug guard state", "node", node, "err", err)
+			continue
+		}
+		if !state.PauseUntilReady && !state.ExpiresAt.IsZero() && now.After(state.ExpiresAt) {
+			continue
+		}
+		if state.Node == "" {
+			state.Node = node
+		}
+		states[node] = state
+	}
+	d.hotplugGuard.Load(states)
 	return nil
 }
 

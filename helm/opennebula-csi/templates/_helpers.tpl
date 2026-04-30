@@ -93,6 +93,7 @@ Create chart name and version as used by the chart label.
 {{- $nodeDeviceCache := (get $root.Values.driver "nodeDeviceCache") | default dict -}}
 {{- $hotplugQueue := (get $root.Values.driver "hotplugQueue") | default dict -}}
 {{- $hotplugDiagnostics := (get $root.Values.driver "hotplugDiagnostics") | default dict -}}
+{{- $nodeHotplugGuard := (get $root.Values.driver "nodeHotplugGuard") | default dict -}}
 {{- $localRestart := (get $root.Values.driver "localRestartOptimization") | default dict -}}
 {{- $localRWORecovery := (get $root.Values.driver "localRWOStaleMountRecovery") | default dict -}}
 {{- $lastNodePreference := (get $root.Values.driver "lastNodePreference") | default dict -}}
@@ -117,6 +118,10 @@ Create chart name and version as used by the chart label.
 {{- $hotplugDiagnosticsStuckAfterSeconds := (get $hotplugDiagnostics "stuckAfterSeconds") | default 300 -}}
 {{- $hotplugDiagnosticsProgressWindowSeconds := (get $hotplugDiagnostics "progressWindowSeconds") | default 60 -}}
 {{- $hotplugDiagnosticsRecoveryMode := (get $hotplugDiagnostics "recoveryMode") | default "readOnly" -}}
+{{- $nodeHotplugGuardEnabled := (get $nodeHotplugGuard "enabled") | default true -}}
+{{- $nodeHotplugGuardFailureThreshold := (get $nodeHotplugGuard "failureThreshold") | default 2 -}}
+{{- $nodeHotplugGuardRequireKubernetesReady := (get $nodeHotplugGuard "requireKubernetesReady") | default true -}}
+{{- $nodeHotplugGuardRequireOpenNebulaReady := (get $nodeHotplugGuard "requireOpenNebulaReady") | default true -}}
 {{- $localRestartEnabled := (get $localRestart "enabled") | default true -}}
 {{- $localRestartDetachGrace := (get $localRestart "detachGraceSeconds") | default 90 -}}
 {{- $localRestartDetachGraceMax := (get $localRestart "maxDetachGraceSeconds") | default 300 -}}
@@ -223,6 +228,14 @@ Create chart name and version as used by the chart label.
   value: {{ $hotplugDiagnosticsProgressWindowSeconds | quote }}
 - name: ONE_CSI_HOTPLUG_DIAGNOSTICS_RECOVERY_MODE
   value: {{ $hotplugDiagnosticsRecoveryMode | quote }}
+- name: ONE_CSI_NODE_HOTPLUG_GUARD_ENABLED
+  value: {{ $nodeHotplugGuardEnabled | quote }}
+- name: ONE_CSI_NODE_HOTPLUG_GUARD_FAILURE_THRESHOLD
+  value: {{ $nodeHotplugGuardFailureThreshold | quote }}
+- name: ONE_CSI_NODE_HOTPLUG_GUARD_REQUIRE_KUBERNETES_READY
+  value: {{ $nodeHotplugGuardRequireKubernetesReady | quote }}
+- name: ONE_CSI_NODE_HOTPLUG_GUARD_REQUIRE_OPENNEBULA_READY
+  value: {{ $nodeHotplugGuardRequireOpenNebulaReady | quote }}
 - name: ONE_CSI_LOCAL_RESTART_OPTIMIZATION_ENABLED
   value: {{ $localRestartEnabled | quote }}
 - name: ONE_CSI_LOCAL_RESTART_DETACH_GRACE_SECONDS

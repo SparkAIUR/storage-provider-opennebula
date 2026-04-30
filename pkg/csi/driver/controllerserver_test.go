@@ -1685,6 +1685,52 @@ func TestControllerUnpublishVolumeBypassesStickyDetachWhenNodeNotReady(t *testin
 	mockProvider.AssertExpectations(t)
 }
 
+func TestControllerUnpublishVolumePausesHotplugAfterUnhealthyNodeFailures(t *testing.T) {
+	node := newReadyNode("node-1", false)
+	driver := newStickyTestDriver(t, node)
+	driver.PluginConfig.OverrideVal(config.NodeHotplugGuardEnabledVar, true)
+	driver.PluginConfig.OverrideVal(config.NodeHotplugGuardFailureThresholdVar, 2)
+	driver.PluginConfig.OverrideVal(config.NodeHotplugGuardRequireKubernetesReadyVar, true)
+	driver.PluginConfig.OverrideVal(config.NodeHotplugGuardRequireOpenNebulaReadyVar, true)
+
+	timeoutErr := &opennebula.HotplugTimeoutError{
+		Operation:            "detach",
+		Volume:               "vol-pause",
+		Node:                 "node-1",
+		Timeout:              time.Second,
+		LastObservedAttached: true,
+		LastObservedReady:    false,
+		Cause:                errors.New("wrong state HOTPLUG"),
+	}
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	mockProvider.On("VolumeExists", mock.Anything, "vol-pause").Return(1, 1, nil).Times(3)
+	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil).Times(3)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdb", nil).Times(5)
+	mockProvider.On("NodeReady", mock.Anything, "node-1").Return(false, nil).Times(3)
+	mockProvider.On("DetachVolume", mock.Anything, "vol-pause", "node-1").Return(timeoutErr).Twice()
+
+	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
+	req := &csi.ControllerUnpublishVolumeRequest{VolumeId: "vol-pause", NodeId: "node-1"}
+
+	_, err := cs.ControllerUnpublishVolume(context.Background(), req)
+	require.Error(t, err)
+	assert.Equal(t, codes.Internal, status.Code(err))
+
+	_, err = cs.ControllerUnpublishVolume(context.Background(), req)
+	require.Error(t, err)
+	assert.Equal(t, codes.Internal, status.Code(err))
+
+	_, err = cs.ControllerUnpublishVolume(context.Background(), req)
+	require.Error(t, err)
+	assert.Equal(t, codes.Unavailable, status.Code(err))
+
+	state, ok := driver.hotplugGuard.Get("node-1")
+	require.True(t, ok)
+	assert.True(t, state.PauseUntilReady)
+	assert.Equal(t, 2, state.FailureCount)
+	mockProvider.AssertExpectations(t)
+}
+
 func TestControllerPublishVolumeSerializesSameNodeHotplug(t *testing.T) {
 	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
 	provider := &serializingVolumeProvider{MockOpenNebulaVolumeProviderTestify: mockProvider}

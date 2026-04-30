@@ -638,15 +638,26 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 		status.SystemDatastoreDisplay = fmt.Sprintf("%d:%s", systemDSID, status.OpenNebula.SystemDatastoreName)
 	}
 	if state, ok := hotplugStates[node.Name]; ok {
-		status.Hotplug.InCooldown = true
-		expires := metav1.NewTime(state.ExpiresAt)
-		status.Hotplug.CooldownExpiresAt = &expires
+		status.Hotplug.InCooldown = state.PauseUntilReady || state.FailureCount == 0
+		if !state.ExpiresAt.IsZero() {
+			expires := metav1.NewTime(state.ExpiresAt)
+			status.Hotplug.CooldownExpiresAt = &expires
+		}
 		status.Hotplug.LastCooldownOperation = state.Operation
 		status.Hotplug.LastCooldownVolume = state.Volume
 		attached := state.LastObservedAttached
 		ready := state.LastObservedReady
 		status.Hotplug.LastObservedAttached = &attached
 		status.Hotplug.LastObservedReady = &ready
+		status.Hotplug.FailureCount = state.FailureCount
+		status.Hotplug.Reason = state.Reason
+		status.Hotplug.PauseUntilReady = state.PauseUntilReady
+		kubernetesReady := state.KubernetesReady
+		openNebulaReady := state.OpenNebulaReady
+		unschedulable := state.Unschedulable
+		status.Hotplug.KubernetesReady = &kubernetesReady
+		status.Hotplug.OpenNebulaReady = &openNebulaReady
+		status.Hotplug.Unschedulable = &unschedulable
 	}
 
 	for _, va := range vas {
@@ -2270,7 +2281,7 @@ func (s *Syncer) loadHotplugStateMap(ctx context.Context) (map[string]opennebula
 		if err := json.Unmarshal([]byte(raw), &state); err != nil {
 			continue
 		}
-		if time.Now().After(state.ExpiresAt) {
+		if !state.PauseUntilReady && !state.ExpiresAt.IsZero() && time.Now().After(state.ExpiresAt) {
 			continue
 		}
 		result[node] = state

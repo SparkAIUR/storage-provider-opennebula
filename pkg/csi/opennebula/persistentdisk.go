@@ -753,7 +753,9 @@ func (p *PersistentDiskVolumeProvider) DetachVolume(ctx context.Context, volume,
 			return nil
 		}
 	}
-	return fmt.Errorf("volume: %s not found on node %s", volume, node)
+	klog.V(1).InfoS("Volume already absent from node, treating detach as successful",
+		"method", "DetachVolume", "volumeID", volumeID, "volumeHandle", volume, "nodeID", nodeID, "node", node)
+	return nil
 }
 
 func (p *PersistentDiskVolumeProvider) ListVolumes(ctx context.Context, owner string, maxEntries int32, startingToken string) ([]string, error) {
@@ -1142,7 +1144,7 @@ func (p *PersistentDiskVolumeProvider) waitForDetachState(ctx context.Context, t
 
 		lastAttached = attached
 		lastReady = ready
-		if !attached && ready {
+		if !attached {
 			return nil
 		}
 

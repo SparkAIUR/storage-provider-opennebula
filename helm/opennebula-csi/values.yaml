@@ -52,6 +52,11 @@ driver:
     stuckAfterSeconds: 300
     progressWindowSeconds: 60
     recoveryMode: "readOnly"
+  nodeHotplugGuard:
+    enabled: true
+    failureThreshold: 2
+    requireKubernetesReady: true
+    requireOpenNebulaReady: true
   localRestartOptimization:
     enabled: true
     detachGraceSeconds: 90

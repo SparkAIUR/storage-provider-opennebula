@@ -197,3 +197,26 @@ func TestHotplugQueueDropsStaleRequestBeforeDispatch(t *testing.T) {
 	assert.False(t, called)
 	assert.Equal(t, "persistent_volume_released", staleErr.Reason)
 }
+
+func TestHotplugQueueReturnsPausedRequestBeforeDispatch(t *testing.T) {
+	manager := NewHotplugQueueManager(nil, "", NewDriverMetrics("test", "test"), time.Second, 0)
+	manager.Configure(true, 0, 0, 0, func(context.Context, string, string, string) HotplugQueueValidation {
+		return HotplugQueueValidation{
+			Decision: HotplugQueueValidationPaused,
+			Reason:   "kubernetes_node_not_ready",
+			Message:  "node node-a hotplug operations are paused",
+		}
+	})
+
+	called := false
+	err := manager.Run(context.Background(), "node-a", "detach", "vol-1", hotplugQueuePriorityNormal, func(context.Context) error {
+		called = true
+		return nil
+	})
+
+	require.Error(t, err)
+	var pausedErr *HotplugQueuePausedError
+	assert.True(t, errors.As(err, &pausedErr))
+	assert.False(t, called)
+	assert.Equal(t, "kubernetes_node_not_ready", pausedErr.Reason)
+}

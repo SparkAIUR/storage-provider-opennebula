@@ -354,6 +354,10 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.hotplugDiagnostics.stuckAfterSeconds` | HOTPLUG age after which an unchanged observation is classified as stuck. | `300` | No |
 | `driver.hotplugDiagnostics.progressWindowSeconds` | Required unchanged observation window before a HOTPLUG VM is classified as stuck. | `60` | No |
 | `driver.hotplugDiagnostics.recoveryMode` | Reserved recovery mode selector. Current implementation is read-only and never mutates OpenNebula state. | `"readOnly"` | No |
+| `driver.nodeHotplugGuard.enabled` | Enable node-health-aware hotplug pause after repeated unhealthy-node hotplug failures. | `true` | No |
+| `driver.nodeHotplugGuard.failureThreshold` | Unhealthy-node hotplug failures allowed before pausing all hotplug work for that node. | `2` | No |
+| `driver.nodeHotplugGuard.requireKubernetesReady` | Require Kubernetes `NodeReady=True` before clearing a node hotplug pause. | `true` | No |
+| `driver.nodeHotplugGuard.requireOpenNebulaReady` | Require the OpenNebula VM to be `RUNNING` before clearing a node hotplug pause. | `true` | No |
 | `driver.localRestartOptimization.enabled` | Enable best-effort same-node restart reuse for opted-in local PVCs. | `true` | No |
 | `driver.localRestartOptimization.detachGraceSeconds` | Default delayed-detach grace used for opted-in local PVCs. | `90` | No |
 | `driver.localRestartOptimization.maxDetachGraceSeconds` | Upper bound for per-PVC delayed-detach overrides. | `300` | No |

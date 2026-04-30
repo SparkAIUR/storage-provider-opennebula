@@ -80,6 +80,11 @@ type KubeRuntime struct {
 
 const hotplugStateConfigMapName = "opennebula-csi-hotplug-state"
 
+type KubernetesNodeHealth struct {
+	Ready         bool
+	Unschedulable bool
+}
+
 func NewKubeRuntime(component string) *KubeRuntime {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
@@ -351,19 +356,29 @@ func (r *KubeRuntime) PodUIDExists(ctx context.Context, uid string) (bool, error
 }
 
 func (r *KubeRuntime) IsNodeReady(ctx context.Context, nodeName string) (bool, error) {
-	if r == nil || !r.enabled {
-		return false, fmt.Errorf("kubernetes runtime is not enabled")
-	}
-	node, err := r.client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	health, err := r.NodeHealth(ctx, nodeName)
 	if err != nil {
 		return false, err
 	}
+	return health.Ready, nil
+}
+
+func (r *KubeRuntime) NodeHealth(ctx context.Context, nodeName string) (KubernetesNodeHealth, error) {
+	if r == nil || !r.enabled {
+		return KubernetesNodeHealth{}, fmt.Errorf("kubernetes runtime is not enabled")
+	}
+	node, err := r.client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return KubernetesNodeHealth{}, err
+	}
+	health := KubernetesNodeHealth{Unschedulable: node.Spec.Unschedulable}
 	for _, condition := range node.Status.Conditions {
 		if condition.Type == corev1.NodeReady {
-			return condition.Status == corev1.ConditionTrue, nil
+			health.Ready = condition.Status == corev1.ConditionTrue
+			return health, nil
 		}
 	}
-	return false, nil
+	return health, nil
 }
 
 func (r *KubeRuntime) emitNamespacedEvent(ctx context.Context, namespace, name string, uid types.UID, kind, eventType, reason, message string) {

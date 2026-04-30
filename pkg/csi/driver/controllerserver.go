@@ -783,14 +783,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	if cooldown, ok := s.hotplugCooldownState(ctx, req.NodeId); ok {
 		s.driver.metrics.RecordHotplugGuard("attach", "vm_cooldown", "rejected")
 		s.driver.metrics.RecordHotplugRecovery("attach", "vm_cooldown", "rejected")
-		message := fmt.Sprintf(
-			"node %s is in hotplug recovery cooldown until %s after timed out %s (last observed attached=%t ready=%t)",
-			req.NodeId,
-			cooldown.ExpiresAt.Format(time.RFC3339),
-			cooldown.Operation,
-			cooldown.LastObservedAttached,
-			cooldown.LastObservedReady,
-		)
+		message := s.formatHotplugGuardMessage(cooldown)
 		s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonHotplugCooldown, message)
 		return nil, status.Error(codes.Unavailable, message)
 	}
@@ -849,6 +842,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			}
 			return status.Error(codes.Internal, "failed to attach volume")
 		}
+		s.clearHotplugGuardState(queueCtx, req.NodeId)
 
 		klog.V(3).InfoS("Checking if volume is attached",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID)
@@ -871,6 +865,11 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	if queueErr != nil {
 		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "internal", time.Since(started))
 		s.driver.metrics.RecordControllerPublishDuration("disk", "internal", time.Since(started))
+		var pausedQueueErr *HotplugQueuePausedError
+		if errors.As(queueErr, &pausedQueueErr) {
+			s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonHotplugCooldown, pausedQueueErr.Error())
+			return nil, status.Error(codes.Unavailable, pausedQueueErr.Error())
+		}
 		var queueTimeoutErr *HotplugQueueTimeoutError
 		if errors.As(queueErr, &queueTimeoutErr) {
 			s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonHotplugQueueTimeout, queueTimeoutErr.Error())
@@ -950,14 +949,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 
 	if cooldown, ok := s.hotplugCooldownState(ctx, req.NodeId); ok {
 		s.driver.metrics.RecordHotplugGuard("detach", "vm_cooldown", "rejected")
-		message := fmt.Sprintf(
-			"node %s is in hotplug recovery cooldown until %s after timed out %s (last observed attached=%t ready=%t)",
-			req.NodeId,
-			cooldown.ExpiresAt.Format(time.RFC3339),
-			cooldown.Operation,
-			cooldown.LastObservedAttached,
-			cooldown.LastObservedReady,
-		)
+		message := s.formatHotplugGuardMessage(cooldown)
 		return nil, status.Error(codes.Unavailable, message)
 	}
 
@@ -1007,6 +999,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 				"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
 			return status.Error(codes.Internal, "failed to detach volume")
 		}
+		s.clearHotplugGuardState(queueCtx, req.NodeId)
 		sizeBytes, sizeErr := s.volumeProvider.ResolveVolumeSizeBytes(queueCtx, req.VolumeId)
 		if sizeErr == nil {
 			s.driver.observeAdaptiveTimeout(queueCtx, "detach", "disk", sizeBytes, time.Since(detachStarted))
@@ -1017,6 +1010,11 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return nil
 	})
 	if queueErr != nil {
+		var pausedQueueErr *HotplugQueuePausedError
+		if errors.As(queueErr, &pausedQueueErr) {
+			s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReasonHotplugCooldown, pausedQueueErr.Error())
+			return nil, status.Error(codes.Unavailable, pausedQueueErr.Error())
+		}
 		var queueTimeoutErr *HotplugQueueTimeoutError
 		if errors.As(queueErr, &queueTimeoutErr) {
 			s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReasonHotplugQueueTimeout, queueTimeoutErr.Error())
@@ -1280,18 +1278,120 @@ func controllerVolumeLockKey(volumeID string) string {
 	return "volume:" + volumeID
 }
 
+type hotplugNodeHealth struct {
+	KubernetesReady bool
+	KubernetesKnown bool
+	OpenNebulaReady bool
+	OpenNebulaKnown bool
+	Unschedulable   bool
+	KubernetesErr   error
+	OpenNebulaErr   error
+}
+
 func (s *ControllerServer) hotplugCooldownState(ctx context.Context, node string) (opennebula.HotplugCooldownState, bool) {
+	if !s.nodeHotplugGuardEnabled() {
+		return opennebula.HotplugCooldownState{}, false
+	}
 	cooldown, ok := s.driver.hotplugGuard.Get(node)
 	if !ok {
 		return opennebula.HotplugCooldownState{}, false
 	}
-	ready, err := s.volumeProvider.NodeReady(ctx, node)
-	if err == nil && ready {
+	health := s.nodeHotplugHealth(ctx, node, cooldown.LastObservedReady)
+	if s.hotplugGuardStateCleared(cooldown, health) {
 		s.driver.hotplugGuard.Clear(node)
 		s.clearHotplugStateSnapshot(ctx, node)
 		return opennebula.HotplugCooldownState{}, false
 	}
+	cooldown.KubernetesReady = health.KubernetesReady
+	cooldown.OpenNebulaReady = health.OpenNebulaReady
+	cooldown.Unschedulable = health.Unschedulable
 	return cooldown, true
+}
+
+func (s *ControllerServer) hotplugGuardStateCleared(state opennebula.HotplugCooldownState, health hotplugNodeHealth) bool {
+	if state.PauseUntilReady {
+		return (!s.nodeHotplugGuardRequireKubernetesReady() || health.KubernetesReady) &&
+			(!s.nodeHotplugGuardRequireOpenNebulaReady() || health.OpenNebulaReady)
+	}
+	if !state.ExpiresAt.IsZero() && time.Now().UTC().After(state.ExpiresAt) {
+		return true
+	}
+	return health.OpenNebulaReady
+}
+
+func (s *ControllerServer) nodeHotplugHealth(ctx context.Context, node string, fallbackOpenNebulaReady bool) hotplugNodeHealth {
+	health := hotplugNodeHealth{
+		KubernetesReady: !s.nodeHotplugGuardRequireKubernetesReady(),
+		OpenNebulaReady: fallbackOpenNebulaReady || !s.nodeHotplugGuardRequireOpenNebulaReady(),
+	}
+	if s.nodeHotplugGuardRequireKubernetesReady() && s != nil && s.driver != nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
+		kubeHealth, err := s.driver.kubeRuntime.NodeHealth(ctx, node)
+		if err != nil {
+			health.KubernetesErr = err
+		} else {
+			health.KubernetesReady = kubeHealth.Ready
+			health.Unschedulable = kubeHealth.Unschedulable
+			health.KubernetesKnown = true
+		}
+	}
+	if s.nodeHotplugGuardRequireOpenNebulaReady() && s != nil && s.volumeProvider != nil {
+		ready, err := s.volumeProvider.NodeReady(ctx, node)
+		if err != nil {
+			health.OpenNebulaErr = err
+		} else {
+			health.OpenNebulaReady = ready
+			health.OpenNebulaKnown = true
+		}
+	}
+	return health
+}
+
+func (s *ControllerServer) hotplugUnhealthyReason(health hotplugNodeHealth) string {
+	reasons := make([]string, 0, 2)
+	if s.nodeHotplugGuardRequireKubernetesReady() && health.KubernetesKnown && !health.KubernetesReady {
+		reasons = append(reasons, "kubernetes_node_not_ready")
+	}
+	if s.nodeHotplugGuardRequireOpenNebulaReady() && !health.OpenNebulaReady {
+		reasons = append(reasons, "opennebula_vm_not_running")
+	}
+	if len(reasons) == 0 {
+		return "node_unhealthy"
+	}
+	return strings.Join(reasons, ",")
+}
+
+func (s *ControllerServer) hotplugNodeUnhealthy(health hotplugNodeHealth) bool {
+	if s.nodeHotplugGuardRequireKubernetesReady() && health.KubernetesKnown && !health.KubernetesReady {
+		return true
+	}
+	if s.nodeHotplugGuardRequireOpenNebulaReady() && !health.OpenNebulaReady {
+		return true
+	}
+	return false
+}
+
+func (s *ControllerServer) formatHotplugGuardMessage(state opennebula.HotplugCooldownState) string {
+	if state.PauseUntilReady {
+		return fmt.Sprintf(
+			"node %s hotplug operations are paused after %d unhealthy-node failure(s) during %s of volume %s; waiting for required readiness gates (kubernetesReady=%t openNebulaReady=%t unschedulable=%t lastObservedAttached=%t)",
+			state.Node,
+			state.FailureCount,
+			state.Operation,
+			state.Volume,
+			state.KubernetesReady,
+			state.OpenNebulaReady,
+			state.Unschedulable,
+			state.LastObservedAttached,
+		)
+	}
+	return fmt.Sprintf(
+		"node %s is in hotplug recovery cooldown until %s after timed out %s (last observed attached=%t ready=%t)",
+		state.Node,
+		state.ExpiresAt.Format(time.RFC3339),
+		state.Operation,
+		state.LastObservedAttached,
+		state.LastObservedReady,
+	)
 }
 
 func (s *ControllerServer) publishContextForVolume(ctx context.Context, volumeID, target string, deviceDiscoveryTimeout time.Duration, sourceContext map[string]string) map[string]string {
@@ -1405,6 +1505,13 @@ func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node
 			Message:  fmt.Sprintf("node %s no longer exists; dropping queued %s for volume %s", node, operation, volume),
 		}
 	}
+	if state, ok := s.hotplugCooldownState(ctx, node); ok {
+		return HotplugQueueValidation{
+			Decision: HotplugQueueValidationPaused,
+			Reason:   state.Reason,
+			Message:  s.formatHotplugGuardMessage(state),
+		}
+	}
 
 	_, attachedErr := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	attached := attachedErr == nil
@@ -1490,22 +1597,49 @@ func (s *ControllerServer) handleHotplugTimeout(ctx context.Context, node, volum
 			s.recordPVCWarningFromParams(ctx, params, eventReasonHotplugCooldown, diagnosis.Message)
 		}
 	}
-	if timeoutErr.LastObservedReady {
+	if !s.nodeHotplugGuardEnabled() {
 		return
 	}
 
-	state := s.driver.hotplugGuard.MarkCooldown(node, operation, volume, timeoutErr.Timeout, timeoutErr.LastObservedAttached, timeoutErr.LastObservedReady)
-	s.persistHotplugStateSnapshot(ctx, state)
-	s.driver.metrics.RecordHotplugGuard(operation, "timeout_exhausted", "cooldown")
-	s.driver.metrics.RecordHotplugRecovery(operation, "timeout_exhausted", "cooldown")
-	message := fmt.Sprintf(
-		"node %s entered hotplug cooldown after %s timeout %s (attached=%t ready=%t)",
+	health := s.nodeHotplugHealth(ctx, node, timeoutErr.LastObservedReady)
+	if !s.hotplugNodeUnhealthy(health) {
+		return
+	}
+
+	state, paused := s.driver.hotplugGuard.MarkUnhealthyFailure(
 		node,
 		operation,
+		volume,
 		timeoutErr.Timeout,
 		timeoutErr.LastObservedAttached,
-		timeoutErr.LastObservedReady,
+		health.OpenNebulaReady,
+		health.KubernetesReady,
+		health.Unschedulable,
+		s.nodeHotplugGuardFailureThreshold(),
+		s.hotplugUnhealthyReason(health),
 	)
+	s.persistHotplugStateSnapshot(ctx, state)
+	outcome := "observed"
+	if paused {
+		outcome = "paused"
+	}
+	s.driver.metrics.RecordHotplugGuard(operation, state.Reason, outcome)
+	s.driver.metrics.RecordHotplugRecovery(operation, state.Reason, outcome)
+	message := fmt.Sprintf(
+		"node %s recorded unhealthy hotplug failure %d/%d after %s timeout %s (kubernetesReady=%t openNebulaReady=%t unschedulable=%t attached=%t)",
+		node,
+		state.FailureCount,
+		s.nodeHotplugGuardFailureThreshold(),
+		operation,
+		timeoutErr.Timeout,
+		state.KubernetesReady,
+		state.OpenNebulaReady,
+		state.Unschedulable,
+		timeoutErr.LastObservedAttached,
+	)
+	if paused {
+		message = s.formatHotplugGuardMessage(state)
+	}
 	s.recordPVCWarningFromParams(ctx, params, eventReasonHotplugCooldown, message)
 }
 
@@ -1532,6 +1666,17 @@ func (s *ControllerServer) clearHotplugStateSnapshot(ctx context.Context, node s
 	if err := s.driver.kubeRuntime.DeleteConfigMapKey(ctx, namespaceFromServiceAccount(), hotplugStateConfigMapName, node); err != nil {
 		klog.V(2).InfoS("Failed to clear hotplug cooldown snapshot", "node", node, "err", err)
 	}
+}
+
+func (s *ControllerServer) clearHotplugGuardState(ctx context.Context, node string) {
+	if s == nil || s.driver == nil || s.driver.hotplugGuard == nil || strings.TrimSpace(node) == "" {
+		return
+	}
+	if state, ok := s.driver.hotplugGuard.Snapshot()[node]; ok && state.PauseUntilReady {
+		return
+	}
+	s.driver.hotplugGuard.Clear(node)
+	s.clearHotplugStateSnapshot(ctx, node)
 }
 
 // TODO: Implement methods specified in https://github.com/container-storage-interface/spec/blob/98819c45a37a67e0cd466bd02b813faf91af4e45/spec.md#controller-service-rpc
@@ -1768,6 +1913,7 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 	if err := s.volumeProvider.DetachVolume(ctx, req.VolumeId, state.NodeID); err != nil {
 		return true, nil, status.Error(codes.Internal, "failed to detach stale same-volume attachment before moving to a different node")
 	}
+	s.clearHotplugGuardState(ctx, state.NodeID)
 	if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
 		return true, nil, status.Errorf(codes.Internal, "failed to clear sticky attachment state: %v", err)
 	}
@@ -1802,6 +1948,7 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 			klog.V(2).InfoS("Failed to detach sticky attachment after grace expiry", "volumeID", confirmed.VolumeID, "nodeID", confirmed.NodeID, "err", err)
 			return err
 		}
+		s.clearHotplugGuardState(queueCtx, confirmed.NodeID)
 		if sizeBytes, sizeErr := s.volumeProvider.ResolveVolumeSizeBytes(queueCtx, confirmed.VolumeID); sizeErr == nil {
 			s.driver.observeAdaptiveTimeout(queueCtx, "detach", "disk", sizeBytes, time.Since(detachStarted))
 		}
@@ -1911,6 +2058,41 @@ func (s *ControllerServer) localRestartRequireNodeReady() bool {
 		return true
 	}
 	enabled, ok := s.driver.PluginConfig.GetBool(config.LocalRestartRequireNodeReadyVar)
+	return !ok || enabled
+}
+
+func (s *ControllerServer) nodeHotplugGuardEnabled() bool {
+	if s == nil || s.driver == nil {
+		return true
+	}
+	enabled, ok := s.driver.PluginConfig.GetBool(config.NodeHotplugGuardEnabledVar)
+	return !ok || enabled
+}
+
+func (s *ControllerServer) nodeHotplugGuardFailureThreshold() int {
+	if s == nil || s.driver == nil {
+		return 2
+	}
+	threshold, ok := s.driver.PluginConfig.GetInt(config.NodeHotplugGuardFailureThresholdVar)
+	if !ok || threshold <= 0 {
+		return 2
+	}
+	return threshold
+}
+
+func (s *ControllerServer) nodeHotplugGuardRequireKubernetesReady() bool {
+	if s == nil || s.driver == nil {
+		return true
+	}
+	enabled, ok := s.driver.PluginConfig.GetBool(config.NodeHotplugGuardRequireKubernetesReadyVar)
+	return !ok || enabled
+}
+
+func (s *ControllerServer) nodeHotplugGuardRequireOpenNebulaReady() bool {
+	if s == nil || s.driver == nil {
+		return true
+	}
+	enabled, ok := s.driver.PluginConfig.GetBool(config.NodeHotplugGuardRequireOpenNebulaReadyVar)
 	return !ok || enabled
 }
 

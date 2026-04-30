@@ -278,6 +278,16 @@ func TestWaitForDetachStateReturnsHotplugTimeoutError(t *testing.T) {
 	assert.Equal(t, 5*time.Millisecond, timeoutErr.Timeout)
 }
 
+func TestWaitForDetachStateSucceedsWhenVolumeAbsentAndNodeNotReady(t *testing.T) {
+	provider := &PersistentDiskVolumeProvider{}
+
+	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+		return false, false, nil
+	}, nil, "vol-a", "node-a")
+
+	require.NoError(t, err)
+}
+
 func TestWaitForAttachStateRetriesAfterNodeBecomesReady(t *testing.T) {
 	provider := &PersistentDiskVolumeProvider{}
 	retryCount := 0

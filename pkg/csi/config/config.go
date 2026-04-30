@@ -57,6 +57,10 @@ const (
 	HotplugDiagnosticsStuckAfterSecondsVar     = "ONE_CSI_HOTPLUG_DIAGNOSTICS_STUCK_AFTER_SECONDS"
 	HotplugDiagnosticsProgressWindowSecondsVar = "ONE_CSI_HOTPLUG_DIAGNOSTICS_PROGRESS_WINDOW_SECONDS"
 	HotplugDiagnosticsRecoveryModeVar          = "ONE_CSI_HOTPLUG_DIAGNOSTICS_RECOVERY_MODE"
+	NodeHotplugGuardEnabledVar                 = "ONE_CSI_NODE_HOTPLUG_GUARD_ENABLED"
+	NodeHotplugGuardFailureThresholdVar        = "ONE_CSI_NODE_HOTPLUG_GUARD_FAILURE_THRESHOLD"
+	NodeHotplugGuardRequireKubernetesReadyVar  = "ONE_CSI_NODE_HOTPLUG_GUARD_REQUIRE_KUBERNETES_READY"
+	NodeHotplugGuardRequireOpenNebulaReadyVar  = "ONE_CSI_NODE_HOTPLUG_GUARD_REQUIRE_OPENNEBULA_READY"
 	LocalRestartOptimizationEnabledVar         = "ONE_CSI_LOCAL_RESTART_OPTIMIZATION_ENABLED"
 	LocalRestartDetachGraceSecondsVar          = "ONE_CSI_LOCAL_RESTART_DETACH_GRACE_SECONDS"
 	LocalRestartDetachGraceMaxSecondsVar       = "ONE_CSI_LOCAL_RESTART_DETACH_GRACE_MAX_SECONDS"
@@ -124,6 +128,10 @@ const (
 	defaultHotplugDiagnosticsStuckAfterSeconds     = 300
 	defaultHotplugDiagnosticsProgressWindowSeconds = 60
 	defaultHotplugDiagnosticsRecoveryMode          = "readOnly"
+	defaultNodeHotplugGuardEnabled                 = true
+	defaultNodeHotplugGuardFailureThreshold        = 2
+	defaultNodeHotplugGuardRequireKubernetesReady  = true
+	defaultNodeHotplugGuardRequireOpenNebulaReady  = true
 	defaultLocalRestartOptimizationEnabled         = true
 	defaultLocalRestartDetachGraceSeconds          = 90
 	defaultLocalRestartDetachGraceMaxSeconds       = 300
@@ -219,6 +227,10 @@ func initViper() *viper.Viper {
 	viper.SetDefault(HotplugDiagnosticsStuckAfterSecondsVar, defaultHotplugDiagnosticsStuckAfterSeconds)
 	viper.SetDefault(HotplugDiagnosticsProgressWindowSecondsVar, defaultHotplugDiagnosticsProgressWindowSeconds)
 	viper.SetDefault(HotplugDiagnosticsRecoveryModeVar, defaultHotplugDiagnosticsRecoveryMode)
+	viper.SetDefault(NodeHotplugGuardEnabledVar, defaultNodeHotplugGuardEnabled)
+	viper.SetDefault(NodeHotplugGuardFailureThresholdVar, defaultNodeHotplugGuardFailureThreshold)
+	viper.SetDefault(NodeHotplugGuardRequireKubernetesReadyVar, defaultNodeHotplugGuardRequireKubernetesReady)
+	viper.SetDefault(NodeHotplugGuardRequireOpenNebulaReadyVar, defaultNodeHotplugGuardRequireOpenNebulaReady)
 	viper.SetDefault(LocalRestartOptimizationEnabledVar, defaultLocalRestartOptimizationEnabled)
 	viper.SetDefault(LocalRestartDetachGraceSecondsVar, defaultLocalRestartDetachGraceSeconds)
 	viper.SetDefault(LocalRestartDetachGraceMaxSecondsVar, defaultLocalRestartDetachGraceMaxSeconds)

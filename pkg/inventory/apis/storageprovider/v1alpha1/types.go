@@ -290,6 +290,12 @@ type OpenNebulaNodeHotplugStatus struct {
 	LastCooldownVolume    string                               `json:"lastCooldownVolume,omitempty"`
 	LastObservedAttached  *bool                                `json:"lastObservedAttached,omitempty"`
 	LastObservedReady     *bool                                `json:"lastObservedReady,omitempty"`
+	FailureCount          int                                  `json:"failureCount,omitempty"`
+	Reason                string                               `json:"reason,omitempty"`
+	PauseUntilReady       bool                                 `json:"pauseUntilReady,omitempty"`
+	KubernetesReady       *bool                                `json:"kubernetesReady,omitempty"`
+	OpenNebulaReady       *bool                                `json:"openNebulaReady,omitempty"`
+	Unschedulable         *bool                                `json:"unschedulable,omitempty"`
 	Diagnosis             OpenNebulaNodeHotplugDiagnosisStatus `json:"diagnosis,omitempty"`
 }
 

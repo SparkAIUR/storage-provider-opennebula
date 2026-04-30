@@ -402,6 +402,18 @@ func (in *OpenNebulaNodeHotplugStatus) DeepCopyInto(out *OpenNebulaNodeHotplugSt
 		value := *in.LastObservedReady
 		out.LastObservedReady = &value
 	}
+	if in.KubernetesReady != nil {
+		value := *in.KubernetesReady
+		out.KubernetesReady = &value
+	}
+	if in.OpenNebulaReady != nil {
+		value := *in.OpenNebulaReady
+		out.OpenNebulaReady = &value
+	}
+	if in.Unschedulable != nil {
+		value := *in.Unschedulable
+		out.Unschedulable = &value
+	}
 	in.Diagnosis.DeepCopyInto(&out.Diagnosis)
 }
 

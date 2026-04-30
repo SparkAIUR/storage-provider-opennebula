@@ -62,6 +62,14 @@ type HotplugCooldownState struct {
 	Timeout              time.Duration
 	LastObservedReady    bool
 	LastObservedAttached bool
+	FailureCount         int
+	Reason               string
+	PauseUntilReady      bool
+	KubernetesReady      bool
+	OpenNebulaReady      bool
+	Unschedulable        bool
+	FirstFailureAt       time.Time
+	LastFailureAt        time.Time
 }
 
 type HotplugTimeoutError struct {
