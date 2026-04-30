@@ -158,7 +158,6 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 			"method", "NodeStageVolume", "volumeID", volumeID, "volumeName", volName, "deviceDiscoveryTimeout", deviceTimeout)
 		return nil, status.Error(codes.DeadlineExceeded, err.Error())
 	}
-	ns.clearLocalDeviceMissing(ctx, volumeID)
 	ns.recordDeviceResolutionFromPublishContext(ctx, volumeContext, resolution)
 	ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "success", resolution.Latency)
 	ns.Driver.observeAdaptiveTimeout(ctx, "device_resolution", ns.publishContextBackend(volumeContext), 0, resolution.Latency)
@@ -248,6 +247,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		//Check if volume_id is already staged in stagingTargetPath and is identical
 		// to the volumeCapability provided in the request, then return 0 OK response
 		ns.recordLocalDiskStageSession(req, devicePath, fsType, mountFlags)
+		ns.clearLocalDeviceMissing(ctx, volumeID)
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
@@ -282,6 +282,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		"stagingTargetPath", stagingTargetPath, "fsType", fsType)
 
 	ns.recordLocalDiskStageSession(req, devicePath, fsType, mountFlags)
+	ns.clearLocalDeviceMissing(ctx, volumeID)
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 

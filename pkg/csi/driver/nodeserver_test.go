@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -14,6 +15,8 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/mount-utils"
 	"k8s.io/utils/exec"
 	testingexec "k8s.io/utils/exec/testing"
@@ -22,6 +25,27 @@ import (
 const (
 	targetPath = "/tmp/target" // Example target path for publishing
 )
+
+type failingMountInterface struct {
+	*mount.FakeMounter
+	err error
+}
+
+func (f *failingMountInterface) Mount(source, target, fstype string, options []string) error {
+	return f.MountSensitive(source, target, fstype, options, nil)
+}
+
+func (f *failingMountInterface) MountSensitive(string, string, string, []string, []string) error {
+	return f.err
+}
+
+func (f *failingMountInterface) MountSensitiveWithoutSystemd(source, target, fstype string, options []string, sensitiveOptions []string) error {
+	return f.MountSensitive(source, target, fstype, options, sensitiveOptions)
+}
+
+func (f *failingMountInterface) MountSensitiveWithoutSystemdWithMountFlags(source, target, fstype string, options []string, sensitiveOptions []string, _ []string) error {
+	return f.MountSensitive(source, target, fstype, options, sensitiveOptions)
+}
 
 func getTestNodeServer(mountPoints []string) *NodeServer {
 	mountPointList := make([]mount.MountPoint, 0, len(mountPoints))
@@ -145,6 +169,114 @@ func TestStageVolume(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestStageVolumeKeepsLocalDeviceReportUntilMountSucceeds(t *testing.T) {
+	tempDir := t.TempDir()
+	diskPath := withTestDiskPath(t)
+	err := os.WriteFile(filepath.Join(diskPath, "sdd"), []byte("test"), 0o644)
+	assert.NoError(t, err)
+
+	pluginConfig := config.LoadConfiguration()
+	pluginConfig.OverrideVal(config.LocalDeviceRecoveryEnabledVar, true)
+	pluginConfig.OverrideVal(config.NodeDeviceRescanOnMissEnabledVar, false)
+	pluginConfig.OverrideVal(config.NodeDeviceUdevSettleTimeoutSecondsVar, 0)
+	driver := &Driver{
+		name:         DefaultDriverName,
+		version:      driverVersion,
+		nodeID:       "node-a",
+		PluginConfig: pluginConfig,
+		featureGates: defaultFeatureGates(),
+		metrics:      NewDriverMetrics(driverVersion, "test"),
+		kubeRuntime:  &KubeRuntime{client: fake.NewSimpleClientset(), enabled: true},
+	}
+	commandScriptArray := []testingexec.FakeCommandAction{}
+	for i := 0; i < 10; i++ {
+		commandScriptArray = append(commandScriptArray, func(cmd string, args ...string) exec.Cmd {
+			return &testingexec.FakeCmd{
+				Argv:           append([]string{cmd}, args...),
+				Stdout:         nil,
+				Stderr:         nil,
+				DisableScripts: true,
+			}
+		})
+	}
+	mountErr := errors.New("can't read superblock")
+	ns := NewNodeServer(driver, mount.NewSafeFormatAndMount(
+		&failingMountInterface{FakeMounter: mount.NewFakeMounter(nil), err: mountErr},
+		&testingexec.FakeExec{
+			CommandScript: commandScriptArray,
+			LookPathFunc: func(path string) (string, error) {
+				return path, nil
+			},
+		},
+	))
+	publishContext := map[string]string{
+		"volumeName":                    "sdd",
+		annotationBackend:               "local",
+		publishContextDeviceSerial:      "onecsi-439",
+		publishContextOpenNebulaImageID: "439",
+	}
+	ns.recordLocalDeviceMissing(context.Background(), "vol-1", "sdd", tempDir, publishContext, errors.New("device not found"))
+
+	req := &csi.NodeStageVolumeRequest{
+		VolumeId:          "vol-1",
+		StagingTargetPath: tempDir,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{FsType: "ext4"},
+			},
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+			},
+		},
+		PublishContext: publishContext,
+	}
+
+	_, err = ns.NodeStageVolume(context.Background(), req)
+	assert.Error(t, err)
+	_, err = ns.NodeStageVolume(context.Background(), req)
+	assert.Error(t, err)
+
+	cm, err := driver.kubeRuntime.client.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(context.Background(), localDeviceStateConfigMapName, metav1.GetOptions{})
+	assert.NoError(t, err)
+	raw := cm.Data[localDeviceReportKey("node-a", "vol-1")]
+	var report LocalDeviceMissingReport
+	assert.NoError(t, json.Unmarshal([]byte(raw), &report))
+	assert.Equal(t, localDeviceFailureClassMountFailed, report.FailureClass)
+	assert.Equal(t, 3, report.Attempts)
+	assert.Equal(t, filepath.Join(diskPath, "sdd"), report.DevicePath)
+}
+
+func TestRecordLocalDiskStageSessionClearsPreviousRecoveryFailure(t *testing.T) {
+	ns := getTestNodeServer(nil)
+	ns.localDiskSessions = newLocalDiskSessionStore(t.TempDir())
+	recoveredAt := time.Now().Add(-time.Minute)
+	ns.recordLocalDiskSession(localDiskSession{
+		VolumeID: "vol-1",
+		PublishedTargets: []localDiskPublishedTarget{
+			{TargetPath: "/pods/pod-a/vol", MountOptions: []string{"rw"}},
+		},
+		LastRecoveredAt:   &recoveredAt,
+		LastRecoveryError: "local RWO recovery attempts exhausted",
+		RecoveryAttempts:  3,
+	})
+
+	ns.recordLocalDiskStageSession(&csi.NodeStageVolumeRequest{
+		VolumeId:          "vol-1",
+		StagingTargetPath: "/stage/vol-1",
+		PublishContext: map[string]string{
+			"volumeName": "sdg",
+		},
+	}, "/dev/sdg", "xfs", []string{"rw"})
+
+	session, exists, err := ns.loadLocalDiskSession("vol-1")
+	assert.NoError(t, err)
+	assert.True(t, exists)
+	assert.Len(t, session.PublishedTargets, 1)
+	assert.Nil(t, session.LastRecoveredAt)
+	assert.Empty(t, session.LastRecoveryError)
+	assert.Equal(t, 0, session.RecoveryAttempts)
 }
 
 func TestResolveDevicePath(t *testing.T) {

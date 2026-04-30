@@ -2202,6 +2202,49 @@ func TestHotplugGuardCleanupClearsReadyCordonedNodeOutsideMaintenance(t *testing
 	mockProvider.AssertExpectations(t)
 }
 
+func TestLoadHotplugGuardStateGarbageCollectsExpiredSnapshots(t *testing.T) {
+	expiredState := opennebula.HotplugCooldownState{
+		Node:      "node-expired",
+		Operation: "detach",
+		Volume:    "vol-expired",
+		ExpiresAt: time.Now().Add(-time.Hour),
+	}
+	activeState := opennebula.HotplugCooldownState{
+		Node:      "node-active",
+		Operation: "attach",
+		Volume:    "vol-active",
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	expiredPayload, err := json.Marshal(expiredState)
+	require.NoError(t, err)
+	activePayload, err := json.Marshal(activeState)
+	require.NoError(t, err)
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: hotplugStateConfigMapName, Namespace: namespaceFromServiceAccount()},
+		Data: map[string]string{
+			"node-expired":          string(expiredPayload),
+			"node-active":           string(activePayload),
+			maintenanceModeKey:      "false",
+			maintenanceReadyKey:     "true",
+			maintenanceModeAliasKey: "false",
+		},
+	}
+	driver := newStickyTestDriver(t, cm)
+
+	require.NoError(t, driver.loadHotplugGuardState(context.Background()))
+
+	_, expiredLoaded := driver.hotplugGuard.Get("node-expired")
+	assert.False(t, expiredLoaded)
+	_, activeLoaded := driver.hotplugGuard.Get("node-active")
+	assert.True(t, activeLoaded)
+	updated, err := driver.kubeRuntime.client.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(context.Background(), hotplugStateConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, updated.Data, "node-expired")
+	assert.Contains(t, updated.Data, "node-active")
+	assert.Contains(t, updated.Data, maintenanceModeKey)
+	assert.Contains(t, updated.Data, maintenanceReadyKey)
+}
+
 func TestControllerPublishVolumeSerializesSameNodeHotplug(t *testing.T) {
 	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
 	provider := &serializingVolumeProvider{MockOpenNebulaVolumeProviderTestify: mockProvider}

@@ -204,27 +204,53 @@ func TestLocalDeviceRecoveryClearsIneligibleReportWithoutOpenNebulaMutation(t *t
 	mockProvider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 }
 
-func TestLocalDeviceReportReadyRetriesAfterNewObservationPastMaxAttempts(t *testing.T) {
+func TestLocalDeviceReportReadyStopsSameFailureAfterMaxAttempts(t *testing.T) {
 	driver := newLocalDeviceRecoveryTestDriver(t)
 	server := NewControllerServer(driver, &MockOpenNebulaVolumeProviderTestify{}, nil)
 	now := time.Now().UTC()
 	recoveredAt := now.Add(-10 * time.Minute)
 	report := LocalDeviceMissingReport{
-		Node:             "node-a",
-		VolumeID:         "vol-1",
-		FirstObservedAt:  now.Add(-30 * time.Minute),
-		LastObservedAt:   now.Add(-time.Minute),
-		Attempts:         3,
-		RecoveryAttempts: 2,
-		LastRecoveryAt:   &recoveredAt,
+		Node:                  "node-a",
+		VolumeID:              "vol-1",
+		VolumeName:            "sdg",
+		DeviceSerial:          "onecsi-439",
+		FirstObservedAt:       now.Add(-30 * time.Minute),
+		LastObservedAt:        now.Add(-time.Minute),
+		Attempts:              3,
+		RecoveryAttempts:      2,
+		LastRecoveryAt:        &recoveredAt,
+		LastRecoverySignature: localDeviceRecoverySignature(LocalDeviceMissingReport{VolumeName: "sdg", DeviceSerial: "onecsi-439"}),
 	}
 
 	ready, reason := server.localDeviceReportReady(report, now)
-	assert.True(t, ready)
-	assert.Empty(t, reason)
+	assert.False(t, ready)
+	assert.Equal(t, "max_recovery_attempts_same_failure", reason)
 
 	report.LastObservedAt = recoveredAt.Add(-time.Minute)
 	ready, reason = server.localDeviceReportReady(report, now)
 	assert.False(t, ready)
 	assert.Equal(t, "max_recovery_attempts", reason)
+}
+
+func TestLocalDeviceReportReadyRetriesAfterFailureSignatureChanges(t *testing.T) {
+	driver := newLocalDeviceRecoveryTestDriver(t)
+	server := NewControllerServer(driver, &MockOpenNebulaVolumeProviderTestify{}, nil)
+	now := time.Now().UTC()
+	recoveredAt := now.Add(-10 * time.Minute)
+	report := LocalDeviceMissingReport{
+		Node:                  "node-a",
+		VolumeID:              "vol-1",
+		VolumeName:            "sdg",
+		DeviceSerial:          "onecsi-439",
+		FirstObservedAt:       now.Add(-30 * time.Minute),
+		LastObservedAt:        now.Add(-time.Minute),
+		Attempts:              3,
+		RecoveryAttempts:      2,
+		LastRecoveryAt:        &recoveredAt,
+		LastRecoverySignature: localDeviceRecoverySignature(LocalDeviceMissingReport{VolumeName: "sdf", DeviceSerial: "onecsi-439"}),
+	}
+
+	ready, reason := server.localDeviceReportReady(report, now)
+	assert.True(t, ready)
+	assert.Empty(t, reason)
 }

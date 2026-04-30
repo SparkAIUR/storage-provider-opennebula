@@ -191,9 +191,6 @@ func (ns *NodeServer) recordLocalDiskStageSession(req *csi.NodeStageVolumeReques
 	}
 	if existing, exists, err := ns.loadLocalDiskSession(session.VolumeID); err == nil && exists {
 		session.PublishedTargets = existing.PublishedTargets
-		session.LastRecoveredAt = existing.LastRecoveredAt
-		session.LastRecoveryError = existing.LastRecoveryError
-		session.RecoveryAttempts = existing.RecoveryAttempts
 	}
 	ns.recordLocalDiskSession(session)
 }

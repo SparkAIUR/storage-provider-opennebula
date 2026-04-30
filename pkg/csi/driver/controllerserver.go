@@ -1576,6 +1576,15 @@ func (s *ControllerServer) publishContextForVolume(ctx context.Context, volumeID
 	}
 	if s.driver != nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
 		if runtimeCtx, runtimeErr := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeID); runtimeErr == nil {
+			if publishContext[paramPVCNamespace] == "" && runtimeCtx.PVCNamespace != "" {
+				publishContext[paramPVCNamespace] = runtimeCtx.PVCNamespace
+			}
+			if publishContext[paramPVCName] == "" && runtimeCtx.PVCName != "" {
+				publishContext[paramPVCName] = runtimeCtx.PVCName
+			}
+			if publishContext[paramPVName] == "" && runtimeCtx.PVName != "" {
+				publishContext[paramPVName] = runtimeCtx.PVName
+			}
 			if backend := strings.TrimSpace(runtimeCtx.Backend); backend != "" {
 				publishContext[annotationBackend] = backend
 			}

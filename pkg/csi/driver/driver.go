@@ -252,6 +252,7 @@ func (d *Driver) loadHotplugGuardState(ctx context.Context) error {
 		return err
 	}
 	states := make(map[string]opennebula.HotplugCooldownState, len(cm.Data))
+	expiredKeys := make([]string, 0)
 	now := time.Now().UTC()
 	for node, raw := range cm.Data {
 		if isMaintenanceConfigMapKey(node) {
@@ -263,6 +264,7 @@ func (d *Driver) loadHotplugGuardState(ctx context.Context) error {
 			continue
 		}
 		if !state.PauseUntilReady && !state.ExpiresAt.IsZero() && now.After(state.ExpiresAt) {
+			expiredKeys = append(expiredKeys, node)
 			continue
 		}
 		if state.Node == "" {
@@ -271,6 +273,11 @@ func (d *Driver) loadHotplugGuardState(ctx context.Context) error {
 		states[node] = state
 	}
 	d.hotplugGuard.Load(states)
+	for _, key := range expiredKeys {
+		if err := d.kubeRuntime.DeleteConfigMapKey(ctx, namespaceFromServiceAccount(), hotplugStateConfigMapName, key); err != nil {
+			klog.V(2).InfoS("Failed to garbage-collect expired hotplug guard state", "node", key, "err", err)
+		}
+	}
 	return nil
 }
 
