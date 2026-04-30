@@ -279,6 +279,12 @@ When maintenance ends, set the mode key to `false`. The controller removes both 
 
 This is best-effort same-node reuse only. The CSI driver does not pin scheduling to the previous node.
 
+### OpenNebula metadata drift guard
+
+For local non-CephFS `ReadWriteOnce` volumes, the controller checks OpenNebula image ownership and VM disk records before cross-node attach. If the image still reports a different VM owner, or detach fails while ownership metadata remains, the driver returns `FailedPrecondition` with actionable owner VM, image, disk, and target details instead of issuing another blind hotplug request.
+
+Repeated matching failures are persisted in `opennebula-csi-volume-quarantine-state` for a temporary quarantine window. The guard is read-only: it never edits OpenNebula DB state and never runs host-level repair commands.
+
 ### Local Device Recovery
 
 When an OpenNebula VM reports a disk attached but the node plugin cannot discover the device inside the guest, the node records a missing-device report in `opennebula-csi-node-device-state`. The controller leader watches those reports and, after the configured threshold, performs a same-node recovery for eligible local non-CephFS `ReadWriteOnce` volumes: detach from the reporting node, attach back to that same node, confirm the OpenNebula attachment, and clear the report once the node can retry staging.
@@ -379,6 +385,9 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.localRestartOptimization.requireNodeReady` | Require Kubernetes node and OpenNebula VM readiness before starting delayed detach. | `true` | No |
 | `driver.maintenanceMode.releaseMinSeconds` | Minimum delay used when releasing ConfigMap-driven maintenance attachment holds after mode exit. | `300` | No |
 | `driver.maintenanceMode.releaseMaxSeconds` | Maximum stagger delay used when releasing ConfigMap-driven maintenance attachment holds after mode exit. | `1800` | No |
+| `driver.metadataDriftQuarantine.enabled` | Enable read-only OpenNebula image/VM metadata drift detection and temporary volume quarantine for local RWO attach/detach loops. | `true` | No |
+| `driver.metadataDriftQuarantine.failureThreshold` | Matching metadata-drift failures required before the volume quarantine is active. | `2` | No |
+| `driver.metadataDriftQuarantine.ttlSeconds` | Active quarantine duration after the threshold is reached. | `1800` | No |
 | `driver.localDeviceRecovery.enabled` | Enable controller-driven same-node detach/reattach recovery after node-side local device discovery repeatedly fails. | `true` | No |
 | `driver.localDeviceRecovery.minAttempts` | Missing-device reports required from a node before recovery is eligible. | `3` | No |
 | `driver.localDeviceRecovery.minAgeSeconds` | Minimum age of the first missing-device report before recovery is eligible. | `60` | No |

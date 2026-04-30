@@ -18,6 +18,7 @@ package opennebula
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	"github.com/OpenNebula/one/src/oca/go/src/goca"
@@ -52,6 +53,54 @@ type ObservedAttachment struct {
 	NodeID       int    `json:"nodeID"`
 	DiskID       int    `json:"diskID"`
 	Backend      string `json:"backend"`
+}
+
+type VolumeDiskRecord struct {
+	NodeName string `json:"nodeName,omitempty"`
+	NodeID   int    `json:"nodeID,omitempty"`
+	DiskID   int    `json:"diskID,omitempty"`
+	Target   string `json:"target,omitempty"`
+	Serial   string `json:"serial,omitempty"`
+}
+
+type VolumeAttachmentMetadata struct {
+	VolumeHandle            string             `json:"volumeHandle,omitempty"`
+	ImageID                 int                `json:"imageID,omitempty"`
+	ImageName               string             `json:"imageName,omitempty"`
+	ImageState              string             `json:"imageState,omitempty"`
+	ImageStateRaw           int                `json:"imageStateRaw,omitempty"`
+	ImageRunningVMs         int                `json:"imageRunningVMs,omitempty"`
+	ImageVMIDs              []int              `json:"imageVMIDs,omitempty"`
+	RequestedNode           string             `json:"requestedNode,omitempty"`
+	RequestedNodeID         int                `json:"requestedNodeID,omitempty"`
+	AttachedToRequestedNode bool               `json:"attachedToRequestedNode,omitempty"`
+	DiskRecords             []VolumeDiskRecord `json:"diskRecords,omitempty"`
+}
+
+func (m VolumeAttachmentMetadata) ConflictingOwnerVMIDs() []int {
+	seen := map[int]struct{}{}
+	for _, vmID := range m.ImageVMIDs {
+		if vmID <= 0 || (m.RequestedNodeID > 0 && vmID == m.RequestedNodeID) {
+			continue
+		}
+		seen[vmID] = struct{}{}
+	}
+	for _, record := range m.DiskRecords {
+		if record.NodeID <= 0 || (m.RequestedNodeID > 0 && record.NodeID == m.RequestedNodeID) {
+			continue
+		}
+		seen[record.NodeID] = struct{}{}
+	}
+	ids := make([]int, 0, len(seen))
+	for vmID := range seen {
+		ids = append(ids, vmID)
+	}
+	sort.Ints(ids)
+	return ids
+}
+
+type VolumeAttachmentInspector interface {
+	InspectVolumeAttachment(ctx context.Context, volume string, node string) (*VolumeAttachmentMetadata, error)
 }
 
 type HotplugCooldownState struct {

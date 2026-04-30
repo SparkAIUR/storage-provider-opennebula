@@ -310,6 +310,11 @@ func (m *MaintenanceModeManager) preferredMaintenanceNode(pv *corev1.PersistentV
 	if _, ok := conflicts[pv.Name]; ok {
 		return "", true
 	}
+	if pv.Annotations != nil {
+		if preferred := strings.TrimSpace(pv.Annotations[annotationPreferredLastNode]); preferred != "" {
+			return preferred, false
+		}
+	}
 	if pv.Spec.CSI != nil && m != nil && m.driver != nil && m.driver.stickyAttachments != nil {
 		if state, ok := m.driver.stickyAttachments.Get(pv.Spec.CSI.VolumeHandle); ok && strings.TrimSpace(state.NodeID) != "" {
 			return strings.TrimSpace(state.NodeID), false

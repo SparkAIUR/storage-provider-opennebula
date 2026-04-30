@@ -50,6 +50,8 @@ type DriverMetrics struct {
 	maintenanceProtectedVolumes  prometheus.Gauge
 	maintenanceTotal             *prometheus.CounterVec
 	maintenanceBlockedTotal      *prometheus.CounterVec
+	metadataDriftTotal           *prometheus.CounterVec
+	volumeQuarantineTotal        *prometheus.CounterVec
 	attachmentReconcilerTotal    *prometheus.CounterVec
 	hotplugRecommendedTimeout    *prometheus.GaugeVec
 	hotplugObservationSamples    *prometheus.GaugeVec
@@ -193,6 +195,14 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 			Name: "opennebula_csi_maintenance_block_total",
 			Help: "Total number of requests blocked by maintenance mode by operation and reason.",
 		}, []string{"operation", "reason"}),
+		metadataDriftTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_metadata_drift_total",
+			Help: "Total number of OpenNebula attachment metadata drift observations by classification and outcome.",
+		}, []string{"classification", "outcome"}),
+		volumeQuarantineTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_volume_quarantine_total",
+			Help: "Total number of volume quarantine decisions by reason and outcome.",
+		}, []string{"reason", "outcome"}),
 		attachmentReconcilerTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "opennebula_csi_attachment_reconciler_total",
 			Help: "Total number of attachment reconciliation checks by check, action, and outcome.",
@@ -250,6 +260,8 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 		metrics.maintenanceProtectedVolumes,
 		metrics.maintenanceTotal,
 		metrics.maintenanceBlockedTotal,
+		metrics.metadataDriftTotal,
+		metrics.volumeQuarantineTotal,
 		metrics.attachmentReconcilerTotal,
 		metrics.hotplugRecommendedTimeout,
 		metrics.hotplugObservationSamples,
@@ -469,6 +481,20 @@ func (m *DriverMetrics) RecordMaintenanceBlock(operation, reason string) {
 		return
 	}
 	m.maintenanceBlockedTotal.WithLabelValues(operation, reason).Inc()
+}
+
+func (m *DriverMetrics) RecordMetadataDrift(classification, outcome string) {
+	if m == nil {
+		return
+	}
+	m.metadataDriftTotal.WithLabelValues(classification, outcome).Inc()
+}
+
+func (m *DriverMetrics) RecordVolumeQuarantine(reason, outcome string) {
+	if m == nil {
+		return
+	}
+	m.volumeQuarantineTotal.WithLabelValues(reason, outcome).Inc()
 }
 
 func (m *DriverMetrics) RecordAttachmentReconciler(check, action, outcome string) {

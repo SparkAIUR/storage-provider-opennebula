@@ -10,10 +10,15 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/klog/v2"
 )
 
 const stickyAttachmentStateConfigMapName = "opennebula-csi-sticky-attachment-state"
+const stickyAttachmentWatchResync = 30 * time.Second
+const stickyAttachmentWatchTimeout = 10 * time.Minute
+const stickyAttachmentWatchRetryWait = 5 * time.Second
 
 type StickyAttachmentState struct {
 	VolumeID           string    `json:"volumeID"`
@@ -170,6 +175,52 @@ func (m *StickyAttachmentManager) LoadFromConfigMap(ctx context.Context) error {
 	m.entries = loaded
 	m.mu.Unlock()
 	return nil
+}
+
+func (m *StickyAttachmentManager) RunConfigMapSync(ctx context.Context) {
+	if m == nil || m.runtime == nil || !m.runtime.enabled {
+		return
+	}
+	_ = m.LoadFromConfigMap(ctx)
+	for {
+		if err := m.watchOnce(ctx); err != nil && ctx.Err() == nil {
+			klog.V(2).InfoS("Sticky attachment state watch failed", "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(stickyAttachmentWatchRetryWait):
+		}
+	}
+}
+
+func (m *StickyAttachmentManager) watchOnce(ctx context.Context) error {
+	timeout := int64(stickyAttachmentWatchTimeout.Seconds())
+	watcher, err := m.runtime.client.CoreV1().ConfigMaps(m.namespace).Watch(ctx, metav1.ListOptions{
+		FieldSelector:  fields.OneTermEqualSelector("metadata.name", stickyAttachmentStateConfigMapName).String(),
+		TimeoutSeconds: &timeout,
+	})
+	if err != nil {
+		return err
+	}
+	defer watcher.Stop()
+
+	ticker := time.NewTicker(stickyAttachmentWatchResync)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case _, ok := <-watcher.ResultChan():
+			if !ok {
+				return nil
+			}
+			_ = m.LoadFromConfigMap(ctx)
+		case <-ticker.C:
+			_ = m.LoadFromConfigMap(ctx)
+		}
+	}
 }
 
 func (m *StickyAttachmentManager) persistEntry(ctx context.Context, state StickyAttachmentState) error {

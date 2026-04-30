@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -57,22 +58,24 @@ type inventoryValidateResult struct {
 }
 
 type VolumeHealthReport struct {
-	PVName             string `json:"pvName,omitempty"`
-	PVCNamespace       string `json:"pvcNamespace,omitempty"`
-	PVCName            string `json:"pvcName,omitempty"`
-	VolumeID           string `json:"volumeID,omitempty"`
-	VolumeAttachment   string `json:"volumeAttachment,omitempty"`
-	NodeName           string `json:"nodeName,omitempty"`
-	OpenNebulaImageID  string `json:"opennebulaImageID,omitempty"`
-	ExpectedSerial     string `json:"expectedSerial,omitempty"`
-	ByIDPath           string `json:"byIDPath,omitempty"`
-	ResolvedDevicePath string `json:"resolvedDevicePath,omitempty"`
-	StagePath          string `json:"stagePath,omitempty"`
-	MountPath          string `json:"mountPath,omitempty"`
-	MountSource        string `json:"mountSource,omitempty"`
-	Status             string `json:"status"`
-	Reason             string `json:"reason,omitempty"`
-	Message            string `json:"message,omitempty"`
+	PVName               string                               `json:"pvName,omitempty"`
+	PVCNamespace         string                               `json:"pvcNamespace,omitempty"`
+	PVCName              string                               `json:"pvcName,omitempty"`
+	VolumeID             string                               `json:"volumeID,omitempty"`
+	VolumeAttachment     string                               `json:"volumeAttachment,omitempty"`
+	NodeName             string                               `json:"nodeName,omitempty"`
+	OpenNebulaImageID    string                               `json:"opennebulaImageID,omitempty"`
+	OpenNebulaAttachment *opennebula.VolumeAttachmentMetadata `json:"openNebulaAttachment,omitempty"`
+	AnnotationAudit      []AnnotationAuditFinding             `json:"annotationAudit,omitempty"`
+	ExpectedSerial       string                               `json:"expectedSerial,omitempty"`
+	ByIDPath             string                               `json:"byIDPath,omitempty"`
+	ResolvedDevicePath   string                               `json:"resolvedDevicePath,omitempty"`
+	StagePath            string                               `json:"stagePath,omitempty"`
+	MountPath            string                               `json:"mountPath,omitempty"`
+	MountSource          string                               `json:"mountSource,omitempty"`
+	Status               string                               `json:"status"`
+	Reason               string                               `json:"reason,omitempty"`
+	Message              string                               `json:"message,omitempty"`
 }
 
 type HotplugQueueRisk struct {
@@ -114,6 +117,7 @@ type SupportBundle struct {
 	ControllerLeadership    map[string]any                                      `json:"controllerLeadership"`
 	HotplugCooldowns        map[string]any                                      `json:"hotplugCooldowns"`
 	StickyAttachments       map[string]any                                      `json:"stickyAttachments"`
+	VolumeQuarantine        map[string]any                                      `json:"volumeQuarantine"`
 	LocalDeviceReports      map[string]any                                      `json:"localDeviceReports"`
 	HotplugQueue            map[string]any                                      `json:"hotplugQueue"`
 	HotplugDiagnostics      map[string]opennebula.HotplugDiagnosis              `json:"hotplugDiagnostics"`
@@ -205,7 +209,7 @@ func RunVolumeHealthCommand(ctx context.Context, cfg config.CSIPluginConfig, opt
 	if err != nil {
 		return err
 	}
-	reports, err := collectVolumeHealthReports(ctx, kubeClient, opts)
+	reports, err := collectVolumeHealthReports(ctx, kubeClient, cfg, opts)
 	if err != nil {
 		return err
 	}
@@ -278,7 +282,7 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 	if err != nil {
 		return err
 	}
-	volumeHealth, _ := collectVolumeHealthReports(ctx, kubeClient, VolumeHealthOptions{})
+	volumeHealth, _ := collectVolumeHealthReports(ctx, kubeClient, cfg, VolumeHealthOptions{})
 	eventList, err := kubeClient.CoreV1().Events("").List(ctx, metav1.ListOptions{Limit: 50})
 	if err != nil {
 		return err
@@ -295,6 +299,7 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 		}
 	}
 	stickySnapshot := configMapJSONSnapshot(ctx, kubeClient, stickyAttachmentStateConfigMapName)
+	volumeQuarantineSnapshot := configMapJSONSnapshot(ctx, kubeClient, volumeQuarantineStateConfigMapName)
 	localDeviceSnapshot := configMapJSONSnapshot(ctx, kubeClient, localDeviceStateConfigMapName)
 	queueSnapshot := configMapJSONSnapshot(ctx, kubeClient, hotplugQueueStateConfigMapName)
 	typedQueueSnapshot := typedHotplugQueueSnapshot(ctx, kubeClient)
@@ -316,6 +321,7 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 		},
 		HotplugCooldowns:        hotplugSnapshot,
 		StickyAttachments:       stickySnapshot,
+		VolumeQuarantine:        volumeQuarantineSnapshot,
 		LocalDeviceReports:      localDeviceSnapshot,
 		HotplugQueue:            queueSnapshot,
 		HotplugDiagnostics:      hotplugDiagnostics,
@@ -384,7 +390,7 @@ func findDatastoreByID(ctx context.Context, client ctrlclient.Client, datastoreI
 	return nil, fmt.Errorf("opennebuladatastore with ID %d was not found", datastoreID)
 }
 
-func collectVolumeHealthReports(ctx context.Context, kubeClient kubernetes.Interface, opts VolumeHealthOptions) ([]VolumeHealthReport, error) {
+func collectVolumeHealthReports(ctx context.Context, kubeClient kubernetes.Interface, cfg config.CSIPluginConfig, opts VolumeHealthOptions) ([]VolumeHealthReport, error) {
 	pvs, err := kubeClient.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
@@ -396,6 +402,7 @@ func collectVolumeHealthReports(ctx context.Context, kubeClient kubernetes.Inter
 	localSessions, _ := newLocalDiskSessionStore(localDiskSessionRootPath).List()
 	sharedSessions, _ := newSharedFilesystemSessionStore(sharedFilesystemSessionRootPath).List()
 	mountSources := currentMountSources()
+	openNebulaMetadata := openNebulaAttachmentMetadataSnapshot(ctx, cfg, pvs.Items, vas.Items)
 
 	reports := make([]VolumeHealthReport, 0)
 	for _, pv := range pvs.Items {
@@ -410,7 +417,11 @@ func collectVolumeHealthReports(ctx context.Context, kubeClient kubernetes.Inter
 		if pv.Spec.ClaimRef != nil {
 			report.PVCNamespace = pv.Spec.ClaimRef.Namespace
 			report.PVCName = pv.Spec.ClaimRef.Name
+			if pvc, pvcErr := kubeClient.CoreV1().PersistentVolumeClaims(report.PVCNamespace).Get(ctx, report.PVCName, metav1.GetOptions{}); pvcErr == nil {
+				report.AnnotationAudit = append(report.AnnotationAudit, auditVolumeAnnotations("pvc", pvc.Annotations)...)
+			}
 		}
+		report.AnnotationAudit = append(report.AnnotationAudit, auditVolumeAnnotations("pv", pv.Annotations)...)
 		for _, va := range vas.Items {
 			if va.Spec.Source.PersistentVolumeName == nil || *va.Spec.Source.PersistentVolumeName != pv.Name {
 				continue
@@ -418,6 +429,12 @@ func collectVolumeHealthReports(ctx context.Context, kubeClient kubernetes.Inter
 			report.VolumeAttachment = va.Name
 			report.NodeName = va.Spec.NodeName
 			break
+		}
+		if metadata, ok := openNebulaMetadata[metadataSnapshotKey(report.VolumeID, report.NodeName)]; ok {
+			report.OpenNebulaAttachment = metadata
+			if metadata.ImageID > 0 {
+				report.OpenNebulaImageID = strconv.Itoa(metadata.ImageID)
+			}
 		}
 		if session, ok := localSessionForVolume(localSessions, report.VolumeID); ok {
 			report.StagePath = session.StagingTargetPath
@@ -456,6 +473,9 @@ func collectVolumeHealthReports(ctx context.Context, kubeClient kubernetes.Inter
 		report.Status = "no-node-session"
 		report.Reason = "SessionNotFound"
 		report.Message = "No local node session was found in this container"
+		if status, reason, message, ok := classifyOpenNebulaMetadataHealth(report); ok {
+			report.Status, report.Reason, report.Message = status, reason, message
+		}
 		reports = append(reports, report)
 	}
 	return reports, nil
@@ -529,6 +549,9 @@ func resolveByIDForReport(serial, fallback string) (string, string) {
 }
 
 func classifyVolumeHealthReport(report VolumeHealthReport) (string, string, string) {
+	if status, reason, message, ok := classifyOpenNebulaMetadataHealth(report); ok {
+		return status, reason, message
+	}
 	if strings.TrimSpace(report.MountPath) == "" {
 		return "unknown", "MountPathMissing", "No node mount path was available"
 	}
@@ -544,6 +567,67 @@ func classifyVolumeHealthReport(report VolumeHealthReport) (string, string, stri
 		}
 	}
 	return "healthy", "MountPresent", "Mount source is present"
+}
+
+func classifyOpenNebulaMetadataHealth(report VolumeHealthReport) (string, string, string, bool) {
+	if report.OpenNebulaAttachment == nil {
+		return "", "", "", false
+	}
+	if attachmentMetadataDriftDetected(report.OpenNebulaAttachment) && strings.TrimSpace(report.NodeName) != "" {
+		return "stale", "OpenNebulaMetadataDrift", metadataDriftMessage(report.OpenNebulaAttachment, report.VolumeID, report.NodeName), true
+	}
+	if strings.TrimSpace(report.NodeName) == "" && report.OpenNebulaAttachment.ImageRunningVMs > 0 {
+		return "attention", "OpenNebulaMetadataOwnerPresent", fmt.Sprintf("OpenNebula image %d reports runningVMs=%d ownerVMs=%s but Kubernetes has no selected VolumeAttachment node in this report", report.OpenNebulaAttachment.ImageID, report.OpenNebulaAttachment.ImageRunningVMs, firstNonEmpty(intList(report.OpenNebulaAttachment.ImageVMIDs), "unknown")), true
+	}
+	return "", "", "", false
+}
+
+func openNebulaAttachmentMetadataSnapshot(ctx context.Context, cfg config.CSIPluginConfig, pvs []corev1.PersistentVolume, vas []storagev1.VolumeAttachment) map[string]*opennebula.VolumeAttachmentMetadata {
+	snapshot := map[string]*opennebula.VolumeAttachmentMetadata{}
+	endpoint, endpointOK := cfg.GetString(config.OpenNebulaRPCEndpointVar)
+	credentials, credentialsOK := cfg.GetString(config.OpenNebulaCredentialsVar)
+	if !endpointOK || !credentialsOK || strings.TrimSpace(endpoint) == "" || strings.TrimSpace(credentials) == "" {
+		return snapshot
+	}
+	provider, err := opennebula.NewPersistentDiskVolumeProvider(opennebula.NewClient(opennebula.OpenNebulaConfig{
+		Endpoint:    endpoint,
+		Credentials: credentials,
+	}), loadHotplugTimeoutPolicy(cfg))
+	if err != nil {
+		return snapshot
+	}
+
+	nodeByPV := map[string]string{}
+	for _, va := range vas {
+		if va.Spec.Source.PersistentVolumeName == nil {
+			continue
+		}
+		if strings.TrimSpace(va.Spec.NodeName) == "" {
+			continue
+		}
+		nodeByPV[strings.TrimSpace(*va.Spec.Source.PersistentVolumeName)] = strings.TrimSpace(va.Spec.NodeName)
+	}
+
+	for _, pv := range pvs {
+		if pv.Spec.CSI == nil || strings.TrimSpace(pv.Spec.CSI.Driver) != DefaultDriverName || opennebula.IsSharedFilesystemVolumeID(pv.Spec.CSI.VolumeHandle) {
+			continue
+		}
+		volumeID := strings.TrimSpace(pv.Spec.CSI.VolumeHandle)
+		if volumeID == "" {
+			continue
+		}
+		nodeName := nodeByPV[pv.Name]
+		metadata, err := provider.InspectVolumeAttachment(ctx, volumeID, nodeName)
+		if err != nil {
+			continue
+		}
+		snapshot[metadataSnapshotKey(volumeID, nodeName)] = metadata
+	}
+	return snapshot
+}
+
+func metadataSnapshotKey(volumeID, nodeName string) string {
+	return strings.TrimSpace(volumeID) + "\x00" + strings.TrimSpace(nodeName)
 }
 
 func validationSummaryForCommand(status inventoryv1alpha1.OpenNebulaDatastoreStatus) string {
@@ -857,6 +941,11 @@ func supportBundleConfig(cfg config.CSIPluginConfig) map[string]any {
 		"localRestartDetachGraceSeconds":          getInt(cfg, config.LocalRestartDetachGraceSecondsVar),
 		"localRestartDetachGraceMaxSeconds":       getInt(cfg, config.LocalRestartDetachGraceMaxSecondsVar),
 		"localRestartRequireNodeReady":            getBool(cfg, config.LocalRestartRequireNodeReadyVar),
+		"maintenanceReleaseMinSeconds":            getInt(cfg, config.MaintenanceReleaseMinSecondsVar),
+		"maintenanceReleaseMaxSeconds":            getInt(cfg, config.MaintenanceReleaseMaxSecondsVar),
+		"metadataDriftQuarantineEnabled":          getBool(cfg, config.MetadataDriftQuarantineEnabledVar),
+		"metadataDriftQuarantineFailureThreshold": getInt(cfg, config.MetadataDriftQuarantineFailureThresholdVar),
+		"metadataDriftQuarantineTTLSeconds":       getInt(cfg, config.MetadataDriftQuarantineTTLSecondsVar),
 		"localDeviceRecoveryEnabled":              getBool(cfg, config.LocalDeviceRecoveryEnabledVar),
 		"localDeviceRecoveryMinAttempts":          getInt(cfg, config.LocalDeviceRecoveryMinAttemptsVar),
 		"localDeviceRecoveryMinAgeSeconds":        getInt(cfg, config.LocalDeviceRecoveryMinAgeSecondsVar),

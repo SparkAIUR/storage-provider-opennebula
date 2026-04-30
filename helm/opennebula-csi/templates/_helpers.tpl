@@ -96,6 +96,7 @@ Create chart name and version as used by the chart label.
 {{- $nodeHotplugGuard := (get $root.Values.driver "nodeHotplugGuard") | default dict -}}
 {{- $localRestart := (get $root.Values.driver "localRestartOptimization") | default dict -}}
 {{- $maintenanceMode := (get $root.Values.driver "maintenanceMode") | default dict -}}
+{{- $metadataDriftQuarantine := (get $root.Values.driver "metadataDriftQuarantine") | default dict -}}
 {{- $localDeviceRecovery := (get $root.Values.driver "localDeviceRecovery") | default dict -}}
 {{- $localRWORecovery := (get $root.Values.driver "localRWOStaleMountRecovery") | default dict -}}
 {{- $lastNodePreference := (get $root.Values.driver "lastNodePreference") | default dict -}}
@@ -131,6 +132,9 @@ Create chart name and version as used by the chart label.
 {{- $localRestartRequireNodeReady := (get $localRestart "requireNodeReady") | default true -}}
 {{- $maintenanceReleaseMinSeconds := (get $maintenanceMode "releaseMinSeconds") | default 300 -}}
 {{- $maintenanceReleaseMaxSeconds := (get $maintenanceMode "releaseMaxSeconds") | default 1800 -}}
+{{- $metadataDriftQuarantineEnabled := (get $metadataDriftQuarantine "enabled") | default true -}}
+{{- $metadataDriftQuarantineFailureThreshold := (get $metadataDriftQuarantine "failureThreshold") | default 2 -}}
+{{- $metadataDriftQuarantineTTLSeconds := (get $metadataDriftQuarantine "ttlSeconds") | default 1800 -}}
 {{- $localDeviceRecoveryEnabled := (get $localDeviceRecovery "enabled") | default true -}}
 {{- $localDeviceRecoveryMinAttempts := (get $localDeviceRecovery "minAttempts") | default 3 -}}
 {{- $localDeviceRecoveryMinAgeSeconds := (get $localDeviceRecovery "minAgeSeconds") | default 60 -}}
@@ -261,6 +265,12 @@ Create chart name and version as used by the chart label.
   value: {{ $maintenanceReleaseMinSeconds | quote }}
 - name: ONE_CSI_MAINTENANCE_RELEASE_MAX_SECONDS
   value: {{ $maintenanceReleaseMaxSeconds | quote }}
+- name: ONE_CSI_METADATA_DRIFT_QUARANTINE_ENABLED
+  value: {{ $metadataDriftQuarantineEnabled | quote }}
+- name: ONE_CSI_METADATA_DRIFT_QUARANTINE_FAILURE_THRESHOLD
+  value: {{ $metadataDriftQuarantineFailureThreshold | quote }}
+- name: ONE_CSI_METADATA_DRIFT_QUARANTINE_TTL_SECONDS
+  value: {{ $metadataDriftQuarantineTTLSeconds | quote }}
 - name: ONE_CSI_LOCAL_DEVICE_RECOVERY_ENABLED
   value: {{ $localDeviceRecoveryEnabled | quote }}
 - name: ONE_CSI_LOCAL_DEVICE_RECOVERY_MIN_ATTEMPTS

@@ -69,6 +69,7 @@ type Driver struct {
 	metrics           *DriverMetrics
 	kubeRuntime       *KubeRuntime
 	stickyAttachments *StickyAttachmentManager
+	volumeQuarantine  *VolumeQuarantineManager
 	hotplugQueue      *HotplugQueueManager
 	maintenanceMode   *MaintenanceModeManager
 	adaptiveTimeouts  *opennebula.AdaptiveTimeoutTracker
@@ -117,6 +118,10 @@ func (d *Driver) Run(ctx context.Context) error {
 		d.stickyAttachments = NewStickyAttachmentManager(d.kubeRuntime, "")
 		if err := d.stickyAttachments.LoadFromConfigMap(ctx); err != nil {
 			klog.V(2).InfoS("Failed to load sticky attachment state", "err", err)
+		}
+		d.volumeQuarantine = NewVolumeQuarantineManager(d.kubeRuntime, "")
+		if err := d.volumeQuarantine.LoadFromConfigMap(ctx); err != nil {
+			klog.V(2).InfoS("Failed to load volume quarantine state", "err", err)
 		}
 		if err := d.loadHotplugGuardState(ctx); err != nil {
 			klog.V(2).InfoS("Failed to load hotplug guard state", "err", err)

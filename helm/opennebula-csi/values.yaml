@@ -66,6 +66,10 @@ driver:
   maintenanceMode:
     releaseMinSeconds: 300
     releaseMaxSeconds: 1800
+  metadataDriftQuarantine:
+    enabled: true
+    failureThreshold: 2
+    ttlSeconds: 1800
   localDeviceRecovery:
     enabled: true
     minAttempts: 3

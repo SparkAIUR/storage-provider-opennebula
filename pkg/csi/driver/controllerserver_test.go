@@ -18,6 +18,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -117,6 +118,7 @@ func newStickyTestDriver(t *testing.T, objects ...runtime.Object) *Driver {
 		kubeRuntime:        runtime,
 	}
 	driver.stickyAttachments = NewStickyAttachmentManager(runtime, "default")
+	driver.volumeQuarantine = NewVolumeQuarantineManager(runtime, "default")
 	require.NoError(t, driver.stickyAttachments.LoadFromConfigMap(context.Background()))
 	return driver
 }
@@ -1649,6 +1651,98 @@ func TestControllerPublishVolumeBlocksCrossNodeDuringMaintenance(t *testing.T) {
 	mockProvider.AssertExpectations(t)
 }
 
+func TestControllerPublishVolumeRejectsOpenNebulaMetadataDriftAndQuarantines(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-drift", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pvc.Spec.VolumeName = pv.Name
+	driver := newStickyTestDriver(t, pv, pvc)
+	driver.PluginConfig.OverrideVal(config.MetadataDriftQuarantineFailureThresholdVar, 2)
+	driver.PluginConfig.OverrideVal(config.MetadataDriftQuarantineTTLSecondsVar, 1800)
+
+	provider := new(MockOpenNebulaVolumeProviderTestify)
+	provider.On("VolumeExists", mock.Anything, "vol-drift").Return(488, volumeSize, nil).Twice()
+	provider.On("NodeExists", mock.Anything, "node-new").Return(181, nil).Twice()
+	provider.On("GetVolumeInNode", mock.Anything, 488, 181).Return("", errors.New("not attached")).Times(4)
+	provider.On("InspectVolumeAttachment", mock.Anything, "vol-drift", "node-new").Return(&opennebula.VolumeAttachmentMetadata{
+		VolumeHandle:    "vol-drift",
+		ImageID:         488,
+		ImageState:      "USED_PERS",
+		ImageRunningVMs: 1,
+		ImageVMIDs:      []int{160},
+		RequestedNode:   "node-new",
+		RequestedNodeID: 181,
+		DiskRecords: []opennebula.VolumeDiskRecord{{
+			NodeName: "node-old",
+			NodeID:   160,
+			DiskID:   12,
+			Target:   "sdd",
+		}},
+	}, nil).Twice()
+
+	cs := NewControllerServer(driver, provider, &MockSharedFilesystemProviderTestify{})
+	req := newPublishReq("vol-drift", "node-new")
+	_, err := cs.ControllerPublishVolume(context.Background(), req)
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "OpenNebula metadata drift")
+
+	_, err = cs.ControllerPublishVolume(context.Background(), req)
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+
+	cm, err := driver.kubeRuntime.client.CoreV1().ConfigMaps("default").Get(context.Background(), volumeQuarantineStateConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+	var state VolumeQuarantineState
+	require.NoError(t, json.Unmarshal([]byte(cm.Data["vol-drift"]), &state))
+	assert.Equal(t, 2, state.FailureCount)
+	assert.True(t, state.ExpiresAt.After(time.Now()))
+	assert.Equal(t, metadataDriftReason, state.Reason)
+	provider.AssertNotCalled(t, "AttachVolume", mock.Anything, "vol-drift", "node-new", false, mock.Anything)
+	provider.AssertExpectations(t)
+}
+
+func TestControllerUnpublishVolumeClassifiesDetachMetadataDrift(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-detach-drift", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pvc.Spec.VolumeName = pv.Name
+	driver := newStickyTestDriver(t, pv, pvc)
+	driver.PluginConfig.OverrideVal(config.MetadataDriftQuarantineFailureThresholdVar, 1)
+
+	provider := new(MockOpenNebulaVolumeProviderTestify)
+	provider.On("VolumeExists", mock.Anything, "vol-detach-drift").Return(489, volumeSize, nil).Once()
+	provider.On("NodeExists", mock.Anything, "node-old").Return(160, nil).Once()
+	provider.On("GetVolumeInNode", mock.Anything, 489, 160).Return("sdd", nil).Twice()
+	provider.On("DetachVolume", mock.Anything, "vol-detach-drift", "node-old").Return(errors.New("DETACHDISK: Could not detach sdd")).Once()
+	provider.On("InspectVolumeAttachment", mock.Anything, "vol-detach-drift", "node-old").Return(&opennebula.VolumeAttachmentMetadata{
+		VolumeHandle:            "vol-detach-drift",
+		ImageID:                 489,
+		ImageState:              "USED_PERS",
+		ImageRunningVMs:         1,
+		ImageVMIDs:              []int{160},
+		RequestedNode:           "node-old",
+		RequestedNodeID:         160,
+		AttachedToRequestedNode: true,
+		DiskRecords: []opennebula.VolumeDiskRecord{{
+			NodeName: "node-old",
+			NodeID:   160,
+			DiskID:   12,
+			Target:   "sdd",
+		}},
+	}, nil).Once()
+
+	cs := NewControllerServer(driver, provider, &MockSharedFilesystemProviderTestify{})
+	_, err := cs.ControllerUnpublishVolume(context.Background(), &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: "vol-detach-drift",
+		NodeId:   "node-old",
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "OpenNebula detach failed")
+
+	cm, err := driver.kubeRuntime.client.CoreV1().ConfigMaps("default").Get(context.Background(), volumeQuarantineStateConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Contains(t, cm.Data, "vol-detach-drift")
+	provider.AssertExpectations(t)
+}
+
 func TestControllerPublishVolumeReusesStickyAttachmentOnSameNode(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-reuse", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
 		annotationRestartOpt: restartOptimizationAnnotationValue,
@@ -2254,6 +2348,17 @@ func (m *MockOpenNebulaVolumeProviderTestify) ListCurrentAttachments(ctx context
 	args := m.Called(ctx)
 	if attachments := args.Get(0); attachments != nil {
 		return attachments.([]opennebula.ObservedAttachment), args.Error(1)
+	}
+	return nil, args.Error(1)
+}
+
+func (m *MockOpenNebulaVolumeProviderTestify) InspectVolumeAttachment(ctx context.Context, volume string, node string) (*opennebula.VolumeAttachmentMetadata, error) {
+	if !m.hasExpectation("InspectVolumeAttachment") {
+		return nil, nil
+	}
+	args := m.Called(ctx, volume, node)
+	if metadata := args.Get(0); metadata != nil {
+		return metadata.(*opennebula.VolumeAttachmentMetadata), args.Error(1)
 	}
 	return nil, args.Error(1)
 }

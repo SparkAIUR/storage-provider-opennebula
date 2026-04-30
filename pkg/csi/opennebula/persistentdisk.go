@@ -1254,6 +1254,78 @@ func (p *PersistentDiskVolumeProvider) GetVolumeInNode(ctx context.Context, volu
 	return "", fmt.Errorf("volume %d not found on node %d", volumeID, nodeID)
 }
 
+func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Context, volume string, node string) (*VolumeAttachmentMetadata, error) {
+	volumeID, _, err := p.VolumeExists(ctx, volume)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check if volume exists while inspecting attachment metadata: %w", err)
+	}
+	if volumeID == -1 {
+		return nil, fmt.Errorf("volume %s was not found while inspecting attachment metadata", volume)
+	}
+
+	requestedNodeID := -1
+	if strings.TrimSpace(node) != "" {
+		requestedNodeID, err = p.NodeExists(ctx, node)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check if node exists while inspecting attachment metadata: %w", err)
+		}
+	}
+
+	imageInfo, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect image %d attachment metadata: %w", volumeID, err)
+	}
+
+	imageState := fmt.Sprintf("UNKNOWN_%d", imageInfo.StateRaw)
+	if parsed, stateErr := imageInfo.StateString(); stateErr == nil {
+		imageState = parsed
+	}
+
+	metadata := &VolumeAttachmentMetadata{
+		VolumeHandle:    volume,
+		ImageID:         volumeID,
+		ImageName:       imageInfo.Name,
+		ImageState:      imageState,
+		ImageStateRaw:   imageInfo.StateRaw,
+		ImageRunningVMs: imageInfo.RunningVMs,
+		ImageVMIDs:      append([]int(nil), imageInfo.VMs.ID...),
+		RequestedNode:   strings.TrimSpace(node),
+		RequestedNodeID: requestedNodeID,
+	}
+
+	vmPool, err := p.ctrl.VMs().InfoContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list virtual machines while inspecting volume %d attachment metadata: %w", volumeID, err)
+	}
+	for _, vmInfo := range vmPool.VMs {
+		for _, disk := range vmInfo.Template.GetDisks() {
+			diskImageID, diskErr := disk.GetI(shared.ImageID)
+			if diskErr != nil || diskImageID != volumeID {
+				continue
+			}
+			record := VolumeDiskRecord{
+				NodeName: vmInfo.Name,
+				NodeID:   vmInfo.ID,
+			}
+			if diskID, diskIDErr := disk.GetI(shared.DiskID); diskIDErr == nil {
+				record.DiskID = diskID
+			}
+			if target, targetErr := disk.Get(shared.TargetDisk); targetErr == nil {
+				record.Target = target
+			}
+			if serial, serialErr := disk.Get(shared.Serial); serialErr == nil {
+				record.Serial = serial
+			}
+			if requestedNodeID > 0 && vmInfo.ID == requestedNodeID {
+				metadata.AttachedToRequestedNode = true
+			}
+			metadata.DiskRecords = append(metadata.DiskRecords, record)
+		}
+	}
+
+	return metadata, nil
+}
+
 func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Context) ([]ObservedAttachment, error) {
 	vmPool, err := p.ctrl.VMs().InfoContext(ctx)
 	if err != nil {

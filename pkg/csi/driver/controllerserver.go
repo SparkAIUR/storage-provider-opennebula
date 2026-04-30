@@ -86,6 +86,7 @@ func (s *ControllerServer) StartBackgroundWorkers(ctx context.Context) {
 	if s.driver.maintenanceMode != nil {
 		go s.driver.maintenanceMode.Run(ctx)
 	}
+	go s.driver.stickyAttachments.RunConfigMapSync(ctx)
 	go s.runStickyDetachReaper(ctx)
 	if enabled, ok := s.driver.PluginConfig.GetBool(config.StuckAttachmentReconcilerEnabledVar); !ok || enabled {
 		go NewAttachmentReconciler(s).Run(ctx)
@@ -774,6 +775,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err == nil {
+		if s.driver.volumeQuarantine != nil {
+			_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
+		}
 		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
 		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
 		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext())
@@ -823,12 +827,19 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 		target, err = s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
 		if err == nil {
+			if s.driver.volumeQuarantine != nil {
+				_ = s.driver.volumeQuarantine.Clear(queueCtx, req.VolumeId)
+			}
 			s.clearStickyReuseState(queueCtx, req.VolumeId, req.NodeId, "disk")
 			s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
 			response = &csi.ControllerPublishVolumeResponse{
 				PublishContext: s.publishContextForVolume(queueCtx, req.VolumeId, target, 0, req.GetVolumeContext()),
 			}
 			return nil
+		}
+
+		if driftErr := s.rejectIfOpenNebulaMetadataDrift(queueCtx, req); driftErr != nil {
+			return driftErr
 		}
 
 		params := req.GetVolumeContext()
@@ -855,6 +866,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			return status.Error(codes.Internal, "failed to attach volume")
 		}
 		s.clearHotplugGuardState(queueCtx, req.NodeId)
+		if s.driver.volumeQuarantine != nil {
+			_ = s.driver.volumeQuarantine.Clear(queueCtx, req.VolumeId)
+		}
 
 		klog.V(3).InfoS("Checking if volume is attached",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID)
@@ -1015,6 +1029,9 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		err = s.volumeProvider.DetachVolume(queueCtx, req.VolumeId, req.NodeId)
 		if err != nil {
 			s.handleHotplugTimeout(queueCtx, req.NodeId, req.VolumeId, nil, "detach", "disk", err)
+			if driftErr := s.detachMetadataDriftError(queueCtx, req.VolumeId, req.NodeId, err); driftErr != nil {
+				return driftErr
+			}
 			klog.V(0).ErrorS(err, "Failed to detach volume",
 				"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
 			return status.Error(codes.Internal, "failed to detach volume")
@@ -2106,11 +2123,17 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 	}
 
 	if err := s.volumeProvider.DetachVolume(ctx, req.VolumeId, state.NodeID); err != nil {
+		if driftErr := s.detachMetadataDriftError(ctx, req.VolumeId, state.NodeID, err); driftErr != nil {
+			return true, nil, driftErr
+		}
 		message := fmt.Sprintf("failed to detach stale attachment for local RWO volume %s from old node %s before publishing to requested node %s: %v", req.VolumeId, state.NodeID, req.NodeId, err)
 		s.recordPVCEventFromStickyState(ctx, state, eventReasonDetachGraceBypassed, message)
 		return true, nil, status.Error(codes.Internal, message)
 	}
 	s.clearHotplugGuardState(ctx, state.NodeID)
+	if s.driver.volumeQuarantine != nil {
+		_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
+	}
 	if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
 		return true, nil, status.Errorf(codes.Internal, "failed to clear sticky attachment state: %v", err)
 	}
@@ -2174,6 +2197,9 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 					klog.V(2).InfoS("Failed to clear already-absent sticky attachment state", "volumeID", confirmed.VolumeID, "err", err)
 					return err
 				}
+				if s.driver.volumeQuarantine != nil {
+					_ = s.driver.volumeQuarantine.Clear(queueCtx, confirmed.VolumeID)
+				}
 				s.driver.metrics.RecordStickyDetach("already_absent", confirmed.Reason)
 				s.driver.metrics.RecordStickyDetachResidency("already_absent", time.Since(confirmed.StartedAt))
 				s.recordPVCEventFromStickyState(queueCtx, confirmed, eventReasonDetachGraceExpired, fmt.Sprintf("cleared expired sticky state for volume %s because it is already absent from node %s", confirmed.VolumeID, confirmed.NodeID))
@@ -2183,10 +2209,17 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 
 		detachStarted := time.Now()
 		if err := s.volumeProvider.DetachVolume(queueCtx, confirmed.VolumeID, confirmed.NodeID); err != nil {
+			if driftErr := s.detachMetadataDriftError(queueCtx, confirmed.VolumeID, confirmed.NodeID, err); driftErr != nil {
+				klog.V(2).InfoS("Classified sticky detach failure as OpenNebula metadata drift", "volumeID", confirmed.VolumeID, "nodeID", confirmed.NodeID, "err", driftErr)
+				return driftErr
+			}
 			klog.V(2).InfoS("Failed to detach sticky attachment after grace expiry", "volumeID", confirmed.VolumeID, "nodeID", confirmed.NodeID, "err", err)
 			return err
 		}
 		s.clearHotplugGuardState(queueCtx, confirmed.NodeID)
+		if s.driver.volumeQuarantine != nil {
+			_ = s.driver.volumeQuarantine.Clear(queueCtx, confirmed.VolumeID)
+		}
 		if sizeBytes, sizeErr := s.volumeProvider.ResolveVolumeSizeBytes(queueCtx, confirmed.VolumeID); sizeErr == nil {
 			s.driver.observeAdaptiveTimeout(queueCtx, "detach", "disk", sizeBytes, time.Since(detachStarted))
 		}

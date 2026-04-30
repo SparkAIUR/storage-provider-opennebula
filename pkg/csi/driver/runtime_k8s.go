@@ -46,6 +46,8 @@ const (
 	annotationPreferredLastNode = "storage-provider.opennebula.sparkaiur.io/preferred-last-node"
 	annotationLastNodeInjected  = "storage-provider.opennebula.sparkaiur.io/last-node-preference-injected"
 
+	annotationLegacyLastAttachedNode = "csi.opennebula.io/last-attached-node"
+
 	restartOptimizationAnnotationValue = "sticky-local-restart-v1"
 	lastNodePreferenceDisabledValue    = "disabled"
 

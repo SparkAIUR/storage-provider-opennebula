@@ -202,6 +202,18 @@ The controller accepts both `maintainenceMode` and `maintenanceMode`. While acti
 
 When maintenance is complete, set the mode key back to `false`. The controller removes `maintainenceReady`/`maintenanceReady` and releases maintenance holds gradually using `driver.maintenanceMode.releaseMinSeconds` and `driver.maintenanceMode.releaseMaxSeconds`.
 
+### OpenNebula metadata drift guard
+
+For local non-CephFS `ReadWriteOnce` volumes, the controller now checks OpenNebula image and VM disk metadata before attempting a cross-node attach. If OpenNebula still reports the image owned by another VM, or a detach fails while OpenNebula still reports an owner, the driver classifies the condition as metadata drift and returns `FailedPrecondition` with the image ID, owner VM IDs, disk IDs, and target devices it could observe.
+
+This guard is intentionally read-only. It does not edit the OpenNebula database or run host-level `virsh` repair. After repeated matching failures, the controller records a temporary volume quarantine in `opennebula-csi-volume-quarantine-state` so retry loops stop issuing new physical hotplug work while operators repair OpenNebula state.
+
+Default controls:
+
+- `ONE_CSI_METADATA_DRIFT_QUARANTINE_ENABLED=true`
+- `ONE_CSI_METADATA_DRIFT_QUARANTINE_FAILURE_THRESHOLD=2`
+- `ONE_CSI_METADATA_DRIFT_QUARANTINE_TTL_SECONDS=1800`
+
 New workload controls:
 
 - pod or PVC opt-out annotation:
@@ -209,8 +221,14 @@ New workload controls:
 
 New support signals:
 
-- support bundles now include sticky attachment state, hotplug queue state, and adaptive timeout observations/recommendations
+- support bundles now include sticky attachment state, volume quarantine state, hotplug queue state, OpenNebula metadata drift details, and adaptive timeout observations/recommendations
 - controller/node metrics expose queue depth, device-resolution methods, last-node preference outcomes, reconciler actions, and adaptive timeout recommendations
+
+Canonical annotation namespace:
+
+- driver-owned PV/PVC annotations use `storage-provider.opennebula.sparkaiur.io/*`
+- `storage-provider.opennebula.sparkaiur.io/last-attached-node` is the canonical last-node annotation consumed by the driver
+- legacy `csi.opennebula.io/last-attached-node` is ignored and reported in `volume-health`/support-bundle annotation audits
 
 ## Access mode support
 
