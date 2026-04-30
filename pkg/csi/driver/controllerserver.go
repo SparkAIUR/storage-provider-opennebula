@@ -83,6 +83,9 @@ func (s *ControllerServer) StartBackgroundWorkers(ctx context.Context) {
 	if s == nil || s.driver == nil || strings.TrimSpace(s.driver.nodeID) != "" || s.driver.stickyAttachments == nil {
 		return
 	}
+	if s.driver.maintenanceMode != nil {
+		go s.driver.maintenanceMode.Run(ctx)
+	}
 	go s.runStickyDetachReaper(ctx)
 	if enabled, ok := s.driver.PluginConfig.GetBool(config.StuckAttachmentReconcilerEnabledVar); !ok || enabled {
 		go NewAttachmentReconciler(s).Run(ctx)
@@ -780,6 +783,12 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		}, nil
 	}
 
+	if blocked, message := s.maintenanceBlocksPublish(ctx, req); blocked {
+		s.driver.metrics.RecordMaintenanceBlock("publish", "cross_node_attach")
+		s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonMaintenanceModeBlocked, message)
+		return nil, status.Error(codes.Unavailable, message)
+	}
+
 	if cooldown, ok := s.hotplugCooldownState(ctx, req.NodeId); ok {
 		s.driver.metrics.RecordHotplugGuard("attach", "vm_cooldown", "rejected")
 		s.driver.metrics.RecordHotplugRecovery("attach", "vm_cooldown", "rejected")
@@ -945,6 +954,14 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		klog.V(1).InfoS("Volume does not exist in node, skipping unpublish",
 			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
+
+	if rescued, response, rescueErr := s.rescueSameNodeUnpublish(ctx, req, volumeID, nodeID); rescued {
+		return response, rescueErr
+	}
+
+	if held, response, holdErr := s.startMaintenanceDetachHold(ctx, req); held {
+		return response, holdErr
 	}
 
 	if cooldown, ok := s.hotplugCooldownState(ctx, req.NodeId); ok {
@@ -1292,6 +1309,12 @@ func (s *ControllerServer) hotplugCooldownState(ctx context.Context, node string
 	if !s.nodeHotplugGuardEnabled() {
 		return opennebula.HotplugCooldownState{}, false
 	}
+	if state, ok := s.openNebulaNodeHotplugPauseState(ctx, node); ok {
+		state = s.driver.hotplugGuard.MarkPaused(state)
+		s.persistHotplugStateSnapshot(ctx, state)
+		s.driver.metrics.RecordHotplugGuard(strings.TrimSpace(state.Operation), state.Reason, "paused")
+		return state, true
+	}
 	cooldown, ok := s.driver.hotplugGuard.Get(node)
 	if !ok {
 		return opennebula.HotplugCooldownState{}, false
@@ -1306,6 +1329,52 @@ func (s *ControllerServer) hotplugCooldownState(ctx context.Context, node string
 	cooldown.OpenNebulaReady = health.OpenNebulaReady
 	cooldown.Unschedulable = health.Unschedulable
 	return cooldown, true
+}
+
+func (s *ControllerServer) openNebulaNodeHotplugPauseState(ctx context.Context, node string) (opennebula.HotplugCooldownState, bool) {
+	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil || s.driver.hotplugGuard == nil || strings.TrimSpace(node) == "" {
+		return opennebula.HotplugCooldownState{}, false
+	}
+	openNebulaNode, err := s.driver.kubeRuntime.OpenNebulaNode(ctx, node)
+	if err != nil || openNebulaNode == nil {
+		return opennebula.HotplugCooldownState{}, false
+	}
+	diagnosis := openNebulaNode.Status.Hotplug.Diagnosis
+	classification := strings.TrimSpace(diagnosis.Classification)
+	if !strings.EqualFold(classification, opennebula.HotplugClassificationStuck) &&
+		!strings.EqualFold(strings.TrimSpace(openNebulaNode.Status.DisplayState), "HotplugStuck") {
+		return opennebula.HotplugCooldownState{}, false
+	}
+	health := s.nodeHotplugHealth(ctx, node, false)
+	state := opennebula.HotplugCooldownState{
+		Node:                 node,
+		Operation:            strings.TrimSpace(diagnosis.Operation),
+		Volume:               strings.TrimSpace(diagnosis.VolumeHandle),
+		Timeout:              loadHotplugDiagnosisConfig(s.driver.PluginConfig).StuckAfter,
+		LastObservedAttached: strings.EqualFold(strings.TrimSpace(diagnosis.DiskAttachFlag), "YES"),
+		LastObservedReady:    false,
+		FailureCount:         1,
+		Reason:               "opennebula_hotplug_stuck",
+		PauseUntilReady:      true,
+		KubernetesReady:      health.KubernetesReady,
+		OpenNebulaReady:      false,
+		Unschedulable:        health.Unschedulable,
+		FirstFailureAt:       time.Now().UTC(),
+		LastFailureAt:        time.Now().UTC(),
+	}
+	if diagnosis.FirstObservedAt != nil {
+		state.FirstFailureAt = diagnosis.FirstObservedAt.Time
+	}
+	if diagnosis.LastObservedAt != nil {
+		state.LastFailureAt = diagnosis.LastObservedAt.Time
+	}
+	if state.Operation == "" {
+		state.Operation = "hotplug"
+	}
+	if state.Volume == "" {
+		state.Volume = "unknown"
+	}
+	return state, true
 }
 
 func (s *ControllerServer) hotplugGuardStateCleared(state opennebula.HotplugCooldownState, health hotplugNodeHealth) bool {
@@ -1354,6 +1423,9 @@ func (s *ControllerServer) hotplugUnhealthyReason(health hotplugNodeHealth) stri
 	if s.nodeHotplugGuardRequireOpenNebulaReady() && !health.OpenNebulaReady {
 		reasons = append(reasons, "opennebula_vm_not_running")
 	}
+	if health.Unschedulable {
+		reasons = append(reasons, "kubernetes_node_unschedulable")
+	}
 	if len(reasons) == 0 {
 		return "node_unhealthy"
 	}
@@ -1365,6 +1437,9 @@ func (s *ControllerServer) hotplugNodeUnhealthy(health hotplugNodeHealth) bool {
 		return true
 	}
 	if s.nodeHotplugGuardRequireOpenNebulaReady() && !health.OpenNebulaReady {
+		return true
+	}
+	if health.Unschedulable {
 		return true
 	}
 	return false
@@ -1802,10 +1877,100 @@ func (s *ControllerServer) runStickyDetachReaper(ctx context.Context) {
 				continue
 			}
 			for _, state := range s.driver.stickyAttachments.ListExpired(time.Now()) {
+				if state.Reason == maintenanceStickyReason && s.driver.maintenanceMode != nil && s.driver.maintenanceMode.Active() {
+					continue
+				}
 				s.expireStickyDetach(ctx, state)
 			}
 		}
 	}
+}
+
+func (s *ControllerServer) maintenanceBlocksPublish(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (bool, string) {
+	if s == nil || s.driver == nil || s.driver.maintenanceMode == nil || !s.driver.maintenanceMode.Active() {
+		return false, ""
+	}
+	if req == nil || s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
+		return false, ""
+	}
+	runtimeCtx, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId)
+	if err != nil || !runtimeContextEligibleForMaintenance(runtimeCtx, req.VolumeId) {
+		return false, ""
+	}
+	lastNode := maintenanceLastNodeForVolume(s.driver, runtimeCtx, req.VolumeId)
+	if strings.TrimSpace(lastNode) == "" || strings.TrimSpace(lastNode) == strings.TrimSpace(req.NodeId) {
+		return false, ""
+	}
+	return true, maintenanceModeError(req.VolumeId, req.NodeId, lastNode).Error()
+}
+
+func (s *ControllerServer) startMaintenanceDetachHold(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (bool, *csi.ControllerUnpublishVolumeResponse, error) {
+	if s == nil || s.driver == nil || s.driver.maintenanceMode == nil || !s.driver.maintenanceMode.Active() {
+		return false, nil, nil
+	}
+	if req == nil || s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled || s.driver.stickyAttachments == nil {
+		return false, nil, nil
+	}
+	runtimeCtx, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId)
+	if err != nil || !runtimeContextEligibleForMaintenance(runtimeCtx, req.VolumeId) {
+		return false, nil, nil
+	}
+	graceSeconds := maintenanceStickyGraceSeconds(s.driver.PluginConfig)
+	now := time.Now().UTC()
+	state := StickyAttachmentState{
+		VolumeID:           req.VolumeId,
+		NodeID:             req.NodeId,
+		Backend:            "local",
+		DatastoreID:        runtimeCtx.DatastoreID,
+		PVCNamespace:       runtimeCtx.PVCNamespace,
+		PVCName:            runtimeCtx.PVCName,
+		StartedAt:          now,
+		ExpiresAt:          now.Add(time.Duration(graceSeconds) * time.Second),
+		GraceSeconds:       graceSeconds,
+		Reason:             maintenanceStickyReason,
+		LastKnownNodeReady: true,
+	}
+	if err := s.driver.stickyAttachments.StartGrace(state); err != nil {
+		s.driver.metrics.RecordMaintenanceBlock("unpublish", "persist_failed")
+		s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonMaintenanceModeBlocked, fmt.Sprintf("failed to persist maintenance hold for volume %s on node %s: %v", req.VolumeId, req.NodeId, err))
+		return true, nil, status.Errorf(codes.Internal, "failed to persist maintenance hold: %v", err)
+	}
+	s.driver.metrics.RecordStickyDetach("started", state.Reason)
+	s.driver.metrics.RecordMaintenance("hold", "started")
+	s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonMaintenanceModePrepared, fmt.Sprintf("maintenance mode is holding local RWO volume %s on node %s without detaching", req.VolumeId, req.NodeId))
+	s.annotateRestartOptimization(ctx, runtimeCtx, req.NodeId, graceSeconds)
+	return true, &csi.ControllerUnpublishVolumeResponse{}, nil
+}
+
+func (s *ControllerServer) rescueSameNodeUnpublish(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, volumeID, nodeID int) (bool, *csi.ControllerUnpublishVolumeResponse, error) {
+	if s == nil || s.driver == nil || req == nil || s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
+		return false, nil, nil
+	}
+	runtimeCtx, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId)
+	if err != nil || !runtimeContextEligibleForMaintenance(runtimeCtx, req.VolumeId) {
+		return false, nil, nil
+	}
+	desired, reason, err := s.driver.kubeRuntime.VolumeDesiredOnNode(ctx, req.VolumeId, req.NodeId)
+	if err != nil || !desired {
+		return false, nil, nil
+	}
+	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
+	if err != nil {
+		return false, nil, nil
+	}
+	if s.driver.stickyAttachments != nil {
+		if state, ok := s.driver.stickyAttachments.Get(req.VolumeId); ok && strings.TrimSpace(state.NodeID) == strings.TrimSpace(req.NodeId) {
+			if clearErr := s.driver.stickyAttachments.Clear(req.VolumeId); clearErr != nil {
+				return true, nil, status.Errorf(codes.Internal, "failed to clear sticky attachment state after same-node detach rescue: %v", clearErr)
+			}
+			s.driver.metrics.RecordStickyDetach("reused", state.Reason)
+			s.driver.metrics.RecordStickyDetachResidency("reused", time.Since(state.StartedAt))
+		}
+	}
+	s.driver.metrics.RecordSameNodeRestartReuse("disk")
+	s.driver.metrics.RecordStickyDetach("reused", "same_node_detach_rescue")
+	s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonSameNodeDetachRescued, fmt.Sprintf("kept local RWO volume %s attached to node %s because Kubernetes still desires it there (%s, target %s)", req.VolumeId, req.NodeId, reason, target))
+	return true, &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
 func (s *ControllerServer) shouldDelayDetach(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*VolumeRuntimeContext, StickyAttachmentState, bool, string) {
@@ -1910,6 +2075,33 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 	oldNodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(state.NodeID))
 	defer oldNodeRelease()
 
+	if cooldown, ok := s.hotplugCooldownState(ctx, state.NodeID); ok {
+		s.driver.metrics.RecordStickyDetach("deferred", cooldown.Reason)
+		message := fmt.Sprintf("refusing to move local RWO volume %s from node %s to node %s while old node hotplug is paused: %s", req.VolumeId, state.NodeID, req.NodeId, s.formatHotplugGuardMessage(cooldown))
+		s.recordPVCEventFromStickyState(ctx, state, eventReasonHotplugCooldown, message)
+		return true, nil, status.Error(codes.Unavailable, message)
+	}
+
+	if desired, reason, desiredErr := s.driver.kubeRuntime.VolumeDesiredOnNode(ctx, req.VolumeId, state.NodeID); desiredErr == nil && desired {
+		message := fmt.Sprintf("refusing to move local RWO volume %s from node %s to node %s because Kubernetes still desires it on the old node (%s)", req.VolumeId, state.NodeID, req.NodeId, reason)
+		s.driver.metrics.RecordStickyDetach("deferred", "old_node_still_desired")
+		s.recordPVCEventFromStickyState(ctx, state, eventReasonDetachGraceBypassed, message)
+		return true, nil, status.Error(codes.Unavailable, message)
+	}
+
+	oldNodeID, oldNodeErr := s.volumeProvider.NodeExists(ctx, state.NodeID)
+	if oldNodeErr == nil && oldNodeID != -1 {
+		if _, oldAttachErr := s.volumeProvider.GetVolumeInNode(ctx, volumeID, oldNodeID); oldAttachErr != nil {
+			if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
+				return true, nil, status.Errorf(codes.Internal, "failed to clear sticky attachment state: %v", err)
+			}
+			s.driver.metrics.RecordStickyDetach("already_absent", state.Reason)
+			s.driver.metrics.RecordStickyDetachResidency("already_absent", time.Since(state.StartedAt))
+			s.recordPVCEventFromStickyState(ctx, state, eventReasonDetachGraceCancelled, fmt.Sprintf("cleared stale attachment state for volume %s because it is already absent from node %s", req.VolumeId, state.NodeID))
+			return false, nil, nil
+		}
+	}
+
 	if err := s.volumeProvider.DetachVolume(ctx, req.VolumeId, state.NodeID); err != nil {
 		return true, nil, status.Error(codes.Internal, "failed to detach stale same-volume attachment before moving to a different node")
 	}
@@ -1931,6 +2123,10 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 	if !ok || current.ExpiresAt.After(time.Now()) {
 		return
 	}
+	if cooldown, ok := s.hotplugCooldownState(ctx, current.NodeID); ok {
+		s.deferStickyDetach(ctx, current, cooldown.Reason, time.Minute)
+		return
+	}
 	_ = s.withQueuedHotplug(ctx, current.NodeID, "detach", current.VolumeID, hotplugQueuePriorityBackground, func(queueCtx context.Context) error {
 		nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(current.NodeID))
 		defer nodeRelease()
@@ -1941,6 +2137,43 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 		confirmed, ok := s.driver.stickyAttachments.Get(current.VolumeID)
 		if !ok || confirmed.ExpiresAt.After(time.Now()) {
 			return nil
+		}
+
+		if cooldown, ok := s.hotplugCooldownState(queueCtx, confirmed.NodeID); ok {
+			s.deferStickyDetach(queueCtx, confirmed, cooldown.Reason, time.Minute)
+			return nil
+		}
+
+		if desired, reason, desiredErr := s.driver.kubeRuntime.VolumeDesiredOnNode(queueCtx, confirmed.VolumeID, confirmed.NodeID); desiredErr == nil && desired {
+			volumeID, _, volumeErr := s.volumeProvider.VolumeExists(queueCtx, confirmed.VolumeID)
+			nodeID, nodeErr := s.volumeProvider.NodeExists(queueCtx, confirmed.NodeID)
+			if volumeErr == nil && nodeErr == nil && volumeID != -1 && nodeID != -1 {
+				if _, attachedErr := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID); attachedErr == nil {
+					if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
+						klog.V(2).InfoS("Failed to clear sticky attachment state after same-node desired validation", "volumeID", confirmed.VolumeID, "err", err)
+						return err
+					}
+					s.driver.metrics.RecordStickyDetach("reused", confirmed.Reason)
+					s.driver.metrics.RecordStickyDetachResidency("reused", time.Since(confirmed.StartedAt))
+					s.recordPVCEventFromStickyState(queueCtx, confirmed, eventReasonSameNodeDetachRescued, fmt.Sprintf("kept expired sticky volume %s attached to node %s because Kubernetes still desires it there (%s)", confirmed.VolumeID, confirmed.NodeID, reason))
+					return nil
+				}
+			}
+		}
+
+		volumeID, _, volumeErr := s.volumeProvider.VolumeExists(queueCtx, confirmed.VolumeID)
+		nodeID, nodeErr := s.volumeProvider.NodeExists(queueCtx, confirmed.NodeID)
+		if volumeErr == nil && nodeErr == nil && volumeID != -1 && nodeID != -1 {
+			if _, attachedErr := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID); attachedErr != nil {
+				if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
+					klog.V(2).InfoS("Failed to clear already-absent sticky attachment state", "volumeID", confirmed.VolumeID, "err", err)
+					return err
+				}
+				s.driver.metrics.RecordStickyDetach("already_absent", confirmed.Reason)
+				s.driver.metrics.RecordStickyDetachResidency("already_absent", time.Since(confirmed.StartedAt))
+				s.recordPVCEventFromStickyState(queueCtx, confirmed, eventReasonDetachGraceExpired, fmt.Sprintf("cleared expired sticky state for volume %s because it is already absent from node %s", confirmed.VolumeID, confirmed.NodeID))
+				return nil
+			}
 		}
 
 		detachStarted := time.Now()
@@ -1961,6 +2194,22 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 		s.recordPVCEventFromStickyState(queueCtx, confirmed, eventReasonDetachGraceExpired, fmt.Sprintf("detach grace expired for volume %s on node %s; detached volume", confirmed.VolumeID, confirmed.NodeID))
 		return nil
 	})
+}
+
+func (s *ControllerServer) deferStickyDetach(ctx context.Context, state StickyAttachmentState, reason string, delay time.Duration) {
+	if s == nil || s.driver == nil || s.driver.stickyAttachments == nil {
+		return
+	}
+	if delay <= 0 {
+		delay = time.Minute
+	}
+	state.ExpiresAt = time.Now().UTC().Add(delay)
+	if err := s.driver.stickyAttachments.Update(state); err != nil {
+		klog.V(2).InfoS("Failed to defer sticky detach", "volumeID", state.VolumeID, "nodeID", state.NodeID, "reason", reason, "err", err)
+		return
+	}
+	s.driver.metrics.RecordStickyDetach("deferred", reason)
+	s.recordPVCEventFromStickyState(ctx, state, eventReasonHotplugCooldown, fmt.Sprintf("deferred expired sticky detach for volume %s on node %s for %s: %s", state.VolumeID, state.NodeID, delay, reason))
 }
 
 func (s *ControllerServer) clearStickyReuseState(ctx context.Context, volumeID, nodeID, backend string) {

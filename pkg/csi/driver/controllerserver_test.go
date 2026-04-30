@@ -26,6 +26,7 @@ import (
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
+	inventoryv1alpha1 "github.com/SparkAIUR/storage-provider-opennebula/pkg/inventory/apis/storageprovider/v1alpha1"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -33,9 +34,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 const (
@@ -115,6 +119,13 @@ func newStickyTestDriver(t *testing.T, objects ...runtime.Object) *Driver {
 	driver.stickyAttachments = NewStickyAttachmentManager(runtime, "default")
 	require.NoError(t, driver.stickyAttachments.LoadFromConfigMap(context.Background()))
 	return driver
+}
+
+func newInventoryFakeClient(t *testing.T, objects ...ctrlclient.Object) ctrlclient.Client {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	require.NoError(t, inventoryv1alpha1.AddToScheme(scheme))
+	return ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 }
 
 func newLocalPVAndPVC(volumeHandle string, accessModes []corev1.PersistentVolumeAccessMode, pvcAnnotations map[string]string) (*corev1.PersistentVolume, *corev1.PersistentVolumeClaim) {
@@ -1589,6 +1600,55 @@ func TestControllerUnpublishVolumeStartsStickyDetachGraceForOptedInLocalPVC(t *t
 	mockProvider.AssertExpectations(t)
 }
 
+func TestControllerUnpublishVolumeStartsMaintenanceHold(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-maint-hold", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	driver := newStickyTestDriver(t, pv, pvc)
+	driver.PluginConfig.OverrideVal(config.MaintenanceReleaseMaxSecondsVar, 1200)
+	driver.maintenanceMode = NewMaintenanceModeManager(driver, "default")
+	driver.maintenanceMode.setState(true, true, false)
+
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	mockProvider.On("VolumeExists", mock.Anything, "vol-maint-hold").Return(1, 1, nil)
+	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdb", nil).Once()
+
+	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
+	resp, err := cs.ControllerUnpublishVolume(context.Background(), &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: "vol-maint-hold",
+		NodeId:   "node-1",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	state, ok := driver.stickyAttachments.Get("vol-maint-hold")
+	require.True(t, ok)
+	assert.Equal(t, maintenanceStickyReason, state.Reason)
+	assert.Equal(t, "node-1", state.NodeID)
+	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, "vol-maint-hold", "node-1")
+	mockProvider.AssertExpectations(t)
+}
+
+func TestControllerPublishVolumeBlocksCrossNodeDuringMaintenance(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-maint-block", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv.Annotations[annotationLastAttachedNode] = "node-old"
+	driver := newStickyTestDriver(t, pv, pvc)
+	driver.maintenanceMode = NewMaintenanceModeManager(driver, "default")
+	driver.maintenanceMode.setState(true, true, false)
+
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	mockProvider.On("VolumeExists", mock.Anything, "vol-maint-block").Return(1, 1, nil)
+	mockProvider.On("NodeExists", mock.Anything, "node-new").Return(42, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 42).Return("", fmt.Errorf("not attached")).Once()
+
+	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
+	resp, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-maint-block", "node-new"))
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Equal(t, codes.Unavailable, status.Code(err))
+	mockProvider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	mockProvider.AssertExpectations(t)
+}
+
 func TestControllerPublishVolumeReusesStickyAttachmentOnSameNode(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-reuse", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
 		annotationRestartOpt: restartOptimizationAnnotationValue,
@@ -1644,7 +1704,9 @@ func TestControllerPublishVolumeCancelsStickyAttachmentOnDifferentNode(t *testin
 	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
 	mockProvider.On("VolumeExists", mock.Anything, "vol-move").Return(1, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-new").Return(42, nil)
+	mockProvider.On("NodeExists", mock.Anything, "node-old").Return(41, nil)
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 42).Return("", fmt.Errorf("not attached")).Twice()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdc", nil).Once()
 	mockProvider.On("DetachVolume", mock.Anything, "vol-move", "node-old").Return(nil).Once()
 	mockProvider.On("AttachVolume", mock.Anything, "vol-move", "node-new", false, mock.Anything).Return(nil).Once()
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 42).Return("vdd", nil).Once()
@@ -1657,6 +1719,163 @@ func TestControllerPublishVolumeCancelsStickyAttachmentOnDifferentNode(t *testin
 	_, ok := driver.stickyAttachments.Get("vol-move")
 	assert.False(t, ok)
 	mockProvider.AssertExpectations(t)
+}
+
+func TestControllerPublishVolumeClearsStickyWhenOldAttachmentAlreadyAbsent(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-absent", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationRestartOpt: restartOptimizationAnnotationValue,
+	})
+	driver := newStickyTestDriver(t, pv, pvc)
+	require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
+		VolumeID:     "vol-absent",
+		NodeID:       "node-old",
+		Backend:      "local",
+		PVCNamespace: "default",
+		PVCName:      "pvc-vol-absent",
+		StartedAt:    time.Now().Add(-10 * time.Second),
+		ExpiresAt:    time.Now().Add(90 * time.Second),
+		GraceSeconds: 90,
+		Reason:       "stateful_restart",
+	}))
+
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	mockProvider.On("NodeExists", mock.Anything, "node-old").Return(41, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", fmt.Errorf("already absent")).Once()
+
+	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
+	handled, resp, err := cs.reuseStickyAttachment(context.Background(), newPublishReq("vol-absent", "node-new"), 1, 42)
+	require.NoError(t, err)
+	assert.False(t, handled)
+	assert.Nil(t, resp)
+	_, ok := driver.stickyAttachments.Get("vol-absent")
+	assert.False(t, ok)
+	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+	mockProvider.AssertExpectations(t)
+}
+
+func TestControllerPublishVolumeBlocksCrossNodeWhenOldNodeHotplugStuck(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-stuck", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationRestartOpt: restartOptimizationAnnotationValue,
+	})
+	driver := newStickyTestDriver(t, pv, pvc)
+	driver.kubeRuntime.inventoryClient = newInventoryFakeClient(t, &inventoryv1alpha1.OpenNebulaNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-old"},
+		Status: inventoryv1alpha1.OpenNebulaNodeStatus{
+			DisplayState: "HotplugStuck",
+			Hotplug: inventoryv1alpha1.OpenNebulaNodeHotplugStatus{
+				Diagnosis: inventoryv1alpha1.OpenNebulaNodeHotplugDiagnosisStatus{
+					Classification: opennebula.HotplugClassificationStuck,
+					Operation:      "attach",
+					VolumeHandle:   "vol-stuck",
+					DiskAttachFlag: "YES",
+				},
+			},
+		},
+	})
+	require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
+		VolumeID:     "vol-stuck",
+		NodeID:       "node-old",
+		Backend:      "local",
+		PVCNamespace: "default",
+		PVCName:      "pvc-vol-stuck",
+		StartedAt:    time.Now().Add(-10 * time.Second),
+		ExpiresAt:    time.Now().Add(90 * time.Second),
+		GraceSeconds: 90,
+		Reason:       "stateful_restart",
+	}))
+
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	mockProvider.On("VolumeExists", mock.Anything, "vol-stuck").Return(1, 1, nil)
+	mockProvider.On("NodeExists", mock.Anything, "node-new").Return(42, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 42).Return("", fmt.Errorf("not attached")).Once()
+
+	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
+	resp, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-stuck", "node-new"))
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Equal(t, codes.Unavailable, status.Code(err))
+	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+	mockProvider.AssertExpectations(t)
+}
+
+func TestControllerUnpublishVolumeRescuesSameNodeDesiredVolume(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-rescue", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pod-rescue", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			NodeName: "node-1",
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc.Name},
+				},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	driver := newStickyTestDriver(t, pv, pvc, pod)
+
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	mockProvider.On("VolumeExists", mock.Anything, "vol-rescue").Return(1, 1, nil)
+	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdb", nil).Twice()
+
+	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
+	resp, err := cs.ControllerUnpublishVolume(context.Background(), &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: "vol-rescue",
+		NodeId:   "node-1",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+	mockProvider.AssertExpectations(t)
+}
+
+func TestExpireStickyDetachClearsAlreadyAbsentAttachment(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-expired-absent", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	driver := newStickyTestDriver(t, pv, pvc)
+	state := StickyAttachmentState{
+		VolumeID:     "vol-expired-absent",
+		NodeID:       "node-1",
+		Backend:      "local",
+		PVCNamespace: "default",
+		PVCName:      "pvc-vol-expired-absent",
+		StartedAt:    time.Now().Add(-2 * time.Minute),
+		ExpiresAt:    time.Now().Add(-time.Minute),
+		GraceSeconds: 60,
+		Reason:       "stateful_restart",
+	}
+	require.NoError(t, driver.stickyAttachments.StartGrace(state))
+
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	mockProvider.On("VolumeExists", mock.Anything, "vol-expired-absent").Return(1, 1, nil)
+	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", fmt.Errorf("already absent")).Once()
+
+	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
+	cs.expireStickyDetach(context.Background(), state)
+
+	_, ok := driver.stickyAttachments.Get("vol-expired-absent")
+	assert.False(t, ok)
+	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+	mockProvider.AssertExpectations(t)
+}
+
+func TestMaintenanceAttachedNodesIgnoresDeletingVolumeAttachments(t *testing.T) {
+	now := metav1.Now()
+	pvName := "pv-vol"
+	attached, conflicts := maintenanceAttachedNodesByPV([]storagev1.VolumeAttachment{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "va-deleting", DeletionTimestamp: &now},
+			Spec: storagev1.VolumeAttachmentSpec{
+				NodeName: "node-a",
+				Source:   storagev1.VolumeAttachmentSource{PersistentVolumeName: &pvName},
+			},
+			Status: storagev1.VolumeAttachmentStatus{Attached: true},
+		},
+	})
+	assert.Empty(t, attached)
+	assert.Empty(t, conflicts)
 }
 
 func TestControllerUnpublishVolumeBypassesStickyDetachWhenNodeNotReady(t *testing.T) {

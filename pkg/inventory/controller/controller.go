@@ -2277,6 +2277,9 @@ func (s *Syncer) loadHotplugStateMap(ctx context.Context) (map[string]opennebula
 	}
 	result := make(map[string]opennebula.HotplugCooldownState, len(cm.Data))
 	for node, raw := range cm.Data {
+		if node == "maintainenceMode" || node == "maintenanceMode" || node == "maintainenceReady" || node == "maintenanceReady" {
+			continue
+		}
 		var state opennebula.HotplugCooldownState
 		if err := json.Unmarshal([]byte(raw), &state); err != nil {
 			continue

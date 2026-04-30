@@ -10,6 +10,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestHotplugQueueSequentializesSameNodeRequests(t *testing.T) {
@@ -219,4 +222,41 @@ func TestHotplugQueueReturnsPausedRequestBeforeDispatch(t *testing.T) {
 	assert.True(t, errors.As(err, &pausedErr))
 	assert.False(t, called)
 	assert.Equal(t, "kubernetes_node_not_ready", pausedErr.Reason)
+}
+
+func TestHotplugQueueSnapshotDebounce(t *testing.T) {
+	runtime := &KubeRuntime{
+		client: fake.NewSimpleClientset(&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: hotplugQueueStateConfigMapName, Namespace: "default"},
+			Data:       map[string]string{},
+		}),
+		enabled: true,
+	}
+	manager := NewHotplugQueueManager(runtime, "default", NewDriverMetrics("test", "test"), time.Second, 0)
+	manager.SetSnapshotDebounce(50 * time.Millisecond)
+
+	manager.persistSnapshot(HotplugQueueNodeSnapshot{
+		Node:        "node-a",
+		QueuedCount: 1,
+		Queued: []HotplugQueueItemSnapshot{{
+			ID:        1,
+			Node:      "node-a",
+			Operation: "attach",
+			Volume:    "vol-a",
+			Priority:  hotplugQueuePriorityNormal,
+		}},
+	})
+	cm, err := runtime.client.CoreV1().ConfigMaps("default").Get(context.Background(), hotplugQueueStateConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, cm.Data, "node-a")
+
+	require.Eventually(t, func() bool {
+		cm, err := runtime.client.CoreV1().ConfigMaps("default").Get(context.Background(), hotplugQueueStateConfigMapName, metav1.GetOptions{})
+		return err == nil && cm.Data["node-a"] != ""
+	}, time.Second, 10*time.Millisecond)
+
+	manager.persistSnapshot(HotplugQueueNodeSnapshot{Node: "node-a"})
+	cm, err = runtime.client.CoreV1().ConfigMaps("default").Get(context.Background(), hotplugQueueStateConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, cm.Data, "node-a")
 }

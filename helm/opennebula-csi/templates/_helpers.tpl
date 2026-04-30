@@ -95,6 +95,7 @@ Create chart name and version as used by the chart label.
 {{- $hotplugDiagnostics := (get $root.Values.driver "hotplugDiagnostics") | default dict -}}
 {{- $nodeHotplugGuard := (get $root.Values.driver "nodeHotplugGuard") | default dict -}}
 {{- $localRestart := (get $root.Values.driver "localRestartOptimization") | default dict -}}
+{{- $maintenanceMode := (get $root.Values.driver "maintenanceMode") | default dict -}}
 {{- $localRWORecovery := (get $root.Values.driver "localRWOStaleMountRecovery") | default dict -}}
 {{- $lastNodePreference := (get $root.Values.driver "lastNodePreference") | default dict -}}
 {{- $lastNodePreferenceWebhook := (get $lastNodePreference "webhook") | default dict -}}
@@ -114,6 +115,7 @@ Create chart name and version as used by the chart label.
 {{- $hotplugQueuePerItemWaitSeconds := (get $hotplugQueue "perItemWaitSeconds") | default 60 -}}
 {{- $hotplugQueueMaxWaitCapSeconds := (get $hotplugQueue "maxWaitCapSeconds") | default 900 -}}
 {{- $hotplugQueueMaxActiveSeconds := (get $hotplugQueue "maxActiveSeconds") | default 900 -}}
+{{- $hotplugQueueSnapshotDebounceSeconds := (get $hotplugQueue "snapshotDebounceSeconds") | default 2 -}}
 {{- $hotplugDiagnosticsEnabled := (get $hotplugDiagnostics "enabled") | default true -}}
 {{- $hotplugDiagnosticsStuckAfterSeconds := (get $hotplugDiagnostics "stuckAfterSeconds") | default 300 -}}
 {{- $hotplugDiagnosticsProgressWindowSeconds := (get $hotplugDiagnostics "progressWindowSeconds") | default 60 -}}
@@ -126,6 +128,8 @@ Create chart name and version as used by the chart label.
 {{- $localRestartDetachGrace := (get $localRestart "detachGraceSeconds") | default 90 -}}
 {{- $localRestartDetachGraceMax := (get $localRestart "maxDetachGraceSeconds") | default 300 -}}
 {{- $localRestartRequireNodeReady := (get $localRestart "requireNodeReady") | default true -}}
+{{- $maintenanceReleaseMinSeconds := (get $maintenanceMode "releaseMinSeconds") | default 300 -}}
+{{- $maintenanceReleaseMaxSeconds := (get $maintenanceMode "releaseMaxSeconds") | default 1800 -}}
 {{- $localRWORecoveryActivePod := (get $localRWORecovery "activePodRecovery") | default false -}}
 {{- $localRWORecoveryMaxAttempts := (get $localRWORecovery "maxAttempts") | default 3 -}}
 {{- $localRWORecoveryBackoffSeconds := (get $localRWORecovery "backoffSeconds") | default 10 -}}
@@ -220,6 +224,8 @@ Create chart name and version as used by the chart label.
   value: {{ $hotplugQueueMaxWaitCapSeconds | quote }}
 - name: ONE_CSI_HOTPLUG_QUEUE_MAX_ACTIVE_SECONDS
   value: {{ $hotplugQueueMaxActiveSeconds | quote }}
+- name: ONE_CSI_HOTPLUG_QUEUE_SNAPSHOT_DEBOUNCE_SECONDS
+  value: {{ $hotplugQueueSnapshotDebounceSeconds | quote }}
 - name: ONE_CSI_HOTPLUG_DIAGNOSTICS_ENABLED
   value: {{ $hotplugDiagnosticsEnabled | quote }}
 - name: ONE_CSI_HOTPLUG_DIAGNOSTICS_STUCK_AFTER_SECONDS
@@ -244,6 +250,10 @@ Create chart name and version as used by the chart label.
   value: {{ $localRestartDetachGraceMax | quote }}
 - name: ONE_CSI_LOCAL_RESTART_REQUIRE_NODE_READY
   value: {{ $localRestartRequireNodeReady | quote }}
+- name: ONE_CSI_MAINTENANCE_RELEASE_MIN_SECONDS
+  value: {{ $maintenanceReleaseMinSeconds | quote }}
+- name: ONE_CSI_MAINTENANCE_RELEASE_MAX_SECONDS
+  value: {{ $maintenanceReleaseMaxSeconds | quote }}
 - name: ONE_CSI_LOCAL_RWO_STALE_MOUNT_ACTIVE_POD_RECOVERY
   value: {{ $localRWORecoveryActivePod | quote }}
 - name: ONE_CSI_LOCAL_RWO_STALE_MOUNT_MAX_ATTEMPTS

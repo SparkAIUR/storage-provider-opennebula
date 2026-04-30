@@ -46,6 +46,10 @@ type DriverMetrics struct {
 	hotplugDiagnosisTotal        *prometheus.CounterVec
 	hotplugStateAge              *prometheus.GaugeVec
 	lastNodePreferenceTotal      *prometheus.CounterVec
+	maintenanceActive            prometheus.Gauge
+	maintenanceProtectedVolumes  prometheus.Gauge
+	maintenanceTotal             *prometheus.CounterVec
+	maintenanceBlockedTotal      *prometheus.CounterVec
 	attachmentReconcilerTotal    *prometheus.CounterVec
 	hotplugRecommendedTimeout    *prometheus.GaugeVec
 	hotplugObservationSamples    *prometheus.GaugeVec
@@ -171,8 +175,24 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 		}, []string{"node", "lcm_state", "classification"}),
 		lastNodePreferenceTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "opennebula_csi_last_node_preference_total",
-			Help: "Total number of soft last-node preference webhook outcomes by outcome and reason.",
+			Help: "Total number of last-node preference webhook outcomes by outcome and reason.",
 		}, []string{"outcome", "reason"}),
+		maintenanceActive: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "opennebula_csi_maintenance_active",
+			Help: "Whether ConfigMap-driven maintenance mode is currently active.",
+		}),
+		maintenanceProtectedVolumes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "opennebula_csi_maintenance_protected_volumes",
+			Help: "Number of local single-writer volumes prepared during the latest maintenance scan.",
+		}),
+		maintenanceTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_maintenance_total",
+			Help: "Total number of maintenance mode lifecycle and preparation outcomes.",
+		}, []string{"operation", "outcome"}),
+		maintenanceBlockedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_maintenance_block_total",
+			Help: "Total number of requests blocked by maintenance mode by operation and reason.",
+		}, []string{"operation", "reason"}),
 		attachmentReconcilerTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "opennebula_csi_attachment_reconciler_total",
 			Help: "Total number of attachment reconciliation checks by check, action, and outcome.",
@@ -226,6 +246,10 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 		metrics.hotplugDiagnosisTotal,
 		metrics.hotplugStateAge,
 		metrics.lastNodePreferenceTotal,
+		metrics.maintenanceActive,
+		metrics.maintenanceProtectedVolumes,
+		metrics.maintenanceTotal,
+		metrics.maintenanceBlockedTotal,
 		metrics.attachmentReconcilerTotal,
 		metrics.hotplugRecommendedTimeout,
 		metrics.hotplugObservationSamples,
@@ -413,6 +437,38 @@ func (m *DriverMetrics) RecordLastNodePreference(outcome, reason string) {
 		return
 	}
 	m.lastNodePreferenceTotal.WithLabelValues(outcome, reason).Inc()
+}
+
+func (m *DriverMetrics) SetMaintenanceActive(active bool) {
+	if m == nil {
+		return
+	}
+	if active {
+		m.maintenanceActive.Set(1)
+		return
+	}
+	m.maintenanceActive.Set(0)
+}
+
+func (m *DriverMetrics) SetMaintenanceProtectedVolumes(count int) {
+	if m == nil {
+		return
+	}
+	m.maintenanceProtectedVolumes.Set(float64(count))
+}
+
+func (m *DriverMetrics) RecordMaintenance(operation, outcome string) {
+	if m == nil {
+		return
+	}
+	m.maintenanceTotal.WithLabelValues(operation, outcome).Inc()
+}
+
+func (m *DriverMetrics) RecordMaintenanceBlock(operation, reason string) {
+	if m == nil {
+		return
+	}
+	m.maintenanceBlockedTotal.WithLabelValues(operation, reason).Inc()
 }
 
 func (m *DriverMetrics) RecordAttachmentReconciler(check, action, outcome string) {

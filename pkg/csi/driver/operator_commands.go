@@ -841,6 +841,7 @@ func supportBundleConfig(cfg config.CSIPluginConfig) map[string]any {
 		"hotplugQueuePerItemWaitSeconds":          getInt(cfg, config.HotplugQueuePerItemWaitSecondsVar),
 		"hotplugQueueMaxWaitCapSeconds":           getInt(cfg, config.HotplugQueueMaxWaitCapSecondsVar),
 		"hotplugQueueMaxActiveSeconds":            getInt(cfg, config.HotplugQueueMaxActiveSecondsVar),
+		"hotplugQueueSnapshotDebounceSeconds":     getInt(cfg, config.HotplugQueueSnapshotDebounceSecondsVar),
 		"hotplugDiagnosticsEnabled":               getBool(cfg, config.HotplugDiagnosticsEnabledVar),
 		"hotplugDiagnosticsStuckAfterSeconds":     getInt(cfg, config.HotplugDiagnosticsStuckAfterSecondsVar),
 		"hotplugDiagnosticsProgressWindowSeconds": getInt(cfg, config.HotplugDiagnosticsProgressWindowSecondsVar),

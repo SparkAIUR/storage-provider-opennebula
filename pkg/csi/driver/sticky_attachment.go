@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -82,6 +83,30 @@ func (m *StickyAttachmentManager) Clear(volumeID string) error {
 	return m.deleteEntry(context.Background(), volumeID)
 }
 
+func (m *StickyAttachmentManager) Update(state StickyAttachmentState) error {
+	if m == nil {
+		return nil
+	}
+	if strings.TrimSpace(state.VolumeID) == "" {
+		return fmt.Errorf("volumeID is required")
+	}
+	m.mu.Lock()
+	previous, hadPrevious := m.entries[state.VolumeID]
+	m.entries[state.VolumeID] = state
+	m.mu.Unlock()
+	if err := m.persistEntry(context.Background(), state); err != nil {
+		m.mu.Lock()
+		if hadPrevious {
+			m.entries[state.VolumeID] = previous
+		} else {
+			delete(m.entries, state.VolumeID)
+		}
+		m.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
 func (m *StickyAttachmentManager) ListExpired(now time.Time) []StickyAttachmentState {
 	if m == nil {
 		return nil
@@ -95,6 +120,25 @@ func (m *StickyAttachmentManager) ListExpired(now time.Time) []StickyAttachmentS
 		}
 	}
 	return expired
+}
+
+func (m *StickyAttachmentManager) ListByReason(reason string) []StickyAttachmentState {
+	if m == nil {
+		return nil
+	}
+	reason = strings.TrimSpace(reason)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	states := make([]StickyAttachmentState, 0)
+	for _, entry := range m.entries {
+		if strings.TrimSpace(entry.Reason) == reason {
+			states = append(states, entry)
+		}
+	}
+	sort.Slice(states, func(i, j int) bool {
+		return states[i].VolumeID < states[j].VolumeID
+	})
+	return states
 }
 
 func (m *StickyAttachmentManager) LoadFromConfigMap(ctx context.Context) error {

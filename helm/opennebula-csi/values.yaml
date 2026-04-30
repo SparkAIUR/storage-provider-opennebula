@@ -47,6 +47,7 @@ driver:
     perItemWaitSeconds: 60
     maxWaitCapSeconds: 900
     maxActiveSeconds: 900
+    snapshotDebounceSeconds: 2
   hotplugDiagnostics:
     enabled: true
     stuckAfterSeconds: 300
@@ -62,6 +63,9 @@ driver:
     detachGraceSeconds: 90
     maxDetachGraceSeconds: 300
     requireNodeReady: true
+  maintenanceMode:
+    releaseMinSeconds: 300
+    releaseMaxSeconds: 1800
   localRWOStaleMountRecovery:
     activePodRecovery: false
     maxAttempts: 3

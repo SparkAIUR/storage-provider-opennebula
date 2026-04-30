@@ -8,11 +8,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	inventoryv1alpha1 "github.com/SparkAIUR/storage-provider-opennebula/pkg/inventory/apis/storageprovider/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -20,7 +23,9 @@ import (
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
@@ -73,9 +78,18 @@ type VolumeRuntimeContext struct {
 }
 
 type KubeRuntime struct {
-	client   kubernetes.Interface
-	recorder record.EventRecorder
-	enabled  bool
+	client          kubernetes.Interface
+	inventoryClient ctrlclient.Client
+	recorder        record.EventRecorder
+	enabled         bool
+
+	inventoryNodeCacheMu sync.Mutex
+	inventoryNodeCache   map[string]inventoryNodeCacheEntry
+}
+
+type inventoryNodeCacheEntry struct {
+	node      *inventoryv1alpha1.OpenNebulaNode
+	expiresAt time.Time
 }
 
 const hotplugStateConfigMapName = "opennebula-csi-hotplug-state"
@@ -97,6 +111,7 @@ func NewKubeRuntime(component string) *KubeRuntime {
 		klog.Warningf("failed to initialize Kubernetes client for runtime integrations: %v", err)
 		return &KubeRuntime{}
 	}
+	inventoryClient := newInventoryRuntimeClient(cfg)
 
 	broadcaster := record.NewBroadcaster()
 	broadcaster.StartStructuredLogging(0)
@@ -104,10 +119,25 @@ func NewKubeRuntime(component string) *KubeRuntime {
 	recorder := broadcaster.NewRecorder(clientgoscheme.Scheme, corev1.EventSource{Component: component})
 
 	return &KubeRuntime{
-		client:   client,
-		recorder: recorder,
-		enabled:  true,
+		client:          client,
+		inventoryClient: inventoryClient,
+		recorder:        recorder,
+		enabled:         true,
 	}
+}
+
+func newInventoryRuntimeClient(cfg *rest.Config) ctrlclient.Client {
+	scheme := kruntime.NewScheme()
+	if err := inventoryv1alpha1.AddToScheme(scheme); err != nil {
+		klog.V(2).InfoS("Inventory runtime client disabled", "err", err)
+		return nil
+	}
+	client, err := ctrlclient.New(cfg, ctrlclient.Options{Scheme: scheme})
+	if err != nil {
+		klog.V(2).InfoS("Inventory runtime client disabled", "err", err)
+		return nil
+	}
+	return client
 }
 
 func (r *KubeRuntime) EmitPVCEvent(ctx context.Context, namespace, name, reason, message string) {
@@ -216,25 +246,30 @@ func (r *KubeRuntime) UpsertConfigMapData(ctx context.Context, namespace, name s
 		namespace = namespaceFromServiceAccount()
 	}
 	cmClient := r.client.CoreV1().ConfigMaps(namespace)
-	current, err := cmClient.Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		if !errors.IsNotFound(err) {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current, err := cmClient.Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			if !errors.IsNotFound(err) {
+				return err
+			}
+			_, err = cmClient.Create(ctx, &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+				Data:       data,
+			}, metav1.CreateOptions{})
+			if errors.IsAlreadyExists(err) {
+				return errors.NewConflict(corev1.Resource("configmaps"), name, err)
+			}
 			return err
 		}
-		_, err = cmClient.Create(ctx, &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
-			Data:       data,
-		}, metav1.CreateOptions{})
+		if current.Data == nil {
+			current.Data = map[string]string{}
+		}
+		for key, value := range data {
+			current.Data[key] = value
+		}
+		_, err = cmClient.Update(ctx, current, metav1.UpdateOptions{})
 		return err
-	}
-	if current.Data == nil {
-		current.Data = map[string]string{}
-	}
-	for key, value := range data {
-		current.Data[key] = value
-	}
-	_, err = cmClient.Update(ctx, current, metav1.UpdateOptions{})
-	return err
+	})
 }
 
 func (r *KubeRuntime) DeleteConfigMapKey(ctx context.Context, namespace, name, key string) error {
@@ -245,22 +280,24 @@ func (r *KubeRuntime) DeleteConfigMapKey(ctx context.Context, namespace, name, k
 		namespace = namespaceFromServiceAccount()
 	}
 	cmClient := r.client.CoreV1().ConfigMaps(namespace)
-	current, err := cmClient.Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		if errors.IsNotFound(err) {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current, err := cmClient.Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			if errors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if current.Data == nil {
 			return nil
 		}
+		if _, ok := current.Data[key]; !ok {
+			return nil
+		}
+		delete(current.Data, key)
+		_, err = cmClient.Update(ctx, current, metav1.UpdateOptions{})
 		return err
-	}
-	if current.Data == nil {
-		return nil
-	}
-	if _, ok := current.Data[key]; !ok {
-		return nil
-	}
-	delete(current.Data, key)
-	_, err = cmClient.Update(ctx, current, metav1.UpdateOptions{})
-	return err
+	})
 }
 
 func (r *KubeRuntime) GetConfigMap(ctx context.Context, namespace, name string) (*corev1.ConfigMap, error) {
@@ -379,6 +416,96 @@ func (r *KubeRuntime) NodeHealth(ctx context.Context, nodeName string) (Kubernet
 		}
 	}
 	return health, nil
+}
+
+func (r *KubeRuntime) OpenNebulaNode(ctx context.Context, nodeName string) (*inventoryv1alpha1.OpenNebulaNode, error) {
+	if r == nil || !r.enabled || r.inventoryClient == nil {
+		return nil, fmt.Errorf("inventory runtime is not enabled")
+	}
+	nodeName = strings.TrimSpace(nodeName)
+	if nodeName == "" {
+		return nil, fmt.Errorf("node name is required")
+	}
+	now := time.Now().UTC()
+	r.inventoryNodeCacheMu.Lock()
+	if entry, ok := r.inventoryNodeCache[nodeName]; ok && entry.expiresAt.After(now) && entry.node != nil {
+		cached := entry.node.DeepCopy()
+		r.inventoryNodeCacheMu.Unlock()
+		return cached, nil
+	}
+	r.inventoryNodeCacheMu.Unlock()
+
+	node := &inventoryv1alpha1.OpenNebulaNode{}
+	if err := r.inventoryClient.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
+		return nil, err
+	}
+
+	r.inventoryNodeCacheMu.Lock()
+	if r.inventoryNodeCache == nil {
+		r.inventoryNodeCache = map[string]inventoryNodeCacheEntry{}
+	}
+	r.inventoryNodeCache[nodeName] = inventoryNodeCacheEntry{
+		node:      node.DeepCopy(),
+		expiresAt: now.Add(5 * time.Second),
+	}
+	r.inventoryNodeCacheMu.Unlock()
+	return node, nil
+}
+
+func (r *KubeRuntime) VolumeDesiredOnNode(ctx context.Context, volumeHandle, nodeName string) (bool, string, error) {
+	if r == nil || !r.enabled {
+		return false, "", fmt.Errorf("kubernetes runtime is not enabled")
+	}
+	nodeName = strings.TrimSpace(nodeName)
+	if strings.TrimSpace(volumeHandle) == "" || nodeName == "" {
+		return false, "", nil
+	}
+	runtimeCtx, err := r.ResolveVolumeRuntimeContext(ctx, volumeHandle)
+	if err != nil {
+		return false, "", err
+	}
+
+	if runtimeCtx.PVName != "" {
+		vas, err := r.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return false, "", err
+		}
+		for idx := range vas.Items {
+			va := &vas.Items[idx]
+			if va.Spec.Source.PersistentVolumeName == nil || strings.TrimSpace(*va.Spec.Source.PersistentVolumeName) != runtimeCtx.PVName {
+				continue
+			}
+			if strings.TrimSpace(va.Spec.NodeName) == nodeName && va.DeletionTimestamp.IsZero() {
+				return true, "volume_attachment", nil
+			}
+		}
+	}
+
+	if runtimeCtx.PVCNamespace == "" || runtimeCtx.PVCName == "" {
+		return false, "", nil
+	}
+	pods, err := r.client.CoreV1().Pods(runtimeCtx.PVCNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, "", err
+	}
+	for idx := range pods.Items {
+		pod := &pods.Items[idx]
+		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if strings.TrimSpace(pod.Spec.NodeName) != nodeName {
+			continue
+		}
+		for _, volume := range pod.Spec.Volumes {
+			if volume.PersistentVolumeClaim == nil {
+				continue
+			}
+			if strings.TrimSpace(volume.PersistentVolumeClaim.ClaimName) == runtimeCtx.PVCName {
+				return true, "active_pod", nil
+			}
+		}
+	}
+	return false, "", nil
 }
 
 func (r *KubeRuntime) emitNamespacedEvent(ctx context.Context, namespace, name string, uid types.UID, kind, eventType, reason, message string) {

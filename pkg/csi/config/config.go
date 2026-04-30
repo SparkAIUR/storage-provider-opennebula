@@ -53,6 +53,7 @@ const (
 	HotplugQueuePerItemWaitSecondsVar          = "ONE_CSI_HOTPLUG_QUEUE_PER_ITEM_WAIT_SECONDS"
 	HotplugQueueMaxWaitCapSecondsVar           = "ONE_CSI_HOTPLUG_QUEUE_MAX_WAIT_CAP_SECONDS"
 	HotplugQueueMaxActiveSecondsVar            = "ONE_CSI_HOTPLUG_QUEUE_MAX_ACTIVE_SECONDS"
+	HotplugQueueSnapshotDebounceSecondsVar     = "ONE_CSI_HOTPLUG_QUEUE_SNAPSHOT_DEBOUNCE_SECONDS"
 	HotplugDiagnosticsEnabledVar               = "ONE_CSI_HOTPLUG_DIAGNOSTICS_ENABLED"
 	HotplugDiagnosticsStuckAfterSecondsVar     = "ONE_CSI_HOTPLUG_DIAGNOSTICS_STUCK_AFTER_SECONDS"
 	HotplugDiagnosticsProgressWindowSecondsVar = "ONE_CSI_HOTPLUG_DIAGNOSTICS_PROGRESS_WINDOW_SECONDS"
@@ -65,6 +66,8 @@ const (
 	LocalRestartDetachGraceSecondsVar          = "ONE_CSI_LOCAL_RESTART_DETACH_GRACE_SECONDS"
 	LocalRestartDetachGraceMaxSecondsVar       = "ONE_CSI_LOCAL_RESTART_DETACH_GRACE_MAX_SECONDS"
 	LocalRestartRequireNodeReadyVar            = "ONE_CSI_LOCAL_RESTART_REQUIRE_NODE_READY"
+	MaintenanceReleaseMinSecondsVar            = "ONE_CSI_MAINTENANCE_RELEASE_MIN_SECONDS"
+	MaintenanceReleaseMaxSecondsVar            = "ONE_CSI_MAINTENANCE_RELEASE_MAX_SECONDS"
 	LocalRWOStaleMountActivePodRecoveryVar     = "ONE_CSI_LOCAL_RWO_STALE_MOUNT_ACTIVE_POD_RECOVERY"
 	LocalRWOStaleMountMaxAttemptsVar           = "ONE_CSI_LOCAL_RWO_STALE_MOUNT_MAX_ATTEMPTS"
 	LocalRWOStaleMountBackoffSecondsVar        = "ONE_CSI_LOCAL_RWO_STALE_MOUNT_BACKOFF_SECONDS"
@@ -124,6 +127,7 @@ const (
 	defaultHotplugQueuePerItemWaitSeconds          = 60
 	defaultHotplugQueueMaxWaitCapSeconds           = 900
 	defaultHotplugQueueMaxActiveSeconds            = 900
+	defaultHotplugQueueSnapshotDebounceSeconds     = 2
 	defaultHotplugDiagnosticsEnabled               = true
 	defaultHotplugDiagnosticsStuckAfterSeconds     = 300
 	defaultHotplugDiagnosticsProgressWindowSeconds = 60
@@ -136,6 +140,8 @@ const (
 	defaultLocalRestartDetachGraceSeconds          = 90
 	defaultLocalRestartDetachGraceMaxSeconds       = 300
 	defaultLocalRestartRequireNodeReady            = true
+	defaultMaintenanceReleaseMinSeconds            = 300
+	defaultMaintenanceReleaseMaxSeconds            = 1800
 	defaultLocalRWOStaleMountActivePodRecovery     = false
 	defaultLocalRWOStaleMountMaxAttempts           = 3
 	defaultLocalRWOStaleMountBackoffSeconds        = 10
@@ -223,6 +229,7 @@ func initViper() *viper.Viper {
 	viper.SetDefault(HotplugQueuePerItemWaitSecondsVar, defaultHotplugQueuePerItemWaitSeconds)
 	viper.SetDefault(HotplugQueueMaxWaitCapSecondsVar, defaultHotplugQueueMaxWaitCapSeconds)
 	viper.SetDefault(HotplugQueueMaxActiveSecondsVar, defaultHotplugQueueMaxActiveSeconds)
+	viper.SetDefault(HotplugQueueSnapshotDebounceSecondsVar, defaultHotplugQueueSnapshotDebounceSeconds)
 	viper.SetDefault(HotplugDiagnosticsEnabledVar, defaultHotplugDiagnosticsEnabled)
 	viper.SetDefault(HotplugDiagnosticsStuckAfterSecondsVar, defaultHotplugDiagnosticsStuckAfterSeconds)
 	viper.SetDefault(HotplugDiagnosticsProgressWindowSecondsVar, defaultHotplugDiagnosticsProgressWindowSeconds)
@@ -235,6 +242,8 @@ func initViper() *viper.Viper {
 	viper.SetDefault(LocalRestartDetachGraceSecondsVar, defaultLocalRestartDetachGraceSeconds)
 	viper.SetDefault(LocalRestartDetachGraceMaxSecondsVar, defaultLocalRestartDetachGraceMaxSeconds)
 	viper.SetDefault(LocalRestartRequireNodeReadyVar, defaultLocalRestartRequireNodeReady)
+	viper.SetDefault(MaintenanceReleaseMinSecondsVar, defaultMaintenanceReleaseMinSeconds)
+	viper.SetDefault(MaintenanceReleaseMaxSecondsVar, defaultMaintenanceReleaseMaxSeconds)
 	viper.SetDefault(LocalRWOStaleMountActivePodRecoveryVar, defaultLocalRWOStaleMountActivePodRecovery)
 	viper.SetDefault(LocalRWOStaleMountMaxAttemptsVar, defaultLocalRWOStaleMountMaxAttempts)
 	viper.SetDefault(LocalRWOStaleMountBackoffSecondsVar, defaultLocalRWOStaleMountBackoffSeconds)

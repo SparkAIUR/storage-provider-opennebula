@@ -63,7 +63,7 @@ rules:
     resources: ["customresourcedefinitions"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["storageprovider.opennebula.sparkaiur.io"]
-    resources: ["opennebuladatastores"]
+    resources: ["opennebuladatastores", "opennebulanodes"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]

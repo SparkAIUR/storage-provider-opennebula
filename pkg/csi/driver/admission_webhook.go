@@ -112,10 +112,15 @@ func (w *LastNodePreferenceWebhook) buildPatch(ctx context.Context, pod *corev1.
 		return nil, nil, nil
 	}
 
+	maintenanceActive := w.driver.maintenanceMode != nil && w.driver.maintenanceMode.Active()
 	targetNode, warnings, reason, err := w.resolvePreferredNode(ctx, pod)
 	if err != nil {
 		w.driver.metrics.RecordLastNodePreference("error", "resolution_failed")
 		return nil, warnings, err
+	}
+	if maintenanceActive && reason == "conflicting_nodes" {
+		w.driver.metrics.RecordLastNodePreference("error", "maintenance_conflicting_nodes")
+		return nil, warnings, fmt.Errorf("maintenance mode requires a single last attached node for local RWO PVCs")
 	}
 	if strings.TrimSpace(targetNode) == "" {
 		w.driver.metrics.RecordLastNodePreference("skipped", reason)
@@ -126,12 +131,18 @@ func (w *LastNodePreferenceWebhook) buildPatch(ctx context.Context, pod *corev1.
 		w.driver.metrics.RecordLastNodePreference("error", "node_lookup_failed")
 		return nil, warnings, err
 	}
-	if hasPreferredHostnameAffinity(pod, hostname) {
+	if !maintenanceActive && hasPreferredHostnameAffinity(pod, hostname) {
 		w.driver.metrics.RecordLastNodePreference("skipped", "already_present")
 		return nil, warnings, nil
 	}
 
-	patch := buildLastNodePreferencePatch(pod, targetNode, hostname)
+	var patch []jsonPatchOperation
+	if maintenanceActive {
+		patch = buildLastNodeRequiredPatch(pod, targetNode, hostname)
+		w.driver.metrics.RecordLastNodePreference("injected", "maintenance_required_hostname")
+		return patch, warnings, nil
+	}
+	patch = buildLastNodePreferencePatch(pod, targetNode, hostname)
 	w.driver.metrics.RecordLastNodePreference("injected", "preferred_hostname")
 	return patch, warnings, nil
 }
@@ -262,6 +273,67 @@ func buildLastNodePreferencePatch(pod *corev1.Pod, targetNode, hostname string) 
 		},
 	})
 	return patch
+}
+
+func buildLastNodeRequiredPatch(pod *corev1.Pod, targetNode, hostname string) []jsonPatchOperation {
+	patch := make([]jsonPatchOperation, 0, 4)
+	if pod.Annotations == nil {
+		patch = append(patch, jsonPatchOperation{Op: "add", Path: "/metadata/annotations", Value: map[string]string{}})
+	}
+	patch = append(patch,
+		jsonPatchOperation{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(annotationPreferredLastNode), Value: targetNode},
+		jsonPatchOperation{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(annotationLastNodeInjected), Value: "true"},
+	)
+
+	affinity := corev1.Affinity{}
+	affinityOp := "add"
+	if pod.Spec.Affinity != nil {
+		affinity = *pod.Spec.Affinity.DeepCopy()
+		affinityOp = "replace"
+	}
+	if affinity.NodeAffinity == nil {
+		affinity.NodeAffinity = &corev1.NodeAffinity{}
+	}
+	requirement := corev1.NodeSelectorRequirement{
+		Key:      corev1.LabelHostname,
+		Operator: corev1.NodeSelectorOpIn,
+		Values:   []string{hostname},
+	}
+	required := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if required == nil || len(required.NodeSelectorTerms) == 0 {
+		affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{
+			NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+				MatchExpressions: []corev1.NodeSelectorRequirement{requirement},
+			}},
+		}
+	} else {
+		for i := range required.NodeSelectorTerms {
+			if !nodeSelectorTermHasHostname(required.NodeSelectorTerms[i], hostname) {
+				required.NodeSelectorTerms[i].MatchExpressions = append(required.NodeSelectorTerms[i].MatchExpressions, requirement)
+			}
+		}
+		affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = required
+	}
+	patch = append(patch, jsonPatchOperation{
+		Op:    affinityOp,
+		Path:  "/spec/affinity",
+		Value: affinity,
+	})
+	return patch
+}
+
+func nodeSelectorTermHasHostname(term corev1.NodeSelectorTerm, hostname string) bool {
+	for _, expr := range term.MatchExpressions {
+		if expr.Key != corev1.LabelHostname || expr.Operator != corev1.NodeSelectorOpIn {
+			continue
+		}
+		for _, value := range expr.Values {
+			if value == hostname {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func jsonPointerEscape(value string) string {

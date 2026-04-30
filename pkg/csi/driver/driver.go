@@ -70,6 +70,7 @@ type Driver struct {
 	kubeRuntime       *KubeRuntime
 	stickyAttachments *StickyAttachmentManager
 	hotplugQueue      *HotplugQueueManager
+	maintenanceMode   *MaintenanceModeManager
 	adaptiveTimeouts  *opennebula.AdaptiveTimeoutTracker
 
 	inventoryEligibility inventorycache.DatastoreEligibilityProvider
@@ -120,8 +121,12 @@ func (d *Driver) Run(ctx context.Context) error {
 		if err := d.loadHotplugGuardState(ctx); err != nil {
 			klog.V(2).InfoS("Failed to load hotplug guard state", "err", err)
 		}
+		d.maintenanceMode = NewMaintenanceModeManager(d, "")
 	}
 	d.hotplugQueue = NewHotplugQueueManager(d.kubeRuntime, "", d.metrics, loadHotplugQueueMaxWait(d.PluginConfig), loadHotplugQueueAgeBoost(d.PluginConfig))
+	if d.hotplugQueue != nil {
+		d.hotplugQueue.SetSnapshotDebounce(loadHotplugQueueSnapshotDebounce(d.PluginConfig))
+	}
 	d.adaptiveTimeouts = opennebula.NewAdaptiveTimeoutTracker(loadAdaptiveTimeoutConfig(d.PluginConfig))
 	if err := d.loadAdaptiveTimeoutObservations(ctx); err != nil {
 		klog.V(2).InfoS("Failed to load adaptive timeout observations", "err", err)
@@ -239,6 +244,9 @@ func (d *Driver) loadHotplugGuardState(ctx context.Context) error {
 	states := make(map[string]opennebula.HotplugCooldownState, len(cm.Data))
 	now := time.Now().UTC()
 	for node, raw := range cm.Data {
+		if isMaintenanceConfigMapKey(node) {
+			continue
+		}
 		var state opennebula.HotplugCooldownState
 		if err := json.Unmarshal([]byte(raw), &state); err != nil {
 			klog.V(2).InfoS("Skipping invalid hotplug guard state", "node", node, "err", err)
@@ -337,6 +345,14 @@ func loadHotplugQueueMaxActive(cfg config.CSIPluginConfig) time.Duration {
 	seconds, ok := cfg.GetInt(config.HotplugQueueMaxActiveSecondsVar)
 	if !ok || seconds <= 0 {
 		seconds = 900
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func loadHotplugQueueSnapshotDebounce(cfg config.CSIPluginConfig) time.Duration {
+	seconds, ok := cfg.GetInt(config.HotplugQueueSnapshotDebounceSecondsVar)
+	if !ok || seconds < 0 {
+		seconds = 2
 	}
 	return time.Duration(seconds) * time.Second
 }

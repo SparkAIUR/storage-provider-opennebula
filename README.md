@@ -146,6 +146,8 @@ Behavior:
 - the disk stays attached for a short grace period, default `90s`
 - if the replacement pod is published back to the same node during that window, the controller reuses the existing attachment and skips detach/reattach
 - if the replacement pod lands on a different node, the controller cancels the grace and detaches immediately so normal attach can continue
+- if Kubernetes asks to detach while an active pod or non-deleting `VolumeAttachment` still desires the same node, the controller treats that stale same-node detach as successful and leaves the disk attached
+- if stale sticky state points at an old node where OpenNebula already reports the disk absent, the controller clears the sticky state instead of issuing another detach
 
 This is best-effort same-node reuse only. The CSI driver does not force Kubernetes to reschedule the pod onto the previous node.
 
@@ -182,7 +184,23 @@ The local restart path includes a broader CSI performance and stability layer:
 - same-node hotplug work is queued fairly instead of failing fast with `node_busy`
 - the controller can inject a soft last-node scheduling preference for local single-writer pods so StatefulSet restarts are more likely to land back on the previous node
 - a conservative stuck-attachment reconciler repairs orphaned OpenNebula attachments and stale `VolumeAttachment` objects
+- OpenNebulaNode `HotplugStuck` inventory status immediately pauses new hotplug work for that node until readiness gates and inventory diagnosis clear
+- hotplug queue state snapshots are debounced during churn while empty-queue snapshots still flush immediately for operator visibility
 - attach, detach, and device-resolution latencies now feed an adaptive timeout window so slower environments raise budgets without reducing the current static timeout floor
+
+### Controller maintenance mode
+
+For Talos/Kubernetes rolling maintenance on clusters with local RWO volumes, operators can pause cross-node PVC movement through the controller ConfigMap:
+
+```bash
+kubectl -n kube-system patch configmap opennebula-csi-hotplug-state \
+  --type merge \
+  -p '{"data":{"maintainenceMode":"true"}}'
+```
+
+The controller accepts both `maintainenceMode` and `maintenanceMode`. While active, it prepares local non-CephFS `ReadWriteOnce` volumes best-effort, publishes `maintainenceReady=true`, injects required same-node affinity for eligible pods, holds maintenance detaches without physical OpenNebula detach, and rejects cross-node attach attempts with retryable `Unavailable`.
+
+When maintenance is complete, set the mode key back to `false`. The controller removes `maintainenceReady`/`maintenanceReady` and releases maintenance holds gradually using `driver.maintenanceMode.releaseMinSeconds` and `driver.maintenanceMode.releaseMaxSeconds`.
 
 New workload controls:
 

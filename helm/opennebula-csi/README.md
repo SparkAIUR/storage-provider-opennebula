@@ -268,6 +268,14 @@ Behavior:
 - on `ControllerUnpublishVolume`, the driver keeps the local disk attached for a short grace period instead of detaching immediately
 - if the replacement pod is scheduled back to the same node during that grace window, the driver reuses the existing attachment and skips detach/reattach
 - if the pod lands on a different node, the grace is cancelled and the normal detach/attach path proceeds immediately
+- stale same-node detaches are treated as successful when Kubernetes still desires the PVC on that node
+- expired sticky state is cleared without detach when OpenNebula already reports the old-node attachment absent
+
+### ConfigMap-driven maintenance mode
+
+For rolling node maintenance, set `maintainenceMode=true` or `maintenanceMode=true` in `opennebula-csi-hotplug-state` in the driver namespace. The controller will prepare eligible local non-CephFS `ReadWriteOnce` volumes, publish `maintainenceReady=true`, inject required same-node affinity for eligible pods, hold maintenance detaches without physical OpenNebula detach, and reject cross-node attach attempts with retryable `Unavailable`.
+
+When maintenance ends, set the mode key to `false`. The controller removes both ready keys and releases maintenance holds gradually using `driver.maintenanceMode.releaseMinSeconds` and `driver.maintenanceMode.releaseMaxSeconds`.
 
 This is best-effort same-node reuse only. The CSI driver does not pin scheduling to the previous node.
 
@@ -350,6 +358,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.hotplugQueue.perItemWaitSeconds` | Extra wait budget added per active or queued request ahead of a new request. | `60` | No |
 | `driver.hotplugQueue.maxWaitCapSeconds` | Upper bound for dynamic queue wait budgets. | `900` | No |
 | `driver.hotplugQueue.maxActiveSeconds` | Maximum execution time for an active queued hotplug request before it is classified as timed out. | `900` | No |
+| `driver.hotplugQueue.snapshotDebounceSeconds` | Debounce interval for hotplug queue ConfigMap snapshots during recovery churn. Empty queue snapshots still flush immediately. | `2` | No |
 | `driver.hotplugDiagnostics.enabled` | Persist read-only OpenNebula HOTPLUG observations for support bundles, inventory status, and timeout diagnosis. | `true` | No |
 | `driver.hotplugDiagnostics.stuckAfterSeconds` | HOTPLUG age after which an unchanged observation is classified as stuck. | `300` | No |
 | `driver.hotplugDiagnostics.progressWindowSeconds` | Required unchanged observation window before a HOTPLUG VM is classified as stuck. | `60` | No |
@@ -362,6 +371,8 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.localRestartOptimization.detachGraceSeconds` | Default delayed-detach grace used for opted-in local PVCs. | `90` | No |
 | `driver.localRestartOptimization.maxDetachGraceSeconds` | Upper bound for per-PVC delayed-detach overrides. | `300` | No |
 | `driver.localRestartOptimization.requireNodeReady` | Require Kubernetes node and OpenNebula VM readiness before starting delayed detach. | `true` | No |
+| `driver.maintenanceMode.releaseMinSeconds` | Minimum delay used when releasing ConfigMap-driven maintenance attachment holds after mode exit. | `300` | No |
+| `driver.maintenanceMode.releaseMaxSeconds` | Maximum stagger delay used when releasing ConfigMap-driven maintenance attachment holds after mode exit. | `1800` | No |
 | `driver.localRWOStaleMountRecovery.activePodRecovery` | Allow experimental recovery of stale local RWO mounts while a pod target is still active. Requires `featureGates.localRWOStaleMountRecovery=true`. | `false` | No |
 | `driver.localRWOStaleMountRecovery.maxAttempts` | Maximum recovery attempts persisted per local RWO volume session. | `3` | No |
 | `driver.localRWOStaleMountRecovery.backoffSeconds` | Backoff after a failed local RWO stale-mount recovery attempt. | `10` | No |

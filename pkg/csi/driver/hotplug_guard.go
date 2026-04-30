@@ -81,6 +81,29 @@ func (g *HotplugGuard) MarkUnhealthyFailure(node, operation, volume string, time
 	return state, state.PauseUntilReady
 }
 
+func (g *HotplugGuard) MarkPaused(state opennebula.HotplugCooldownState) opennebula.HotplugCooldownState {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	now := time.Now().UTC()
+	if state.Node == "" {
+		return state
+	}
+	if state.FirstFailureAt.IsZero() {
+		state.FirstFailureAt = now
+	}
+	if state.LastFailureAt.IsZero() {
+		state.LastFailureAt = now
+	}
+	if state.FailureCount <= 0 {
+		state.FailureCount = 1
+	}
+	state.PauseUntilReady = true
+	state.ExpiresAt = time.Time{}
+	g.states[state.Node] = state
+	return state
+}
+
 func (g *HotplugGuard) Load(states map[string]opennebula.HotplugCooldownState) {
 	if g == nil || len(states) == 0 {
 		return
