@@ -52,6 +52,7 @@ type DriverMetrics struct {
 	maintenanceBlockedTotal      *prometheus.CounterVec
 	metadataDriftTotal           *prometheus.CounterVec
 	volumeQuarantineTotal        *prometheus.CounterVec
+	hostArtifactQuarantineTotal  *prometheus.CounterVec
 	attachmentReconcilerTotal    *prometheus.CounterVec
 	hotplugRecommendedTimeout    *prometheus.GaugeVec
 	hotplugObservationSamples    *prometheus.GaugeVec
@@ -203,6 +204,10 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 			Name: "opennebula_csi_volume_quarantine_total",
 			Help: "Total number of volume quarantine decisions by reason and outcome.",
 		}, []string{"reason", "outcome"}),
+		hostArtifactQuarantineTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_host_artifact_quarantine_total",
+			Help: "Total number of host artifact quarantine decisions by classification and outcome.",
+		}, []string{"classification", "outcome"}),
 		attachmentReconcilerTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "opennebula_csi_attachment_reconciler_total",
 			Help: "Total number of attachment reconciliation checks by check, action, and outcome.",
@@ -262,6 +267,7 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 		metrics.maintenanceBlockedTotal,
 		metrics.metadataDriftTotal,
 		metrics.volumeQuarantineTotal,
+		metrics.hostArtifactQuarantineTotal,
 		metrics.attachmentReconcilerTotal,
 		metrics.hotplugRecommendedTimeout,
 		metrics.hotplugObservationSamples,
@@ -495,6 +501,13 @@ func (m *DriverMetrics) RecordVolumeQuarantine(reason, outcome string) {
 		return
 	}
 	m.volumeQuarantineTotal.WithLabelValues(reason, outcome).Inc()
+}
+
+func (m *DriverMetrics) RecordHostArtifactQuarantine(classification, outcome string) {
+	if m == nil {
+		return
+	}
+	m.hostArtifactQuarantineTotal.WithLabelValues(classification, outcome).Inc()
 }
 
 func (m *DriverMetrics) RecordAttachmentReconciler(check, action, outcome string) {

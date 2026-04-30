@@ -34,6 +34,7 @@ const (
 	eventReasonMaintenanceModeReleased      = "MaintenanceModeReleased"
 	eventReasonOpenNebulaMetadataDrift      = "OpenNebulaMetadataDriftDetected"
 	eventReasonVolumeQuarantined            = "VolumeQuarantined"
+	eventReasonHostArtifactQuarantined      = "HostArtifactQuarantined"
 	eventReasonStuckAttachmentDetached      = "StuckAttachmentDetached"
 	eventReasonStuckAttachmentRepublish     = "StuckAttachmentRepublishRequested"
 	eventReasonLocalImmediateBindingWarning = "LocalImmediateBindingWarning"

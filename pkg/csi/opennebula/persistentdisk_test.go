@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/shared"
 	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/vm"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/google/uuid"
@@ -220,6 +221,37 @@ func TestIsHotplugStateError(t *testing.T) {
 	require.True(t, isHotplugStateError(fmt.Errorf("wrong state hotplug")))
 	require.False(t, isHotplugStateError(fmt.Errorf("wrong state running")))
 	require.False(t, isHotplugStateError(nil))
+}
+
+func TestHostArtifactConflictFromMessageParsesLocalLVName(t *testing.T) {
+	conflict, ok := HostArtifactConflictFromMessage(
+		`ATTACHDISK: Logical volume "lv-one-161-2" already exists`,
+		HostArtifactAttachmentTarget{NodeName: "hplbravow02", ImageID: 233},
+		fmt.Errorf("attach failed"),
+	)
+
+	require.True(t, ok)
+	require.NotNil(t, conflict)
+	assert.Equal(t, HostArtifactConflictClassification, conflict.Classification)
+	assert.Equal(t, 161, conflict.Target.VMID)
+	assert.Equal(t, 2, conflict.Target.DiskID)
+	assert.Equal(t, "lv-one-161-2", conflict.Target.LVName)
+	assert.Contains(t, conflict.Error(), "lv=lv-one-161-2")
+}
+
+func TestNextAvailableDiskIDIncludesContextDisk(t *testing.T) {
+	tpl := vm.NewTemplate()
+	root := shared.NewDisk()
+	root.Add(shared.DiskID, 0)
+	root.Add(shared.TargetDisk, "sda")
+	rootVector := root.Vector
+	tpl.Elements = append(tpl.Elements, &rootVector)
+	require.NoError(t, tpl.AddPairToVec("CONTEXT", "DISK_ID", 1))
+
+	vmInfo := &vm.VM{ID: 161, Template: *tpl}
+
+	assert.Equal(t, 2, nextAvailableDiskID(vmInfo))
+	assert.Equal(t, "sdb", nextAvailableDiskTarget(vmInfo, map[string]string{"devPrefix": "sd"}))
 }
 
 func TestComputeHotplugTimeoutScalesWithVolumeSize(t *testing.T) {

@@ -388,6 +388,9 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.metadataDriftQuarantine.enabled` | Enable read-only OpenNebula image/VM metadata drift detection and temporary volume quarantine for local RWO attach/detach loops. | `true` | No |
 | `driver.metadataDriftQuarantine.failureThreshold` | Matching metadata-drift failures required before the volume quarantine is active. | `2` | No |
 | `driver.metadataDriftQuarantine.ttlSeconds` | Active quarantine duration after the threshold is reached. | `1800` | No |
+| `driver.hostArtifactQuarantine.enabled` | Enable read-only quarantine when local `fs_lvm_ssh` attach failures indicate a stale host-side LV such as `lv-one-<vm>-<disk>`. | `true` | No |
+| `driver.hostArtifactQuarantine.failureThreshold` | Matching host-artifact failures required before the VM/disk slot quarantine is active. | `1` | No |
+| `driver.hostArtifactQuarantine.ttlSeconds` | Active host-artifact quarantine duration; after external repair, operators can also clear the matching `opennebula-csi-host-artifact-state` key to retry immediately. | `3600` | No |
 | `driver.localDeviceRecovery.enabled` | Enable controller-driven same-node detach/reattach recovery after node-side local device discovery repeatedly fails. | `true` | No |
 | `driver.localDeviceRecovery.minAttempts` | Missing-device reports required from a node before recovery is eligible. | `3` | No |
 | `driver.localDeviceRecovery.minAgeSeconds` | Minimum age of the first missing-device report before recovery is eligible. | `60` | No |

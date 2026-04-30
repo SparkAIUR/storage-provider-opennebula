@@ -71,6 +71,9 @@ const (
 	MetadataDriftQuarantineEnabledVar          = "ONE_CSI_METADATA_DRIFT_QUARANTINE_ENABLED"
 	MetadataDriftQuarantineFailureThresholdVar = "ONE_CSI_METADATA_DRIFT_QUARANTINE_FAILURE_THRESHOLD"
 	MetadataDriftQuarantineTTLSecondsVar       = "ONE_CSI_METADATA_DRIFT_QUARANTINE_TTL_SECONDS"
+	HostArtifactQuarantineEnabledVar           = "ONE_CSI_HOST_ARTIFACT_QUARANTINE_ENABLED"
+	HostArtifactQuarantineFailureThresholdVar  = "ONE_CSI_HOST_ARTIFACT_QUARANTINE_FAILURE_THRESHOLD"
+	HostArtifactQuarantineTTLSecondsVar        = "ONE_CSI_HOST_ARTIFACT_QUARANTINE_TTL_SECONDS"
 	LocalDeviceRecoveryEnabledVar              = "ONE_CSI_LOCAL_DEVICE_RECOVERY_ENABLED"
 	LocalDeviceRecoveryMinAttemptsVar          = "ONE_CSI_LOCAL_DEVICE_RECOVERY_MIN_ATTEMPTS"
 	LocalDeviceRecoveryMinAgeSecondsVar        = "ONE_CSI_LOCAL_DEVICE_RECOVERY_MIN_AGE_SECONDS"
@@ -154,6 +157,9 @@ const (
 	defaultMetadataDriftQuarantineEnabled          = true
 	defaultMetadataDriftQuarantineFailureThreshold = 2
 	defaultMetadataDriftQuarantineTTLSeconds       = 1800
+	defaultHostArtifactQuarantineEnabled           = true
+	defaultHostArtifactQuarantineFailureThreshold  = 1
+	defaultHostArtifactQuarantineTTLSeconds        = 3600
 	defaultLocalDeviceRecoveryEnabled              = true
 	defaultLocalDeviceRecoveryMinAttempts          = 3
 	defaultLocalDeviceRecoveryMinAgeSeconds        = 60
@@ -265,6 +271,9 @@ func initViper() *viper.Viper {
 	viper.SetDefault(MetadataDriftQuarantineEnabledVar, defaultMetadataDriftQuarantineEnabled)
 	viper.SetDefault(MetadataDriftQuarantineFailureThresholdVar, defaultMetadataDriftQuarantineFailureThreshold)
 	viper.SetDefault(MetadataDriftQuarantineTTLSecondsVar, defaultMetadataDriftQuarantineTTLSeconds)
+	viper.SetDefault(HostArtifactQuarantineEnabledVar, defaultHostArtifactQuarantineEnabled)
+	viper.SetDefault(HostArtifactQuarantineFailureThresholdVar, defaultHostArtifactQuarantineFailureThreshold)
+	viper.SetDefault(HostArtifactQuarantineTTLSecondsVar, defaultHostArtifactQuarantineTTLSeconds)
 	viper.SetDefault(LocalDeviceRecoveryEnabledVar, defaultLocalDeviceRecoveryEnabled)
 	viper.SetDefault(LocalDeviceRecoveryMinAttemptsVar, defaultLocalDeviceRecoveryMinAttempts)
 	viper.SetDefault(LocalDeviceRecoveryMinAgeSecondsVar, defaultLocalDeviceRecoveryMinAgeSeconds)

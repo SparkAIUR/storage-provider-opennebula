@@ -498,6 +498,13 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 			klog.Warningf("volume %s attach validation warning: %s", volume, warning)
 		}
 	}
+	hostArtifactTarget, targetErr := p.hostArtifactAttachmentTargetForResolved(ctx, volume, node, volumeID, nodeID, params, report)
+	if targetErr != nil {
+		klog.V(3).InfoS("Failed to predict host artifact attachment target",
+			"volume", volume,
+			"node", node,
+			"err", targetErr)
+	}
 	disk := shared.NewDisk()
 	disk.Add(shared.ImageID, volumeID)
 	disk.Add(shared.Serial, fmt.Sprintf("onecsi-%d", volumeID))
@@ -517,6 +524,9 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 
 	attachErr := attachDisk()
 	if attachErr != nil && !isHotplugStateError(attachErr) {
+		if conflict, ok := p.classifyHostArtifactConflict(ctx, nodeID, report, hostArtifactTarget, attachErr); ok {
+			return conflict
+		}
 		return fmt.Errorf("failed to attach volume %s to node %s: %w",
 			volume, node, attachErr)
 	}
@@ -537,12 +547,194 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		}
 		return attached, ready, nil
 	}, retryAttach, volume, node); err != nil {
+		if conflict, ok := p.classifyHostArtifactConflict(ctx, nodeID, report, hostArtifactTarget, err); ok {
+			return conflict
+		}
 		if attachErr != nil {
 			return fmt.Errorf("%w (initial attach error: %v)", err, attachErr)
 		}
 		return err
 	}
 	return nil
+}
+
+func (p *PersistentDiskVolumeProvider) InspectHostArtifactAttachmentTarget(ctx context.Context, volume string, node string, params map[string]string) (*HostArtifactAttachmentTarget, error) {
+	nodeID, err := p.NodeExists(ctx, node)
+	if err != nil || nodeID == -1 {
+		return nil, fmt.Errorf("failed to check if node exists: %w", err)
+	}
+
+	volumeID, _, err := p.VolumeExists(ctx, volume)
+	if err != nil || volumeID == -1 {
+		return nil, fmt.Errorf("failed to check if volume exists: %w", err)
+	}
+
+	report, err := p.inspectAttachmentEnvironment(ctx, volumeID, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	return p.hostArtifactAttachmentTargetForResolved(ctx, volume, node, volumeID, nodeID, params, report)
+}
+
+func (p *PersistentDiskVolumeProvider) hostArtifactAttachmentTargetForResolved(ctx context.Context, volume, node string, volumeID, nodeID int, params map[string]string, report *DatastoreEnvironmentReport) (*HostArtifactAttachmentTarget, error) {
+	if !hostArtifactCandidateDeployment(report) {
+		return nil, nil
+	}
+	vmInfo, err := p.ctrl.VM(nodeID).InfoContext(ctx, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect node %d for host artifact target: %w", nodeID, err)
+	}
+
+	diskID := nextAvailableDiskID(vmInfo)
+	target := nextAvailableDiskTarget(vmInfo, params)
+	candidate := &HostArtifactAttachmentTarget{
+		VolumeHandle: volume,
+		ImageID:      volumeID,
+		NodeName:     node,
+		VMID:         nodeID,
+		DiskID:       diskID,
+		Target:       target,
+	}
+	if diskID > 0 {
+		candidate.LVName = fmt.Sprintf("lv-one-%d-%d", nodeID, diskID)
+	}
+	if report != nil && report.SystemDatastore != nil {
+		candidate.SystemDatastoreID = report.SystemDatastore.ID
+		candidate.SystemDatastoreName = report.SystemDatastore.Name
+		candidate.SystemDatastoreTM = report.SystemDatastore.TMMad
+	}
+	if history := latestHistoryRecord(vmInfo); history != nil {
+		candidate.HostID = history.HID
+		candidate.HostName = history.Hostname
+	}
+	return candidate, nil
+}
+
+func (p *PersistentDiskVolumeProvider) classifyHostArtifactConflict(ctx context.Context, nodeID int, report *DatastoreEnvironmentReport, target *HostArtifactAttachmentTarget, cause error) (*HostArtifactConflictError, bool) {
+	if !hostArtifactCandidateDeployment(report) {
+		return nil, false
+	}
+	candidate := HostArtifactAttachmentTarget{}
+	if target != nil {
+		candidate = *target
+	}
+	if conflict, ok := HostArtifactConflictFromMessage(causeMessage(cause), candidate, cause); ok {
+		return conflict, true
+	}
+	vmError := strings.TrimSpace(p.latestVMError(ctx, nodeID))
+	if vmError == "" {
+		return nil, false
+	}
+	return HostArtifactConflictFromMessage(vmError, candidate, cause)
+}
+
+func (p *PersistentDiskVolumeProvider) latestVMError(ctx context.Context, nodeID int) string {
+	vmInfo, err := p.ctrl.VM(nodeID).InfoContext(ctx, true)
+	if err != nil {
+		return ""
+	}
+	if value, err := vmInfo.UserTemplate.GetStr("ERROR"); err == nil {
+		return value
+	}
+	return ""
+}
+
+func hostArtifactCandidateDeployment(report *DatastoreEnvironmentReport) bool {
+	if report == nil || report.SystemDatastore == nil {
+		return false
+	}
+	tm := strings.ToLower(strings.TrimSpace(report.SystemDatastore.TMMad))
+	return report.DeploymentMode == DeploymentModeSSH &&
+		(strings.Contains(tm, "lvm") || strings.Contains(tm, "fs_lvm"))
+}
+
+func causeMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func nextAvailableDiskID(vmInfo *vm.VM) int {
+	if vmInfo == nil {
+		return 0
+	}
+	used := map[int]struct{}{}
+	for _, disk := range vmInfo.Template.GetDisks() {
+		if diskID, err := disk.GetI(shared.DiskID); err == nil && diskID >= 0 {
+			used[diskID] = struct{}{}
+		}
+	}
+	if raw, err := vmInfo.Template.GetStrFromVec("CONTEXT", "DISK_ID"); err == nil {
+		if diskID, convErr := strconv.Atoi(strings.TrimSpace(raw)); convErr == nil && diskID >= 0 {
+			used[diskID] = struct{}{}
+		}
+	}
+	for diskID := 0; diskID < 512; diskID++ {
+		if _, ok := used[diskID]; !ok {
+			return diskID
+		}
+	}
+	return len(used)
+}
+
+func nextAvailableDiskTarget(vmInfo *vm.VM, params map[string]string) string {
+	prefix := "sd"
+	if params != nil && strings.TrimSpace(params["devPrefix"]) != "" {
+		prefix = strings.TrimSpace(params["devPrefix"])
+	}
+	used := map[int]struct{}{}
+	if vmInfo != nil {
+		for _, disk := range vmInfo.Template.GetDisks() {
+			target, err := disk.Get(shared.TargetDisk)
+			if err != nil {
+				continue
+			}
+			if index, ok := linuxDiskTargetIndex(strings.TrimSpace(target), prefix); ok {
+				used[index] = struct{}{}
+			}
+		}
+	}
+	for index := 0; index < 512; index++ {
+		if _, ok := used[index]; !ok {
+			return prefix + linuxDiskLetters(index)
+		}
+	}
+	return ""
+}
+
+func linuxDiskTargetIndex(target, prefix string) (int, bool) {
+	if prefix == "" || !strings.HasPrefix(target, prefix) {
+		return 0, false
+	}
+	suffix := strings.TrimPrefix(target, prefix)
+	if suffix == "" {
+		return 0, false
+	}
+	index := 0
+	for _, char := range suffix {
+		if char < 'a' || char > 'z' {
+			return 0, false
+		}
+		index = index*26 + int(char-'a'+1)
+	}
+	return index - 1, true
+}
+
+func linuxDiskLetters(index int) string {
+	if index < 0 {
+		index = 0
+	}
+	letters := ""
+	for {
+		remainder := index % 26
+		letters = string(rune('a'+remainder)) + letters
+		index = index/26 - 1
+		if index < 0 {
+			break
+		}
+	}
+	return letters
 }
 
 func (p *PersistentDiskVolumeProvider) inspectAttachmentEnvironment(ctx context.Context, volumeID, nodeID int) (*DatastoreEnvironmentReport, error) {
@@ -1398,6 +1590,19 @@ func latestHistoryDatastoreID(vmInfo *vm.VM) (int, error) {
 		return 0, &datastoreConfigError{message: "target VM information is not available"}
 	}
 
+	latest := latestHistoryRecord(vmInfo)
+
+	if latest == nil {
+		return 0, &datastoreConfigError{message: fmt.Sprintf("target VM %d does not expose a system datastore history record", vmInfo.ID)}
+	}
+
+	return latest.DSID, nil
+}
+
+func latestHistoryRecord(vmInfo *vm.VM) *vm.HistoryRecord {
+	if vmInfo == nil {
+		return nil
+	}
 	var latest *vm.HistoryRecord
 	for idx := range vmInfo.HistoryRecords {
 		record := &vmInfo.HistoryRecords[idx]
@@ -1408,12 +1613,7 @@ func latestHistoryDatastoreID(vmInfo *vm.VM) (int, error) {
 			latest = record
 		}
 	}
-
-	if latest == nil {
-		return 0, &datastoreConfigError{message: fmt.Sprintf("target VM %d does not expose a system datastore history record", vmInfo.ID)}
-	}
-
-	return latest.DSID, nil
+	return latest
 }
 
 func imageSnapshotByID(imageInfo *img.Image, snapshotID int) (shared.Snapshot, error) {

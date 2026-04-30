@@ -70,6 +70,10 @@ driver:
     enabled: true
     failureThreshold: 2
     ttlSeconds: 1800
+  hostArtifactQuarantine:
+    enabled: true
+    failureThreshold: 1
+    ttlSeconds: 3600
   localDeviceRecovery:
     enabled: true
     minAttempts: 3

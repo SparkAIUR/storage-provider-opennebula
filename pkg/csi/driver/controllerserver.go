@@ -778,6 +778,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		if s.driver.volumeQuarantine != nil {
 			_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
 		}
+		s.clearHostArtifactQuarantineForVolume(ctx, req.VolumeId)
 		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
 		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
 		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext())
@@ -830,6 +831,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			if s.driver.volumeQuarantine != nil {
 				_ = s.driver.volumeQuarantine.Clear(queueCtx, req.VolumeId)
 			}
+			s.clearHostArtifactQuarantineForVolume(queueCtx, req.VolumeId)
 			s.clearStickyReuseState(queueCtx, req.VolumeId, req.NodeId, "disk")
 			s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
 			response = &csi.ControllerPublishVolumeResponse{
@@ -840,6 +842,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 		if driftErr := s.rejectIfOpenNebulaMetadataDrift(queueCtx, req); driftErr != nil {
 			return driftErr
+		}
+		if hostArtifactErr := s.rejectIfHostArtifactQuarantineActive(queueCtx, req); hostArtifactErr != nil {
+			return hostArtifactErr
 		}
 
 		params := req.GetVolumeContext()
@@ -856,6 +861,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		attachStarted := time.Now()
 		err = s.volumeProvider.AttachVolume(queueCtx, req.VolumeId, req.NodeId, immutableVolume, params)
 		if err != nil {
+			if conflict, ok := opennebula.AsHostArtifactConflictError(err); ok {
+				return s.handleHostArtifactConflict(queueCtx, req, conflict)
+			}
 			s.handleHotplugTimeout(queueCtx, req.NodeId, req.VolumeId, params, "attach", "disk", err)
 			switch {
 			case opennebula.IsDatastoreConfigError(err):
@@ -869,6 +877,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		if s.driver.volumeQuarantine != nil {
 			_ = s.driver.volumeQuarantine.Clear(queueCtx, req.VolumeId)
 		}
+		s.clearHostArtifactQuarantineForVolume(queueCtx, req.VolumeId)
 
 		klog.V(3).InfoS("Checking if volume is attached",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID)

@@ -65,14 +65,15 @@ type Driver struct {
 
 	mounter *mount.SafeFormatAndMount
 
-	featureGates      FeatureGates
-	metrics           *DriverMetrics
-	kubeRuntime       *KubeRuntime
-	stickyAttachments *StickyAttachmentManager
-	volumeQuarantine  *VolumeQuarantineManager
-	hotplugQueue      *HotplugQueueManager
-	maintenanceMode   *MaintenanceModeManager
-	adaptiveTimeouts  *opennebula.AdaptiveTimeoutTracker
+	featureGates           FeatureGates
+	metrics                *DriverMetrics
+	kubeRuntime            *KubeRuntime
+	stickyAttachments      *StickyAttachmentManager
+	volumeQuarantine       *VolumeQuarantineManager
+	hostArtifactQuarantine *HostArtifactQuarantineManager
+	hotplugQueue           *HotplugQueueManager
+	maintenanceMode        *MaintenanceModeManager
+	adaptiveTimeouts       *opennebula.AdaptiveTimeoutTracker
 
 	inventoryEligibility inventorycache.DatastoreEligibilityProvider
 }
@@ -122,6 +123,10 @@ func (d *Driver) Run(ctx context.Context) error {
 		d.volumeQuarantine = NewVolumeQuarantineManager(d.kubeRuntime, "")
 		if err := d.volumeQuarantine.LoadFromConfigMap(ctx); err != nil {
 			klog.V(2).InfoS("Failed to load volume quarantine state", "err", err)
+		}
+		d.hostArtifactQuarantine = NewHostArtifactQuarantineManager(d.kubeRuntime, "")
+		if err := d.hostArtifactQuarantine.LoadFromConfigMap(ctx); err != nil {
+			klog.V(2).InfoS("Failed to load host artifact quarantine state", "err", err)
 		}
 		if err := d.loadHotplugGuardState(ctx); err != nil {
 			klog.V(2).InfoS("Failed to load hotplug guard state", "err", err)

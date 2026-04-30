@@ -119,6 +119,7 @@ func newStickyTestDriver(t *testing.T, objects ...runtime.Object) *Driver {
 	}
 	driver.stickyAttachments = NewStickyAttachmentManager(runtime, "default")
 	driver.volumeQuarantine = NewVolumeQuarantineManager(runtime, "default")
+	driver.hostArtifactQuarantine = NewHostArtifactQuarantineManager(runtime, "default")
 	require.NoError(t, driver.stickyAttachments.LoadFromConfigMap(context.Background()))
 	return driver
 }
@@ -1700,6 +1701,95 @@ func TestControllerPublishVolumeRejectsOpenNebulaMetadataDriftAndQuarantines(t *
 	provider.AssertExpectations(t)
 }
 
+func TestControllerPublishVolumeClassifiesHostArtifactConflictAndQuarantines(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-host-artifact", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pvc.Spec.VolumeName = pv.Name
+	driver := newStickyTestDriver(t, pv, pvc)
+	driver.PluginConfig.OverrideVal(config.HostArtifactQuarantineFailureThresholdVar, 1)
+	driver.PluginConfig.OverrideVal(config.HostArtifactQuarantineTTLSecondsVar, 3600)
+
+	conflict := &opennebula.HostArtifactConflictError{
+		Classification: opennebula.HostArtifactConflictClassification,
+		Target: opennebula.HostArtifactAttachmentTarget{
+			VolumeHandle:        "vol-host-artifact",
+			ImageID:             233,
+			NodeName:            "node-161",
+			VMID:                161,
+			DiskID:              2,
+			Target:              "sdb",
+			LVName:              "lv-one-161-2",
+			SystemDatastoreID:   104,
+			SystemDatastoreName: "DEVONeb1",
+			SystemDatastoreTM:   "fs_lvm_ssh",
+		},
+		RawMessage: `ATTACHDISK: Logical volume "lv-one-161-2" already exists`,
+		Cause:      errors.New("attach failed"),
+	}
+
+	provider := new(MockOpenNebulaVolumeProviderTestify)
+	provider.On("VolumeExists", mock.Anything, "vol-host-artifact").Return(233, volumeSize, nil).Once()
+	provider.On("NodeExists", mock.Anything, "node-161").Return(161, nil).Once()
+	provider.On("GetVolumeInNode", mock.Anything, 233, 161).Return("", errors.New("not attached")).Twice()
+	provider.On("AttachVolume", mock.Anything, "vol-host-artifact", "node-161", false, mock.Anything).Return(conflict).Once()
+
+	cs := NewControllerServer(driver, provider, &MockSharedFilesystemProviderTestify{})
+	_, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-host-artifact", "node-161"))
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "lv-one-161-2")
+
+	cm, err := driver.kubeRuntime.client.CoreV1().ConfigMaps("default").Get(context.Background(), hostArtifactStateConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+	var state HostArtifactQuarantineState
+	require.NoError(t, json.Unmarshal([]byte(cm.Data["vm-161.disk-2"]), &state))
+	assert.Equal(t, 1, state.FailureCount)
+	assert.True(t, state.ExpiresAt.After(time.Now()))
+	assert.Equal(t, "vol-host-artifact", state.VolumeID)
+	assert.Equal(t, "lv-one-161-2", state.LVName)
+	assert.Contains(t, state.RepairHint, "read-only quarantine")
+	provider.AssertExpectations(t)
+}
+
+func TestControllerPublishVolumeBlocksActiveHostArtifactQuarantine(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-host-artifact-active", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pvc.Spec.VolumeName = pv.Name
+	driver := newStickyTestDriver(t, pv, pvc)
+	_, active, err := driver.hostArtifactQuarantine.MarkFailure(context.Background(), HostArtifactQuarantineState{
+		Key:            "vm-161.disk-2",
+		Classification: opennebula.HostArtifactConflictClassification,
+		Reason:         hostArtifactReason,
+		VolumeID:       "vol-host-artifact-active",
+		NodeName:       "node-161",
+		VMID:           161,
+		DiskID:         2,
+		LVName:         "lv-one-161-2",
+		Message:        "stale host LV lv-one-161-2 blocks attach",
+	}, 1, time.Hour)
+	require.NoError(t, err)
+	require.True(t, active)
+
+	provider := new(MockOpenNebulaVolumeProviderTestify)
+	provider.On("VolumeExists", mock.Anything, "vol-host-artifact-active").Return(233, volumeSize, nil).Once()
+	provider.On("NodeExists", mock.Anything, "node-161").Return(161, nil).Once()
+	provider.On("GetVolumeInNode", mock.Anything, 233, 161).Return("", errors.New("not attached")).Twice()
+	provider.On("InspectHostArtifactAttachmentTarget", mock.Anything, "vol-host-artifact-active", "node-161", mock.Anything).Return(&opennebula.HostArtifactAttachmentTarget{
+		VolumeHandle: "vol-host-artifact-active",
+		ImageID:      233,
+		NodeName:     "node-161",
+		VMID:         161,
+		DiskID:       2,
+		LVName:       "lv-one-161-2",
+	}, nil).Once()
+
+	cs := NewControllerServer(driver, provider, &MockSharedFilesystemProviderTestify{})
+	_, err = cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-host-artifact-active", "node-161"))
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "host artifact quarantine active")
+	provider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	provider.AssertExpectations(t)
+}
+
 func TestControllerUnpublishVolumeClassifiesDetachMetadataDrift(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-detach-drift", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 	pvc.Spec.VolumeName = pv.Name
@@ -2359,6 +2449,17 @@ func (m *MockOpenNebulaVolumeProviderTestify) InspectVolumeAttachment(ctx contex
 	args := m.Called(ctx, volume, node)
 	if metadata := args.Get(0); metadata != nil {
 		return metadata.(*opennebula.VolumeAttachmentMetadata), args.Error(1)
+	}
+	return nil, args.Error(1)
+}
+
+func (m *MockOpenNebulaVolumeProviderTestify) InspectHostArtifactAttachmentTarget(ctx context.Context, volume string, node string, params map[string]string) (*opennebula.HostArtifactAttachmentTarget, error) {
+	if !m.hasExpectation("InspectHostArtifactAttachmentTarget") {
+		return nil, nil
+	}
+	args := m.Called(ctx, volume, node, params)
+	if target := args.Get(0); target != nil {
+		return target.(*opennebula.HostArtifactAttachmentTarget), args.Error(1)
 	}
 	return nil, args.Error(1)
 }

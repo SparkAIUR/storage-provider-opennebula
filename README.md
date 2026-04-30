@@ -214,6 +214,18 @@ Default controls:
 - `ONE_CSI_METADATA_DRIFT_QUARANTINE_FAILURE_THRESHOLD=2`
 - `ONE_CSI_METADATA_DRIFT_QUARANTINE_TTL_SECONDS=1800`
 
+### Host artifact quarantine
+
+For local `fs_lvm_ssh` attach failures, the controller now preserves stale host-artifact details from OpenNebula instead of returning only `failed to attach volume`. If the failure references a host-local LV such as `lv-one-161-2`, or a local attach failure can be tied to the predicted VM/disk slot, the driver classifies it as `host_local_lv_conflict`, records a read-only quarantine in `opennebula-csi-host-artifact-state`, and returns `FailedPrecondition` with the VM ID, disk ID, target, LV name, and repair hint.
+
+This path is intentionally read-only. It blocks repeated hotplug attempts against the same VM/disk slot until an operator repairs the host artifact externally and clears the matching `opennebula-csi-host-artifact-state` key, or until the quarantine TTL expires.
+
+Default controls:
+
+- `ONE_CSI_HOST_ARTIFACT_QUARANTINE_ENABLED=true`
+- `ONE_CSI_HOST_ARTIFACT_QUARANTINE_FAILURE_THRESHOLD=1`
+- `ONE_CSI_HOST_ARTIFACT_QUARANTINE_TTL_SECONDS=3600`
+
 New workload controls:
 
 - pod or PVC opt-out annotation:
@@ -221,7 +233,7 @@ New workload controls:
 
 New support signals:
 
-- support bundles now include sticky attachment state, volume quarantine state, hotplug queue state, OpenNebula metadata drift details, and adaptive timeout observations/recommendations
+- support bundles now include sticky attachment state, volume quarantine state, host artifact quarantine state, hotplug queue state, OpenNebula metadata drift details, and adaptive timeout observations/recommendations
 - controller/node metrics expose queue depth, device-resolution methods, last-node preference outcomes, reconciler actions, and adaptive timeout recommendations
 
 Canonical annotation namespace:

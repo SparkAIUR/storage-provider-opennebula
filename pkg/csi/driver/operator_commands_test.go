@@ -65,6 +65,8 @@ func TestSupportBundleConfigIncludesInventorySettings(t *testing.T) {
 	cfg.OverrideVal(config.PreflightLocalImmediateBindingPolicyVar, "warn")
 	cfg.OverrideVal(config.LocalDeviceRecoveryEnabledVar, true)
 	cfg.OverrideVal(config.LocalDeviceRecoveryMinAttemptsVar, 3)
+	cfg.OverrideVal(config.HostArtifactQuarantineEnabledVar, true)
+	cfg.OverrideVal(config.HostArtifactQuarantineFailureThresholdVar, 1)
 
 	bundleCfg := supportBundleConfig(cfg)
 	if enabled, ok := bundleCfg["inventoryControllerEnabled"].(bool); !ok || !enabled {
@@ -78,6 +80,12 @@ func TestSupportBundleConfigIncludesInventorySettings(t *testing.T) {
 	}
 	if bundleCfg["localDeviceRecoveryMinAttempts"] != 3 {
 		t.Fatalf("unexpected local device recovery min attempts: %#v", bundleCfg["localDeviceRecoveryMinAttempts"])
+	}
+	if enabled, ok := bundleCfg["hostArtifactQuarantineEnabled"].(bool); !ok || !enabled {
+		t.Fatalf("expected host artifact quarantine enabled in support bundle config, got %#v", bundleCfg["hostArtifactQuarantineEnabled"])
+	}
+	if bundleCfg["hostArtifactQuarantineFailureThreshold"] != 1 {
+		t.Fatalf("unexpected host artifact quarantine threshold: %#v", bundleCfg["hostArtifactQuarantineFailureThreshold"])
 	}
 }
 

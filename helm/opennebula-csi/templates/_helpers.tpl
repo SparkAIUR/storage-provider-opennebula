@@ -97,6 +97,7 @@ Create chart name and version as used by the chart label.
 {{- $localRestart := (get $root.Values.driver "localRestartOptimization") | default dict -}}
 {{- $maintenanceMode := (get $root.Values.driver "maintenanceMode") | default dict -}}
 {{- $metadataDriftQuarantine := (get $root.Values.driver "metadataDriftQuarantine") | default dict -}}
+{{- $hostArtifactQuarantine := (get $root.Values.driver "hostArtifactQuarantine") | default dict -}}
 {{- $localDeviceRecovery := (get $root.Values.driver "localDeviceRecovery") | default dict -}}
 {{- $localRWORecovery := (get $root.Values.driver "localRWOStaleMountRecovery") | default dict -}}
 {{- $lastNodePreference := (get $root.Values.driver "lastNodePreference") | default dict -}}
@@ -135,6 +136,9 @@ Create chart name and version as used by the chart label.
 {{- $metadataDriftQuarantineEnabled := (get $metadataDriftQuarantine "enabled") | default true -}}
 {{- $metadataDriftQuarantineFailureThreshold := (get $metadataDriftQuarantine "failureThreshold") | default 2 -}}
 {{- $metadataDriftQuarantineTTLSeconds := (get $metadataDriftQuarantine "ttlSeconds") | default 1800 -}}
+{{- $hostArtifactQuarantineEnabled := (get $hostArtifactQuarantine "enabled") | default true -}}
+{{- $hostArtifactQuarantineFailureThreshold := (get $hostArtifactQuarantine "failureThreshold") | default 1 -}}
+{{- $hostArtifactQuarantineTTLSeconds := (get $hostArtifactQuarantine "ttlSeconds") | default 3600 -}}
 {{- $localDeviceRecoveryEnabled := (get $localDeviceRecovery "enabled") | default true -}}
 {{- $localDeviceRecoveryMinAttempts := (get $localDeviceRecovery "minAttempts") | default 3 -}}
 {{- $localDeviceRecoveryMinAgeSeconds := (get $localDeviceRecovery "minAgeSeconds") | default 60 -}}
@@ -271,6 +275,12 @@ Create chart name and version as used by the chart label.
   value: {{ $metadataDriftQuarantineFailureThreshold | quote }}
 - name: ONE_CSI_METADATA_DRIFT_QUARANTINE_TTL_SECONDS
   value: {{ $metadataDriftQuarantineTTLSeconds | quote }}
+- name: ONE_CSI_HOST_ARTIFACT_QUARANTINE_ENABLED
+  value: {{ $hostArtifactQuarantineEnabled | quote }}
+- name: ONE_CSI_HOST_ARTIFACT_QUARANTINE_FAILURE_THRESHOLD
+  value: {{ $hostArtifactQuarantineFailureThreshold | quote }}
+- name: ONE_CSI_HOST_ARTIFACT_QUARANTINE_TTL_SECONDS
+  value: {{ $hostArtifactQuarantineTTLSeconds | quote }}
 - name: ONE_CSI_LOCAL_DEVICE_RECOVERY_ENABLED
   value: {{ $localDeviceRecoveryEnabled | quote }}
 - name: ONE_CSI_LOCAL_DEVICE_RECOVERY_MIN_ATTEMPTS

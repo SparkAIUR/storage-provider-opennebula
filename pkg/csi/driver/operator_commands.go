@@ -118,6 +118,7 @@ type SupportBundle struct {
 	HotplugCooldowns        map[string]any                                      `json:"hotplugCooldowns"`
 	StickyAttachments       map[string]any                                      `json:"stickyAttachments"`
 	VolumeQuarantine        map[string]any                                      `json:"volumeQuarantine"`
+	HostArtifactQuarantine  map[string]any                                      `json:"hostArtifactQuarantine"`
 	LocalDeviceReports      map[string]any                                      `json:"localDeviceReports"`
 	HotplugQueue            map[string]any                                      `json:"hotplugQueue"`
 	HotplugDiagnostics      map[string]opennebula.HotplugDiagnosis              `json:"hotplugDiagnostics"`
@@ -300,6 +301,7 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 	}
 	stickySnapshot := configMapJSONSnapshot(ctx, kubeClient, stickyAttachmentStateConfigMapName)
 	volumeQuarantineSnapshot := configMapJSONSnapshot(ctx, kubeClient, volumeQuarantineStateConfigMapName)
+	hostArtifactSnapshot := configMapJSONSnapshot(ctx, kubeClient, hostArtifactStateConfigMapName)
 	localDeviceSnapshot := configMapJSONSnapshot(ctx, kubeClient, localDeviceStateConfigMapName)
 	queueSnapshot := configMapJSONSnapshot(ctx, kubeClient, hotplugQueueStateConfigMapName)
 	typedQueueSnapshot := typedHotplugQueueSnapshot(ctx, kubeClient)
@@ -322,6 +324,7 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 		HotplugCooldowns:        hotplugSnapshot,
 		StickyAttachments:       stickySnapshot,
 		VolumeQuarantine:        volumeQuarantineSnapshot,
+		HostArtifactQuarantine:  hostArtifactSnapshot,
 		LocalDeviceReports:      localDeviceSnapshot,
 		HotplugQueue:            queueSnapshot,
 		HotplugDiagnostics:      hotplugDiagnostics,
@@ -946,6 +949,9 @@ func supportBundleConfig(cfg config.CSIPluginConfig) map[string]any {
 		"metadataDriftQuarantineEnabled":          getBool(cfg, config.MetadataDriftQuarantineEnabledVar),
 		"metadataDriftQuarantineFailureThreshold": getInt(cfg, config.MetadataDriftQuarantineFailureThresholdVar),
 		"metadataDriftQuarantineTTLSeconds":       getInt(cfg, config.MetadataDriftQuarantineTTLSecondsVar),
+		"hostArtifactQuarantineEnabled":           getBool(cfg, config.HostArtifactQuarantineEnabledVar),
+		"hostArtifactQuarantineFailureThreshold":  getInt(cfg, config.HostArtifactQuarantineFailureThresholdVar),
+		"hostArtifactQuarantineTTLSeconds":        getInt(cfg, config.HostArtifactQuarantineTTLSecondsVar),
 		"localDeviceRecoveryEnabled":              getBool(cfg, config.LocalDeviceRecoveryEnabledVar),
 		"localDeviceRecoveryMinAttempts":          getInt(cfg, config.LocalDeviceRecoveryMinAttemptsVar),
 		"localDeviceRecoveryMinAgeSeconds":        getInt(cfg, config.LocalDeviceRecoveryMinAgeSecondsVar),
