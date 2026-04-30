@@ -14,7 +14,7 @@ credentials:
 
 image:
   repository: "nudevco/opennebula-csi"
-  tag: "v0.5.10"
+  tag: "v0.5.11"
   pullPolicy: "IfNotPresent"
 
 imagePullSecrets: []
