@@ -60,6 +60,7 @@ const publishContextHotplugTimeoutSeconds = "hotplugTimeoutSeconds"
 const publishContextDeviceDiscoveryTimeoutSeconds = "deviceDiscoveryTimeoutSeconds"
 const volumeContextUUID = "uuid"
 const stickyDetachReaperInterval = 5 * time.Second
+const hotplugGuardCleanupInterval = 30 * time.Second
 
 type ControllerServer struct {
 	driver                   *Driver
@@ -93,6 +94,9 @@ func (s *ControllerServer) StartBackgroundWorkers(ctx context.Context) {
 	}
 	if s.localDeviceRecoveryEnabled() {
 		go s.runLocalDeviceRecovery(ctx)
+	}
+	if s.nodeHotplugGuardEnabled() && s.driver.hotplugGuard != nil {
+		go s.runHotplugGuardCleanup(ctx)
 	}
 }
 
@@ -1409,7 +1413,8 @@ func (s *ControllerServer) openNebulaNodeHotplugPauseState(ctx context.Context, 
 func (s *ControllerServer) hotplugGuardStateCleared(state opennebula.HotplugCooldownState, health hotplugNodeHealth) bool {
 	if state.PauseUntilReady {
 		return (!s.nodeHotplugGuardRequireKubernetesReady() || health.KubernetesReady) &&
-			(!s.nodeHotplugGuardRequireOpenNebulaReady() || health.OpenNebulaReady)
+			(!s.nodeHotplugGuardRequireOpenNebulaReady() || health.OpenNebulaReady) &&
+			(!s.nodeHotplugGuardTreatUnschedulableAsUnhealthy() || !health.Unschedulable)
 	}
 	if !state.ExpiresAt.IsZero() && time.Now().UTC().After(state.ExpiresAt) {
 		return true
@@ -1452,7 +1457,7 @@ func (s *ControllerServer) hotplugUnhealthyReason(health hotplugNodeHealth) stri
 	if s.nodeHotplugGuardRequireOpenNebulaReady() && !health.OpenNebulaReady {
 		reasons = append(reasons, "opennebula_vm_not_running")
 	}
-	if health.Unschedulable {
+	if s.nodeHotplugGuardTreatUnschedulableAsUnhealthy() && health.Unschedulable {
 		reasons = append(reasons, "kubernetes_node_unschedulable")
 	}
 	if len(reasons) == 0 {
@@ -1468,10 +1473,66 @@ func (s *ControllerServer) hotplugNodeUnhealthy(health hotplugNodeHealth) bool {
 	if s.nodeHotplugGuardRequireOpenNebulaReady() && !health.OpenNebulaReady {
 		return true
 	}
-	if health.Unschedulable {
+	if s.nodeHotplugGuardTreatUnschedulableAsUnhealthy() && health.Unschedulable {
 		return true
 	}
 	return false
+}
+
+func (s *ControllerServer) nodeHotplugGuardTreatUnschedulableAsUnhealthy() bool {
+	return s != nil &&
+		s.driver != nil &&
+		s.driver.maintenanceMode != nil &&
+		s.driver.maintenanceMode.Active()
+}
+
+func (s *ControllerServer) runHotplugGuardCleanup(ctx context.Context) {
+	ticker := time.NewTicker(hotplugGuardCleanupInterval)
+	defer ticker.Stop()
+
+	s.reconcileHotplugGuardCleanup(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.reconcileHotplugGuardCleanup(ctx)
+		}
+	}
+}
+
+func (s *ControllerServer) reconcileHotplugGuardCleanup(ctx context.Context) {
+	if s == nil || s.driver == nil || s.driver.hotplugGuard == nil || !s.nodeHotplugGuardEnabled() {
+		return
+	}
+	if s.driver.controllerLeadership != nil && !s.driver.controllerLeadership.IsLeader() {
+		return
+	}
+	for node, state := range s.driver.hotplugGuard.Snapshot() {
+		node = strings.TrimSpace(node)
+		if node == "" {
+			continue
+		}
+		health := s.nodeHotplugHealth(ctx, node, state.LastObservedReady)
+		if health.KubernetesErr != nil || health.OpenNebulaErr != nil {
+			klog.V(4).InfoS("Skipping hotplug guard cleanup while node health is unavailable",
+				"node", node, "kubernetesErr", health.KubernetesErr, "openNebulaErr", health.OpenNebulaErr)
+			continue
+		}
+		if s.hotplugGuardStateCleared(state, health) {
+			s.driver.hotplugGuard.Clear(node)
+			s.clearHotplugStateSnapshot(ctx, node)
+			klog.V(2).InfoS("Cleared stale hotplug guard state",
+				"node", node, "operation", state.Operation, "volumeID", state.Volume,
+				"kubernetesReady", health.KubernetesReady, "openNebulaReady", health.OpenNebulaReady,
+				"unschedulable", health.Unschedulable)
+			continue
+		}
+		state.KubernetesReady = health.KubernetesReady
+		state.OpenNebulaReady = health.OpenNebulaReady
+		state.Unschedulable = health.Unschedulable
+		s.persistHotplugStateSnapshot(ctx, state)
+	}
 }
 
 func (s *ControllerServer) formatHotplugGuardMessage(state opennebula.HotplugCooldownState) string {

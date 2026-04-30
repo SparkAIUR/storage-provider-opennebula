@@ -19,12 +19,21 @@ import (
 
 const localDeviceStateConfigMapName = "opennebula-csi-node-device-state"
 
+const (
+	localDeviceFailureClassMissingDevice = "device_missing"
+	localDeviceFailureClassMountFailed   = "mount_failed"
+)
+
 type LocalDeviceMissingReport struct {
 	Node                string     `json:"node"`
 	VolumeID            string     `json:"volumeID"`
 	VolumeName          string     `json:"volumeName,omitempty"`
+	FailureClass        string     `json:"failureClass,omitempty"`
+	DevicePath          string     `json:"devicePath,omitempty"`
 	DeviceSerial        string     `json:"deviceSerial,omitempty"`
 	OpenNebulaImageID   string     `json:"openNebulaImageID,omitempty"`
+	FsType              string     `json:"fsType,omitempty"`
+	ResolvedBy          string     `json:"resolvedBy,omitempty"`
 	PVCNamespace        string     `json:"pvcNamespace,omitempty"`
 	PVCName             string     `json:"pvcName,omitempty"`
 	PVName              string     `json:"pvName,omitempty"`
@@ -66,8 +75,12 @@ func (ns *NodeServer) recordLocalDeviceMissing(ctx context.Context, volumeID, vo
 		report.Node = node
 		report.VolumeID = volumeID
 		report.VolumeName = strings.TrimSpace(volumeName)
+		report.FailureClass = localDeviceFailureClassMissingDevice
+		report.DevicePath = ""
 		report.DeviceSerial = strings.TrimSpace(publishContext[publishContextDeviceSerial])
 		report.OpenNebulaImageID = strings.TrimSpace(publishContext[publishContextOpenNebulaImageID])
+		report.FsType = ""
+		report.ResolvedBy = ""
 		report.PVCNamespace = strings.TrimSpace(publishContext[paramPVCNamespace])
 		report.PVCName = strings.TrimSpace(publishContext[paramPVCName])
 		report.PVName = strings.TrimSpace(publishContext[paramPVName])
@@ -94,6 +107,68 @@ func (ns *NodeServer) recordLocalDeviceMissing(ctx context.Context, volumeID, vo
 	if attempts == 1 || attempts%minAttempts == 0 {
 		message := fmt.Sprintf("node %s reported missing local device for volume %s after %d attempt(s): %v", node, volumeID, attempts, cause)
 		ns.recordPVCWarningFromPublishContext(ctx, publishContext, eventReasonLocalDeviceMissingReported, message)
+	}
+}
+
+func (ns *NodeServer) recordLocalDeviceMountFailure(ctx context.Context, volumeID, volumeName, devicePath, stagingTargetPath, fsType string, resolution deviceResolutionResult, publishContext map[string]string, cause error) {
+	if ns == nil || ns.Driver == nil || ns.Driver.kubeRuntime == nil || !ns.Driver.kubeRuntime.enabled {
+		return
+	}
+	if enabled, ok := ns.Driver.PluginConfig.GetBool(config.LocalDeviceRecoveryEnabledVar); ok && !enabled {
+		return
+	}
+	volumeID = strings.TrimSpace(volumeID)
+	node := strings.TrimSpace(ns.Driver.nodeID)
+	if volumeID == "" || node == "" || opennebula.IsSharedFilesystemVolumeID(volumeID) {
+		return
+	}
+	if backend := strings.TrimSpace(publishContext[annotationBackend]); backend != "" && !strings.EqualFold(backend, "local") {
+		return
+	}
+
+	now := time.Now().UTC()
+	key := localDeviceReportKey(node, volumeID)
+	namespace := namespaceFromServiceAccount()
+	var attempts int
+	err := updateLocalDeviceReport(ctx, ns.Driver.kubeRuntime, namespace, key, func(report *LocalDeviceMissingReport) {
+		if report.FirstObservedAt.IsZero() {
+			report.FirstObservedAt = now
+		}
+		report.Node = node
+		report.VolumeID = volumeID
+		report.VolumeName = strings.TrimSpace(volumeName)
+		report.FailureClass = localDeviceFailureClassMountFailed
+		report.DevicePath = strings.TrimSpace(devicePath)
+		report.DeviceSerial = strings.TrimSpace(publishContext[publishContextDeviceSerial])
+		report.OpenNebulaImageID = strings.TrimSpace(publishContext[publishContextOpenNebulaImageID])
+		report.FsType = strings.TrimSpace(fsType)
+		report.ResolvedBy = strings.TrimSpace(resolution.ResolvedBy)
+		report.PVCNamespace = strings.TrimSpace(publishContext[paramPVCNamespace])
+		report.PVCName = strings.TrimSpace(publishContext[paramPVCName])
+		report.PVName = strings.TrimSpace(publishContext[paramPVName])
+		report.StagingTargetPath = strings.TrimSpace(stagingTargetPath)
+		report.LastObservedAt = now
+		report.Attempts++
+		attempts = report.Attempts
+		if cause != nil {
+			report.LastError = cause.Error()
+		}
+	})
+	if err != nil {
+		klog.V(2).InfoS("Failed to persist local device mount failure report",
+			"node", node, "volumeID", volumeID, "devicePath", devicePath, "configMap", localDeviceStateConfigMapName, "err", err)
+		return
+	}
+	if ns.Driver.metrics != nil {
+		ns.Driver.metrics.RecordLocalVolumeHealth("device_mount_failed", "reported")
+	}
+	minAttempts := 3
+	if configured, ok := ns.Driver.PluginConfig.GetInt(config.LocalDeviceRecoveryMinAttemptsVar); ok && configured > 0 {
+		minAttempts = configured
+	}
+	if attempts == 1 || attempts%minAttempts == 0 {
+		message := fmt.Sprintf("node %s failed to mount local device %s for volume %s after %d attempt(s) (fsType=%s resolvedBy=%s): %v", node, devicePath, volumeID, attempts, fsType, resolution.ResolvedBy, cause)
+		ns.recordPVCWarningFromPublishContext(ctx, publishContext, eventReasonLocalDeviceMountFailed, message)
 	}
 }
 
@@ -227,6 +302,9 @@ func (s *ControllerServer) recoverLocalDeviceReport(ctx context.Context, key str
 	}
 
 	message := fmt.Sprintf("attempting same-node device recovery for local RWO volume %s on node %s after %d missing-device report(s) (%s)", volumeID, node, report.Attempts, desiredReason)
+	if localDeviceFailureClass(report) == localDeviceFailureClassMountFailed {
+		message = fmt.Sprintf("attempting same-node device recovery for local RWO volume %s on node %s after %d mount failure report(s) using %s (%s)", volumeID, node, report.Attempts, strings.TrimSpace(report.DevicePath), desiredReason)
+	}
 	s.recordLocalDeviceRecoveryEvent(ctx, report, runtimeCtx, eventReasonLocalDeviceRecoveryAttempted, message)
 	if s.driver.metrics != nil {
 		s.driver.metrics.RecordLocalVolumeHealth("device_recovery", "attempted")
@@ -320,11 +398,13 @@ func (s *ControllerServer) localDeviceReportReady(report LocalDeviceMissingRepor
 	if !firstObserved.IsZero() && now.Sub(firstObserved) < s.localDeviceRecoveryMinAge() {
 		return false, "min_age"
 	}
-	if maxAttempts := s.localDeviceRecoveryMaxAttempts(); maxAttempts > 0 && report.RecoveryAttempts >= maxAttempts {
-		return false, "max_recovery_attempts"
-	}
 	if report.LastRecoveryAt != nil && s.localDeviceRecoveryCooldown() > 0 && now.Sub(*report.LastRecoveryAt) < s.localDeviceRecoveryCooldown() {
 		return false, "cooldown"
+	}
+	if maxAttempts := s.localDeviceRecoveryMaxAttempts(); maxAttempts > 0 && report.RecoveryAttempts >= maxAttempts {
+		if report.LastRecoveryAt == nil || !report.LastObservedAt.After(*report.LastRecoveryAt) {
+			return false, "max_recovery_attempts"
+		}
 	}
 	return true, ""
 }
@@ -350,6 +430,10 @@ func (s *ControllerServer) updateLocalDeviceRecoveryFailure(ctx context.Context,
 		}
 		current.Node = report.Node
 		current.VolumeID = report.VolumeID
+		current.FailureClass = localDeviceFailureClass(report)
+		current.DevicePath = report.DevicePath
+		current.FsType = report.FsType
+		current.ResolvedBy = report.ResolvedBy
 		current.RecoveryAttempts++
 		current.LastRecoveryAt = &now
 		current.LastRecoveryError = message
@@ -483,6 +567,15 @@ func localDeviceRecoveryParams(report LocalDeviceMissingReport, runtimeCtx *Volu
 		params[publishContextOpenNebulaImageID] = value
 	}
 	return params
+}
+
+func localDeviceFailureClass(report LocalDeviceMissingReport) string {
+	switch strings.TrimSpace(report.FailureClass) {
+	case localDeviceFailureClassMountFailed:
+		return localDeviceFailureClassMountFailed
+	default:
+		return localDeviceFailureClassMissingDevice
+	}
 }
 
 func localDeviceReportKey(node, volumeID string) string {

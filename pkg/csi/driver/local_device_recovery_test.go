@@ -64,6 +64,7 @@ func TestNodeRecordsAndClearsLocalDeviceMissingReport(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(raw), &report))
 	assert.Equal(t, "node-a", report.Node)
 	assert.Equal(t, "vol-1", report.VolumeID)
+	assert.Equal(t, localDeviceFailureClassMissingDevice, report.FailureClass)
 	assert.Equal(t, "onecsi-439", report.DeviceSerial)
 	assert.Equal(t, 2, report.Attempts)
 
@@ -71,6 +72,51 @@ func TestNodeRecordsAndClearsLocalDeviceMissingReport(t *testing.T) {
 	cm, err = driver.kubeRuntime.client.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(context.Background(), localDeviceStateConfigMapName, metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.NotContains(t, cm.Data, key)
+}
+
+func TestNodeRecordsLocalDeviceMountFailureReport(t *testing.T) {
+	driver := newLocalDeviceRecoveryTestDriver(t)
+	driver.nodeID = "node-a"
+	ns := &NodeServer{Driver: driver}
+	publishContext := map[string]string{
+		annotationBackend:                   "local",
+		paramPVCNamespace:                   "default",
+		paramPVCName:                        "pvc-vol-1",
+		paramPVName:                         "pv-vol-1",
+		publishContextDeviceSerial:          "onecsi-439",
+		publishContextOpenNebulaImageID:     "439",
+		publishContextHotplugTimeoutSeconds: "120",
+	}
+
+	ns.recordLocalDeviceMountFailure(
+		context.Background(),
+		"vol-1",
+		"sdd",
+		"/dev/sdd",
+		"/stage/vol-1",
+		"xfs",
+		deviceResolutionResult{ResolvedBy: "cache", Latency: time.Millisecond},
+		publishContext,
+		errors.New("can't read superblock"),
+	)
+
+	cm, err := driver.kubeRuntime.client.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(context.Background(), localDeviceStateConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+	key := localDeviceReportKey("node-a", "vol-1")
+	raw := cm.Data[key]
+	require.NotEmpty(t, raw)
+	var report LocalDeviceMissingReport
+	require.NoError(t, json.Unmarshal([]byte(raw), &report))
+	assert.Equal(t, "node-a", report.Node)
+	assert.Equal(t, "vol-1", report.VolumeID)
+	assert.Equal(t, localDeviceFailureClassMountFailed, report.FailureClass)
+	assert.Equal(t, "/dev/sdd", report.DevicePath)
+	assert.Equal(t, "onecsi-439", report.DeviceSerial)
+	assert.Equal(t, "439", report.OpenNebulaImageID)
+	assert.Equal(t, "xfs", report.FsType)
+	assert.Equal(t, "cache", report.ResolvedBy)
+	assert.Equal(t, "can't read superblock", report.LastError)
+	assert.Equal(t, 1, report.Attempts)
 }
 
 func TestLocalDeviceRecoveryReattachesSameNodeAndClearsReport(t *testing.T) {
@@ -156,4 +202,29 @@ func TestLocalDeviceRecoveryClearsIneligibleReportWithoutOpenNebulaMutation(t *t
 	assert.NotContains(t, updated.Data, key)
 	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
 	mockProvider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+func TestLocalDeviceReportReadyRetriesAfterNewObservationPastMaxAttempts(t *testing.T) {
+	driver := newLocalDeviceRecoveryTestDriver(t)
+	server := NewControllerServer(driver, &MockOpenNebulaVolumeProviderTestify{}, nil)
+	now := time.Now().UTC()
+	recoveredAt := now.Add(-10 * time.Minute)
+	report := LocalDeviceMissingReport{
+		Node:             "node-a",
+		VolumeID:         "vol-1",
+		FirstObservedAt:  now.Add(-30 * time.Minute),
+		LastObservedAt:   now.Add(-time.Minute),
+		Attempts:         3,
+		RecoveryAttempts: 2,
+		LastRecoveryAt:   &recoveredAt,
+	}
+
+	ready, reason := server.localDeviceReportReady(report, now)
+	assert.True(t, ready)
+	assert.Empty(t, reason)
+
+	report.LastObservedAt = recoveredAt.Add(-time.Minute)
+	ready, reason = server.localDeviceReportReady(report, now)
+	assert.False(t, ready)
+	assert.Equal(t, "max_recovery_attempts", reason)
 }

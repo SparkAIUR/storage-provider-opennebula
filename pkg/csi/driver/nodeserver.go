@@ -266,6 +266,10 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 
 	err = ns.mounter.FormatAndMount(devicePath, stagingTargetPath, fsType, mountFlags)
 	if err != nil {
+		if ns.deviceResolver != nil {
+			ns.deviceResolver.Invalidate(volumeID)
+		}
+		ns.recordLocalDeviceMountFailure(ctx, volumeID, volName, devicePath, stagingTargetPath, fsType, resolution, volumeContext, err)
 		klog.V(0).ErrorS(err, "Failed to format and mount volume",
 			"method", "NodeStageVolume", "devicePath", devicePath,
 			"stagingTargetPath", stagingTargetPath, "fsType", fsType)

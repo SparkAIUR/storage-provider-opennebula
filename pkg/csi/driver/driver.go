@@ -433,7 +433,34 @@ func (d *Driver) adaptiveTimeoutSourceID() string {
 	if strings.TrimSpace(d.nodeID) == "" {
 		return "controller"
 	}
-	return "node:" + strings.TrimSpace(d.nodeID)
+	return sanitizeConfigMapDataKey("node." + strings.TrimSpace(d.nodeID))
+}
+
+func sanitizeConfigMapDataKey(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "unknown"
+	}
+	var b strings.Builder
+	b.Grow(len(value))
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_' || r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "unknown"
+	}
+	return b.String()
 }
 
 func (d *Driver) loadAdaptiveTimeoutObservations(ctx context.Context) error {

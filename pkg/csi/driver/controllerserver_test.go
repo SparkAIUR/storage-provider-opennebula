@@ -2134,6 +2134,74 @@ func TestControllerUnpublishVolumePausesHotplugAfterUnhealthyNodeFailures(t *tes
 	mockProvider.AssertExpectations(t)
 }
 
+func TestHotplugGuardTreatsUnschedulableAsUnhealthyOnlyDuringMaintenance(t *testing.T) {
+	node := newReadyNode("node-1", true)
+	node.Spec.Unschedulable = true
+	driver := newStickyTestDriver(t, node)
+	driver.PluginConfig.OverrideVal(config.NodeHotplugGuardRequireKubernetesReadyVar, true)
+	driver.PluginConfig.OverrideVal(config.NodeHotplugGuardRequireOpenNebulaReadyVar, true)
+
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	mockProvider.On("NodeReady", mock.Anything, "node-1").Return(true, nil).Twice()
+	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
+
+	health := cs.nodeHotplugHealth(context.Background(), "node-1", false)
+	require.True(t, health.KubernetesReady)
+	require.True(t, health.OpenNebulaReady)
+	require.True(t, health.Unschedulable)
+	assert.False(t, cs.hotplugNodeUnhealthy(health))
+
+	driver.maintenanceMode = NewMaintenanceModeManager(driver, "default")
+	driver.maintenanceMode.setState(true, false, false)
+	health = cs.nodeHotplugHealth(context.Background(), "node-1", false)
+	assert.True(t, cs.hotplugNodeUnhealthy(health))
+	assert.Equal(t, "kubernetes_node_unschedulable", cs.hotplugUnhealthyReason(health))
+	mockProvider.AssertExpectations(t)
+}
+
+func TestHotplugGuardCleanupClearsReadyCordonedNodeOutsideMaintenance(t *testing.T) {
+	node := newReadyNode("node-1", true)
+	node.Spec.Unschedulable = true
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: hotplugStateConfigMapName, Namespace: namespaceFromServiceAccount()},
+		Data:       map[string]string{"node-1": "stale"},
+	}
+	driver := newStickyTestDriver(t, node, cm)
+	driver.PluginConfig.OverrideVal(config.NodeHotplugGuardEnabledVar, true)
+	driver.PluginConfig.OverrideVal(config.NodeHotplugGuardRequireKubernetesReadyVar, true)
+	driver.PluginConfig.OverrideVal(config.NodeHotplugGuardRequireOpenNebulaReadyVar, true)
+	driver.maintenanceMode = NewMaintenanceModeManager(driver, "default")
+	driver.maintenanceMode.setState(true, false, false)
+	driver.hotplugGuard.MarkPaused(opennebula.HotplugCooldownState{
+		Node:            "node-1",
+		Operation:       "detach",
+		Volume:          "vol-1",
+		KubernetesReady: false,
+		OpenNebulaReady: false,
+		Unschedulable:   true,
+	})
+
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	mockProvider.On("NodeReady", mock.Anything, "node-1").Return(true, nil).Twice()
+	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
+
+	cs.reconcileHotplugGuardCleanup(context.Background())
+	_, ok := driver.hotplugGuard.Get("node-1")
+	assert.True(t, ok)
+	updated, err := driver.kubeRuntime.client.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(context.Background(), hotplugStateConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Contains(t, updated.Data, "node-1")
+
+	driver.maintenanceMode.setState(false, false, false)
+	cs.reconcileHotplugGuardCleanup(context.Background())
+	_, ok = driver.hotplugGuard.Get("node-1")
+	assert.False(t, ok)
+	updated, err = driver.kubeRuntime.client.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(context.Background(), hotplugStateConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, updated.Data, "node-1")
+	mockProvider.AssertExpectations(t)
+}
+
 func TestControllerPublishVolumeSerializesSameNodeHotplug(t *testing.T) {
 	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
 	provider := &serializingVolumeProvider{MockOpenNebulaVolumeProviderTestify: mockProvider}
