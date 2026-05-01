@@ -575,6 +575,7 @@ Current gates:
 - `cephfsSelfHealing=false`
 - `cephfsPersistentRecovery=true`
 - `cephfsKernelMounts=false`
+- `localRWOStaleMountRecovery=false`
 - `topologyAccessibility=false`
 
 The chart renders these into `ONE_CSI_FEATURE_GATES`.

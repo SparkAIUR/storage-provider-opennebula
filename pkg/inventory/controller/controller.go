@@ -88,6 +88,8 @@ type Syncer struct {
 	validationEnabled      bool
 	defaultValidationImage string
 	hotplugDiagnosisConfig opennebula.HotplugDiagnosisConfig
+	syncDatastoresFn       func(context.Context) error
+	syncNodesFn            func(context.Context) error
 }
 
 func Run(ctx context.Context, cfg config.CSIPluginConfig, options Options) error {
@@ -179,10 +181,10 @@ func (s *Syncer) Start(ctx context.Context) error {
 	nodeTicker := time.NewTicker(s.resyncNodes)
 	defer nodeTicker.Stop()
 
-	if err := s.syncDatastores(ctx); err != nil {
+	if err := s.syncDatastoresOnce(ctx); err != nil {
 		ctrl.Log.Error(err, "initial datastore inventory sync failed")
 	}
-	if err := s.syncNodes(ctx); err != nil {
+	if err := s.syncNodesOnce(ctx); err != nil {
 		ctrl.Log.Error(err, "initial node inventory sync failed")
 	}
 
@@ -191,15 +193,29 @@ func (s *Syncer) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-dsTicker.C:
-			if err := s.syncDatastores(ctx); err != nil {
+			if err := s.syncDatastoresOnce(ctx); err != nil {
 				ctrl.Log.Error(err, "datastore inventory sync failed")
 			}
 		case <-nodeTicker.C:
-			if err := s.syncNodes(ctx); err != nil {
+			if err := s.syncNodesOnce(ctx); err != nil {
 				ctrl.Log.Error(err, "node inventory sync failed")
 			}
 		}
 	}
+}
+
+func (s *Syncer) syncDatastoresOnce(ctx context.Context) error {
+	if s != nil && s.syncDatastoresFn != nil {
+		return s.syncDatastoresFn(ctx)
+	}
+	return s.syncDatastores(ctx)
+}
+
+func (s *Syncer) syncNodesOnce(ctx context.Context) error {
+	if s != nil && s.syncNodesFn != nil {
+		return s.syncNodesFn(ctx)
+	}
+	return s.syncNodes(ctx)
 }
 
 func (s *Syncer) syncDatastores(ctx context.Context) error {

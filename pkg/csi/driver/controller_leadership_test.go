@@ -6,10 +6,30 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+func TestNewControllerLeadershipReturnsNoopWhenDisabled(t *testing.T) {
+	cfg := config.LoadConfiguration()
+	cfg.OverrideVal(config.ControllerLeaderElectionEnabledVar, false)
+
+	leadership, err := NewControllerLeadership(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("expected disabled leadership init to succeed, got err=%v", err)
+	}
+	if leadership == nil {
+		t.Fatal("expected non-nil leadership object")
+	}
+	if leadership.Enabled() {
+		t.Fatal("expected leadership to be disabled")
+	}
+	if !leadership.IsLeader() {
+		t.Fatal("disabled leadership should allow controller RPCs")
+	}
+}
 
 func TestControllerLeaderInterceptorAllowsNonControllerMethods(t *testing.T) {
 	leadership := &ControllerLeadership{enabled: true}

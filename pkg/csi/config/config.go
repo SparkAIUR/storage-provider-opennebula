@@ -117,7 +117,7 @@ const (
 	defaultOpenNebulaRPCEndpoint                   = "http://localhost:2633/RPC2"
 	defaultDatastorePolicy                         = "least-used"
 	defaultAllowedDatastoreTypes                   = "local,ceph,cephfs"
-	defaultFeatureGates                            = "compatibilityAwareSelection=true,detachedDiskExpansion=false,cephfsExpansion=false,cephfsSnapshots=false,cephfsClones=false,cephfsSelfHealing=false,localRWOStaleMountRecovery=false,topologyAccessibility=false"
+		defaultFeatureGates                            = "compatibilityAwareSelection=true,detachedDiskExpansion=true,cephfsExpansion=true,cephfsSnapshots=false,cephfsClones=false,cephfsSelfHealing=false,cephfsPersistentRecovery=true,cephfsKernelMounts=false,localRWOStaleMountRecovery=false,topologyAccessibility=false"
 	defaultMetricsEndpoint                         = ":9810"
 	defaultVMHotplugTimeout                        = 60
 	defaultVMHotplugTimeoutBase                    = 120

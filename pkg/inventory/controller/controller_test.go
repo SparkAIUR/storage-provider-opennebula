@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +15,108 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 )
+
+func TestSyncerStartRunsInitialAndPeriodicSyncLoops(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var datastoreCalls atomic.Int32
+	var nodeCalls atomic.Int32
+
+	s := &Syncer{
+		resyncDatastores: 5 * time.Millisecond,
+		resyncNodes:      5 * time.Millisecond,
+		syncDatastoresFn: func(context.Context) error {
+			datastoreCalls.Add(1)
+			if datastoreCalls.Load() >= 2 && nodeCalls.Load() >= 2 {
+				cancel()
+			}
+			return nil
+		},
+		syncNodesFn: func(context.Context) error {
+			nodeCalls.Add(1)
+			if datastoreCalls.Load() >= 2 && nodeCalls.Load() >= 2 {
+				cancel()
+			}
+			return nil
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Start(ctx)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected sync loop to stop cleanly, got err=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for sync loop to stop")
+	}
+
+	if datastoreCalls.Load() < 2 {
+		t.Fatalf("expected datastore sync to run at least twice, got %d", datastoreCalls.Load())
+	}
+	if nodeCalls.Load() < 2 {
+		t.Fatalf("expected node sync to run at least twice, got %d", nodeCalls.Load())
+	}
+}
+
+func TestSyncerStartContinuesAfterInitialSyncErrors(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var datastoreCalls atomic.Int32
+	var nodeCalls atomic.Int32
+
+	s := &Syncer{
+		resyncDatastores: 5 * time.Millisecond,
+		resyncNodes:      5 * time.Millisecond,
+		syncDatastoresFn: func(context.Context) error {
+			call := datastoreCalls.Add(1)
+			if call == 1 {
+				return context.DeadlineExceeded
+			}
+			if call >= 2 && nodeCalls.Load() >= 2 {
+				cancel()
+			}
+			return nil
+		},
+		syncNodesFn: func(context.Context) error {
+			call := nodeCalls.Add(1)
+			if call == 1 {
+				return context.DeadlineExceeded
+			}
+			if call >= 2 && datastoreCalls.Load() >= 2 {
+				cancel()
+			}
+			return nil
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Start(ctx)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected sync loop to stop cleanly, got err=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for sync loop to stop")
+	}
+
+	if datastoreCalls.Load() < 2 {
+		t.Fatalf("expected datastore sync to continue after initial failure, got %d calls", datastoreCalls.Load())
+	}
+	if nodeCalls.Load() < 2 {
+		t.Fatalf("expected node sync to continue after initial failure, got %d calls", nodeCalls.Load())
+	}
+}
 
 func TestBuildDatastoreStatusEnabled(t *testing.T) {
 	s := &Syncer{}

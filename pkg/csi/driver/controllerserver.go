@@ -43,6 +43,7 @@ var (
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 		csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 		csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
+		csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
 		csi.ControllerServiceCapability_RPC_GET_CAPACITY,
 		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 		csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
@@ -372,8 +373,29 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		}
 	}
 
-	volumeID, volumeSize, _ := s.volumeProvider.VolumeExists(ctx, name)
+	volumeID, volumeSize, volumeExistsErr := s.volumeProvider.VolumeExists(ctx, name)
+	if volumeExistsErr != nil && !volumeLookupNotFound(volumeExistsErr) {
+		s.driver.metrics.RecordOperation("create_volume", backend, "internal", time.Since(started))
+		klog.V(0).ErrorS(volumeExistsErr, "Failed to verify whether volume already exists",
+			"method", "CreateVolume", "volumeName", name)
+		return nil, status.Errorf(codes.Internal, "failed to verify whether volume %q already exists: %v", name, volumeExistsErr)
+	}
 	if volumeID != -1 {
+		ready, readyErr := s.volumeProvider.VolumeReadyWithTimeout(volumeID)
+		if readyErr != nil {
+			s.driver.metrics.RecordOperation("create_volume", backend, "already_exists", time.Since(started))
+			klog.V(0).ErrorS(readyErr, "Volume with same name already exists but readiness check failed",
+				"method", "CreateVolume", "volumeID", volumeID, "requiredSize", requiredBytes)
+			return nil, status.Errorf(codes.AlreadyExists,
+				"volume with the same name already exists but readiness could not be confirmed: %v", readyErr)
+		}
+		if !ready {
+			s.driver.metrics.RecordOperation("create_volume", backend, "already_exists", time.Since(started))
+			klog.V(0).InfoS("Volume with same name already exists but is not ready",
+				"method", "CreateVolume", "volumeID", volumeID, "requiredSize", requiredBytes)
+			return nil, status.Error(codes.AlreadyExists,
+				"volume with the same name already exists but is not ready")
+		}
 		if int64(volumeSize) == requiredBytes {
 			s.driver.metrics.RecordOperation("create_volume", backend, "success", time.Since(started))
 			klog.V(3).InfoS("Volume already exists with the same size",
@@ -875,7 +897,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			case opennebula.IsDatastoreCapacityError(err):
 				return status.Error(codes.ResourceExhausted, err.Error())
 			}
-			return status.Error(codes.Internal, "failed to attach volume")
+			return status.Errorf(codes.Internal, "failed to attach volume: %v", err)
 		}
 		s.clearHotplugGuardState(queueCtx, req.NodeId)
 		if s.driver.volumeQuarantine != nil {
@@ -1047,7 +1069,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 			}
 			klog.V(0).ErrorS(err, "Failed to detach volume",
 				"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
-			return status.Error(codes.Internal, "failed to detach volume")
+			return status.Errorf(codes.Internal, "failed to detach volume: %v", err)
 		}
 		s.clearHotplugGuardState(queueCtx, req.NodeId)
 		sizeBytes, sizeErr := s.volumeProvider.ResolveVolumeSizeBytes(queueCtx, req.VolumeId)
@@ -1940,6 +1962,14 @@ func supportedAccessModeNames() []string {
 	}
 
 	return names
+}
+
+func volumeLookupNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(message, "not found") || strings.Contains(message, "does not exist")
 }
 
 func (s *ControllerServer) recordPVCEventFromParams(ctx context.Context, params map[string]string, reason, message string) {

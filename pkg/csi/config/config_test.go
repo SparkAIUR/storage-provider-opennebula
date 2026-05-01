@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -49,4 +50,25 @@ func TestNodeExpandOverrides(t *testing.T) {
 	sizeToleranceBytes, ok := cfg.GetInt(NodeExpandSizeToleranceBytesVar)
 	require.True(t, ok)
 	assert.Equal(t, 67108864, sizeToleranceBytes)
+}
+
+func TestFeatureGateDefaultsAlignWithDriverDefaults(t *testing.T) {
+	cfg := LoadConfiguration()
+	raw, ok := cfg.GetString(FeatureGatesVar)
+	require.True(t, ok)
+
+	for _, expected := range []string{
+		"compatibilityAwareSelection=true",
+		"detachedDiskExpansion=true",
+		"cephfsExpansion=true",
+		"cephfsSnapshots=false",
+		"cephfsClones=false",
+		"cephfsSelfHealing=false",
+		"cephfsPersistentRecovery=true",
+		"cephfsKernelMounts=false",
+		"localRWOStaleMountRecovery=false",
+		"topologyAccessibility=false",
+	} {
+		assert.Truef(t, strings.Contains(raw, expected), "expected feature gate default %q in %q", expected, raw)
+	}
 }

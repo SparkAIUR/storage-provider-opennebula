@@ -318,6 +318,59 @@ func TestCreateVolume(t *testing.T) {
 	}
 }
 
+func TestCreateVolumeReturnsAlreadyExistsWhenExistingVolumeIsNotReady(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	cs := getTestControllerServer(mockProvider)
+
+	mockProvider.On("VolumeExists", mock.Anything, "test-volume").Return(101, 1024*1024*1024, nil)
+	mockProvider.On("VolumeReadyWithTimeout", 101).Return(false, nil)
+
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name: "test-volume",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: int64(1024 * 1024 * 1024),
+		},
+		VolumeCapabilities: []*csi.VolumeCapability{{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{},
+			},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		}},
+		Parameters: map[string]string{storageClassParamDatastoreIDs: "100"},
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, codes.AlreadyExists, status.Code(err))
+	assert.Contains(t, err.Error(), "already exists but is not ready")
+	mockProvider.AssertExpectations(t)
+}
+
+func TestCreateVolumeReturnsInternalWhenVolumeLookupFails(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	cs := getTestControllerServer(mockProvider)
+
+	mockProvider.On("VolumeExists", mock.Anything, "test-volume").Return(-1, -1, errors.New("permission denied"))
+
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name: "test-volume",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: int64(1024 * 1024 * 1024),
+		},
+		VolumeCapabilities: []*csi.VolumeCapability{{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{},
+			},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		}},
+		Parameters: map[string]string{storageClassParamDatastoreIDs: "100"},
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, codes.Internal, status.Code(err))
+	assert.Contains(t, err.Error(), "failed to verify whether volume")
+	mockProvider.AssertExpectations(t)
+}
+
 func TestCreateVolumeAddsUUIDToVolumeContext(t *testing.T) {
 	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
 	cs := getTestControllerServer(mockProvider)
@@ -593,13 +646,14 @@ func TestCreateVolumeRejectsMixedCephFSAndDiskDatastores(t *testing.T) {
 	sharedProvider.AssertExpectations(t)
 }
 
-func TestControllerGetCapabilitiesIncludesCloneVolume(t *testing.T) {
+func TestControllerGetCapabilitiesIncludesCloneAndListSnapshots(t *testing.T) {
 	cs := getTestControllerServer(&MockOpenNebulaVolumeProviderTestify{})
 
 	resp, err := cs.ControllerGetCapabilities(context.Background(), &csi.ControllerGetCapabilitiesRequest{})
 	assert.NoError(t, err)
 
 	var cloneCap bool
+	var listSnapshotsCap bool
 	for _, capability := range resp.GetCapabilities() {
 		rpc := capability.GetRpc()
 		if rpc == nil {
@@ -607,11 +661,14 @@ func TestControllerGetCapabilitiesIncludesCloneVolume(t *testing.T) {
 		}
 		if rpc.GetType() == csi.ControllerServiceCapability_RPC_CLONE_VOLUME {
 			cloneCap = true
-			break
+		}
+		if rpc.GetType() == csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS {
+			listSnapshotsCap = true
 		}
 	}
 
 	assert.True(t, cloneCap, "controller must advertise CLONE_VOLUME capability")
+	assert.True(t, listSnapshotsCap, "controller must advertise LIST_SNAPSHOTS capability")
 }
 
 func TestCreateVolumeIncludesAccessibleTopologyWhenEnabled(t *testing.T) {
@@ -957,6 +1014,30 @@ func TestControllerPublishVolume(t *testing.T) {
 			mockProvider.AssertExpectations(t)
 		})
 	}
+}
+
+func TestControllerPublishVolumeIncludesAttachFailureDetailInInternalError(t *testing.T) {
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	cs := getTestControllerServer(mockProvider)
+
+	mockProvider.On("VolumeExists", mock.Anything, "vol-attach-fail").Return(1, 1, nil)
+	mockProvider.On("NodeExists", mock.Anything, "test-node-id").Return(1, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 1).Twice().Return("", errors.New("volume not attached to node"))
+	mockProvider.On("AttachVolume", mock.Anything, "vol-attach-fail", "test-node-id", false, mock.Anything).Return(errors.New("attachdisk: target already in use"))
+
+	_, err := cs.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
+		VolumeId: "vol-attach-fail",
+		NodeId:   "test-node-id",
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{FsType: "ext4"}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		},
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, codes.Internal, status.Code(err))
+	assert.Contains(t, err.Error(), "attachdisk: target already in use")
+	mockProvider.AssertExpectations(t)
 }
 
 func TestControllerPublishVolumeReturnsSharedFilesystemPublishContext(t *testing.T) {
@@ -1574,6 +1655,26 @@ func TestControllerUnpublishVolume(t *testing.T) {
 			mockProvider.AssertExpectations(t)
 		})
 	}
+}
+
+func TestControllerUnpublishVolumeIncludesDetachFailureDetailInInternalError(t *testing.T) {
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	cs := getTestControllerServer(mockProvider)
+
+	mockProvider.On("VolumeExists", mock.Anything, "vol-detach-fail").Return(1, 1, nil)
+	mockProvider.On("NodeExists", mock.Anything, "test-node-id").Return(1, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 1).Return("attached-volume", nil)
+	mockProvider.On("DetachVolume", mock.Anything, "vol-detach-fail", "test-node-id").Return(errors.New("detachdisk: vm not in running state"))
+
+	_, err := cs.ControllerUnpublishVolume(context.Background(), &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: "vol-detach-fail",
+		NodeId:   "test-node-id",
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, codes.Internal, status.Code(err))
+	assert.Contains(t, err.Error(), "detachdisk: vm not in running state")
+	mockProvider.AssertExpectations(t)
 }
 
 func TestControllerUnpublishVolumeStartsStickyDetachGraceForOptedInLocalPVC(t *testing.T) {
@@ -2538,6 +2639,9 @@ func (m *MockOpenNebulaVolumeProviderTestify) NodeReady(ctx context.Context, nod
 }
 
 func (m *MockOpenNebulaVolumeProviderTestify) VolumeReadyWithTimeout(volumeID int) (bool, error) {
+	if !m.hasExpectation("VolumeReadyWithTimeout") {
+		return true, nil
+	}
 	args := m.Called(volumeID)
 	return args.Bool(0), args.Error(1)
 }
