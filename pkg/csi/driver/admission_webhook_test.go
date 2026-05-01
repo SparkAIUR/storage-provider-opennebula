@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
+	inventoryv1alpha1 "github.com/SparkAIUR/storage-provider-opennebula/pkg/inventory/apis/storageprovider/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -164,4 +165,151 @@ func TestLastNodePreferenceWebhookHonorsOptOut(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, patch)
 	assert.Empty(t, warnings)
+}
+
+func TestLastNodePreferenceWebhookInjectsRequiredSystemDatastoreAffinity(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-1", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationDatastoreID: "111",
+	})
+	pvc.Spec.VolumeName = pv.Name
+	driver := newWebhookTestDriver(pv, pvc)
+	driver.kubeRuntime.inventoryClient = newInventoryFakeClient(t, &inventoryv1alpha1.OpenNebulaDatastore{
+		ObjectMeta: metav1.ObjectMeta{Name: "ds-111"},
+		Spec: inventoryv1alpha1.OpenNebulaDatastoreSpec{
+			Discovery: inventoryv1alpha1.OpenNebulaDatastoreDiscoverySpec{OpenNebulaDatastoreID: 111},
+		},
+		Status: inventoryv1alpha1.OpenNebulaDatastoreStatus{
+			ID:      111,
+			Backend: "local",
+			OpenNebula: inventoryv1alpha1.OpenNebulaDatastoreOpenNebulaStatus{
+				CompatibleSystemDatastores: []int{104, 100},
+			},
+		},
+	})
+	webhook := NewLastNodePreferenceWebhook(driver)
+
+	patch, warnings, err := webhook.buildPatch(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "postgres-1", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name:         "data",
+				VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc.Name}},
+			}},
+		},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, warnings)
+	require.NotEmpty(t, patch)
+
+	raw, err := json.Marshal(patch)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), jsonPointerEscape(annotationSystemDSAffinity))
+	assert.Contains(t, string(raw), jsonPointerEscape(annotationSystemDSInjected))
+	assert.Contains(t, string(raw), topologySystemDSLabel)
+	assert.Contains(t, string(raw), "100")
+	assert.Contains(t, string(raw), "104")
+	assert.Contains(t, string(raw), "requiredDuringSchedulingIgnoredDuringExecution")
+}
+
+func TestLastNodePreferenceWebhookIntersectsSystemDatastoreAffinity(t *testing.T) {
+	pv1, pvc1 := newLocalPVAndPVC("vol-1", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationDatastoreID: "111",
+	})
+	pv2, pvc2 := newLocalPVAndPVC("vol-2", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationDatastoreID: "124",
+	})
+	pvc1.Spec.VolumeName = pv1.Name
+	pvc2.Spec.VolumeName = pv2.Name
+	driver := newWebhookTestDriver(pv1, pvc1, pv2, pvc2)
+	driver.kubeRuntime.inventoryClient = newInventoryFakeClient(t,
+		&inventoryv1alpha1.OpenNebulaDatastore{
+			ObjectMeta: metav1.ObjectMeta{Name: "ds-111"},
+			Spec:       inventoryv1alpha1.OpenNebulaDatastoreSpec{Discovery: inventoryv1alpha1.OpenNebulaDatastoreDiscoverySpec{OpenNebulaDatastoreID: 111}},
+			Status: inventoryv1alpha1.OpenNebulaDatastoreStatus{
+				ID:      111,
+				Backend: "local",
+				OpenNebula: inventoryv1alpha1.OpenNebulaDatastoreOpenNebulaStatus{
+					CompatibleSystemDatastores: []int{100, 104},
+				},
+			},
+		},
+		&inventoryv1alpha1.OpenNebulaDatastore{
+			ObjectMeta: metav1.ObjectMeta{Name: "ds-124"},
+			Spec:       inventoryv1alpha1.OpenNebulaDatastoreSpec{Discovery: inventoryv1alpha1.OpenNebulaDatastoreDiscoverySpec{OpenNebulaDatastoreID: 124}},
+			Status: inventoryv1alpha1.OpenNebulaDatastoreStatus{
+				ID:      124,
+				Backend: "ceph-rbd",
+				OpenNebula: inventoryv1alpha1.OpenNebulaDatastoreOpenNebulaStatus{
+					CompatibleSystemDatastores: []int{104, 123},
+				},
+			},
+		},
+	)
+	webhook := NewLastNodePreferenceWebhook(driver)
+
+	patch, warnings, err := webhook.buildPatch(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "postgres-1", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{
+				{Name: "data-a", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc1.Name}}},
+				{Name: "data-b", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc2.Name}}},
+			},
+		},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, warnings)
+	raw, err := json.Marshal(patch)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"104"`)
+	assert.NotContains(t, string(raw), `"100"`)
+	assert.NotContains(t, string(raw), `"123"`)
+}
+
+func TestLastNodePreferenceWebhookRejectsDisjointSystemDatastoreAffinity(t *testing.T) {
+	pv1, pvc1 := newLocalPVAndPVC("vol-1", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationDatastoreID: "111",
+	})
+	pv2, pvc2 := newLocalPVAndPVC("vol-2", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationDatastoreID: "124",
+	})
+	pvc1.Spec.VolumeName = pv1.Name
+	pvc2.Spec.VolumeName = pv2.Name
+	driver := newWebhookTestDriver(pv1, pvc1, pv2, pvc2)
+	driver.kubeRuntime.inventoryClient = newInventoryFakeClient(t,
+		&inventoryv1alpha1.OpenNebulaDatastore{
+			ObjectMeta: metav1.ObjectMeta{Name: "ds-111"},
+			Spec:       inventoryv1alpha1.OpenNebulaDatastoreSpec{Discovery: inventoryv1alpha1.OpenNebulaDatastoreDiscoverySpec{OpenNebulaDatastoreID: 111}},
+			Status: inventoryv1alpha1.OpenNebulaDatastoreStatus{
+				ID:      111,
+				Backend: "local",
+				OpenNebula: inventoryv1alpha1.OpenNebulaDatastoreOpenNebulaStatus{
+					CompatibleSystemDatastores: []int{100},
+				},
+			},
+		},
+		&inventoryv1alpha1.OpenNebulaDatastore{
+			ObjectMeta: metav1.ObjectMeta{Name: "ds-124"},
+			Spec:       inventoryv1alpha1.OpenNebulaDatastoreSpec{Discovery: inventoryv1alpha1.OpenNebulaDatastoreDiscoverySpec{OpenNebulaDatastoreID: 124}},
+			Status: inventoryv1alpha1.OpenNebulaDatastoreStatus{
+				ID:      124,
+				Backend: "ceph-rbd",
+				OpenNebula: inventoryv1alpha1.OpenNebulaDatastoreOpenNebulaStatus{
+					CompatibleSystemDatastores: []int{123},
+				},
+			},
+		},
+	)
+	webhook := NewLastNodePreferenceWebhook(driver)
+
+	patch, _, err := webhook.buildPatch(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "postgres-1", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{
+				{Name: "data-a", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc1.Name}}},
+				{Name: "data-b", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc2.Name}}},
+			},
+		},
+	})
+	require.Error(t, err)
+	assert.Empty(t, patch)
 }

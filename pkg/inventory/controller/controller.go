@@ -637,6 +637,13 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 	if systemDSID != 0 || status.OpenNebula.SystemDatastoreName != "" {
 		status.SystemDatastoreDisplay = fmt.Sprintf("%d:%s", systemDSID, status.OpenNebula.SystemDatastoreName)
 	}
+	if systemDSID > 0 {
+		if err := s.syncNodeTopologyLabel(ctx, node, systemDSID); err != nil {
+			log.Error(err, "failed to sync node topology label", "node", node.Name, "systemDatastoreID", systemDSID, "label", topologySystemDSLabel)
+		} else {
+			status.Storage.TopologySystemDatastore = strconv.Itoa(systemDSID)
+		}
+	}
 	if state, ok := hotplugStates[node.Name]; ok {
 		status.Hotplug.InCooldown = state.PauseUntilReady || state.FailureCount == 0
 		if !state.ExpiresAt.IsZero() {
@@ -712,6 +719,28 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 		newCondition("HotplugPressureAcceptable", boolCondition(status.ActiveHotplugPressure < 8), boolReason(status.ActiveHotplugPressure < 8, "HotplugPressureNormal", "HotplugPressureHigh"), fmt.Sprintf("Node has %d active CSI attachment(s)", status.ActiveHotplugPressure)),
 	}
 	return status
+}
+
+func (s *Syncer) syncNodeTopologyLabel(ctx context.Context, node corev1.Node, systemDSID int) error {
+	if s == nil || s.kube == nil || strings.TrimSpace(node.Name) == "" || systemDSID <= 0 {
+		return nil
+	}
+	desired := strconv.Itoa(systemDSID)
+	if strings.TrimSpace(node.Labels[topologySystemDSLabel]) == desired {
+		return nil
+	}
+	payload, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{
+			"labels": map[string]string{
+				topologySystemDSLabel: desired,
+			},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = s.kube.CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, payload, metav1.PatchOptions{})
+	return err
 }
 
 func (s *Syncer) reconcileBenchmarkRuns(ctx context.Context, discovered map[int]datastoreSchema.Datastore, scs []storagev1.StorageClass) error {

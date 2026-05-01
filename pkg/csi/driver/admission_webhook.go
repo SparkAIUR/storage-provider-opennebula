@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
@@ -103,17 +105,50 @@ func (w *LastNodePreferenceWebhook) buildPatch(ctx context.Context, pod *corev1.
 	if pod == nil || strings.TrimSpace(pod.Spec.NodeName) != "" {
 		return nil, nil, nil
 	}
+
+	annotations := map[string]string{}
+	var affinity corev1.Affinity
+	affinityInitialized := false
+	affinityChanged := false
+	ensureAffinity := func() *corev1.Affinity {
+		if !affinityInitialized {
+			if pod.Spec.Affinity != nil {
+				affinity = *pod.Spec.Affinity.DeepCopy()
+			}
+			affinityInitialized = true
+		}
+		return &affinity
+	}
+
+	systemDatastores, systemWarnings, err := w.resolveCompatibleSystemDatastores(ctx, pod)
+	warnings := append([]string{}, systemWarnings...)
+	if err != nil {
+		w.driver.metrics.RecordLastNodePreference("error", "system_ds_conflict")
+		return nil, warnings, err
+	}
+	if len(systemDatastores) > 0 {
+		applyRequiredNodeSelector(ensureAffinity(), corev1.NodeSelectorRequirement{
+			Key:      topologySystemDSLabel,
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   systemDatastores,
+		})
+		annotations[annotationSystemDSAffinity] = strings.Join(systemDatastores, ",")
+		annotations[annotationSystemDSInjected] = "true"
+		affinityChanged = true
+	}
+
 	if !w.lastNodePreferenceEnabled() {
 		w.driver.metrics.RecordLastNodePreference("skipped", "feature_disabled")
-		return nil, nil, nil
+		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
 	}
 	if strings.EqualFold(strings.TrimSpace(pod.Annotations[annotationLastNodePref]), lastNodePreferenceDisabledValue) {
 		w.driver.metrics.RecordLastNodePreference("skipped", "pod_opt_out")
-		return nil, nil, nil
+		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
 	}
 
 	maintenanceActive := w.driver.maintenanceMode != nil && w.driver.maintenanceMode.Active()
-	targetNode, warnings, reason, err := w.resolvePreferredNode(ctx, pod)
+	targetNode, lastNodeWarnings, reason, err := w.resolvePreferredNode(ctx, pod)
+	warnings = append(warnings, lastNodeWarnings...)
 	if err != nil {
 		w.driver.metrics.RecordLastNodePreference("error", "resolution_failed")
 		return nil, warnings, err
@@ -124,7 +159,7 @@ func (w *LastNodePreferenceWebhook) buildPatch(ctx context.Context, pod *corev1.
 	}
 	if strings.TrimSpace(targetNode) == "" {
 		w.driver.metrics.RecordLastNodePreference("skipped", reason)
-		return nil, warnings, nil
+		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
 	}
 	hostname, err := w.driver.kubeRuntime.GetNodeHostname(ctx, targetNode)
 	if err != nil {
@@ -133,18 +168,27 @@ func (w *LastNodePreferenceWebhook) buildPatch(ctx context.Context, pod *corev1.
 	}
 	if !maintenanceActive && hasPreferredHostnameAffinity(pod, hostname) {
 		w.driver.metrics.RecordLastNodePreference("skipped", "already_present")
-		return nil, warnings, nil
+		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
 	}
 
-	var patch []jsonPatchOperation
 	if maintenanceActive {
-		patch = buildLastNodeRequiredPatch(pod, targetNode, hostname)
+		applyRequiredNodeSelector(ensureAffinity(), corev1.NodeSelectorRequirement{
+			Key:      corev1.LabelHostname,
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   []string{hostname},
+		})
+		annotations[annotationPreferredLastNode] = targetNode
+		annotations[annotationLastNodeInjected] = "true"
+		affinityChanged = true
 		w.driver.metrics.RecordLastNodePreference("injected", "maintenance_required_hostname")
-		return patch, warnings, nil
+		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
 	}
-	patch = buildLastNodePreferencePatch(pod, targetNode, hostname)
+	appendPreferredHostname(ensureAffinity(), hostname)
+	annotations[annotationPreferredLastNode] = targetNode
+	annotations[annotationLastNodeInjected] = "true"
+	affinityChanged = true
 	w.driver.metrics.RecordLastNodePreference("injected", "preferred_hostname")
-	return patch, warnings, nil
+	return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
 }
 
 func (w *LastNodePreferenceWebhook) resolvePreferredNode(ctx context.Context, pod *corev1.Pod) (string, []string, string, error) {
@@ -189,6 +233,107 @@ func (w *LastNodePreferenceWebhook) resolvePreferredNode(ctx context.Context, po
 	}
 	warnings = append(warnings, "skipping soft last-node preference because referenced PVCs disagree on preferred node")
 	return "", warnings, "conflicting_nodes", nil
+}
+
+func (w *LastNodePreferenceWebhook) resolveCompatibleSystemDatastores(ctx context.Context, pod *corev1.Pod) ([]string, []string, error) {
+	if w == nil || w.driver == nil || w.driver.kubeRuntime == nil || pod == nil {
+		return nil, nil, nil
+	}
+	if w.driver.kubeRuntime.inventoryClient == nil {
+		return nil, nil, nil
+	}
+	warnings := []string{}
+	var intersection map[string]struct{}
+	seenVolume := false
+
+	for _, volume := range pod.Spec.Volumes {
+		if volume.PersistentVolumeClaim == nil {
+			continue
+		}
+		pvcName := strings.TrimSpace(volume.PersistentVolumeClaim.ClaimName)
+		if pvcName == "" {
+			continue
+		}
+		pvc, err := w.driver.kubeRuntime.client.CoreV1().PersistentVolumeClaims(pod.Namespace).Get(ctx, pvcName, metav1.GetOptions{})
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("skipping PVC %s for system datastore affinity: %v", pvcName, err))
+			continue
+		}
+		if strings.TrimSpace(pvc.Spec.VolumeName) == "" {
+			continue
+		}
+		pv, err := w.driver.kubeRuntime.client.CoreV1().PersistentVolumes().Get(ctx, pvc.Spec.VolumeName, metav1.GetOptions{})
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("skipping PV %s for system datastore affinity: %v", pvc.Spec.VolumeName, err))
+			continue
+		}
+		values, reason, err := w.compatibleSystemDatastoresForPV(ctx, pv)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("skipping PV %s for system datastore affinity: %v", pv.Name, err))
+			continue
+		}
+		if len(values) == 0 {
+			if reason != "" {
+				warnings = append(warnings, fmt.Sprintf("skipping PV %s for system datastore affinity: %s", pv.Name, reason))
+			}
+			continue
+		}
+		current := stringSet(values)
+		if !seenVolume {
+			intersection = current
+			seenVolume = true
+			continue
+		}
+		intersection = intersectStringSets(intersection, current)
+		if len(intersection) == 0 {
+			return nil, warnings, fmt.Errorf("OpenNebula CSI PVCs on pod %s/%s require incompatible system datastore sets", pod.Namespace, pod.Name)
+		}
+	}
+
+	if len(intersection) == 0 {
+		return nil, warnings, nil
+	}
+	values := sortedSetValues(intersection)
+	return values, warnings, nil
+}
+
+func (w *LastNodePreferenceWebhook) compatibleSystemDatastoresForPV(ctx context.Context, pv *corev1.PersistentVolume) ([]string, string, error) {
+	if pv == nil || pv.Spec.CSI == nil {
+		return nil, "", nil
+	}
+	if strings.TrimSpace(pv.Spec.CSI.Driver) != DefaultDriverName {
+		return nil, "", nil
+	}
+	if opennebula.IsSharedFilesystemVolumeID(pv.Spec.CSI.VolumeHandle) || strings.EqualFold(strings.TrimSpace(pv.Annotations[annotationBackend]), "cephfs") {
+		return nil, "shared filesystem volumes are node-agnostic", nil
+	}
+	rawDatastoreID := strings.TrimSpace(pv.Annotations[annotationDatastoreID])
+	if rawDatastoreID == "" {
+		return nil, "missing datastore-id annotation", nil
+	}
+	datastoreID, err := strconv.Atoi(rawDatastoreID)
+	if err != nil || datastoreID <= 0 {
+		return nil, "", fmt.Errorf("invalid datastore-id annotation %q", rawDatastoreID)
+	}
+	datastore, err := w.driver.kubeRuntime.OpenNebulaDatastoreByID(ctx, datastoreID)
+	if err != nil {
+		return nil, "", err
+	}
+	if strings.EqualFold(strings.TrimSpace(datastore.Status.Backend), "cephfs") {
+		return nil, "shared filesystem datastores are node-agnostic", nil
+	}
+	if len(datastore.Status.OpenNebula.CompatibleSystemDatastores) == 0 {
+		return nil, fmt.Sprintf("datastore %d does not report compatible system datastores", datastoreID), nil
+	}
+	values := make([]string, 0, len(datastore.Status.OpenNebula.CompatibleSystemDatastores))
+	for _, id := range datastore.Status.OpenNebula.CompatibleSystemDatastores {
+		if id <= 0 {
+			continue
+		}
+		values = append(values, strconv.Itoa(id))
+	}
+	sort.Strings(values)
+	return values, "", nil
 }
 
 func (w *LastNodePreferenceWebhook) lastNodePreferenceEnabled() bool {
@@ -240,64 +385,60 @@ func hasPreferredHostnameAffinity(pod *corev1.Pod, hostname string) bool {
 	return false
 }
 
-func buildLastNodePreferencePatch(pod *corev1.Pod, targetNode, hostname string) []jsonPatchOperation {
-	patch := make([]jsonPatchOperation, 0, 8)
-	if pod.Annotations == nil {
-		patch = append(patch, jsonPatchOperation{Op: "add", Path: "/metadata/annotations", Value: map[string]string{}})
+func buildPodMutationPatch(pod *corev1.Pod, annotations map[string]string, affinityChanged bool, affinityFn func() *corev1.Affinity) []jsonPatchOperation {
+	patch := make([]jsonPatchOperation, 0, len(annotations)+2)
+	if len(annotations) > 0 {
+		if pod.Annotations == nil {
+			patch = append(patch, jsonPatchOperation{Op: "add", Path: "/metadata/annotations", Value: map[string]string{}})
+		}
+		keys := make([]string, 0, len(annotations))
+		for key := range annotations {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			patch = append(patch, jsonPatchOperation{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(key), Value: annotations[key]})
+		}
 	}
-	patch = append(patch,
-		jsonPatchOperation{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(annotationPreferredLastNode), Value: targetNode},
-		jsonPatchOperation{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(annotationLastNodeInjected), Value: "true"},
-	)
-	if pod.Spec.Affinity == nil {
-		patch = append(patch, jsonPatchOperation{Op: "add", Path: "/spec/affinity", Value: corev1.Affinity{}})
+	if affinityChanged {
+		op := "add"
+		if pod.Spec.Affinity != nil {
+			op = "replace"
+		}
+		patch = append(patch, jsonPatchOperation{
+			Op:    op,
+			Path:  "/spec/affinity",
+			Value: *affinityFn(),
+		})
 	}
-	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil {
-		patch = append(patch, jsonPatchOperation{Op: "add", Path: "/spec/affinity/nodeAffinity", Value: corev1.NodeAffinity{}})
-	}
-	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil || pod.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution == nil {
-		patch = append(patch, jsonPatchOperation{Op: "add", Path: "/spec/affinity/nodeAffinity/preferredDuringSchedulingIgnoredDuringExecution", Value: []corev1.PreferredSchedulingTerm{}})
-	}
-	patch = append(patch, jsonPatchOperation{
-		Op:   "add",
-		Path: "/spec/affinity/nodeAffinity/preferredDuringSchedulingIgnoredDuringExecution/-",
-		Value: corev1.PreferredSchedulingTerm{
-			Weight: 100,
-			Preference: corev1.NodeSelectorTerm{
-				MatchExpressions: []corev1.NodeSelectorRequirement{{
-					Key:      corev1.LabelHostname,
-					Operator: corev1.NodeSelectorOpIn,
-					Values:   []string{hostname},
-				}},
-			},
-		},
-	})
 	return patch
 }
 
-func buildLastNodeRequiredPatch(pod *corev1.Pod, targetNode, hostname string) []jsonPatchOperation {
-	patch := make([]jsonPatchOperation, 0, 4)
-	if pod.Annotations == nil {
-		patch = append(patch, jsonPatchOperation{Op: "add", Path: "/metadata/annotations", Value: map[string]string{}})
-	}
-	patch = append(patch,
-		jsonPatchOperation{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(annotationPreferredLastNode), Value: targetNode},
-		jsonPatchOperation{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(annotationLastNodeInjected), Value: "true"},
-	)
-
-	affinity := corev1.Affinity{}
-	affinityOp := "add"
-	if pod.Spec.Affinity != nil {
-		affinity = *pod.Spec.Affinity.DeepCopy()
-		affinityOp = "replace"
+func appendPreferredHostname(affinity *corev1.Affinity, hostname string) {
+	if affinity == nil || strings.TrimSpace(hostname) == "" {
+		return
 	}
 	if affinity.NodeAffinity == nil {
 		affinity.NodeAffinity = &corev1.NodeAffinity{}
 	}
-	requirement := corev1.NodeSelectorRequirement{
-		Key:      corev1.LabelHostname,
-		Operator: corev1.NodeSelectorOpIn,
-		Values:   []string{hostname},
+	affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution = append(affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution, corev1.PreferredSchedulingTerm{
+		Weight: 100,
+		Preference: corev1.NodeSelectorTerm{
+			MatchExpressions: []corev1.NodeSelectorRequirement{{
+				Key:      corev1.LabelHostname,
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{hostname},
+			}},
+		},
+	})
+}
+
+func applyRequiredNodeSelector(affinity *corev1.Affinity, requirement corev1.NodeSelectorRequirement) {
+	if affinity == nil || strings.TrimSpace(requirement.Key) == "" || len(requirement.Values) == 0 {
+		return
+	}
+	if affinity.NodeAffinity == nil {
+		affinity.NodeAffinity = &corev1.NodeAffinity{}
 	}
 	required := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
 	if required == nil || len(required.NodeSelectorTerms) == 0 {
@@ -306,34 +447,68 @@ func buildLastNodeRequiredPatch(pod *corev1.Pod, targetNode, hostname string) []
 				MatchExpressions: []corev1.NodeSelectorRequirement{requirement},
 			}},
 		}
-	} else {
-		for i := range required.NodeSelectorTerms {
-			if !nodeSelectorTermHasHostname(required.NodeSelectorTerms[i], hostname) {
-				required.NodeSelectorTerms[i].MatchExpressions = append(required.NodeSelectorTerms[i].MatchExpressions, requirement)
-			}
-		}
-		affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = required
+		return
 	}
-	patch = append(patch, jsonPatchOperation{
-		Op:    affinityOp,
-		Path:  "/spec/affinity",
-		Value: affinity,
-	})
-	return patch
+	for i := range required.NodeSelectorTerms {
+		if !nodeSelectorTermHasRequirement(required.NodeSelectorTerms[i], requirement) {
+			required.NodeSelectorTerms[i].MatchExpressions = append(required.NodeSelectorTerms[i].MatchExpressions, requirement)
+		}
+	}
+	affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = required
 }
 
-func nodeSelectorTermHasHostname(term corev1.NodeSelectorTerm, hostname string) bool {
+func nodeSelectorTermHasRequirement(term corev1.NodeSelectorTerm, requirement corev1.NodeSelectorRequirement) bool {
 	for _, expr := range term.MatchExpressions {
-		if expr.Key != corev1.LabelHostname || expr.Operator != corev1.NodeSelectorOpIn {
+		if expr.Key != requirement.Key || expr.Operator != requirement.Operator {
 			continue
 		}
-		for _, value := range expr.Values {
-			if value == hostname {
-				return true
-			}
+		if equalStringSets(expr.Values, requirement.Values) {
+			return true
 		}
 	}
 	return false
+}
+
+func stringSet(values []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			set[trimmed] = struct{}{}
+		}
+	}
+	return set
+}
+
+func intersectStringSets(left, right map[string]struct{}) map[string]struct{} {
+	out := map[string]struct{}{}
+	for value := range left {
+		if _, ok := right[value]; ok {
+			out[value] = struct{}{}
+		}
+	}
+	return out
+}
+
+func sortedSetValues(set map[string]struct{}) []string {
+	values := make([]string, 0, len(set))
+	for value := range set {
+		values = append(values, value)
+	}
+	sort.Strings(values)
+	return values
+}
+
+func equalStringSets(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	leftSet := stringSet(left)
+	for _, value := range right {
+		if _, ok := leftSet[strings.TrimSpace(value)]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func jsonPointerEscape(value string) string {

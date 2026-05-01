@@ -45,6 +45,8 @@ const (
 	annotationLastNodePref      = "storage-provider.opennebula.sparkaiur.io/last-node-preference"
 	annotationPreferredLastNode = "storage-provider.opennebula.sparkaiur.io/preferred-last-node"
 	annotationLastNodeInjected  = "storage-provider.opennebula.sparkaiur.io/last-node-preference-injected"
+	annotationSystemDSAffinity  = "storage-provider.opennebula.sparkaiur.io/system-ds-affinity"
+	annotationSystemDSInjected  = "storage-provider.opennebula.sparkaiur.io/system-ds-affinity-injected"
 
 	annotationLegacyLastAttachedNode = "csi.opennebula.io/last-attached-node"
 
@@ -452,6 +454,27 @@ func (r *KubeRuntime) OpenNebulaNode(ctx context.Context, nodeName string) (*inv
 	}
 	r.inventoryNodeCacheMu.Unlock()
 	return node, nil
+}
+
+func (r *KubeRuntime) OpenNebulaDatastoreByID(ctx context.Context, datastoreID int) (*inventoryv1alpha1.OpenNebulaDatastore, error) {
+	if r == nil || !r.enabled || r.inventoryClient == nil {
+		return nil, fmt.Errorf("inventory runtime is not enabled")
+	}
+	if datastoreID <= 0 {
+		return nil, fmt.Errorf("datastore id is required")
+	}
+
+	var list inventoryv1alpha1.OpenNebulaDatastoreList
+	if err := r.inventoryClient.List(ctx, &list); err != nil {
+		return nil, err
+	}
+	for i := range list.Items {
+		item := &list.Items[i]
+		if item.Status.ID == datastoreID || item.Spec.Discovery.OpenNebulaDatastoreID == datastoreID {
+			return item.DeepCopy(), nil
+		}
+	}
+	return nil, fmt.Errorf("opennebula datastore %d was not found in inventory", datastoreID)
 }
 
 func (r *KubeRuntime) VolumeDesiredOnNode(ctx context.Context, volumeHandle, nodeName string) (bool, string, error) {

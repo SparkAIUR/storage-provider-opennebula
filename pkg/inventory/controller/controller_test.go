@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestBuildDatastoreStatusEnabled(t *testing.T) {
@@ -561,6 +563,22 @@ func TestNodeDisplayState(t *testing.T) {
 	}
 	if got := nodeDisplayState(true, false, false); got != "VMNotReady" {
 		t.Fatalf("expected VMNotReady, got %q", got)
+	}
+}
+
+func TestSyncNodeTopologyLabelPatchesSystemDatastore(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{corev1.LabelHostname: "node-a"}}}
+	s := &Syncer{kube: fake.NewSimpleClientset(node)}
+
+	if err := s.syncNodeTopologyLabel(context.Background(), *node, 104); err != nil {
+		t.Fatalf("syncNodeTopologyLabel failed: %v", err)
+	}
+	updated, err := s.kube.CoreV1().Nodes().Get(context.Background(), "node-a", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get patched node: %v", err)
+	}
+	if got := updated.Labels[topologySystemDSLabel]; got != "104" {
+		t.Fatalf("expected topology system datastore label 104, got %q", got)
 	}
 }
 
