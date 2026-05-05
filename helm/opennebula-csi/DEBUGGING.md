@@ -366,6 +366,159 @@ If maintenance behavior looks wrong, inspect:
 - `MaintenanceHintIgnored` events
 - whether the referenced node still exists in Kubernetes and inventory
 
+## MinIO Recovery Guidance
+
+These learnings come from recovering a degraded local-RWO MinIO tenant after Talos rollout churn caused repeated attach/detach storms, stale `VolumeAttachment` state, and OpenNebula runtime drift.
+
+Use this as an operator playbook when a MinIO StatefulSet ordinal is stuck or comes back with the wrong shard.
+
+### Preserve the blast radius first
+
+For MinIO recovery:
+
+- recover one tenant and one ordinal at a time
+- keep unrelated MinIO pools or namespaces scaled down while you are proving storage state
+- avoid cross-node movement until you know which node and which backing disk are correct
+
+Do not let Kubernetes keep “trying things” against local RWO storage while you are still discovering the actual disk state.
+
+### Prefer same-node recovery before any cross-node move
+
+When a MinIO pod previously had valid data on node A:
+
+1. try to keep the ordinal on node A
+2. start with `preferred-node`
+3. escalate to `required-node` only when you need fail-closed behavior
+4. use `allow-cross-node-until` only after external storage evidence proves a bounded move is safe
+
+In practice, this often means:
+
+- cordoning competing nodes temporarily
+- checking the pod, PVC, PV, and `VolumeAttachment` together
+- validating that the OpenNebula VM attachment and the Kubernetes scheduling target still match
+
+### Distinguish the failure class before you repair
+
+Do not treat all MinIO attach failures as the same issue.
+
+#### 1. Stale API or stale external-attacher work
+
+Symptoms:
+
+- `VolumeAttachment` is already gone or no longer reflects the intended state
+- pod still times out waiting for the external attacher
+- controller appears to be acting on stale in-memory detach or attach work
+
+Interpretation:
+
+- this is controller-side reconciliation drift, not necessarily a bad disk
+
+Guidance:
+
+- confirm the API state first
+- avoid changing MinIO rollout state until CSI controller state is coherent
+- if the API is clean but the sidecar is still acting on dead work, a bounded controller restart may be the cleanest operational reset
+
+#### 2. OpenNebula metadata says attached, but the guest runtime is missing the disk
+
+Symptoms:
+
+- OpenNebula or VM template shows the disk attached
+- kubelet or node-stage waits on `/dev/sdX` or by-id resolution
+- libvirt runtime or guest device list does not actually contain the expected disk
+
+Interpretation:
+
+- this is a same-node runtime attach problem
+- do not solve it with a cross-node move
+
+Guidance:
+
+- inspect the live VM runtime attachment, target, and serial
+- repair the same-node hotplug/runtime visibility first
+- only after the device is visible on the correct node should you continue with staging and pod startup
+
+#### 3. The disk mounts, but MinIO sees the wrong shard identity
+
+Symptoms:
+
+- MinIO reports one drive offline or wrong while Linux mount looks healthy
+- `.minio.sys/format.json` shows duplicate `this` values across different exports
+- an expected MinIO disk UUID is missing from the set
+
+Interpretation:
+
+- this is not a scheduler problem anymore
+- it usually means a replacement/empty disk or wrong historical disk landed in the slot
+
+Guidance:
+
+- stop trusting heal to fix it
+- preserve current state before writing anything else
+- recover the original shard from OpenNebula/LV artifacts if possible
+- restore it into the exact original slot before resuming heal
+
+### Validate MinIO shard identity, not just mount success
+
+For local RWO MinIO, a successful mount is necessary but not sufficient.
+
+Before you trust a recovered ordinal:
+
+- inspect `.minio.sys/format.json` on every export
+- confirm the erasure set contains the expected number of unique `this` disk IDs
+- look for duplicates, missing IDs, or obviously fresh metadata-only disks
+- compare approximate disk usage between exports to distinguish real shards from empty replacements
+
+If the disk identity is wrong, do not keep healing or writing through that slot.
+
+### Use MinIO object visibility as the source of truth
+
+During repair, top-level MinIO totals can lag or mislead.
+
+Prefer:
+
+- `mc admin info <alias>` for drive and erasure-set health
+- `mc admin heal <alias>` for active repair progress
+- `mc ls --recursive --summarize <alias>/<bucket>` for bucket-level readability
+
+Do not assume low object counts in `mc admin info` always mean permanent loss while healing is still in progress. Verify with direct bucket listing and shard inspection.
+
+### Recovery sequencing that worked
+
+The successful pattern was:
+
+1. identify which currently mounted exports were original and which were empty replacements
+2. recover an original shard from OpenNebula/LV artifacts
+3. place that shard back into its exact logical slot
+4. keep the affected ordinal on the proven node
+5. let MinIO heal only after quorum of original shard identities was restored
+
+The key point is sequencing:
+
+- restore the correct disk first
+- heal second
+
+Not the other way around.
+
+### Cleanup after a successful MinIO repair
+
+After the tenant is healthy:
+
+- remove `required-node`, `required-node-until`, and `allow-cross-node-until`
+- remove temporary `preferred-node` hints if they were only for incident handling
+- uncordon temporary node blocks only after repeated restarts prove the attach path is stable
+- capture support-bundle and volume-health output while the system is healthy, so future incidents have a known-good baseline
+
+### What not to do
+
+Avoid these failure-amplifying patterns:
+
+- do not let multiple MinIO ordinals flap across nodes while OpenNebula disk ownership is still unclear
+- do not use manual node annotations to bypass `wrong_device_identity`, metadata drift, or quarantine
+- do not trust an empty replacement PVC just because it stages successfully
+- do not edit MinIO `format.json` on a live disk to “make the set green” unless you have already proven the underlying shard data is correct
+- do not turn on `mc mirror --remove` or similar destructive sync behavior while the source tenant is still healing
+
 ## Deprecated Annotation
 
 `storage-provider.opennebula.sparkaiur.io/preferred-last-node` is deprecated.
