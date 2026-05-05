@@ -92,6 +92,7 @@ All other StorageClass parameters are passed through to the existing disk/image 
 - `ONE_CSI_LOCAL_RESTART_DETACH_GRACE_SECONDS`: default delayed-detach grace for opted-in local PVCs, default `90`
 - `ONE_CSI_LOCAL_RESTART_DETACH_GRACE_MAX_SECONDS`: maximum delayed-detach grace allowed by per-PVC override, default `300`
 - `ONE_CSI_LOCAL_RESTART_REQUIRE_NODE_READY`: require Kubernetes node and OpenNebula VM readiness before using delayed detach, default `true`
+- `ONE_CSI_FEATURE_GATES=...localRWOAutoProtection=false...`: optional protection gate that treats the last good node being `NotReady` or `unschedulable` the same way as explicit maintenance mode for local `RWO` movement
 
 ### Policy behavior
 
@@ -145,11 +146,11 @@ Behavior:
 - `ControllerUnpublishVolume` does not detach immediately for opted-in local PVCs
 - the disk stays attached for a short grace period, default `90s`
 - if the replacement pod is published back to the same node during that window, the controller reuses the existing attachment and skips detach/reattach
-- if the replacement pod lands on a different node, the controller cancels the grace and detaches immediately so normal attach can continue
+- if the replacement pod lands on a different node while sticky reuse, maintenance mode, local-device recovery, or last-known-good history still protects the volume, the controller rejects the cross-node publish with retryable `Unavailable`
 - if Kubernetes asks to detach while an active pod or non-deleting `VolumeAttachment` still desires the same node, the controller treats that stale same-node detach as successful and leaves the disk attached
 - if stale sticky state points at an old node where OpenNebula already reports the disk absent, the controller clears the sticky state instead of issuing another detach
 
-This is best-effort same-node reuse only. The CSI driver does not force Kubernetes to reschedule the pod onto the previous node.
+This path is now a hard same-node safety gate until the driver proves release safety or an operator sets `storage-provider.opennebula.sparkaiur.io/allow-cross-node-until=<RFC3339>` on the PV. Active protection returns retryable `Unavailable`; repair-required states such as missing image records, metadata drift, or wrong-device identity return `FailedPrecondition`.
 
 Opt in from a StatefulSet `volumeClaimTemplates` entry:
 
@@ -198,7 +199,7 @@ kubectl -n kube-system patch configmap opennebula-csi-hotplug-state \
   -p '{"data":{"maintainenceMode":"true"}}'
 ```
 
-The controller accepts both `maintainenceMode` and `maintenanceMode`. While active, it prepares local non-CephFS `ReadWriteOnce` volumes best-effort, publishes `maintainenceReady=true`, injects required same-node affinity for eligible pods, holds maintenance detaches without physical OpenNebula detach, and rejects cross-node attach attempts with retryable `Unavailable`.
+The controller accepts both `maintainenceMode` and `maintenanceMode`. While active, it prepares local non-CephFS `ReadWriteOnce` volumes, publishes `maintainenceReady=true`, injects required same-node affinity for eligible pods, holds maintenance detaches without physical OpenNebula detach, and rejects cross-node attach attempts with retryable `Unavailable`.
 
 When maintenance is complete, set the mode key back to `false`. The controller removes `maintainenceReady`/`maintenanceReady` and releases maintenance holds gradually using `driver.maintenanceMode.releaseMinSeconds` and `driver.maintenanceMode.releaseMaxSeconds`.
 
@@ -230,10 +231,12 @@ New workload controls:
 
 - pod or PVC opt-out annotation:
   `storage-provider.opennebula.sparkaiur.io/last-node-preference: "disabled"`
+- PV-only emergency override annotation:
+  `storage-provider.opennebula.sparkaiur.io/allow-cross-node-until: "<RFC3339 UTC>"`
 
 New support signals:
 
-- support bundles now include sticky attachment state, volume quarantine state, host artifact quarantine state, hotplug queue state, OpenNebula metadata drift details, and adaptive timeout observations/recommendations
+- support bundles now include sticky attachment state, durable `volumeHistory`, active `volumeRepairState`, `lastNodeProtection`, hotplug queue reason summaries, volume quarantine state, host artifact quarantine state, OpenNebula metadata drift details, and adaptive timeout observations/recommendations
 - controller/node metrics expose queue depth, device-resolution methods, last-node preference outcomes, reconciler actions, and adaptive timeout recommendations
 
 Canonical annotation namespace:

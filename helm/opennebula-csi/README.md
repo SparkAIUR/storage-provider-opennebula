@@ -267,7 +267,7 @@ Behavior:
 
 - on `ControllerUnpublishVolume`, the driver keeps the local disk attached for a short grace period instead of detaching immediately
 - if the replacement pod is scheduled back to the same node during that grace window, the driver reuses the existing attachment and skips detach/reattach
-- if the pod lands on a different node, the grace is cancelled and the normal detach/attach path proceeds immediately
+- if the pod lands on a different node while sticky reuse, maintenance mode, local-device recovery, or last-known-good history still protects the volume, the controller rejects the cross-node publish with retryable `Unavailable`
 - stale same-node detaches are treated as successful when Kubernetes still desires the PVC on that node
 - expired sticky state is cleared without detach when OpenNebula already reports the old-node attachment absent
 
@@ -277,7 +277,7 @@ For rolling node maintenance, set `maintainenceMode=true` or `maintenanceMode=tr
 
 When maintenance ends, set the mode key to `false`. The controller removes both ready keys and releases maintenance holds gradually using `driver.maintenanceMode.releaseMinSeconds` and `driver.maintenanceMode.releaseMaxSeconds`.
 
-This is best-effort same-node reuse only. The CSI driver does not pin scheduling to the previous node.
+This path is now a hard same-node safety gate until the driver proves release safety or an operator sets `storage-provider.opennebula.sparkaiur.io/allow-cross-node-until=<RFC3339>` on the PV. Active protection returns retryable `Unavailable`; repair-required states such as missing image records, metadata drift, or wrong-device identity return `FailedPrecondition`.
 
 ### OpenNebula metadata drift guard
 
@@ -290,6 +290,8 @@ Repeated matching failures are persisted in `opennebula-csi-volume-quarantine-st
 When an OpenNebula VM reports a disk attached but the node plugin cannot discover the device inside the guest, the node records a missing-device report in `opennebula-csi-node-device-state`. The controller leader watches those reports and, after the configured threshold, performs a same-node recovery for eligible local non-CephFS `ReadWriteOnce` volumes: detach from the reporting node, attach back to that same node, confirm the OpenNebula attachment, and clear the report once the node can retry staging.
 
 This recovery path never moves a volume to a different node. It skips CephFS, RWX, non-local backends, missing desired state, NotReady Kubernetes nodes, and non-running OpenNebula VMs. Failed recovery attempts are rate-limited with `driver.localDeviceRecovery.cooldownSeconds` and capped with `driver.localDeviceRecovery.maxAttemptsPerVolume`.
+
+If same-node restage observes a different local block device identity than the last healthy stage, the driver records `wrong_device_identity` in `opennebula-csi-volume-repair-state` and returns `FailedPrecondition`. Clear the matching ConfigMap key only after external repair or after a later healthy publish/stage path clears it automatically.
 
 `v0.4.7` adds four supporting behaviors on top of that restart fast path:
 
@@ -304,6 +306,14 @@ To opt out of the soft last-node preference for a specific Pod or PVC, set:
 metadata:
   annotations:
     storage-provider.opennebula.sparkaiur.io/last-node-preference: "disabled"
+```
+
+For a bounded emergency override that allows one protected cross-node move, annotate the PV:
+
+```yaml
+metadata:
+  annotations:
+    storage-provider.opennebula.sparkaiur.io/allow-cross-node-until: "2026-05-04T18:30:00Z"
 ```
 
 ## Values Reference
@@ -433,6 +443,7 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | `featureGates.cephfsPersistentRecovery` | Persist node-local CephFS session state, scan for stale mounts after node-plugin restart, and enqueue async recovery when volume stats detect a stale CephFS mount. | `true` | No |
 | `featureGates.cephfsKernelMounts` | Allow CephFS StorageClasses to request `cephfsMounter=kernel`. Host kernel CephFS client support is still required. | `false` | No |
 | `featureGates.localRWOStaleMountRecovery` | Enable local RWO stale mount detection and recovery from persisted node-side disk sessions. Active-pod recovery also requires `driver.localRWOStaleMountRecovery.activePodRecovery=true`. | `false` | No |
+| `featureGates.localRWOAutoProtection` | When a local RWO volume has last-known-good history, treat the protected node being `NotReady` or `unschedulable` the same way as explicit maintenance mode for cross-node movement decisions. | `false` | No |
 | `featureGates.topologyAccessibility` | Enable topology capability advertisement and `accessible_topology` handling. | `false` | No |
 
 ### Controller
@@ -570,7 +581,7 @@ The driver image includes cluster-operator modes that work well with a kubeconfi
   - triggers a manual datastore validation run and waits for the result
   - accepts `--access-modes=ReadWriteOnce` or `--access-modes=ReadWriteMany` when the benchmark PVC mode must be explicit
 - `--mode=support-bundle`
-  - emits a JSON support bundle with inventory, hotplug, local-device recovery, StorageClass, volume-health, VolumeAttachment, and event data
+  - emits a JSON support bundle with inventory, hotplug, local-device recovery, durable `volumeHistory`, active `volumeRepairState`, `lastNodeProtection`, queue reason summaries, StorageClass, volume-health, VolumeAttachment, and event data
 - `--mode=volume-health`
   - emits focused JSON diagnostics for a volume selected by `--volume-id`, `--pv`, or `--pvc namespace/name`
 
