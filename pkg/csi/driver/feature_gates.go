@@ -17,6 +17,7 @@ type FeatureGates struct {
 	CephFSPersistentRecovery    bool
 	CephFSKernelMounts          bool
 	LocalRWOStaleMountRecovery  bool
+	LocalRWOAutoProtection      bool
 	TopologyAccessibility       bool
 }
 
@@ -31,6 +32,7 @@ func defaultFeatureGates() FeatureGates {
 		CephFSPersistentRecovery:    true,
 		CephFSKernelMounts:          false,
 		LocalRWOStaleMountRecovery:  false,
+		LocalRWOAutoProtection:      false,
 		TopologyAccessibility:       false,
 	}
 }
@@ -71,6 +73,8 @@ func loadFeatureGates(cfg config.CSIPluginConfig) FeatureGates {
 			gates.CephFSKernelMounts = enabled
 		case "localRWOStaleMountRecovery":
 			gates.LocalRWOStaleMountRecovery = enabled
+		case "localRWOAutoProtection":
+			gates.LocalRWOAutoProtection = enabled
 		case "topologyAccessibility":
 			gates.TopologyAccessibility = enabled
 		}

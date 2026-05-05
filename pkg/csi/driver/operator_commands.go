@@ -90,6 +90,14 @@ type HotplugQueueRisk struct {
 	Message          string `json:"message"`
 }
 
+type HotplugQueueReasonSnapshot struct {
+	EventReason    string    `json:"eventReason"`
+	QueueReason    string    `json:"queueReason,omitempty"`
+	Count          int       `json:"count"`
+	LastMessage    string    `json:"lastMessage,omitempty"`
+	LastObservedAt time.Time `json:"lastObservedAt,omitempty"`
+}
+
 type StorageClassImmutableFieldSnapshot struct {
 	Name                 string            `json:"name"`
 	Provisioner          string            `json:"provisioner"`
@@ -111,28 +119,32 @@ type HotplugDiagnoseReport struct {
 }
 
 type SupportBundle struct {
-	Timestamp               time.Time                                           `json:"timestamp"`
-	Config                  map[string]any                                      `json:"config"`
-	FeatureGates            FeatureGates                                        `json:"featureGates"`
-	ControllerLeadership    map[string]any                                      `json:"controllerLeadership"`
-	HotplugCooldowns        map[string]any                                      `json:"hotplugCooldowns"`
-	StickyAttachments       map[string]any                                      `json:"stickyAttachments"`
-	VolumeQuarantine        map[string]any                                      `json:"volumeQuarantine"`
-	HostArtifactQuarantine  map[string]any                                      `json:"hostArtifactQuarantine"`
-	LocalDeviceReports      map[string]any                                      `json:"localDeviceReports"`
-	HotplugQueue            map[string]any                                      `json:"hotplugQueue"`
-	HotplugDiagnostics      map[string]opennebula.HotplugDiagnosis              `json:"hotplugDiagnostics"`
-	HotplugQueueRisks       []HotplugQueueRisk                                  `json:"hotplugQueueRisks,omitempty"`
-	AdaptiveTimeouts        map[string]any                                      `json:"adaptiveTimeouts"`
-	AdaptiveRecommendations map[string]any                                      `json:"adaptiveRecommendations"`
-	Datastores              []inventoryv1alpha1.OpenNebulaDatastore             `json:"datastores"`
-	BenchmarkRuns           []inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun `json:"benchmarkRuns"`
-	Nodes                   []inventoryv1alpha1.OpenNebulaNode                  `json:"nodes"`
-	StorageClassAudit       []inventoryv1alpha1.StorageClassDetail              `json:"storageClassAudit"`
-	StorageClassImmutables  []StorageClassImmutableFieldSnapshot                `json:"storageClassImmutables"`
-	VolumeHealth            []VolumeHealthReport                                `json:"volumeHealth,omitempty"`
-	VolumeAttachments       []storagev1.VolumeAttachment                        `json:"volumeAttachments"`
-	Events                  []corev1.Event                                      `json:"events"`
+	Timestamp                 time.Time                                           `json:"timestamp"`
+	Config                    map[string]any                                      `json:"config"`
+	FeatureGates              FeatureGates                                        `json:"featureGates"`
+	ControllerLeadership      map[string]any                                      `json:"controllerLeadership"`
+	HotplugCooldowns          map[string]any                                      `json:"hotplugCooldowns"`
+	StickyAttachments         map[string]any                                      `json:"stickyAttachments"`
+	VolumeHistory             map[string]VolumeHistoryRecord                      `json:"volumeHistory"`
+	VolumeRepairState         map[string]VolumeRepairState                        `json:"volumeRepairState"`
+	LastNodeProtection        map[string]LocalRWOProtectionDecision               `json:"lastNodeProtection"`
+	VolumeQuarantine          map[string]any                                      `json:"volumeQuarantine"`
+	HostArtifactQuarantine    map[string]any                                      `json:"hostArtifactQuarantine"`
+	LocalDeviceReports        map[string]any                                      `json:"localDeviceReports"`
+	HotplugQueue              map[string]any                                      `json:"hotplugQueue"`
+	HotplugDiagnostics        map[string]opennebula.HotplugDiagnosis              `json:"hotplugDiagnostics"`
+	HotplugQueueRisks         []HotplugQueueRisk                                  `json:"hotplugQueueRisks,omitempty"`
+	HotplugQueueRecentReasons []HotplugQueueReasonSnapshot                        `json:"hotplugQueueRecentReasons,omitempty"`
+	AdaptiveTimeouts          map[string]any                                      `json:"adaptiveTimeouts"`
+	AdaptiveRecommendations   map[string]any                                      `json:"adaptiveRecommendations"`
+	Datastores                []inventoryv1alpha1.OpenNebulaDatastore             `json:"datastores"`
+	BenchmarkRuns             []inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun `json:"benchmarkRuns"`
+	Nodes                     []inventoryv1alpha1.OpenNebulaNode                  `json:"nodes"`
+	StorageClassAudit         []inventoryv1alpha1.StorageClassDetail              `json:"storageClassAudit"`
+	StorageClassImmutables    []StorageClassImmutableFieldSnapshot                `json:"storageClassImmutables"`
+	VolumeHealth              []VolumeHealthReport                                `json:"volumeHealth,omitempty"`
+	VolumeAttachments         []storagev1.VolumeAttachment                        `json:"volumeAttachments"`
+	Events                    []corev1.Event                                      `json:"events"`
 }
 
 func RunInventoryValidateCommand(ctx context.Context, cfg config.CSIPluginConfig, opts InventoryValidateOptions, w io.Writer) error {
@@ -279,6 +291,10 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 	if err != nil {
 		return err
 	}
+	pvList, err := kubeClient.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
 	vaList, err := kubeClient.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return err
@@ -308,6 +324,7 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 	hotplugDiagnostics := hotplugDiagnosticSnapshot(ctx, kubeClient, cfg)
 	adaptiveSnapshot := configMapJSONSnapshot(ctx, kubeClient, adaptiveTimeoutObservationsConfigMapName)
 	adaptiveRecommendations := adaptiveRecommendationSnapshot(cfg, adaptiveSnapshot)
+	volumeHistorySnapshot, volumeRepairSnapshot, protectionSnapshot := collectSupportBundleLocalRWOSnapshot(ctx, cfg, kubeClient, pvList.Items)
 
 	bundle := SupportBundle{
 		Timestamp:    time.Now().UTC(),
@@ -321,24 +338,28 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 			"renewDeadline":  getInt(cfg, config.ControllerLeaderElectionRenewDeadlineVar),
 			"retryPeriod":    getInt(cfg, config.ControllerLeaderElectionRetryPeriodVar),
 		},
-		HotplugCooldowns:        hotplugSnapshot,
-		StickyAttachments:       stickySnapshot,
-		VolumeQuarantine:        volumeQuarantineSnapshot,
-		HostArtifactQuarantine:  hostArtifactSnapshot,
-		LocalDeviceReports:      localDeviceSnapshot,
-		HotplugQueue:            queueSnapshot,
-		HotplugDiagnostics:      hotplugDiagnostics,
-		HotplugQueueRisks:       buildHotplugQueueRisks(typedQueueSnapshot, hotplugDiagnostics, cfg),
-		AdaptiveTimeouts:        adaptiveSnapshot,
-		AdaptiveRecommendations: adaptiveRecommendations,
-		Datastores:              dsList.Items,
-		BenchmarkRuns:           benchmarkList.Items,
-		Nodes:                   nodeList.Items,
-		StorageClassAudit:       flattenStorageClassDetails(dsList.Items, scList.Items),
-		StorageClassImmutables:  storageClassImmutableFieldSnapshots(scList.Items),
-		VolumeHealth:            volumeHealth,
-		VolumeAttachments:       vaList.Items,
-		Events:                  eventList.Items,
+		HotplugCooldowns:          hotplugSnapshot,
+		StickyAttachments:         stickySnapshot,
+		VolumeHistory:             volumeHistorySnapshot,
+		VolumeRepairState:         volumeRepairSnapshot,
+		LastNodeProtection:        protectionSnapshot,
+		VolumeQuarantine:          volumeQuarantineSnapshot,
+		HostArtifactQuarantine:    hostArtifactSnapshot,
+		LocalDeviceReports:        localDeviceSnapshot,
+		HotplugQueue:              queueSnapshot,
+		HotplugDiagnostics:        hotplugDiagnostics,
+		HotplugQueueRisks:         buildHotplugQueueRisks(typedQueueSnapshot, hotplugDiagnostics, cfg),
+		HotplugQueueRecentReasons: summarizeHotplugQueueReasons(eventList.Items),
+		AdaptiveTimeouts:          adaptiveSnapshot,
+		AdaptiveRecommendations:   adaptiveRecommendations,
+		Datastores:                dsList.Items,
+		BenchmarkRuns:             benchmarkList.Items,
+		Nodes:                     nodeList.Items,
+		StorageClassAudit:         flattenStorageClassDetails(dsList.Items, scList.Items),
+		StorageClassImmutables:    storageClassImmutableFieldSnapshots(scList.Items),
+		VolumeHealth:              volumeHealth,
+		VolumeAttachments:         vaList.Items,
+		Events:                    eventList.Items,
 	}
 
 	enc := json.NewEncoder(w)
@@ -687,6 +708,124 @@ func typedHotplugQueueSnapshot(ctx context.Context, kubeClient kubernetes.Interf
 		snapshot[node] = parsed
 	}
 	return snapshot
+}
+
+func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPluginConfig, kubeClient kubernetes.Interface, pvs []corev1.PersistentVolume) (map[string]VolumeHistoryRecord, map[string]VolumeRepairState, map[string]LocalRWOProtectionDecision) {
+	runtime := &KubeRuntime{client: kubeClient, enabled: true}
+	driver := &Driver{
+		PluginConfig: cfg,
+		kubeRuntime:  runtime,
+		featureGates: loadFeatureGates(cfg),
+	}
+	driver.stickyAttachments = NewStickyAttachmentManager(runtime, "")
+	driver.volumeHistory = NewVolumeHistoryManager(runtime, "")
+	driver.volumeRepairState = NewVolumeRepairStateManager(runtime, "")
+	_ = driver.stickyAttachments.LoadFromConfigMap(ctx)
+	_ = driver.volumeHistory.LoadFromConfigMap(ctx)
+	_ = driver.volumeRepairState.LoadFromConfigMap(ctx)
+	driver.maintenanceMode = NewMaintenanceModeManager(driver, "")
+	if driver.maintenanceMode != nil {
+		_ = driver.maintenanceMode.Reconcile(ctx)
+	}
+
+	historySnapshot := map[string]VolumeHistoryRecord{}
+	if driver.volumeHistory != nil {
+		historySnapshot = driver.volumeHistory.Snapshot()
+	}
+	repairSnapshot := map[string]VolumeRepairState{}
+	if driver.volumeRepairState != nil {
+		repairSnapshot = driver.volumeRepairState.Snapshot()
+	}
+	protectionSnapshot := map[string]LocalRWOProtectionDecision{}
+	for _, pv := range pvs {
+		if !eligibleForLastNodePreference(&pv) {
+			continue
+		}
+		decision, err := localRWOProtectionDecisionForDriver(ctx, driver, pv.Spec.CSI.VolumeHandle, "")
+		if err != nil {
+			protectionSnapshot[pv.Spec.CSI.VolumeHandle] = LocalRWOProtectionDecision{
+				Reason:  "evaluation_error",
+				Message: err.Error(),
+			}
+			continue
+		}
+		if decision.Protected || strings.TrimSpace(decision.Reason) != "" {
+			protectionSnapshot[pv.Spec.CSI.VolumeHandle] = decision
+		}
+	}
+	return historySnapshot, repairSnapshot, protectionSnapshot
+}
+
+func summarizeHotplugQueueReasons(events []corev1.Event) []HotplugQueueReasonSnapshot {
+	type queueReasonKey struct {
+		eventReason string
+		queueReason string
+	}
+	grouped := map[queueReasonKey]HotplugQueueReasonSnapshot{}
+	for _, event := range events {
+		eventReason := strings.TrimSpace(event.Reason)
+		switch eventReason {
+		case eventReasonHotplugQueueStale, eventReasonHotplugQueueTimeout, eventReasonHotplugCooldown:
+		default:
+			continue
+		}
+		queueReason := supportBundleQueueReason(eventReason, event.Message)
+		key := queueReasonKey{eventReason: eventReason, queueReason: queueReason}
+		current := grouped[key]
+		current.EventReason = eventReason
+		current.QueueReason = queueReason
+		current.Count++
+		observedAt := supportBundleEventObservedAt(event)
+		if current.LastObservedAt.Before(observedAt) {
+			current.LastObservedAt = observedAt
+			current.LastMessage = strings.TrimSpace(event.Message)
+		}
+		grouped[key] = current
+	}
+	snapshot := make([]HotplugQueueReasonSnapshot, 0, len(grouped))
+	for _, item := range grouped {
+		snapshot = append(snapshot, item)
+	}
+	sort.Slice(snapshot, func(i, j int) bool {
+		if snapshot[i].EventReason != snapshot[j].EventReason {
+			return snapshot[i].EventReason < snapshot[j].EventReason
+		}
+		if snapshot[i].QueueReason != snapshot[j].QueueReason {
+			return snapshot[i].QueueReason < snapshot[j].QueueReason
+		}
+		return snapshot[i].LastObservedAt.After(snapshot[j].LastObservedAt)
+	})
+	return snapshot
+}
+
+func supportBundleQueueReason(eventReason, message string) string {
+	trimmed := strings.TrimSpace(message)
+	if trimmed == "" {
+		return ""
+	}
+	switch eventReason {
+	case eventReasonHotplugQueueStale, eventReasonHotplugCooldown:
+		if idx := strings.LastIndex(trimmed, ": "); idx >= 0 && idx+2 < len(trimmed) {
+			return strings.TrimSpace(trimmed[idx+2:])
+		}
+	}
+	return ""
+}
+
+func supportBundleEventObservedAt(event corev1.Event) time.Time {
+	if event.Series != nil && !event.Series.LastObservedTime.IsZero() {
+		return event.Series.LastObservedTime.Time.UTC()
+	}
+	if !event.EventTime.IsZero() {
+		return event.EventTime.Time.UTC()
+	}
+	if !event.LastTimestamp.IsZero() {
+		return event.LastTimestamp.Time.UTC()
+	}
+	if !event.FirstTimestamp.IsZero() {
+		return event.FirstTimestamp.Time.UTC()
+	}
+	return event.CreationTimestamp.Time.UTC()
 }
 
 func hotplugDiagnosticSnapshot(ctx context.Context, kubeClient kubernetes.Interface, cfg config.CSIPluginConfig) map[string]opennebula.HotplugDiagnosis {

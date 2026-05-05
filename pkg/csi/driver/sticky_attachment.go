@@ -78,6 +78,19 @@ func (m *StickyAttachmentManager) Get(volumeID string) (StickyAttachmentState, b
 	return state, ok
 }
 
+func (m *StickyAttachmentManager) Snapshot() map[string]StickyAttachmentState {
+	if m == nil {
+		return map[string]StickyAttachmentState{}
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	snapshot := make(map[string]StickyAttachmentState, len(m.entries))
+	for key, state := range m.entries {
+		snapshot[key] = state
+	}
+	return snapshot
+}
+
 func (m *StickyAttachmentManager) Clear(volumeID string) error {
 	if m == nil || strings.TrimSpace(volumeID) == "" {
 		return nil

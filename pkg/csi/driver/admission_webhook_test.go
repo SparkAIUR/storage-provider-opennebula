@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	inventoryv1alpha1 "github.com/SparkAIUR/storage-provider-opennebula/pkg/inventory/apis/storageprovider/v1alpha1"
@@ -20,12 +21,17 @@ func newWebhookTestDriver(objects ...runtime.Object) *Driver {
 	cfg.OverrideVal(config.LastNodePreferenceEnabledVar, true)
 	cfg.OverrideVal(config.LastNodePreferenceWebhookEnabledVar, true)
 	runtime := &KubeRuntime{client: fake.NewSimpleClientset(objects...), enabled: true}
-	return &Driver{
+	driver := &Driver{
 		name:         DefaultDriverName,
 		PluginConfig: cfg,
 		kubeRuntime:  runtime,
 		metrics:      NewDriverMetrics("test", "test"),
 	}
+	driver.featureGates = loadFeatureGates(cfg)
+	driver.stickyAttachments = NewStickyAttachmentManager(runtime, "default")
+	driver.volumeHistory = NewVolumeHistoryManager(runtime, "default")
+	driver.volumeRepairState = NewVolumeRepairStateManager(runtime, "default")
+	return driver
 }
 
 func TestLastNodePreferenceWebhookInjectsSoftAffinity(t *testing.T) {
@@ -70,6 +76,50 @@ func TestLastNodePreferenceWebhookInjectsHardAffinityDuringMaintenance(t *testin
 
 	patch, warnings, err := webhook.buildPatch(context.Background(), &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "minio-0", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc.Name},
+				},
+			}},
+		},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, warnings)
+	require.NotEmpty(t, patch)
+
+	raw, err := json.Marshal(patch)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), "requiredDuringSchedulingIgnoredDuringExecution")
+	assert.Contains(t, string(raw), "host-a")
+	assert.NotContains(t, string(raw), "preferredDuringSchedulingIgnoredDuringExecution")
+}
+
+func TestLastNodePreferenceWebhookInjectsHardAffinityForProtectedStickyVolume(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-1", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pvc.Spec.VolumeName = pv.Name
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{corev1.LabelHostname: "host-a"}}}
+	driver := newWebhookTestDriver(pv, pvc, node)
+	require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
+		VolumeID:     "vol-1",
+		NodeID:       "node-a",
+		Backend:      "local",
+		PVCNamespace: "default",
+		PVCName:      pvc.Name,
+		StartedAt:    time.Now().Add(-10 * time.Second),
+		ExpiresAt:    time.Now().Add(90 * time.Second),
+		GraceSeconds: 90,
+		Reason:       "stateful_restart",
+	}))
+	webhook := NewLastNodePreferenceWebhook(driver)
+
+	patch, warnings, err := webhook.buildPatch(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "minio-0",
+			Namespace:   "default",
+			Annotations: map[string]string{annotationLastNodePref: lastNodePreferenceDisabledValue},
+		},
 		Spec: corev1.PodSpec{
 			Volumes: []corev1.Volume{{
 				Name: "data",

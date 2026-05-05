@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -98,6 +99,10 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	nodeList, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
 
 	pvByName := make(map[string]*corev1.PersistentVolume, len(pvList.Items))
 	pvByHandle := make(map[string]*corev1.PersistentVolume, len(pvList.Items))
@@ -108,6 +113,11 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			pvByHandle[pv.Spec.CSI.VolumeHandle] = pv
 		}
 	}
+	existingNodes := make(map[string]struct{}, len(nodeList.Items))
+	for idx := range nodeList.Items {
+		existingNodes[strings.TrimSpace(nodeList.Items[idx].Name)] = struct{}{}
+	}
+	r.cleanupStaleDriverState(ctx, pvByHandle, existingNodes)
 
 	activePVCUsers := make(map[string]bool)
 	for idx := range podList.Items {
@@ -244,6 +254,87 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 	r.prune(r.divergentSeen, currentDivergent)
 	r.prune(r.multiAttachSeen, currentMultiAttach)
 	return nil
+}
+
+func (r *AttachmentReconciler) cleanupStaleDriverState(ctx context.Context, pvByHandle map[string]*corev1.PersistentVolume, existingNodes map[string]struct{}) {
+	if r == nil || r.server == nil || r.server.driver == nil {
+		return
+	}
+	if r.server.driver.stickyAttachments != nil {
+		for volumeID, state := range r.server.driver.stickyAttachments.Snapshot() {
+			if pvByHandle[volumeID] == nil || nodeMissing(existingNodes, state.NodeID) {
+				_ = r.server.driver.stickyAttachments.Clear(volumeID)
+			}
+		}
+	}
+	if r.server.driver.volumeHistory != nil {
+		for volumeID := range r.server.driver.volumeHistory.Snapshot() {
+			if pvByHandle[volumeID] == nil {
+				_ = r.server.driver.volumeHistory.Clear(ctx, volumeID)
+			}
+		}
+	}
+	if r.server.driver.volumeRepairState != nil {
+		for volumeID := range r.server.driver.volumeRepairState.Snapshot() {
+			if pvByHandle[volumeID] == nil {
+				_ = r.server.driver.volumeRepairState.Clear(ctx, volumeID)
+			}
+		}
+	}
+	if r.server.driver.kubeRuntime != nil && r.server.driver.kubeRuntime.enabled {
+		r.cleanupNodeScopedState(ctx, existingNodes)
+		r.cleanupLocalDeviceReports(ctx, pvByHandle, existingNodes)
+	}
+}
+
+func (r *AttachmentReconciler) cleanupNodeScopedState(ctx context.Context, existingNodes map[string]struct{}) {
+	if r == nil || r.server == nil || r.server.driver == nil || r.server.driver.kubeRuntime == nil {
+		return
+	}
+	namespace := namespaceFromServiceAccount()
+	for _, name := range []string{hotplugStateConfigMapName, hotplugQueueStateConfigMapName} {
+		cm, err := r.server.driver.kubeRuntime.GetConfigMap(ctx, namespace, name)
+		if err != nil {
+			continue
+		}
+		for key := range cm.Data {
+			if name == hotplugStateConfigMapName && isMaintenanceConfigMapKey(key) {
+				continue
+			}
+			if nodeMissing(existingNodes, key) {
+				_ = r.server.driver.kubeRuntime.DeleteConfigMapKey(ctx, namespace, name, key)
+			}
+		}
+	}
+}
+
+func (r *AttachmentReconciler) cleanupLocalDeviceReports(ctx context.Context, pvByHandle map[string]*corev1.PersistentVolume, existingNodes map[string]struct{}) {
+	if r == nil || r.server == nil || r.server.driver == nil || r.server.driver.kubeRuntime == nil {
+		return
+	}
+	namespace := namespaceFromServiceAccount()
+	cm, err := r.server.driver.kubeRuntime.GetConfigMap(ctx, namespace, localDeviceStateConfigMapName)
+	if err != nil {
+		return
+	}
+	for key, raw := range cm.Data {
+		var report LocalDeviceMissingReport
+		if err := json.Unmarshal([]byte(raw), &report); err != nil {
+			continue
+		}
+		if pvByHandle[strings.TrimSpace(report.VolumeID)] == nil || nodeMissing(existingNodes, report.Node) {
+			_ = r.server.driver.kubeRuntime.DeleteConfigMapKey(ctx, namespace, localDeviceStateConfigMapName, key)
+		}
+	}
+}
+
+func nodeMissing(existingNodes map[string]struct{}, node string) bool {
+	node = strings.TrimSpace(node)
+	if node == "" {
+		return false
+	}
+	_, ok := existingNodes[node]
+	return !ok
 }
 
 func (r *AttachmentReconciler) skipVolume(volumeHandle string) bool {

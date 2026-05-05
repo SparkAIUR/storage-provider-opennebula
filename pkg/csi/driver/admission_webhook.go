@@ -28,6 +28,12 @@ type LastNodePreferenceWebhook struct {
 	driver *Driver
 }
 
+type podNodePlacementDecision struct {
+	TargetNode string
+	Required   bool
+	Reason     string
+}
+
 func NewLastNodePreferenceWebhook(driver *Driver) *LastNodePreferenceWebhook {
 	return &LastNodePreferenceWebhook{driver: driver}
 }
@@ -137,6 +143,33 @@ func (w *LastNodePreferenceWebhook) buildPatch(ctx context.Context, pod *corev1.
 		affinityChanged = true
 	}
 
+	placement, placementWarnings, err := w.resolvePlacementNode(ctx, pod)
+	warnings = append(warnings, placementWarnings...)
+	if err != nil {
+		w.driver.metrics.RecordLastNodePreference("error", "resolution_failed")
+		return nil, warnings, err
+	}
+	if strings.TrimSpace(placement.TargetNode) == "" {
+		w.driver.metrics.RecordLastNodePreference("skipped", placement.Reason)
+		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
+	}
+	if placement.Required {
+		hostname, err := w.driver.kubeRuntime.GetNodeHostname(ctx, placement.TargetNode)
+		if err != nil {
+			w.driver.metrics.RecordLastNodePreference("error", "node_lookup_failed")
+			return nil, warnings, err
+		}
+		applyRequiredNodeSelector(ensureAffinity(), corev1.NodeSelectorRequirement{
+			Key:      corev1.LabelHostname,
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   []string{hostname},
+		})
+		annotations[annotationPreferredLastNode] = placement.TargetNode
+		annotations[annotationLastNodeInjected] = "true"
+		affinityChanged = true
+		w.driver.metrics.RecordLastNodePreference("injected", "protected_required_hostname")
+		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
+	}
 	if !w.lastNodePreferenceEnabled() {
 		w.driver.metrics.RecordLastNodePreference("skipped", "feature_disabled")
 		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
@@ -145,54 +178,27 @@ func (w *LastNodePreferenceWebhook) buildPatch(ctx context.Context, pod *corev1.
 		w.driver.metrics.RecordLastNodePreference("skipped", "pod_opt_out")
 		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
 	}
-
-	maintenanceActive := w.driver.maintenanceMode != nil && w.driver.maintenanceMode.Active()
-	targetNode, lastNodeWarnings, reason, err := w.resolvePreferredNode(ctx, pod)
-	warnings = append(warnings, lastNodeWarnings...)
-	if err != nil {
-		w.driver.metrics.RecordLastNodePreference("error", "resolution_failed")
-		return nil, warnings, err
-	}
-	if maintenanceActive && reason == "conflicting_nodes" {
-		w.driver.metrics.RecordLastNodePreference("error", "maintenance_conflicting_nodes")
-		return nil, warnings, fmt.Errorf("maintenance mode requires a single last attached node for local RWO PVCs")
-	}
-	if strings.TrimSpace(targetNode) == "" {
-		w.driver.metrics.RecordLastNodePreference("skipped", reason)
-		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
-	}
-	hostname, err := w.driver.kubeRuntime.GetNodeHostname(ctx, targetNode)
+	hostname, err := w.driver.kubeRuntime.GetNodeHostname(ctx, placement.TargetNode)
 	if err != nil {
 		w.driver.metrics.RecordLastNodePreference("error", "node_lookup_failed")
 		return nil, warnings, err
 	}
-	if !maintenanceActive && hasPreferredHostnameAffinity(pod, hostname) {
+	if hasPreferredHostnameAffinity(pod, hostname) {
 		w.driver.metrics.RecordLastNodePreference("skipped", "already_present")
 		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
 	}
-
-	if maintenanceActive {
-		applyRequiredNodeSelector(ensureAffinity(), corev1.NodeSelectorRequirement{
-			Key:      corev1.LabelHostname,
-			Operator: corev1.NodeSelectorOpIn,
-			Values:   []string{hostname},
-		})
-		annotations[annotationPreferredLastNode] = targetNode
-		annotations[annotationLastNodeInjected] = "true"
-		affinityChanged = true
-		w.driver.metrics.RecordLastNodePreference("injected", "maintenance_required_hostname")
-		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
-	}
 	appendPreferredHostname(ensureAffinity(), hostname)
-	annotations[annotationPreferredLastNode] = targetNode
+	annotations[annotationPreferredLastNode] = placement.TargetNode
 	annotations[annotationLastNodeInjected] = "true"
 	affinityChanged = true
 	w.driver.metrics.RecordLastNodePreference("injected", "preferred_hostname")
 	return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
 }
 
-func (w *LastNodePreferenceWebhook) resolvePreferredNode(ctx context.Context, pod *corev1.Pod) (string, []string, string, error) {
-	nodes := map[string]struct{}{}
+func (w *LastNodePreferenceWebhook) resolvePlacementNode(ctx context.Context, pod *corev1.Pod) (podNodePlacementDecision, []string, error) {
+	decision := podNodePlacementDecision{Reason: "no_eligible_volume"}
+	requiredNodes := map[string]struct{}{}
+	preferredNodes := map[string]struct{}{}
 	warnings := []string{}
 	for _, volume := range pod.Spec.Volumes {
 		if volume.PersistentVolumeClaim == nil {
@@ -201,9 +207,6 @@ func (w *LastNodePreferenceWebhook) resolvePreferredNode(ctx context.Context, po
 		pvc, err := w.driver.kubeRuntime.client.CoreV1().PersistentVolumeClaims(pod.Namespace).Get(ctx, volume.PersistentVolumeClaim.ClaimName, metav1.GetOptions{})
 		if err != nil {
 			warnings = append(warnings, fmt.Sprintf("skipping PVC %s: %v", volume.PersistentVolumeClaim.ClaimName, err))
-			continue
-		}
-		if strings.EqualFold(strings.TrimSpace(pvc.Annotations[annotationLastNodePref]), lastNodePreferenceDisabledValue) {
 			continue
 		}
 		if strings.TrimSpace(pvc.Spec.VolumeName) == "" {
@@ -217,22 +220,51 @@ func (w *LastNodePreferenceWebhook) resolvePreferredNode(ctx context.Context, po
 		if !eligibleForLastNodePreference(pv) {
 			continue
 		}
+		protection, err := localRWOProtectionDecisionForDriver(ctx, w.driver, pv.Spec.CSI.VolumeHandle, "")
+		if err != nil {
+			return decision, warnings, err
+		}
+		if protection.Protected && strings.TrimSpace(protection.RequiredNode) != "" {
+			requiredNodes[strings.TrimSpace(protection.RequiredNode)] = struct{}{}
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(pvc.Annotations[annotationLastNodePref]), lastNodePreferenceDisabledValue) {
+			continue
+		}
 		lastNode := strings.TrimSpace(pv.Annotations[annotationLastAttachedNode])
 		if lastNode == "" {
 			continue
 		}
-		nodes[lastNode] = struct{}{}
+		preferredNodes[lastNode] = struct{}{}
 	}
-	switch len(nodes) {
+	switch len(requiredNodes) {
 	case 0:
-		return "", warnings, "no_eligible_volume", nil
 	case 1:
-		for node := range nodes {
-			return node, warnings, "eligible", nil
+		for node := range requiredNodes {
+			decision.TargetNode = node
+			decision.Required = true
+			decision.Reason = "protected_required_node"
+			return decision, warnings, nil
 		}
+	default:
+		warnings = append(warnings, "conflicting protected local RWO volumes require different nodes")
+		return decision, warnings, fmt.Errorf("pod references protected local RWO volumes that require different nodes")
 	}
-	warnings = append(warnings, "skipping soft last-node preference because referenced PVCs disagree on preferred node")
-	return "", warnings, "conflicting_nodes", nil
+	switch len(preferredNodes) {
+	case 0:
+		return decision, warnings, nil
+	case 1:
+		for node := range preferredNodes {
+			decision.TargetNode = node
+			decision.Reason = "eligible"
+			return decision, warnings, nil
+		}
+	default:
+		warnings = append(warnings, "skipping soft last-node preference because referenced PVCs disagree on preferred node")
+		decision.Reason = "conflicting_nodes"
+		return decision, warnings, nil
+	}
+	return decision, warnings, nil
 }
 
 func (w *LastNodePreferenceWebhook) resolveCompatibleSystemDatastores(ctx context.Context, pod *corev1.Pod) ([]string, []string, error) {

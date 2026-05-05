@@ -77,6 +77,27 @@ type VolumeAttachmentMetadata struct {
 	DiskRecords             []VolumeDiskRecord `json:"diskRecords,omitempty"`
 }
 
+type VolumeLookupStatus string
+
+const (
+	VolumeLookupPresent              VolumeLookupStatus = "present"
+	VolumeLookupNotFound             VolumeLookupStatus = "not_found"
+	VolumeLookupImageRecordMissing   VolumeLookupStatus = "image_record_missing"
+	VolumeLookupProviderInconsistent VolumeLookupStatus = "provider_lookup_inconsistent"
+)
+
+type VolumeLookupResult struct {
+	Status             VolumeLookupStatus        `json:"status"`
+	VolumeHandle       string                    `json:"volumeHandle"`
+	ImageID            int                       `json:"imageID,omitempty"`
+	SizeBytes          int64                     `json:"sizeBytes,omitempty"`
+	RequestedNode      string                    `json:"requestedNode,omitempty"`
+	RequestedNodeID    int                       `json:"requestedNodeID,omitempty"`
+	NodeResolution     string                    `json:"nodeResolution,omitempty"`
+	Message            string                    `json:"message,omitempty"`
+	AttachmentMetadata *VolumeAttachmentMetadata `json:"attachmentMetadata,omitempty"`
+}
+
 func (m VolumeAttachmentMetadata) ConflictingOwnerVMIDs() []int {
 	seen := map[int]struct{}{}
 	for _, vmID := range m.ImageVMIDs {
@@ -101,6 +122,10 @@ func (m VolumeAttachmentMetadata) ConflictingOwnerVMIDs() []int {
 
 type VolumeAttachmentInspector interface {
 	InspectVolumeAttachment(ctx context.Context, volume string, node string) (*VolumeAttachmentMetadata, error)
+}
+
+type VolumeLookupInspector interface {
+	InspectVolumeLookup(ctx context.Context, volume string, requestedNode string) (*VolumeLookupResult, error)
 }
 
 type HotplugCooldownState struct {

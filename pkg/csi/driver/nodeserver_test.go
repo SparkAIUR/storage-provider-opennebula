@@ -268,7 +268,7 @@ func TestRecordLocalDiskStageSessionClearsPreviousRecoveryFailure(t *testing.T) 
 		PublishContext: map[string]string{
 			"volumeName": "sdg",
 		},
-	}, "/dev/sdg", "xfs", []string{"rw"})
+	}, "/dev/sdg", "xfs", []string{"rw"}, &LocalDiskIdentity{Version: stateObjectVersion, DevicePath: "/dev/sdg", DiskTarget: "sdg"})
 
 	session, exists, err := ns.loadLocalDiskSession("vol-1")
 	assert.NoError(t, err)

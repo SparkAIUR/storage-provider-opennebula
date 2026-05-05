@@ -33,8 +33,6 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 )
 
@@ -785,12 +783,18 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return &csi.ControllerPublishVolumeResponse{PublishContext: publishContext}, nil
 	}
 
-	volumeID, _, err := s.volumeProvider.VolumeExists(ctx, req.VolumeId)
-	if err != nil || volumeID == -1 {
-		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "not_found", time.Since(started))
-		klog.V(0).ErrorS(err, "Volume does not exist", "method", "ControllerPublishVolume", "volumeID", req.VolumeId)
-		return nil, status.Error(codes.NotFound, "volume not found")
+	lookup, _, runtimeCtx, lookupErr := s.lookupVolumeForPublish(ctx, req.VolumeId, req.NodeId)
+	if lookupErr != nil {
+		outcome := "not_found"
+		if status.Code(lookupErr) == codes.FailedPrecondition {
+			outcome = "failed_precondition"
+		}
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", outcome, time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", outcome, time.Since(started))
+		klog.V(0).ErrorS(lookupErr, "Volume lookup failed", "method", "ControllerPublishVolume", "volumeID", req.VolumeId)
+		return nil, lookupErr
 	}
+	volumeID := lookup.ImageID
 
 	nodeID, err := s.volumeProvider.NodeExists(ctx, req.NodeId)
 	if err != nil || nodeID == -1 {
@@ -799,14 +803,23 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.NotFound, "node not found")
 	}
 
+	protection, protectionErr := s.localRWOProtectionDecision(ctx, req.VolumeId, req.NodeId)
+	if protectionErr != nil {
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "internal", time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", "internal", time.Since(started))
+		return nil, protectionErr
+	}
+
 	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err == nil {
 		if s.driver.volumeQuarantine != nil {
 			_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
 		}
+		s.clearRepairStateOnSuccess(ctx, req.VolumeId)
 		s.clearHostArtifactQuarantineForVolume(ctx, req.VolumeId)
 		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
 		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
+		s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), &protection, lookup.AttachmentMetadata)
 		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext())
 		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
 		s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
@@ -817,10 +830,21 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		}, nil
 	}
 
-	if blocked, message := s.maintenanceBlocksPublish(ctx, req); blocked {
-		s.driver.metrics.RecordMaintenanceBlock("publish", "cross_node_attach")
-		s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonMaintenanceModeBlocked, message)
-		return nil, status.Error(codes.Unavailable, message)
+	if repairErr := s.rejectIfActiveRepairState(ctx, req.VolumeId, runtimeCtx); repairErr != nil {
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "failed_precondition", time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", "failed_precondition", time.Since(started))
+		return nil, repairErr
+	}
+
+	if protection.Protected && protection.RequiredNode != "" && strings.TrimSpace(protection.RequiredNode) != strings.TrimSpace(req.NodeId) && !protection.OverrideUsed {
+		s.driver.metrics.RecordLocalRWOProtection(protection.Reason, "blocked")
+		s.driver.metrics.RecordMaintenanceBlock("publish", protection.Reason)
+		s.recordPVCWarningFromRuntimeContext(ctx, protection.RuntimeContext, eventReasonMaintenanceModeBlocked, protection.Message)
+		return nil, status.Error(codes.Unavailable, protection.Message)
+	}
+	if protection.OverrideUsed {
+		s.driver.metrics.RecordLocalRWOProtection(protection.Reason, "override")
+		s.recordCrossNodeOverrideUsed(ctx, protection.RuntimeContext, protection.Message)
 	}
 
 	if cooldown, ok := s.hotplugCooldownState(ctx, req.NodeId); ok {
@@ -847,6 +871,8 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			if reuseErr != nil {
 				return reuseErr
 			}
+			s.clearRepairStateOnSuccess(queueCtx, req.VolumeId)
+			s.recordSuccessfulLocalVolumePublish(queueCtx, req.VolumeId, req.NodeId, reusedResponse.GetPublishContext()["volumeName"], req.GetVolumeContext(), &protection, lookup.AttachmentMetadata)
 			s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
 			response = reusedResponse
 			return nil
@@ -857,9 +883,11 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			if s.driver.volumeQuarantine != nil {
 				_ = s.driver.volumeQuarantine.Clear(queueCtx, req.VolumeId)
 			}
+			s.clearRepairStateOnSuccess(queueCtx, req.VolumeId)
 			s.clearHostArtifactQuarantineForVolume(queueCtx, req.VolumeId)
 			s.clearStickyReuseState(queueCtx, req.VolumeId, req.NodeId, "disk")
 			s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
+			s.recordSuccessfulLocalVolumePublish(queueCtx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), &protection, lookup.AttachmentMetadata)
 			response = &csi.ControllerPublishVolumeResponse{
 				PublishContext: s.publishContextForVolume(queueCtx, req.VolumeId, target, 0, req.GetVolumeContext()),
 			}
@@ -903,6 +931,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		if s.driver.volumeQuarantine != nil {
 			_ = s.driver.volumeQuarantine.Clear(queueCtx, req.VolumeId)
 		}
+		s.clearRepairStateOnSuccess(queueCtx, req.VolumeId)
 		s.clearHostArtifactQuarantineForVolume(queueCtx, req.VolumeId)
 
 		klog.V(3).InfoS("Checking if volume is attached",
@@ -918,6 +947,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		klog.V(1).InfoS("Volume attached successfully",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
 		s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
+		s.recordSuccessfulLocalVolumePublish(queueCtx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), &protection, nil)
 		response = &csi.ControllerPublishVolumeResponse{
 			PublishContext: s.publishContextForVolume(queueCtx, req.VolumeId, target, deviceDiscoveryTimeout, req.GetVolumeContext()),
 		}
@@ -1003,6 +1033,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 
 	_, err = s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err != nil {
+		s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
 		klog.V(1).InfoS("Volume does not exist in node, skipping unpublish",
 			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
@@ -1072,6 +1103,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 			return status.Errorf(codes.Internal, "failed to detach volume: %v", err)
 		}
 		s.clearHotplugGuardState(queueCtx, req.NodeId)
+		s.recordSafeDetach(queueCtx, req.VolumeId, req.NodeId)
 		sizeBytes, sizeErr := s.volumeProvider.ResolveVolumeSizeBytes(queueCtx, req.VolumeId)
 		if sizeErr == nil {
 			s.driver.observeAdaptiveTimeout(queueCtx, "detach", "disk", sizeBytes, time.Since(detachStarted))
@@ -1679,17 +1711,26 @@ func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node
 		return HotplugQueueValidation{Decision: HotplugQueueValidationValid}
 	}
 
-	volumeID, _, err := s.volumeProvider.VolumeExists(ctx, volume)
-	if err != nil {
-		return HotplugQueueValidation{Decision: HotplugQueueValidationValid}
-	}
-	if volumeID == -1 {
-		return HotplugQueueValidation{
-			Decision: HotplugQueueValidationStale,
-			Reason:   "volume_not_found",
-			Message:  fmt.Sprintf("volume %s no longer exists; dropping queued %s for node %s", volume, operation, node),
+	lookup, history, runtimeCtx, lookupErr := s.lookupVolumeForPublish(ctx, volume, node)
+	if lookupErr != nil {
+		switch status.Code(lookupErr) {
+		case codes.NotFound:
+			return HotplugQueueValidation{
+				Decision: HotplugQueueValidationStale,
+				Reason:   "volume_not_found",
+				Message:  fmt.Sprintf("volume %s no longer exists; dropping queued %s for node %s", volume, operation, node),
+			}
+		case codes.FailedPrecondition:
+			return HotplugQueueValidation{
+				Decision: HotplugQueueValidationStale,
+				Reason:   queueReasonRepairRequired,
+				Message:  lookupErr.Error(),
+			}
+		default:
+			return HotplugQueueValidation{Decision: HotplugQueueValidationValid}
 		}
 	}
+	volumeID := lookup.ImageID
 	nodeID, err := s.volumeProvider.NodeExists(ctx, node)
 	if err != nil {
 		return HotplugQueueValidation{Decision: HotplugQueueValidationValid}
@@ -1713,6 +1754,30 @@ func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node
 	attached := attachedErr == nil
 	switch strings.ToLower(strings.TrimSpace(operation)) {
 	case "attach":
+		if state, ok := s.repairStateForQueue(volume); ok {
+			if runtimeCtx != nil {
+				s.recordActiveRepairStateEvent(ctx, runtimeCtx, state)
+			}
+			return HotplugQueueValidation{
+				Decision: HotplugQueueValidationStale,
+				Reason:   queueReasonRepairRequired,
+				Message:  firstNonEmpty(state.Message, fmt.Sprintf("repair-required state %s is active for volume %s", state.Classification, volume)),
+			}
+		}
+		if quarantine, ok := s.activeVolumeQuarantine(volume); ok {
+			return HotplugQueueValidation{
+				Decision: HotplugQueueValidationStale,
+				Reason:   queueReasonVolumeQuarantined,
+				Message:  volumeQuarantineMessage(quarantine),
+			}
+		}
+		if s.activeHostArtifactQuarantine(volume) {
+			return HotplugQueueValidation{
+				Decision: HotplugQueueValidationStale,
+				Reason:   queueReasonRepairRequired,
+				Message:  fmt.Sprintf("host artifact quarantine is active for volume %s", volume),
+			}
+		}
 		if attached {
 			return HotplugQueueValidation{
 				Decision: HotplugQueueValidationCompleted,
@@ -1735,7 +1800,23 @@ func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node
 				Message:  fmt.Sprintf("volume %s is already detached from node %s", volume, node),
 			}
 		}
+		if desiredState, desiredErr := s.driver.kubeRuntime.DesiredNodeForVolume(ctx, volume); desiredErr == nil && desiredState.Desired && !desiredState.MultipleNodes && strings.TrimSpace(desiredState.NodeName) == strings.TrimSpace(node) {
+			return HotplugQueueValidation{
+				Decision: HotplugQueueValidationPaused,
+				Reason:   queueReasonSameNodeReuseRequired,
+				Message:  fmt.Sprintf("queued detach for volume %s on node %s is paused because Kubernetes still desires the volume there (%s)", volume, node, desiredState.Reason),
+			}
+		}
+		protection, protectionErr := s.localRWOProtectionDecision(ctx, volume, node)
+		if protectionErr == nil && protection.Protected && strings.TrimSpace(protection.RequiredNode) == strings.TrimSpace(node) {
+			return HotplugQueueValidation{
+				Decision: HotplugQueueValidationPaused,
+				Reason:   protection.Reason,
+				Message:  fmt.Sprintf("queued detach for volume %s on node %s is paused while local RWO protection is active (%s)", volume, node, protection.Reason),
+			}
+		}
 	}
+	_ = history
 	return HotplugQueueValidation{Decision: HotplugQueueValidationValid}
 }
 
@@ -1743,40 +1824,42 @@ func (s *ControllerServer) attachRequestStale(ctx context.Context, node, volume 
 	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
 		return false, ""
 	}
-	runtimeCtx, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volume)
+	desiredState, err := s.driver.kubeRuntime.DesiredNodeForVolume(ctx, volume)
 	if err != nil {
 		if strings.Contains(err.Error(), "persistent volume for handle") {
 			return true, "persistent_volume_not_found"
 		}
 		return false, ""
 	}
-	pv, err := s.driver.kubeRuntime.client.CoreV1().PersistentVolumes().Get(ctx, runtimeCtx.PVName, metav1.GetOptions{})
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return true, "persistent_volume_not_found"
-		}
-		return false, ""
-	}
-	if !pv.DeletionTimestamp.IsZero() {
+	if desiredState.PVDeleting {
 		return true, "persistent_volume_deleting"
 	}
-	if pv.Status.Phase == corev1.VolumeReleased || pv.Status.Phase == corev1.VolumeFailed {
-		return true, "persistent_volume_" + strings.ToLower(string(pv.Status.Phase))
+	if desiredState.PVPhase == corev1.VolumeReleased || desiredState.PVPhase == corev1.VolumeFailed {
+		return true, "persistent_volume_" + strings.ToLower(string(desiredState.PVPhase))
 	}
-
-	vas, err := s.driver.kubeRuntime.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return false, ""
+	if desiredState.PVCDeleting {
+		return true, "persistent_volume_claim_deleting"
 	}
-	for _, va := range vas.Items {
-		if va.Spec.Source.PersistentVolumeName == nil || *va.Spec.Source.PersistentVolumeName != runtimeCtx.PVName {
-			continue
+	if !desiredState.Desired {
+		if desiredState.Reason == "volume_parked" {
+			return true, queueReasonVolumeParked
 		}
-		if va.Spec.NodeName == node && va.DeletionTimestamp.IsZero() {
-			return false, ""
-		}
+		return true, queueReasonDesiredStateChanged
 	}
-	return true, "volume_attachment_not_found"
+	if desiredState.MultipleNodes {
+		return true, queueReasonDesiredStateChanged
+	}
+	if strings.TrimSpace(desiredState.NodeName) != "" && strings.TrimSpace(desiredState.NodeName) != strings.TrimSpace(node) {
+		return true, queueReasonDesiredStateChanged
+	}
+	protection, protectionErr := s.localRWOProtectionDecision(ctx, volume, node)
+	if protectionErr == nil && protection.Protected && strings.TrimSpace(protection.RequiredNode) != "" && strings.TrimSpace(protection.RequiredNode) != strings.TrimSpace(node) && !protection.OverrideUsed {
+		return true, queueReasonSameNodeReuseRequired
+	}
+	if state, ok := s.repairStateForQueue(volume); ok && strings.TrimSpace(state.Classification) != "" {
+		return true, queueReasonRepairRequired
+	}
+	return false, ""
 }
 
 func (s *ControllerServer) handleHotplugTimeout(ctx context.Context, node, volume string, params map[string]string, operation, backend string, err error) {
@@ -2224,6 +2307,7 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 			if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
 				return true, nil, status.Errorf(codes.Internal, "failed to clear sticky attachment state: %v", err)
 			}
+			s.recordSafeDetach(ctx, req.VolumeId, state.NodeID)
 			s.driver.metrics.RecordStickyDetach("already_absent", state.Reason)
 			s.driver.metrics.RecordStickyDetachResidency("already_absent", time.Since(state.StartedAt))
 			s.recordPVCEventFromStickyState(ctx, state, eventReasonDetachGraceCancelled, fmt.Sprintf("cleared stale attachment state for volume %s because it is already absent from node %s", req.VolumeId, state.NodeID))
@@ -2243,6 +2327,7 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 	if s.driver.volumeQuarantine != nil {
 		_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
 	}
+	s.recordSafeDetach(ctx, req.VolumeId, state.NodeID)
 	if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
 		return true, nil, status.Errorf(codes.Internal, "failed to clear sticky attachment state: %v", err)
 	}
@@ -2306,6 +2391,7 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 					klog.V(2).InfoS("Failed to clear already-absent sticky attachment state", "volumeID", confirmed.VolumeID, "err", err)
 					return err
 				}
+				s.recordSafeDetach(queueCtx, confirmed.VolumeID, confirmed.NodeID)
 				if s.driver.volumeQuarantine != nil {
 					_ = s.driver.volumeQuarantine.Clear(queueCtx, confirmed.VolumeID)
 				}
@@ -2329,6 +2415,7 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 		if s.driver.volumeQuarantine != nil {
 			_ = s.driver.volumeQuarantine.Clear(queueCtx, confirmed.VolumeID)
 		}
+		s.recordSafeDetach(queueCtx, confirmed.VolumeID, confirmed.NodeID)
 		if sizeBytes, sizeErr := s.volumeProvider.ResolveVolumeSizeBytes(queueCtx, confirmed.VolumeID); sizeErr == nil {
 			s.driver.observeAdaptiveTimeout(queueCtx, "detach", "disk", sizeBytes, time.Since(detachStarted))
 		}

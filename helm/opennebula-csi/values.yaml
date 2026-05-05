@@ -120,6 +120,7 @@ featureGates:
   cephfsPersistentRecovery: true
   cephfsKernelMounts: false
   localRWOStaleMountRecovery: false
+  localRWOAutoProtection: false
   topologyAccessibility: false
 
 controller:

@@ -34,19 +34,20 @@ const (
 	paramPVCUID       = "csi.storage.k8s.io/pvc/uid"
 	paramPVName       = "csi.storage.k8s.io/pv/name"
 
-	annotationBackend           = "storage-provider.opennebula.sparkaiur.io/backend"
-	annotationDatastoreID       = "storage-provider.opennebula.sparkaiur.io/datastore-id"
-	annotationDatastoreName     = "storage-provider.opennebula.sparkaiur.io/datastore-name"
-	annotationSelectionPolicy   = "storage-provider.opennebula.sparkaiur.io/selection-policy"
-	annotationPlacementSummary  = "storage-provider.opennebula.sparkaiur.io/placement-summary"
-	annotationLastAttachedNode  = "storage-provider.opennebula.sparkaiur.io/last-attached-node"
-	annotationRestartOpt        = "storage-provider.opennebula.sparkaiur.io/restart-optimization"
-	annotationDetachGrace       = "storage-provider.opennebula.sparkaiur.io/detach-grace-seconds"
-	annotationLastNodePref      = "storage-provider.opennebula.sparkaiur.io/last-node-preference"
-	annotationPreferredLastNode = "storage-provider.opennebula.sparkaiur.io/preferred-last-node"
-	annotationLastNodeInjected  = "storage-provider.opennebula.sparkaiur.io/last-node-preference-injected"
-	annotationSystemDSAffinity  = "storage-provider.opennebula.sparkaiur.io/system-ds-affinity"
-	annotationSystemDSInjected  = "storage-provider.opennebula.sparkaiur.io/system-ds-affinity-injected"
+	annotationBackend             = "storage-provider.opennebula.sparkaiur.io/backend"
+	annotationDatastoreID         = "storage-provider.opennebula.sparkaiur.io/datastore-id"
+	annotationDatastoreName       = "storage-provider.opennebula.sparkaiur.io/datastore-name"
+	annotationSelectionPolicy     = "storage-provider.opennebula.sparkaiur.io/selection-policy"
+	annotationPlacementSummary    = "storage-provider.opennebula.sparkaiur.io/placement-summary"
+	annotationLastAttachedNode    = "storage-provider.opennebula.sparkaiur.io/last-attached-node"
+	annotationRestartOpt          = "storage-provider.opennebula.sparkaiur.io/restart-optimization"
+	annotationDetachGrace         = "storage-provider.opennebula.sparkaiur.io/detach-grace-seconds"
+	annotationLastNodePref        = "storage-provider.opennebula.sparkaiur.io/last-node-preference"
+	annotationPreferredLastNode   = "storage-provider.opennebula.sparkaiur.io/preferred-last-node"
+	annotationAllowCrossNodeUntil = "storage-provider.opennebula.sparkaiur.io/allow-cross-node-until"
+	annotationLastNodeInjected    = "storage-provider.opennebula.sparkaiur.io/last-node-preference-injected"
+	annotationSystemDSAffinity    = "storage-provider.opennebula.sparkaiur.io/system-ds-affinity"
+	annotationSystemDSInjected    = "storage-provider.opennebula.sparkaiur.io/system-ds-affinity-injected"
 
 	annotationLegacyLastAttachedNode = "csi.opennebula.io/last-attached-node"
 
@@ -300,6 +301,33 @@ func (r *KubeRuntime) DeleteConfigMapKey(ctx context.Context, namespace, name, k
 		}
 		delete(current.Data, key)
 		_, err = cmClient.Update(ctx, current, metav1.UpdateOptions{})
+		return err
+	})
+}
+
+func (r *KubeRuntime) DeletePVAnnotation(ctx context.Context, pvName, key string) error {
+	if r == nil || !r.enabled {
+		return fmt.Errorf("kubernetes runtime is not enabled")
+	}
+	if strings.TrimSpace(pvName) == "" || strings.TrimSpace(key) == "" {
+		return nil
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		pv, err := r.client.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
+		if err != nil {
+			if errors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if len(pv.Annotations) == 0 {
+			return nil
+		}
+		if _, ok := pv.Annotations[key]; !ok {
+			return nil
+		}
+		delete(pv.Annotations, key)
+		_, err = r.client.CoreV1().PersistentVolumes().Update(ctx, pv, metav1.UpdateOptions{})
 		return err
 	})
 }

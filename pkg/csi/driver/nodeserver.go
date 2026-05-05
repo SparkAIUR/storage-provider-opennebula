@@ -183,6 +183,16 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	if accessMode.Mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY {
 		mountFlags = append(mountFlags, "ro")
 	}
+	if session, exists, loadErr := ns.loadLocalDiskSession(volumeID); loadErr == nil && exists && session.Identity != nil {
+		observedIdentity := ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext)
+		if ok, _ := localDiskIdentityMatches(session.Identity, observedIdentity); !ok {
+			ns.recordWrongDeviceIdentityRepairState(ctx, session, observedIdentity)
+			ns.recordWrongDeviceIdentityReport(ctx, session, observedIdentity, nil)
+			message := wrongDeviceIdentityMessage(volumeID, session.Identity, observedIdentity)
+			ns.recordPVCWarningFromPublishContext(ctx, volumeContext, eventReasonWrongDeviceIdentity, message)
+			return nil, status.Error(codes.FailedPrecondition, message)
+		}
+	}
 
 	mountCheck, err := ns.checkMountPoint(devicePath, stagingTargetPath, volumeCapability)
 	if err != nil {
@@ -246,7 +256,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 
 		//Check if volume_id is already staged in stagingTargetPath and is identical
 		// to the volumeCapability provided in the request, then return 0 OK response
-		ns.recordLocalDiskStageSession(req, devicePath, fsType, mountFlags)
+		ns.recordLocalDiskStageSession(req, devicePath, fsType, mountFlags, ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext))
 		ns.clearLocalDeviceMissing(ctx, volumeID)
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
@@ -281,7 +291,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath,
 		"stagingTargetPath", stagingTargetPath, "fsType", fsType)
 
-	ns.recordLocalDiskStageSession(req, devicePath, fsType, mountFlags)
+	ns.recordLocalDiskStageSession(req, devicePath, fsType, mountFlags, ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext))
 	ns.clearLocalDeviceMissing(ctx, volumeID)
 	return &csi.NodeStageVolumeResponse{}, nil
 }

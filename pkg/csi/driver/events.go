@@ -32,8 +32,10 @@ const (
 	eventReasonMaintenanceModeBlocked       = "MaintenanceModeBlocked"
 	eventReasonMaintenanceModeReady         = "MaintenanceModeReady"
 	eventReasonMaintenanceModeReleased      = "MaintenanceModeReleased"
+	eventReasonCrossNodeOverrideUsed        = "CrossNodeOverrideUsed"
 	eventReasonOpenNebulaMetadataDrift      = "OpenNebulaMetadataDriftDetected"
 	eventReasonVolumeQuarantined            = "VolumeQuarantined"
+	eventReasonVolumeRepairRequired         = "VolumeRepairRequired"
 	eventReasonHostArtifactQuarantined      = "HostArtifactQuarantined"
 	eventReasonStuckAttachmentDetached      = "StuckAttachmentDetached"
 	eventReasonStuckAttachmentRepublish     = "StuckAttachmentRepublishRequested"
@@ -49,4 +51,5 @@ const (
 	eventReasonLocalDeviceRecoverySucceeded = "LocalDeviceRecoverySucceeded"
 	eventReasonLocalDeviceRecoveryFailed    = "LocalDeviceRecoveryFailed"
 	eventReasonLocalDeviceRecoverySkipped   = "LocalDeviceRecoverySkipped"
+	eventReasonWrongDeviceIdentity          = "WrongDeviceIdentity"
 )

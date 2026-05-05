@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -21,7 +22,7 @@ func newAttachmentTestDriver(objects ...runtime.Object) *Driver {
 	cfg := config.LoadConfiguration()
 	cfg.OverrideVal(config.StuckAttachmentReconcilerEnabledVar, true)
 	runtime := &KubeRuntime{client: fake.NewSimpleClientset(objects...), enabled: true}
-	return &Driver{
+	driver := &Driver{
 		name:           DefaultDriverName,
 		PluginConfig:   cfg,
 		kubeRuntime:    runtime,
@@ -29,6 +30,10 @@ func newAttachmentTestDriver(objects ...runtime.Object) *Driver {
 		operationLocks: NewOperationLocks(),
 		hotplugGuard:   NewHotplugGuard(time.Minute),
 	}
+	driver.stickyAttachments = NewStickyAttachmentManager(runtime, "default")
+	driver.volumeHistory = NewVolumeHistoryManager(runtime, "default")
+	driver.volumeRepairState = NewVolumeRepairStateManager(runtime, "default")
+	return driver
 }
 
 func TestAttachmentReconcilerDetachesOrphanAttachment(t *testing.T) {
@@ -79,5 +84,66 @@ func TestAttachmentReconcilerDeletesStaleVolumeAttachment(t *testing.T) {
 
 	_, err := driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(context.Background(), "va-1", metav1.GetOptions{})
 	assert.Error(t, err)
+	mockProvider.AssertExpectations(t)
+}
+
+func TestAttachmentReconcilerPrunesDeletedVolumeState(t *testing.T) {
+	driver := newAttachmentTestDriver()
+	require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
+		VolumeID:     "vol-gone",
+		NodeID:       "node-a",
+		Backend:      "local",
+		PVCNamespace: "default",
+		PVCName:      "pvc-vol-gone",
+		StartedAt:    time.Now().Add(-10 * time.Second),
+		ExpiresAt:    time.Now().Add(90 * time.Second),
+		GraceSeconds: 90,
+		Reason:       "stateful_restart",
+	}))
+	_, err := driver.volumeHistory.Upsert(context.Background(), "vol-gone", func(state *VolumeHistoryRecord) {
+		state.VolumeID = "vol-gone"
+		state.Backend = "local"
+		state.LastSuccessfulNodeName = "node-a"
+		state.LastSuccessfulPublishTime = time.Now().UTC()
+	})
+	require.NoError(t, err)
+	_, err = driver.volumeRepairState.Mark(context.Background(), VolumeRepairState{
+		VolumeID:        "vol-gone",
+		Version:         stateObjectVersion,
+		Classification:  repairClassificationMissingImageRecord,
+		Message:         "missing image",
+		FirstObservedAt: time.Now().UTC(),
+		LastObservedAt:  time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	report := LocalDeviceMissingReport{
+		Node:            "node-a",
+		VolumeID:        "vol-gone",
+		FailureClass:    localDeviceFailureClassMissingDevice,
+		FirstObservedAt: time.Now().UTC(),
+		LastObservedAt:  time.Now().UTC(),
+	}
+	payload, err := json.Marshal(report)
+	require.NoError(t, err)
+	require.NoError(t, driver.kubeRuntime.UpsertConfigMapData(context.Background(), "default", localDeviceStateConfigMapName, map[string]string{
+		localDeviceReportKey("node-a", "vol-gone"): string(payload),
+	}))
+
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	mockProvider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil).Once()
+
+	server := NewControllerServer(driver, mockProvider, &MockSharedFilesystemProviderTestify{})
+	reconciler := NewAttachmentReconciler(server)
+
+	require.NoError(t, reconciler.ReconcileOnce(context.Background()))
+
+	_, ok := driver.stickyAttachments.Get("vol-gone")
+	assert.False(t, ok)
+	assert.Empty(t, driver.volumeHistory.Snapshot())
+	assert.Empty(t, driver.volumeRepairState.Snapshot())
+
+	cm, getErr := driver.kubeRuntime.client.CoreV1().ConfigMaps("default").Get(context.Background(), localDeviceStateConfigMapName, metav1.GetOptions{})
+	require.NoError(t, getErr)
+	assert.Empty(t, cm.Data)
 	mockProvider.AssertExpectations(t)
 }

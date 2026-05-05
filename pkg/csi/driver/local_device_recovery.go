@@ -22,31 +22,34 @@ const localDeviceStateConfigMapName = "opennebula-csi-node-device-state"
 const (
 	localDeviceFailureClassMissingDevice = "device_missing"
 	localDeviceFailureClassMountFailed   = "mount_failed"
+	localDeviceFailureClassWrongIdentity = "wrong_device_identity"
 )
 
 type LocalDeviceMissingReport struct {
-	Node                  string     `json:"node"`
-	VolumeID              string     `json:"volumeID"`
-	VolumeName            string     `json:"volumeName,omitempty"`
-	FailureClass          string     `json:"failureClass,omitempty"`
-	DevicePath            string     `json:"devicePath,omitempty"`
-	DeviceSerial          string     `json:"deviceSerial,omitempty"`
-	OpenNebulaImageID     string     `json:"openNebulaImageID,omitempty"`
-	FsType                string     `json:"fsType,omitempty"`
-	ResolvedBy            string     `json:"resolvedBy,omitempty"`
-	PVCNamespace          string     `json:"pvcNamespace,omitempty"`
-	PVCName               string     `json:"pvcName,omitempty"`
-	PVName                string     `json:"pvName,omitempty"`
-	StagingTargetPath     string     `json:"stagingTargetPath,omitempty"`
-	FirstObservedAt       time.Time  `json:"firstObservedAt"`
-	LastObservedAt        time.Time  `json:"lastObservedAt"`
-	Attempts              int        `json:"attempts"`
-	LastError             string     `json:"lastError,omitempty"`
-	RecoveryAttempts      int        `json:"recoveryAttempts,omitempty"`
-	LastRecoveryAt        *time.Time `json:"lastRecoveryAt,omitempty"`
-	LastRecoveryError     string     `json:"lastRecoveryError,omitempty"`
-	LastRecoveryOutcome   string     `json:"lastRecoveryOutcome,omitempty"`
-	LastRecoverySignature string     `json:"lastRecoverySignature,omitempty"`
+	Node                  string             `json:"node"`
+	VolumeID              string             `json:"volumeID"`
+	VolumeName            string             `json:"volumeName,omitempty"`
+	FailureClass          string             `json:"failureClass,omitempty"`
+	DevicePath            string             `json:"devicePath,omitempty"`
+	DeviceSerial          string             `json:"deviceSerial,omitempty"`
+	OpenNebulaImageID     string             `json:"openNebulaImageID,omitempty"`
+	FsType                string             `json:"fsType,omitempty"`
+	ResolvedBy            string             `json:"resolvedBy,omitempty"`
+	ExpectedIdentity      *LocalDiskIdentity `json:"expectedIdentity,omitempty"`
+	ObservedIdentity      *LocalDiskIdentity `json:"observedIdentity,omitempty"`
+	PVCNamespace          string             `json:"pvcNamespace,omitempty"`
+	PVCName               string             `json:"pvcName,omitempty"`
+	PVName                string             `json:"pvName,omitempty"`
+	StagingTargetPath     string             `json:"stagingTargetPath,omitempty"`
+	FirstObservedAt       time.Time          `json:"firstObservedAt"`
+	LastObservedAt        time.Time          `json:"lastObservedAt"`
+	Attempts              int                `json:"attempts"`
+	LastError             string             `json:"lastError,omitempty"`
+	RecoveryAttempts      int                `json:"recoveryAttempts,omitempty"`
+	LastRecoveryAt        *time.Time         `json:"lastRecoveryAt,omitempty"`
+	LastRecoveryError     string             `json:"lastRecoveryError,omitempty"`
+	LastRecoveryOutcome   string             `json:"lastRecoveryOutcome,omitempty"`
+	LastRecoverySignature string             `json:"lastRecoverySignature,omitempty"`
 }
 
 type localDeviceReportIdentity struct {
@@ -179,6 +182,52 @@ func (ns *NodeServer) recordLocalDeviceMountFailure(ctx context.Context, volumeI
 		message := fmt.Sprintf("node %s failed to mount local device %s for volume %s after %d attempt(s) (fsType=%s resolvedBy=%s): %v", node, devicePath, volumeID, attempts, fsType, resolution.ResolvedBy, cause)
 		ns.recordPVCWarningFromPublishContext(ctx, publishContext, eventReasonLocalDeviceMountFailed, message)
 	}
+}
+
+func (ns *NodeServer) recordWrongDeviceIdentityReport(ctx context.Context, session localDiskSession, observed *LocalDiskIdentity, cause error) {
+	if ns == nil || ns.Driver == nil || ns.Driver.kubeRuntime == nil || !ns.Driver.kubeRuntime.enabled {
+		return
+	}
+	volumeID := strings.TrimSpace(session.VolumeID)
+	node := strings.TrimSpace(ns.Driver.nodeID)
+	if volumeID == "" || node == "" {
+		return
+	}
+	now := time.Now().UTC()
+	key := localDeviceReportKey(node, volumeID)
+	namespace := namespaceFromServiceAccount()
+	err := updateLocalDeviceReport(ctx, ns.Driver.kubeRuntime, namespace, key, func(report *LocalDeviceMissingReport) {
+		if report.FirstObservedAt.IsZero() {
+			report.FirstObservedAt = now
+		}
+		report.Node = node
+		report.VolumeID = volumeID
+		report.VolumeName = strings.TrimSpace(session.VolumeName)
+		report.FailureClass = localDeviceFailureClassWrongIdentity
+		report.DevicePath = strings.TrimSpace(session.DevicePath)
+		report.DeviceSerial = strings.TrimSpace(session.DeviceSerial)
+		report.OpenNebulaImageID = strings.TrimSpace(session.OpenNebulaImageID)
+		report.FsType = strings.TrimSpace(session.FSType)
+		report.PVCNamespace = strings.TrimSpace(session.PVCNamespace)
+		report.PVCName = strings.TrimSpace(session.PVCName)
+		report.PVName = strings.TrimSpace(session.PVName)
+		report.StagingTargetPath = strings.TrimSpace(session.StagingTargetPath)
+		report.ExpectedIdentity = session.Identity
+		report.ObservedIdentity = observed
+		report.LastObservedAt = now
+		report.Attempts++
+		if cause != nil {
+			report.LastError = cause.Error()
+		}
+	})
+	if err != nil {
+		klog.V(2).InfoS("Failed to persist wrong-device identity report", "node", node, "volumeID", volumeID, "err", err)
+		return
+	}
+	ns.recordPVCWarningFromPublishContext(ctx, map[string]string{
+		paramPVCNamespace: session.PVCNamespace,
+		paramPVCName:      session.PVCName,
+	}, eventReasonWrongDeviceIdentity, wrongDeviceIdentityMessage(volumeID, session.Identity, observed))
 }
 
 func (ns *NodeServer) clearLocalDeviceMissing(ctx context.Context, volumeID string) {

@@ -69,6 +69,8 @@ type Driver struct {
 	metrics                *DriverMetrics
 	kubeRuntime            *KubeRuntime
 	stickyAttachments      *StickyAttachmentManager
+	volumeHistory          *VolumeHistoryManager
+	volumeRepairState      *VolumeRepairStateManager
 	volumeQuarantine       *VolumeQuarantineManager
 	hostArtifactQuarantine *HostArtifactQuarantineManager
 	hotplugQueue           *HotplugQueueManager
@@ -115,6 +117,14 @@ func (d *Driver) Run(ctx context.Context) error {
 
 	d.metrics = NewDriverMetrics(d.version, d.commit)
 	d.kubeRuntime = NewKubeRuntime(d.name)
+	d.volumeHistory = NewVolumeHistoryManager(d.kubeRuntime, "")
+	if err := d.volumeHistory.LoadFromConfigMap(ctx); err != nil {
+		klog.V(2).InfoS("Failed to load volume history state", "err", err)
+	}
+	d.volumeRepairState = NewVolumeRepairStateManager(d.kubeRuntime, "")
+	if err := d.volumeRepairState.LoadFromConfigMap(ctx); err != nil {
+		klog.V(2).InfoS("Failed to load volume repair state", "err", err)
+	}
 	if strings.TrimSpace(d.nodeID) == "" {
 		d.stickyAttachments = NewStickyAttachmentManager(d.kubeRuntime, "")
 		if err := d.stickyAttachments.LoadFromConfigMap(ctx); err != nil {

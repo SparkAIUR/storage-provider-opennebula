@@ -46,12 +46,15 @@ type DriverMetrics struct {
 	hotplugDiagnosisTotal        *prometheus.CounterVec
 	hotplugStateAge              *prometheus.GaugeVec
 	lastNodePreferenceTotal      *prometheus.CounterVec
+	localRWOProtectionTotal      *prometheus.CounterVec
 	maintenanceActive            prometheus.Gauge
 	maintenanceProtectedVolumes  prometheus.Gauge
 	maintenanceTotal             *prometheus.CounterVec
 	maintenanceBlockedTotal      *prometheus.CounterVec
 	metadataDriftTotal           *prometheus.CounterVec
 	volumeQuarantineTotal        *prometheus.CounterVec
+	volumeHistoryTotal           *prometheus.CounterVec
+	volumeRepairStateTotal       *prometheus.CounterVec
 	hostArtifactQuarantineTotal  *prometheus.CounterVec
 	attachmentReconcilerTotal    *prometheus.CounterVec
 	hotplugRecommendedTimeout    *prometheus.GaugeVec
@@ -180,6 +183,10 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 			Name: "opennebula_csi_last_node_preference_total",
 			Help: "Total number of last-node preference webhook outcomes by outcome and reason.",
 		}, []string{"outcome", "reason"}),
+		localRWOProtectionTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_local_rwo_protection_total",
+			Help: "Total number of local RWO protection decisions by reason and outcome.",
+		}, []string{"reason", "outcome"}),
 		maintenanceActive: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "opennebula_csi_maintenance_active",
 			Help: "Whether ConfigMap-driven maintenance mode is currently active.",
@@ -204,6 +211,14 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 			Name: "opennebula_csi_volume_quarantine_total",
 			Help: "Total number of volume quarantine decisions by reason and outcome.",
 		}, []string{"reason", "outcome"}),
+		volumeHistoryTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_volume_history_total",
+			Help: "Total number of durable volume history updates by operation and outcome.",
+		}, []string{"operation", "outcome"}),
+		volumeRepairStateTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "opennebula_csi_volume_repair_state_total",
+			Help: "Total number of volume repair-state lifecycle outcomes by classification and outcome.",
+		}, []string{"classification", "outcome"}),
 		hostArtifactQuarantineTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "opennebula_csi_host_artifact_quarantine_total",
 			Help: "Total number of host artifact quarantine decisions by classification and outcome.",
@@ -261,12 +276,15 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 		metrics.hotplugDiagnosisTotal,
 		metrics.hotplugStateAge,
 		metrics.lastNodePreferenceTotal,
+		metrics.localRWOProtectionTotal,
 		metrics.maintenanceActive,
 		metrics.maintenanceProtectedVolumes,
 		metrics.maintenanceTotal,
 		metrics.maintenanceBlockedTotal,
 		metrics.metadataDriftTotal,
 		metrics.volumeQuarantineTotal,
+		metrics.volumeHistoryTotal,
+		metrics.volumeRepairStateTotal,
 		metrics.hostArtifactQuarantineTotal,
 		metrics.attachmentReconcilerTotal,
 		metrics.hotplugRecommendedTimeout,
@@ -457,6 +475,13 @@ func (m *DriverMetrics) RecordLastNodePreference(outcome, reason string) {
 	m.lastNodePreferenceTotal.WithLabelValues(outcome, reason).Inc()
 }
 
+func (m *DriverMetrics) RecordLocalRWOProtection(reason, outcome string) {
+	if m == nil {
+		return
+	}
+	m.localRWOProtectionTotal.WithLabelValues(reason, outcome).Inc()
+}
+
 func (m *DriverMetrics) SetMaintenanceActive(active bool) {
 	if m == nil {
 		return
@@ -501,6 +526,20 @@ func (m *DriverMetrics) RecordVolumeQuarantine(reason, outcome string) {
 		return
 	}
 	m.volumeQuarantineTotal.WithLabelValues(reason, outcome).Inc()
+}
+
+func (m *DriverMetrics) RecordVolumeHistory(operation, outcome string) {
+	if m == nil {
+		return
+	}
+	m.volumeHistoryTotal.WithLabelValues(operation, outcome).Inc()
+}
+
+func (m *DriverMetrics) RecordVolumeRepairState(classification, outcome string) {
+	if m == nil {
+		return
+	}
+	m.volumeRepairStateTotal.WithLabelValues(classification, outcome).Inc()
 }
 
 func (m *DriverMetrics) RecordHostArtifactQuarantine(classification, outcome string) {

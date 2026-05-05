@@ -1112,6 +1112,14 @@ func (p *PersistentDiskVolumeProvider) VolumeExists(ctx context.Context, volume 
 	return imgID, (img.Size * sizeConversion), nil
 }
 
+func openNebulaLookupNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(message, "not found") || strings.Contains(message, "does not exist") || strings.Contains(message, "no such")
+}
+
 func isInsufficientCapacityError(err error) bool {
 	if err == nil {
 		return false
@@ -1444,6 +1452,52 @@ func (p *PersistentDiskVolumeProvider) GetVolumeInNode(ctx context.Context, volu
 		}
 	}
 	return "", fmt.Errorf("volume %d not found on node %d", volumeID, nodeID)
+}
+
+func (p *PersistentDiskVolumeProvider) InspectVolumeLookup(ctx context.Context, volume string, requestedNode string) (*VolumeLookupResult, error) {
+	result := &VolumeLookupResult{
+		Status:        VolumeLookupNotFound,
+		VolumeHandle:  strings.TrimSpace(volume),
+		RequestedNode: strings.TrimSpace(requestedNode),
+	}
+
+	if strings.TrimSpace(requestedNode) != "" {
+		nodeID, resolution, err := ResolveNodeVMID(ctx, p.ctrl, requestedNode)
+		if err == nil {
+			result.RequestedNodeID = nodeID
+			result.NodeResolution = resolution
+		}
+	}
+
+	imgID, err := p.ctrl.Images().ByName(volume)
+	if err != nil {
+		if openNebulaLookupNotFound(err) {
+			result.Status = VolumeLookupImageRecordMissing
+			result.Message = fmt.Sprintf("OpenNebula image record for volume %s is missing", volume)
+			return result, nil
+		}
+		return nil, fmt.Errorf("failed to inspect volume %s by name: %w", volume, err)
+	}
+
+	imageInfo, err := p.ctrl.Image(imgID).InfoContext(ctx, true)
+	if err != nil {
+		if openNebulaLookupNotFound(err) {
+			result.Status = VolumeLookupProviderInconsistent
+			result.ImageID = imgID
+			result.Message = fmt.Sprintf("OpenNebula image %d for volume %s resolved by name but could not be loaded", imgID, volume)
+			return result, nil
+		}
+		return nil, fmt.Errorf("failed to inspect OpenNebula image %d for volume %s: %w", imgID, volume, err)
+	}
+
+	result.Status = VolumeLookupPresent
+	result.ImageID = imgID
+	result.SizeBytes = int64(imageInfo.Size) * sizeConversion
+	metadata, metadataErr := p.InspectVolumeAttachment(ctx, volume, requestedNode)
+	if metadataErr == nil {
+		result.AttachmentMetadata = metadata
+	}
+	return result, nil
 }
 
 func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Context, volume string, node string) (*VolumeAttachmentMetadata, error) {
