@@ -236,6 +236,38 @@ New workload controls:
 - PV-only emergency override annotation:
   `storage-provider.opennebula.sparkaiur.io/allow-cross-node-until: "<RFC3339 UTC>"`
 
+### Manual node targeting for local RWO remediation
+
+For local, single-writer, non-shared volumes, operators can now supply an explicit placement target for debugging and repair workflows.
+
+Supported PV or PVC annotations:
+
+- `storage-provider.opennebula.sparkaiur.io/required-node`
+- `storage-provider.opennebula.sparkaiur.io/required-node-until`
+- `storage-provider.opennebula.sparkaiur.io/preferred-node`
+- `storage-provider.opennebula.sparkaiur.io/placement-reason`
+
+Resolution precedence is fixed:
+
+1. PV `required-node`
+2. PVC `required-node`
+3. controller-inferred protected node
+4. PV `preferred-node`
+5. PVC `preferred-node`
+6. PV `last-attached-node`
+7. deprecated PV `preferred-last-node` fallback
+
+Behavior:
+
+- `required-node` is hard. The webhook injects required hostname affinity, and the controller rejects publish attempts to any other node with retryable `Unavailable`.
+- invalid or conflicting explicit `required-node` values return `FailedPrecondition`. Validation checks that the Kubernetes node exists, is not tombstoned in OpenNebula inventory, and belongs to a compatible system datastore for the volume.
+- `required-node-until` uses RFC3339 UTC. After expiry, the driver ignores the manual requirement, keeps the annotation in place, and surfaces the expired state in warnings, events, and support-bundle output.
+- `preferred-node` is soft. It injects preferred hostname affinity even when pod-level `last-node-preference: disabled` opt-out is set, because this is an explicit operator decision rather than an automatic heuristic.
+- `storage-provider.opennebula.sparkaiur.io/allow-cross-node-until` remains the only cross-node override. It can authorize an explicit `required-node` that conflicts with inferred protected ownership, but it does not bypass topology validation, repair-required states, or quarantine.
+- `storage-provider.opennebula.sparkaiur.io/preferred-last-node` is deprecated on PVs and will be removed in `v0.6.0`. The driver still reads it as a fallback through `v0.5.x` and reports it in annotation audits.
+
+The admission webhook now defaults to `failurePolicy: Fail`. Ignoring webhook failures would silently bypass explicit `required-node` safety constraints.
+
 New support signals:
 
 - support bundles now include sticky attachment state, durable `volumeHistory`, active `volumeRepairState`, `lastNodeProtection`, hotplug queue reason summaries, volume quarantine state, host artifact quarantine state, OpenNebula metadata drift details, and adaptive timeout observations/recommendations

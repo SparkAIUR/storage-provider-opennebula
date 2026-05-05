@@ -152,7 +152,7 @@ Create chart name and version as used by the chart label.
 {{- $lastNodePreferencePolicy := (get $lastNodePreference "policy") | default "local-single-writer" -}}
 {{- $lastNodePreferenceWebhookEnabled := (get $lastNodePreferenceWebhook "enabled") | default true -}}
 {{- $lastNodePreferenceWebhookPort := (get $lastNodePreferenceWebhook "port") | default 9443 -}}
-{{- $lastNodePreferenceWebhookFailurePolicy := (get $lastNodePreferenceWebhook "failurePolicy") | default "Ignore" -}}
+{{- $lastNodePreferenceWebhookFailurePolicy := (get $lastNodePreferenceWebhook "failurePolicy") | default "Fail" -}}
 {{- $stuckAttachmentReconcilerEnabled := (get $stuckAttachmentReconciler "enabled") | default true -}}
 {{- $stuckAttachmentReconcilerIntervalSeconds := (get $stuckAttachmentReconciler "intervalSeconds") | default 60 -}}
 {{- $stuckAttachmentOrphanGraceSeconds := (get $stuckAttachmentReconciler "orphanGraceSeconds") | default 120 -}}

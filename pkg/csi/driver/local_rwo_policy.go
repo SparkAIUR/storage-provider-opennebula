@@ -31,15 +31,18 @@ const (
 
 	protectionReasonMaintenance          = "maintenance_cross_node_blocked"
 	protectionReasonAutomaticMaintenance = "automatic_maintenance_cross_node_blocked"
+	protectionReasonManualRequiredNode   = "manual_required_node"
 	protectionReasonSticky               = "same_node_reuse_required"
 	protectionReasonLocalDevice          = "local_device_recovery_active"
 	protectionReasonHistory              = "historical_ownership_active"
 
-	protectionSourceExplicitMaintenance  = "explicit_maintenance"
-	protectionSourceAutomaticMaintenance = "automatic_maintenance"
-	protectionSourceStickyReuse          = "sticky_reuse"
-	protectionSourceLocalDeviceRecovery  = "local_device_recovery"
-	protectionSourceHistoricalOwnership  = "historical_ownership"
+	protectionSourceExplicitRequiredNode  = "explicit_required_node"
+	protectionSourceExplicitPreferredNode = "explicit_preferred_node"
+	protectionSourceExplicitMaintenance   = "explicit_maintenance"
+	protectionSourceAutomaticMaintenance  = "automatic_maintenance"
+	protectionSourceStickyReuse           = "sticky_reuse"
+	protectionSourceLocalDeviceRecovery   = "local_device_recovery"
+	protectionSourceHistoricalOwnership   = "historical_ownership"
 
 	protectionTriggerDrainInProgress            = "drain_in_progress"
 	protectionTriggerNodeUnschedulable          = "node_unschedulable"
@@ -48,16 +51,30 @@ const (
 )
 
 type LocalRWOProtectionDecision struct {
-	Protected         bool
-	RequiredNode      string
-	Reason            string
-	Source            string
-	AutomaticTrigger  string
-	Message           string
-	RuntimeContext    *VolumeRuntimeContext
-	History           VolumeHistoryRecord
-	OverrideUsed      bool
-	OverrideExpiresAt time.Time
+	Protected                   bool
+	RequiredNode                string
+	PreferredNode               string
+	Reason                      string
+	Source                      string
+	PlacementSource             string
+	PlacementDecision           string
+	PlacementReason             string
+	AutomaticTrigger            string
+	Message                     string
+	RuntimeContext              *VolumeRuntimeContext
+	History                     VolumeHistoryRecord
+	OverrideUsed                bool
+	OverrideExpiresAt           time.Time
+	Invalid                     bool
+	ExplicitRequiredNode        string
+	ExplicitRequiredNodeUntil   *time.Time
+	ExplicitRequiredNodeExpired bool
+	ExplicitPreferredNode       string
+	LegacyPreferredNode         string
+	InferredRequiredNode        string
+	InferredReason              string
+	InferredSource              string
+	Warnings                    []string
 }
 
 func localRWOProtectionDecisionForDriver(ctx context.Context, driver *Driver, volumeID, requestedNode string) (LocalRWOProtectionDecision, error) {
@@ -89,11 +106,126 @@ func (s *ControllerServer) localRWOProtectionDecision(ctx context.Context, volum
 	}
 	decision.History = history
 
+	explicitPlacement := explicitNodePlacementForRuntimeContext(runtimeCtx)
+	decision.ExplicitRequiredNode = explicitPlacement.RequiredNode
+	decision.ExplicitRequiredNodeUntil = explicitPlacement.RequiredNodeUntil
+	decision.ExplicitRequiredNodeExpired = explicitPlacement.RequiredNodeExpired
+	decision.ExplicitPreferredNode = explicitPlacement.ExplicitPreferredNode
+	decision.LegacyPreferredNode = explicitPlacement.LegacyPreferredNode
+	decision.PlacementReason = explicitPlacement.PlacementReason
+	decision.Warnings = append(decision.Warnings, explicitPlacement.Warnings...)
+
 	eligible := runtimeContextEligibleForMaintenance(runtimeCtx, volumeID) || strings.EqualFold(strings.TrimSpace(history.Backend), "local")
 	if !eligible {
+		if hasManualNodeTargetingAnnotations(runtimeCtx) {
+			decision.PlacementDecision = placementDecisionIgnored
+			decision.Message = fmt.Sprintf("manual node targeting annotations are ignored for non-local or shared volume %s", volumeID)
+		}
 		return decision, nil
 	}
 
+	inferredRequiredNode, inferredReason, inferredSource, automaticTrigger := s.inferredLocalRWORequiredNode(ctx, volumeID, runtimeCtx, history)
+	decision.InferredRequiredNode = inferredRequiredNode
+	decision.InferredReason = inferredReason
+	decision.InferredSource = inferredSource
+	decision.AutomaticTrigger = automaticTrigger
+
+	if explicitPlacement.RequiredNodeParseError != nil {
+		decision.Invalid = true
+		decision.PlacementDecision = placementDecisionInvalid
+		decision.Message = explicitPlacement.RequiredNodeParseError.Error()
+		return decision, nil
+	}
+	if explicitPlacement.RequiredNodeExpired {
+		decision.Warnings = append(decision.Warnings, fmt.Sprintf("explicit required-node %q expired at %s", explicitPlacement.RequiredNode, explicitPlacement.RequiredNodeUntil.Format(time.RFC3339)))
+	}
+
+	if explicitPlacement.RequiredNode != "" && !explicitPlacement.RequiredNodeExpired {
+		if s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
+			decision.Invalid = true
+			decision.PlacementDecision = placementDecisionInvalid
+			decision.Message = "kubernetes runtime is not enabled for manual node targeting validation"
+			return decision, nil
+		}
+		if err := s.driver.kubeRuntime.ValidateManualNodeTarget(ctx, runtimeCtx, explicitPlacement.RequiredNode, "required-node"); err != nil {
+			decision.Invalid = true
+			decision.PlacementDecision = placementDecisionInvalid
+			decision.Message = err.Error()
+			return decision, nil
+		}
+		if inferredRequiredNode != "" && inferredRequiredNode != explicitPlacement.RequiredNode {
+			if deadline, ok := crossNodeOverrideDeadline(runtimeCtx); ok && deadline.After(time.Now().UTC()) {
+				decision.OverrideUsed = true
+				decision.OverrideExpiresAt = deadline
+			} else {
+				decision.Invalid = true
+				decision.PlacementDecision = placementDecisionConflicting
+				decision.Message = fmt.Sprintf("explicit required-node %s conflicts with protected node %s for local RWO volume %s; use %s to authorize a bounded cross-node move", explicitPlacement.RequiredNode, inferredRequiredNode, volumeID, annotationAllowCrossNodeUntil)
+				return decision, nil
+			}
+		}
+		decision.Protected = true
+		decision.RequiredNode = explicitPlacement.RequiredNode
+		decision.Reason = protectionReasonManualRequiredNode
+		decision.Source = protectionSourceExplicitRequiredNode
+		decision.PlacementSource = explicitPlacement.RequiredNodeSource
+		decision.PlacementDecision = placementDecisionRequired
+		if strings.TrimSpace(requestedNode) == "" || strings.TrimSpace(requestedNode) == explicitPlacement.RequiredNode {
+			return decision, nil
+		}
+		decision.Message = localRWOProtectionMessage(volumeID, requestedNode, explicitPlacement.RequiredNode, decision)
+		return decision, nil
+	}
+
+	if inferredRequiredNode != "" {
+		decision.Protected = true
+		decision.RequiredNode = inferredRequiredNode
+		decision.Reason = inferredReason
+		decision.Source = inferredSource
+		decision.PlacementSource = inferredSource
+		decision.PlacementDecision = placementDecisionRequired
+		if strings.TrimSpace(requestedNode) == "" || strings.TrimSpace(requestedNode) == inferredRequiredNode {
+			return decision, nil
+		}
+		if deadline, ok := crossNodeOverrideDeadline(runtimeCtx); ok && deadline.After(time.Now().UTC()) {
+			decision.OverrideUsed = true
+			decision.OverrideExpiresAt = deadline
+			decision.Message = fmt.Sprintf("allowing protected cross-node attach for local RWO volume %s from %s to %s until %s because override annotation %s is active", volumeID, inferredRequiredNode, requestedNode, deadline.Format(time.RFC3339), annotationAllowCrossNodeUntil)
+			return decision, nil
+		}
+		decision.Message = localRWOProtectionMessage(volumeID, requestedNode, inferredRequiredNode, decision)
+		return decision, nil
+	}
+
+	if explicitPlacement.PreferredNode != "" {
+		decision.PlacementReason = firstNonEmpty(explicitPlacement.PlacementReason, decision.PlacementReason)
+		if s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
+			decision.Warnings = append(decision.Warnings, "manual preferred-node was ignored because kubernetes runtime is not enabled")
+		} else if err := s.driver.kubeRuntime.ValidateManualNodeTarget(ctx, runtimeCtx, explicitPlacement.PreferredNode, "preferred-node"); err != nil {
+			decision.Warnings = append(decision.Warnings, err.Error())
+		} else {
+			decision.PreferredNode = explicitPlacement.PreferredNode
+			decision.Source = protectionSourceExplicitPreferredNode
+			decision.PlacementSource = explicitPlacement.PreferredNodeSource
+			decision.PlacementDecision = placementDecisionPreferred
+			return decision, nil
+		}
+	}
+
+	if runtimeCtx != nil && strings.TrimSpace(runtimeCtx.PVAnnotations[annotationLastAttachedNode]) != "" {
+		decision.PreferredNode = strings.TrimSpace(runtimeCtx.PVAnnotations[annotationLastAttachedNode])
+		decision.PlacementSource = placementSourceLastAttachedNode
+		decision.PlacementDecision = placementDecisionPreferred
+	}
+	if decision.PreferredNode == "" && explicitPlacement.LegacyPreferredNode != "" {
+		decision.PreferredNode = explicitPlacement.LegacyPreferredNode
+		decision.PlacementSource = placementSourceLegacyPreferredLastNode
+		decision.PlacementDecision = placementDecisionPreferred
+	}
+	return decision, nil
+}
+
+func (s *ControllerServer) inferredLocalRWORequiredNode(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext, history VolumeHistoryRecord) (string, string, string, string) {
 	requiredNode := ""
 	reason := ""
 	source := ""
@@ -127,7 +259,7 @@ func (s *ControllerServer) localRWOProtectionDecision(ctx context.Context, volum
 		source = protectionSourceHistoricalOwnership
 	}
 	if requiredNode == "" {
-		return decision, nil
+		return "", "", "", ""
 	}
 	if s.driver.featureGates.LocalRWOAutoProtection && reason == protectionReasonHistory && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
 		if trigger, ok, err := s.driver.kubeRuntime.AutomaticMaintenanceTrigger(ctx, requiredNode); err == nil && ok {
@@ -138,26 +270,20 @@ func (s *ControllerServer) localRWOProtectionDecision(ctx context.Context, volum
 			automaticTrigger = protectionTriggerControllerInferredSameNode
 		}
 	}
-
-	decision.Protected = true
-	decision.RequiredNode = requiredNode
-	decision.Reason = reason
-	decision.Source = source
-	decision.AutomaticTrigger = automaticTrigger
-	if strings.TrimSpace(requestedNode) == "" || strings.TrimSpace(requestedNode) == requiredNode {
-		return decision, nil
-	}
-	if deadline, ok := crossNodeOverrideDeadline(runtimeCtx); ok && deadline.After(time.Now().UTC()) {
-		decision.OverrideUsed = true
-		decision.OverrideExpiresAt = deadline
-		decision.Message = fmt.Sprintf("allowing protected cross-node attach for local RWO volume %s from %s to %s until %s because override annotation %s is active", volumeID, requiredNode, requestedNode, deadline.Format(time.RFC3339), annotationAllowCrossNodeUntil)
-		return decision, nil
-	}
-	decision.Message = localRWOProtectionMessage(volumeID, requestedNode, requiredNode, decision)
-	return decision, nil
+	return requiredNode, reason, source, automaticTrigger
 }
 
 func localRWOProtectionMessage(volumeID, requestedNode, requiredNode string, decision LocalRWOProtectionDecision) string {
+	if strings.TrimSpace(decision.Source) == protectionSourceExplicitRequiredNode {
+		return fmt.Sprintf(
+			"manual local RWO required-node is active for volume %s: refusing publish to %s while required node is %s (%s source=%s)",
+			volumeID,
+			requestedNode,
+			requiredNode,
+			firstNonEmpty(decision.Reason, protectionReasonManualRequiredNode),
+			firstNonEmpty(decision.PlacementSource, decision.Source),
+		)
+	}
 	if strings.TrimSpace(decision.Source) == protectionSourceAutomaticMaintenance {
 		return fmt.Sprintf(
 			"automatic local RWO protection is active for volume %s: refusing cross-node attach to %s while protected node is %s (%s trigger=%s)",

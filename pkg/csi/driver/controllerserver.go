@@ -809,6 +809,19 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		s.driver.metrics.RecordControllerPublishDuration("disk", "internal", time.Since(started))
 		return nil, protectionErr
 	}
+	if protection.ExplicitRequiredNodeExpired && protection.ExplicitRequiredNodeUntil != nil {
+		s.recordPVCWarningFromRuntimeContext(ctx, protection.RuntimeContext, eventReasonRequiredNodeExpired, fmt.Sprintf("ignoring expired required-node %s for volume %s because it expired at %s", protection.ExplicitRequiredNode, req.VolumeId, protection.ExplicitRequiredNodeUntil.Format(time.RFC3339)))
+	}
+	if protection.Invalid {
+		eventReason := eventReasonRequiredNodeInvalid
+		if protection.PlacementDecision == placementDecisionConflicting {
+			eventReason = eventReasonRequiredNodeConflict
+		}
+		s.recordPVCWarningFromRuntimeContext(ctx, protection.RuntimeContext, eventReason, protection.Message)
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "failed_precondition", time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", "failed_precondition", time.Since(started))
+		return nil, status.Error(codes.FailedPrecondition, protection.Message)
+	}
 
 	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err == nil {
@@ -853,7 +866,11 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	if protection.Protected && protection.RequiredNode != "" && strings.TrimSpace(protection.RequiredNode) != strings.TrimSpace(req.NodeId) && !protection.OverrideUsed {
 		s.driver.metrics.RecordLocalRWOProtection(protection.Reason, "blocked")
 		s.driver.metrics.RecordMaintenanceBlock("publish", protection.Reason)
-		s.recordPVCWarningFromRuntimeContext(ctx, protection.RuntimeContext, eventReasonMaintenanceModeBlocked, protection.Message)
+		eventReason := eventReasonMaintenanceModeBlocked
+		if protection.Source == protectionSourceExplicitRequiredNode {
+			eventReason = eventReasonRequiredNodeBlocked
+		}
+		s.recordPVCWarningFromRuntimeContext(ctx, protection.RuntimeContext, eventReason, protection.Message)
 		return nil, status.Error(codes.Unavailable, protection.Message)
 	}
 	if protection.OverrideUsed {

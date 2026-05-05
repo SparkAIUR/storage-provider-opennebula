@@ -26,5 +26,15 @@ func auditVolumeAnnotations(scope string, annotations map[string]string) []Annot
 			CanonicalKey: annotationLastAttachedNode,
 		})
 	}
+	if value := strings.TrimSpace(annotations[annotationPreferredLastNode]); value != "" {
+		findings = append(findings, AnnotationAuditFinding{
+			Scope:        scope,
+			Key:          annotationPreferredLastNode,
+			Value:        value,
+			Severity:     "warning",
+			Message:      "preferred-last-node is deprecated and will be removed in v0.6.0",
+			CanonicalKey: annotationPreferredNode,
+		})
+	}
 	return findings
 }

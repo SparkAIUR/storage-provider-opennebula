@@ -272,7 +272,7 @@ func (m *MaintenanceModeManager) prepare(ctx context.Context) maintenancePrepare
 			continue
 		}
 		volumeHandle := strings.TrimSpace(pv.Spec.CSI.VolumeHandle)
-		node, conflict := m.preferredMaintenanceNode(pv, attachedByPV, conflicts)
+		node, conflict := m.preferredMaintenanceNode(ctx, pv, attachedByPV, conflicts)
 		if conflict {
 			report.Conflicts++
 			m.recordMaintenanceOutcome("prepare", "conflict")
@@ -303,17 +303,29 @@ func (m *MaintenanceModeManager) prepare(ctx context.Context) maintenancePrepare
 	return report
 }
 
-func (m *MaintenanceModeManager) preferredMaintenanceNode(pv *corev1.PersistentVolume, attachedByPV map[string]string, conflicts map[string]struct{}) (string, bool) {
+func (m *MaintenanceModeManager) preferredMaintenanceNode(ctx context.Context, pv *corev1.PersistentVolume, attachedByPV map[string]string, conflicts map[string]struct{}) (string, bool) {
 	if pv == nil {
 		return "", false
 	}
 	if _, ok := conflicts[pv.Name]; ok {
 		return "", true
 	}
-	if pv.Annotations != nil {
-		if preferred := strings.TrimSpace(pv.Annotations[annotationPreferredLastNode]); preferred != "" {
-			return preferred, false
+	var pvc *corev1.PersistentVolumeClaim
+	if m != nil && m.runtime != nil && m.runtime.enabled && pv.Spec.ClaimRef != nil && strings.TrimSpace(pv.Spec.ClaimRef.Namespace) != "" && strings.TrimSpace(pv.Spec.ClaimRef.Name) != "" {
+		if resolved, err := m.runtime.client.CoreV1().PersistentVolumeClaims(pv.Spec.ClaimRef.Namespace).Get(ctx, pv.Spec.ClaimRef.Name, metav1.GetOptions{}); err == nil {
+			pvc = resolved
 		}
+	}
+	runtimeCtx := volumeRuntimeContextFromPVAndPVC(pv, pvc)
+	explicitPlacement := explicitNodePlacementForRuntimeContext(runtimeCtx)
+	if explicitPlacement.RequiredNodeParseError == nil && explicitPlacement.RequiredNode != "" && !explicitPlacement.RequiredNodeExpired {
+		return explicitPlacement.RequiredNode, false
+	}
+	if explicitPlacement.PreferredNode != "" && explicitPlacement.PreferredNodeSource != placementSourceLegacyPreferredLastNode {
+		return explicitPlacement.PreferredNode, false
+	}
+	if explicitPlacement.LegacyPreferredNode != "" {
+		return explicitPlacement.LegacyPreferredNode, false
 	}
 	if pv.Spec.CSI != nil && m != nil && m.driver != nil && m.driver.stickyAttachments != nil {
 		if state, ok := m.driver.stickyAttachments.Get(pv.Spec.CSI.VolumeHandle); ok && strings.TrimSpace(state.NodeID) != "" {
@@ -439,6 +451,13 @@ func maintenanceStickyGraceSeconds(cfg config.CSIPluginConfig) int {
 }
 
 func maintenanceLastNodeForVolume(driver *Driver, runtimeCtx *VolumeRuntimeContext, volumeID string) string {
+	explicitPlacement := explicitNodePlacementForRuntimeContext(runtimeCtx)
+	if explicitPlacement.RequiredNodeParseError == nil && explicitPlacement.RequiredNode != "" && !explicitPlacement.RequiredNodeExpired {
+		return explicitPlacement.RequiredNode
+	}
+	if explicitPlacement.PreferredNode != "" {
+		return explicitPlacement.PreferredNode
+	}
 	if driver != nil && driver.stickyAttachments != nil {
 		if state, ok := driver.stickyAttachments.Get(volumeID); ok && strings.TrimSpace(state.NodeID) != "" {
 			return strings.TrimSpace(state.NodeID)

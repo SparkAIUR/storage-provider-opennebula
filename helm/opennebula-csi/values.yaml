@@ -91,7 +91,7 @@ driver:
     webhook:
       enabled: true
       port: 9443
-      failurePolicy: "Ignore"
+      failurePolicy: "Fail"
   stuckAttachmentReconciler:
     enabled: true
     intervalSeconds: 60

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
@@ -29,9 +30,11 @@ type LastNodePreferenceWebhook struct {
 }
 
 type podNodePlacementDecision struct {
-	TargetNode string
-	Required   bool
-	Reason     string
+	TargetNode        string
+	Required          bool
+	Reason            string
+	Source            string
+	PlacementDecision string
 }
 
 func NewLastNodePreferenceWebhook(driver *Driver) *LastNodePreferenceWebhook {
@@ -154,27 +157,36 @@ func (w *LastNodePreferenceWebhook) buildPatch(ctx context.Context, pod *corev1.
 		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
 	}
 	if placement.Required {
-		hostname, err := w.driver.kubeRuntime.GetNodeHostname(ctx, placement.TargetNode)
+		node, err := w.driver.kubeRuntime.GetNode(ctx, placement.TargetNode)
 		if err != nil {
 			w.driver.metrics.RecordLastNodePreference("error", "node_lookup_failed")
 			return nil, warnings, err
+		}
+		hostname := strings.TrimSpace(node.Labels[corev1.LabelHostname])
+		if hostname == "" {
+			hostname = placement.TargetNode
+		}
+		if allowed, reason := podAllowsNodeTarget(pod, node); !allowed {
+			w.driver.metrics.RecordLastNodePreference("error", "pod_constraint_conflict")
+			return nil, warnings, fmt.Errorf("pod %s/%s already has scheduling constraints that exclude required node %s: %s", pod.Namespace, pod.Name, placement.TargetNode, reason)
 		}
 		applyRequiredNodeSelector(ensureAffinity(), corev1.NodeSelectorRequirement{
 			Key:      corev1.LabelHostname,
 			Operator: corev1.NodeSelectorOpIn,
 			Values:   []string{hostname},
 		})
-		annotations[annotationPreferredLastNode] = placement.TargetNode
-		annotations[annotationLastNodeInjected] = "true"
+		annotations[annotationRequiredNodeInjected] = placement.TargetNode
+		annotations[annotationPlacementSource] = firstNonEmpty(placement.Source, protectionSourceExplicitRequiredNode)
+		annotations[annotationPlacementDecision] = placementDecisionRequired
 		affinityChanged = true
-		w.driver.metrics.RecordLastNodePreference("injected", "protected_required_hostname")
+		w.driver.metrics.RecordLastNodePreference("injected", firstNonEmpty(placement.Source, "protected_required_hostname"))
 		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
 	}
-	if !w.lastNodePreferenceEnabled() {
+	if softPlacementRequiresFeatureGate(placement.Source) && !w.lastNodePreferenceEnabled() {
 		w.driver.metrics.RecordLastNodePreference("skipped", "feature_disabled")
 		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
 	}
-	if strings.EqualFold(strings.TrimSpace(pod.Annotations[annotationLastNodePref]), lastNodePreferenceDisabledValue) {
+	if softPlacementRequiresFeatureGate(placement.Source) && strings.EqualFold(strings.TrimSpace(pod.Annotations[annotationLastNodePref]), lastNodePreferenceDisabledValue) {
 		w.driver.metrics.RecordLastNodePreference("skipped", "pod_opt_out")
 		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
 	}
@@ -188,17 +200,18 @@ func (w *LastNodePreferenceWebhook) buildPatch(ctx context.Context, pod *corev1.
 		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
 	}
 	appendPreferredHostname(ensureAffinity(), hostname)
-	annotations[annotationPreferredLastNode] = placement.TargetNode
-	annotations[annotationLastNodeInjected] = "true"
+	annotations[annotationPreferredNodeInjected] = placement.TargetNode
+	annotations[annotationPlacementSource] = firstNonEmpty(placement.Source, placementSourceLastAttachedNode)
+	annotations[annotationPlacementDecision] = placementDecisionPreferred
 	affinityChanged = true
-	w.driver.metrics.RecordLastNodePreference("injected", "preferred_hostname")
+	w.driver.metrics.RecordLastNodePreference("injected", firstNonEmpty(placement.Source, "preferred_hostname"))
 	return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
 }
 
 func (w *LastNodePreferenceWebhook) resolvePlacementNode(ctx context.Context, pod *corev1.Pod) (podNodePlacementDecision, []string, error) {
-	decision := podNodePlacementDecision{Reason: "no_eligible_volume"}
-	requiredNodes := map[string]struct{}{}
-	preferredNodes := map[string]struct{}{}
+	decision := podNodePlacementDecision{Reason: "no_eligible_volume", PlacementDecision: placementDecisionNone}
+	requiredDecisions := map[string]podNodePlacementDecision{}
+	preferredDecisions := map[string]podNodePlacementDecision{}
 	warnings := []string{}
 	for _, volume := range pod.Spec.Volumes {
 		if volume.PersistentVolumeClaim == nil {
@@ -217,46 +230,67 @@ func (w *LastNodePreferenceWebhook) resolvePlacementNode(ctx context.Context, po
 			warnings = append(warnings, fmt.Sprintf("skipping PV %s: %v", pvc.Spec.VolumeName, err))
 			continue
 		}
-		if !eligibleForLastNodePreference(pv) {
+		if pv.Spec.CSI == nil || strings.TrimSpace(pv.Spec.CSI.Driver) != DefaultDriverName {
 			continue
 		}
 		protection, err := localRWOProtectionDecisionForDriver(ctx, w.driver, pv.Spec.CSI.VolumeHandle, "")
 		if err != nil {
 			return decision, warnings, err
 		}
+		warnings = append(warnings, protection.Warnings...)
+		if protection.ExplicitRequiredNodeExpired && protection.ExplicitRequiredNodeUntil != nil {
+			warnings = append(warnings, fmt.Sprintf("ignoring expired required-node %s on PV %s because it expired at %s", protection.ExplicitRequiredNode, pv.Name, protection.ExplicitRequiredNodeUntil.Format(time.RFC3339)))
+		}
+		if protection.Invalid {
+			if strings.TrimSpace(protection.Message) != "" {
+				warnings = append(warnings, protection.Message)
+			}
+			return decision, warnings, fmt.Errorf("%s", protection.Message)
+		}
+		if protection.PlacementDecision == placementDecisionIgnored && strings.TrimSpace(protection.Message) != "" {
+			warnings = append(warnings, protection.Message)
+		}
+		if !eligibleForLastNodePreference(pv) {
+			continue
+		}
 		if protection.Protected && strings.TrimSpace(protection.RequiredNode) != "" {
-			requiredNodes[strings.TrimSpace(protection.RequiredNode)] = struct{}{}
+			requiredDecisions[strings.TrimSpace(protection.RequiredNode)] = podNodePlacementDecision{
+				TargetNode:        strings.TrimSpace(protection.RequiredNode),
+				Required:          true,
+				Reason:            firstNonEmpty(protection.Reason, "protected_required_node"),
+				Source:            firstNonEmpty(protection.PlacementSource, protection.Source),
+				PlacementDecision: placementDecisionRequired,
+			}
 			continue
 		}
-		if strings.EqualFold(strings.TrimSpace(pvc.Annotations[annotationLastNodePref]), lastNodePreferenceDisabledValue) {
+		preferredNode := strings.TrimSpace(protection.PreferredNode)
+		if preferredNode == "" {
 			continue
 		}
-		lastNode := strings.TrimSpace(pv.Annotations[annotationLastAttachedNode])
-		if lastNode == "" {
-			continue
+		preferredDecisions[preferredNode] = podNodePlacementDecision{
+			TargetNode:        preferredNode,
+			Reason:            firstNonEmpty(protection.Reason, "eligible"),
+			Source:            firstNonEmpty(protection.PlacementSource, protection.Source),
+			PlacementDecision: placementDecisionPreferred,
 		}
-		preferredNodes[lastNode] = struct{}{}
 	}
-	switch len(requiredNodes) {
+	switch len(requiredDecisions) {
 	case 0:
 	case 1:
-		for node := range requiredNodes {
-			decision.TargetNode = node
-			decision.Required = true
-			decision.Reason = "protected_required_node"
+		for _, resolved := range requiredDecisions {
+			decision = resolved
 			return decision, warnings, nil
 		}
 	default:
-		warnings = append(warnings, "conflicting protected local RWO volumes require different nodes")
-		return decision, warnings, fmt.Errorf("pod references protected local RWO volumes that require different nodes")
+		warnings = append(warnings, "conflicting local RWO volumes require different manual or protected nodes")
+		return decision, warnings, fmt.Errorf("pod references local RWO volumes that require different nodes")
 	}
-	switch len(preferredNodes) {
+	switch len(preferredDecisions) {
 	case 0:
 		return decision, warnings, nil
 	case 1:
-		for node := range preferredNodes {
-			decision.TargetNode = node
-			decision.Reason = "eligible"
+		for _, resolved := range preferredDecisions {
+			decision = resolved
 			return decision, warnings, nil
 		}
 	default:
@@ -415,6 +449,119 @@ func hasPreferredHostnameAffinity(pod *corev1.Pod, hostname string) bool {
 		}
 	}
 	return false
+}
+
+func softPlacementRequiresFeatureGate(source string) bool {
+	switch strings.TrimSpace(source) {
+	case placementSourcePVPreferredNode, placementSourcePVCPreferredNode, placementSourceLegacyPreferredLastNode:
+		return false
+	default:
+		return true
+	}
+}
+
+func podAllowsNodeTarget(pod *corev1.Pod, node *corev1.Node) (bool, string) {
+	if pod == nil || node == nil {
+		return false, "pod or node is missing"
+	}
+	for key, value := range pod.Spec.NodeSelector {
+		if strings.TrimSpace(node.Labels[key]) != value {
+			return false, fmt.Sprintf("nodeSelector %s=%s excludes node %s", key, value, node.Name)
+		}
+	}
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil || pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return true, ""
+	}
+	required := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if len(required.NodeSelectorTerms) == 0 {
+		return true, ""
+	}
+	for _, term := range required.NodeSelectorTerms {
+		if nodeSelectorTermMatchesNode(term, node) {
+			return true, ""
+		}
+	}
+	return false, "existing required node affinity excludes the target node"
+}
+
+func nodeSelectorTermMatchesNode(term corev1.NodeSelectorTerm, node *corev1.Node) bool {
+	if node == nil {
+		return false
+	}
+	for _, expr := range term.MatchExpressions {
+		if !nodeSelectorRequirementMatchesNode(expr, node) {
+			return false
+		}
+	}
+	for _, expr := range term.MatchFields {
+		if !nodeFieldSelectorRequirementMatchesNode(expr, node) {
+			return false
+		}
+	}
+	return true
+}
+
+func nodeSelectorRequirementMatchesNode(expr corev1.NodeSelectorRequirement, node *corev1.Node) bool {
+	value, present := node.Labels[expr.Key]
+	switch expr.Operator {
+	case corev1.NodeSelectorOpIn:
+		return present && containsString(expr.Values, value)
+	case corev1.NodeSelectorOpNotIn:
+		return !present || !containsString(expr.Values, value)
+	case corev1.NodeSelectorOpExists:
+		return present
+	case corev1.NodeSelectorOpDoesNotExist:
+		return !present
+	case corev1.NodeSelectorOpGt:
+		return nodeSelectorNumericCompare(value, expr.Values, func(left, right int) bool { return left > right })
+	case corev1.NodeSelectorOpLt:
+		return nodeSelectorNumericCompare(value, expr.Values, func(left, right int) bool { return left < right })
+	default:
+		return false
+	}
+}
+
+func nodeFieldSelectorRequirementMatchesNode(expr corev1.NodeSelectorRequirement, node *corev1.Node) bool {
+	var value string
+	var present bool
+	switch expr.Key {
+	case "metadata.name":
+		value = node.Name
+		present = strings.TrimSpace(node.Name) != ""
+	default:
+		return false
+	}
+	switch expr.Operator {
+	case corev1.NodeSelectorOpIn:
+		return present && containsString(expr.Values, value)
+	case corev1.NodeSelectorOpNotIn:
+		return !present || !containsString(expr.Values, value)
+	case corev1.NodeSelectorOpExists:
+		return present
+	case corev1.NodeSelectorOpDoesNotExist:
+		return !present
+	case corev1.NodeSelectorOpGt:
+		return nodeSelectorNumericCompare(value, expr.Values, func(left, right int) bool { return left > right })
+	case corev1.NodeSelectorOpLt:
+		return nodeSelectorNumericCompare(value, expr.Values, func(left, right int) bool { return left < right })
+	default:
+		return false
+	}
+}
+
+func nodeSelectorNumericCompare(leftRaw string, rightValues []string, compare func(int, int) bool) bool {
+	if len(rightValues) == 0 {
+		return false
+	}
+	left, err := strconv.Atoi(strings.TrimSpace(leftRaw))
+	if err != nil {
+		return false
+	}
+	right, err := strconv.Atoi(strings.TrimSpace(rightValues[0]))
+	if err != nil {
+		return false
+	}
+	return compare(left, right)
 }
 
 func buildPodMutationPatch(pod *corev1.Pod, annotations map[string]string, affinityChanged bool, affinityFn func() *corev1.Affinity) []jsonPatchOperation {

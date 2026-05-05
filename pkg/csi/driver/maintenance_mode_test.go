@@ -64,10 +64,10 @@ func TestMaintenanceModeReconcilePreparesLocalRWOPV(t *testing.T) {
 	assert.Equal(t, "node-a", updatedPV.Annotations[annotationLastAttachedNode])
 }
 
-func TestMaintenanceModePrepareHonorsPreferredLastNodeOverride(t *testing.T) {
+func TestMaintenanceModePrepareHonorsExplicitPreferredNode(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-maint-override", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 	pvc.Spec.VolumeName = pv.Name
-	pv.Annotations[annotationPreferredLastNode] = "node-operator"
+	pv.Annotations[annotationPreferredNode] = "node-operator"
 	pvName := pv.Name
 	va := &storagev1.VolumeAttachment{
 		ObjectMeta: metav1.ObjectMeta{Name: "va-maint-override"},
@@ -89,6 +89,33 @@ func TestMaintenanceModePrepareHonorsPreferredLastNodeOverride(t *testing.T) {
 	updatedPV, err := driver.kubeRuntime.client.CoreV1().PersistentVolumes().Get(context.Background(), pv.Name, metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.Equal(t, "node-operator", updatedPV.Annotations[annotationLastAttachedNode])
+}
+
+func TestMaintenanceModePrepareHonorsDeprecatedPreferredLastNodeFallback(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-maint-legacy", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pvc.Spec.VolumeName = pv.Name
+	pv.Annotations[annotationPreferredLastNode] = "node-legacy"
+	pvName := pv.Name
+	va := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "va-maint-legacy"},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: DefaultDriverName,
+			NodeName: "node-stale",
+			Source:   storagev1.VolumeAttachmentSource{PersistentVolumeName: &pvName},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: true},
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: hotplugStateConfigMapName, Namespace: "default"},
+		Data:       map[string]string{maintenanceModeKey: "true"},
+	}
+	driver := newMaintenanceTestDriver(t, pv, pvc, va, cm)
+
+	require.NoError(t, driver.maintenanceMode.Reconcile(context.Background()))
+
+	updatedPV, err := driver.kubeRuntime.client.CoreV1().PersistentVolumes().Get(context.Background(), pv.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "node-legacy", updatedPV.Annotations[annotationLastAttachedNode])
 }
 
 func TestMaintenanceModeReconcileClearsReadyAndStaggersRelease(t *testing.T) {

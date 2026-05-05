@@ -173,7 +173,7 @@ const (
 	defaultLastNodePreferencePolicy                = "local-single-writer"
 	defaultLastNodePreferenceWebhookEnabled        = true
 	defaultLastNodePreferenceWebhookPort           = 9443
-	defaultLastNodePreferenceWebhookFailurePolicy  = "Ignore"
+	defaultLastNodePreferenceWebhookFailurePolicy  = "Fail"
 	defaultStuckAttachmentReconcilerEnabled        = true
 	defaultStuckAttachmentReconcilerInterval       = 60
 	defaultStuckAttachmentOrphanGraceSeconds       = 120

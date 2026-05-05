@@ -1027,6 +1027,9 @@ func typedHotplugQueueSnapshot(ctx context.Context, kubeClient kubernetes.Interf
 
 func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPluginConfig, kubeClient kubernetes.Interface, pvs []corev1.PersistentVolume) (map[string]VolumeHistoryRecord, map[string]VolumeRepairState, map[string]VolumeDesiredState, map[string]LocalRWOProtectionDecision) {
 	runtime := &KubeRuntime{client: kubeClient, enabled: true, staleVAGrace: loadStaleVolumeAttachmentGrace(cfg)}
+	if restConfig, err := loadKubeRestConfig(); err == nil {
+		runtime.inventoryClient = newInventoryRuntimeClient(restConfig)
+	}
 	driver := &Driver{
 		PluginConfig: cfg,
 		kubeRuntime:  runtime,
@@ -1068,7 +1071,7 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 			}
 			continue
 		}
-		if decision.Protected || strings.TrimSpace(decision.Reason) != "" {
+		if decision.Protected || strings.TrimSpace(decision.Reason) != "" || strings.TrimSpace(decision.PreferredNode) != "" || strings.TrimSpace(decision.ExplicitRequiredNode) != "" || strings.TrimSpace(decision.ExplicitPreferredNode) != "" || strings.TrimSpace(decision.PlacementDecision) != "" {
 			protectionSnapshot[pv.Spec.CSI.VolumeHandle] = decision
 		}
 	}

@@ -5,7 +5,7 @@
 {{- $namespace := include "opennebula-csi.namespace" . -}}
 {{- $serviceName := include "opennebula-csi.lastNodeWebhookServiceName" . -}}
 {{- $secretName := include "opennebula-csi.lastNodeWebhookSecretName" . -}}
-{{- $failurePolicy := (get $lastNodePreferenceWebhook "failurePolicy") | default "Ignore" -}}
+{{- $failurePolicy := (get $lastNodePreferenceWebhook "failurePolicy") | default "Fail" -}}
 {{- $port := (get $lastNodePreferenceWebhook "port") | default 9443 -}}
 {{- $existing := lookup "v1" "Secret" $namespace $secretName -}}
 {{- $caCert := "" -}}

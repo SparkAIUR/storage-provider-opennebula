@@ -59,8 +59,9 @@ func TestLastNodePreferenceWebhookInjectsSoftAffinity(t *testing.T) {
 
 	raw, err := json.Marshal(patch)
 	require.NoError(t, err)
-	assert.Contains(t, string(raw), jsonPointerEscape(annotationPreferredLastNode))
-	assert.Contains(t, string(raw), jsonPointerEscape(annotationLastNodeInjected))
+	assert.Contains(t, string(raw), jsonPointerEscape(annotationPreferredNodeInjected))
+	assert.Contains(t, string(raw), jsonPointerEscape(annotationPlacementSource))
+	assert.Contains(t, string(raw), jsonPointerEscape(annotationPlacementDecision))
 	assert.Contains(t, string(raw), "host-a")
 }
 
@@ -215,6 +216,220 @@ func TestLastNodePreferenceWebhookHonorsOptOut(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, patch)
 	assert.Empty(t, warnings)
+}
+
+func TestLastNodePreferenceWebhookInjectsExplicitRequiredNode(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-required", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationDatastoreID: "111",
+	})
+	pvc.Spec.VolumeName = pv.Name
+	pvc.Annotations[annotationRequiredNode] = "node-b"
+	pvc.Annotations[annotationPlacementReason] = "manual-recovery"
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "node-b",
+		Labels: map[string]string{
+			corev1.LabelHostname: hostLabel("b"),
+			topologySystemDSLabel: "104",
+		},
+	}}
+	driver := newWebhookTestDriver(pv, pvc, node)
+	driver.kubeRuntime.inventoryClient = newInventoryFakeClient(t,
+		&inventoryv1alpha1.OpenNebulaDatastore{
+			ObjectMeta: metav1.ObjectMeta{Name: "ds-111"},
+			Spec:       inventoryv1alpha1.OpenNebulaDatastoreSpec{Discovery: inventoryv1alpha1.OpenNebulaDatastoreDiscoverySpec{OpenNebulaDatastoreID: 111}},
+			Status: inventoryv1alpha1.OpenNebulaDatastoreStatus{
+				ID:      111,
+				Backend: "local",
+				OpenNebula: inventoryv1alpha1.OpenNebulaDatastoreOpenNebulaStatus{
+					CompatibleSystemDatastores: []int{104},
+				},
+			},
+		},
+		&inventoryv1alpha1.OpenNebulaNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-b"},
+			Status: inventoryv1alpha1.OpenNebulaNodeStatus{
+				Phase: inventoryv1alpha1.NodePhaseReady,
+				OpenNebula: inventoryv1alpha1.OpenNebulaNodeOpenNebulaStatus{
+					SystemDatastoreID: 104,
+				},
+			},
+		},
+	)
+	webhook := NewLastNodePreferenceWebhook(driver)
+
+	patch, warnings, err := webhook.buildPatch(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-0", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc.Name},
+				},
+			}},
+		},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, warnings)
+	raw, err := json.Marshal(patch)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), jsonPointerEscape(annotationRequiredNodeInjected))
+	assert.Contains(t, string(raw), jsonPointerEscape(annotationPlacementSource))
+	assert.Contains(t, string(raw), jsonPointerEscape(annotationPlacementDecision))
+	assert.Contains(t, string(raw), `"required"`)
+	assert.Contains(t, string(raw), hostLabel("b"))
+}
+
+func TestLastNodePreferenceWebhookRejectsConflictingExplicitRequiredNode(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-conflict", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationDatastoreID: "111",
+	})
+	pvc.Spec.VolumeName = pv.Name
+	pvc.Annotations[annotationRequiredNode] = "node-b"
+	nodeA := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "node-a",
+		Labels: map[string]string{
+			corev1.LabelHostname: hostLabel("a"),
+			topologySystemDSLabel: "104",
+		},
+	}}
+	nodeB := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "node-b",
+		Labels: map[string]string{
+			corev1.LabelHostname: hostLabel("b"),
+			topologySystemDSLabel: "104",
+		},
+	}}
+	driver := newWebhookTestDriver(pv, pvc, nodeA, nodeB)
+	driver.kubeRuntime.inventoryClient = newInventoryFakeClient(t,
+		&inventoryv1alpha1.OpenNebulaDatastore{
+			ObjectMeta: metav1.ObjectMeta{Name: "ds-111"},
+			Spec:       inventoryv1alpha1.OpenNebulaDatastoreSpec{Discovery: inventoryv1alpha1.OpenNebulaDatastoreDiscoverySpec{OpenNebulaDatastoreID: 111}},
+			Status: inventoryv1alpha1.OpenNebulaDatastoreStatus{
+				ID:      111,
+				Backend: "local",
+				OpenNebula: inventoryv1alpha1.OpenNebulaDatastoreOpenNebulaStatus{
+					CompatibleSystemDatastores: []int{104},
+				},
+			},
+		},
+		&inventoryv1alpha1.OpenNebulaNode{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}, Status: inventoryv1alpha1.OpenNebulaNodeStatus{Phase: inventoryv1alpha1.NodePhaseReady, OpenNebula: inventoryv1alpha1.OpenNebulaNodeOpenNebulaStatus{SystemDatastoreID: 104}}},
+		&inventoryv1alpha1.OpenNebulaNode{ObjectMeta: metav1.ObjectMeta{Name: "node-b"}, Status: inventoryv1alpha1.OpenNebulaNodeStatus{Phase: inventoryv1alpha1.NodePhaseReady, OpenNebula: inventoryv1alpha1.OpenNebulaNodeOpenNebulaStatus{SystemDatastoreID: 104}}},
+	)
+	require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
+		VolumeID:     "vol-conflict",
+		NodeID:       "node-a",
+		Backend:      "local",
+		PVCNamespace: "default",
+		PVCName:      pvc.Name,
+		StartedAt:    time.Now().Add(-10 * time.Second),
+		ExpiresAt:    time.Now().Add(90 * time.Second),
+		GraceSeconds: 90,
+		Reason:       "stateful_restart",
+	}))
+	webhook := NewLastNodePreferenceWebhook(driver)
+
+	patch, warnings, err := webhook.buildPatch(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-0", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc.Name},
+				},
+			}},
+		},
+	})
+	require.Error(t, err)
+	assert.Empty(t, patch)
+	assert.NotEmpty(t, warnings)
+	assert.Contains(t, err.Error(), "conflicts with protected node")
+}
+
+func TestLastNodePreferenceWebhookInjectsExplicitPreferredNodeWhenSoftPreferenceDisabled(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-preferred", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationDatastoreID: "111",
+	})
+	pvc.Spec.VolumeName = pv.Name
+	pvc.Annotations[annotationPreferredNode] = "node-b"
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "node-b",
+		Labels: map[string]string{
+			corev1.LabelHostname: hostLabel("b"),
+			topologySystemDSLabel: "104",
+		},
+	}}
+	driver := newWebhookTestDriver(pv, pvc, node)
+	driver.PluginConfig.OverrideVal(config.LastNodePreferenceEnabledVar, false)
+	driver.kubeRuntime.inventoryClient = newInventoryFakeClient(t,
+		&inventoryv1alpha1.OpenNebulaDatastore{
+			ObjectMeta: metav1.ObjectMeta{Name: "ds-111"},
+			Spec:       inventoryv1alpha1.OpenNebulaDatastoreSpec{Discovery: inventoryv1alpha1.OpenNebulaDatastoreDiscoverySpec{OpenNebulaDatastoreID: 111}},
+			Status: inventoryv1alpha1.OpenNebulaDatastoreStatus{
+				ID:      111,
+				Backend: "local",
+				OpenNebula: inventoryv1alpha1.OpenNebulaDatastoreOpenNebulaStatus{
+					CompatibleSystemDatastores: []int{104},
+				},
+			},
+		},
+		&inventoryv1alpha1.OpenNebulaNode{ObjectMeta: metav1.ObjectMeta{Name: "node-b"}, Status: inventoryv1alpha1.OpenNebulaNodeStatus{Phase: inventoryv1alpha1.NodePhaseReady, OpenNebula: inventoryv1alpha1.OpenNebulaNodeOpenNebulaStatus{SystemDatastoreID: 104}}},
+	)
+	webhook := NewLastNodePreferenceWebhook(driver)
+
+	patch, warnings, err := webhook.buildPatch(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "minio-0",
+			Namespace:   "default",
+			Annotations: map[string]string{annotationLastNodePref: lastNodePreferenceDisabledValue},
+		},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc.Name},
+				},
+			}},
+		},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, warnings)
+	raw, err := json.Marshal(patch)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), jsonPointerEscape(annotationPreferredNodeInjected))
+	assert.Contains(t, string(raw), hostLabel("b"))
+}
+
+func TestLastNodePreferenceWebhookIgnoresExpiredExplicitRequiredNode(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-expired", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv.Annotations[annotationLastAttachedNode] = "node-a"
+	pvc.Spec.VolumeName = pv.Name
+	pvc.Annotations[annotationRequiredNode] = "node-b"
+	pvc.Annotations[annotationRequiredNodeUntil] = time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{corev1.LabelHostname: hostLabel("a")}}}
+	driver := newWebhookTestDriver(pv, pvc, node)
+	webhook := NewLastNodePreferenceWebhook(driver)
+
+	patch, warnings, err := webhook.buildPatch(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-0", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc.Name},
+				},
+			}},
+		},
+	})
+	require.NoError(t, err)
+	assert.NotEmpty(t, warnings)
+	raw, err := json.Marshal(patch)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), jsonPointerEscape(annotationPreferredNodeInjected))
+	assert.Contains(t, string(raw), hostLabel("a"))
+}
+
+func hostLabel(suffix string) string {
+	return "host-" + suffix
 }
 
 func TestLastNodePreferenceWebhookInjectsRequiredSystemDatastoreAffinity(t *testing.T) {

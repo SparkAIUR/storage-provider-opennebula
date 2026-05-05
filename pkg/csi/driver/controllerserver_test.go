@@ -142,7 +142,9 @@ func newLocalPVAndPVC(volumeHandle string, accessModes []corev1.PersistentVolume
 		annotationDatastoreName:   "default",
 		annotationSelectionPolicy: "least-used",
 	}
+	pvcAnnotationCopy := map[string]string{}
 	for key, value := range pvcAnnotations {
+		pvcAnnotationCopy[key] = value
 		if key == annotationBackend || key == annotationDatastoreID || key == annotationDatastoreName || key == annotationSelectionPolicy {
 			pvAnnotations[key] = value
 		}
@@ -170,7 +172,7 @@ func newLocalPVAndPVC(volumeHandle string, accessModes []corev1.PersistentVolume
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:   "default",
 			Name:        "pvc-" + volumeHandle,
-			Annotations: pvcAnnotations,
+			Annotations: pvcAnnotationCopy,
 		},
 	}
 	return pv, pvc
