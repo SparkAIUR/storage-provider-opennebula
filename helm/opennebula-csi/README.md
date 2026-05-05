@@ -20,6 +20,10 @@ Chart repo:
 
 - `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
 
+Operator debugging guide:
+
+- [DEBUGGING.md](./DEBUGGING.md)
+
 ## What This Chart Supports
 
 - OpenNebula disk-backed PVC provisioning on explicitly configured datastores
