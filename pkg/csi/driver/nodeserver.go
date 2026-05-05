@@ -256,8 +256,14 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 
 		//Check if volume_id is already staged in stagingTargetPath and is identical
 		// to the volumeCapability provided in the request, then return 0 OK response
-		ns.recordLocalDiskStageSession(req, devicePath, fsType, mountFlags, ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext))
-		ns.clearLocalDeviceMissing(ctx, volumeID)
+		observedIdentity := ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext)
+		report, _ := ns.currentLocalDeviceReport(ctx, volumeID)
+		var reportRef *LocalDeviceMissingReport
+		if strings.TrimSpace(report.VolumeID) != "" {
+			reportRef = &report
+		}
+		ns.recordLocalDiskStageSession(ctx, req, devicePath, fsType, mountFlags, observedIdentity, reportRef)
+		ns.confirmLocalDeviceRecovery(ctx, reportRef, volumeID, devicePath, observedIdentity, volumeContext)
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
@@ -291,8 +297,14 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath,
 		"stagingTargetPath", stagingTargetPath, "fsType", fsType)
 
-	ns.recordLocalDiskStageSession(req, devicePath, fsType, mountFlags, ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext))
-	ns.clearLocalDeviceMissing(ctx, volumeID)
+	observedIdentity := ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext)
+	report, _ := ns.currentLocalDeviceReport(ctx, volumeID)
+	var reportRef *LocalDeviceMissingReport
+	if strings.TrimSpace(report.VolumeID) != "" {
+		reportRef = &report
+	}
+	ns.recordLocalDiskStageSession(ctx, req, devicePath, fsType, mountFlags, observedIdentity, reportRef)
+	ns.confirmLocalDeviceRecovery(ctx, reportRef, volumeID, devicePath, observedIdentity, volumeContext)
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 

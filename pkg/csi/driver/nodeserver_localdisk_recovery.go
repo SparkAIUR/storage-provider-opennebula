@@ -34,22 +34,31 @@ type localDiskPublishedTarget struct {
 }
 
 type localDiskSession struct {
-	VolumeID          string                     `json:"volumeID"`
-	VolumeName        string                     `json:"volumeName,omitempty"`
-	StagingTargetPath string                     `json:"stagingTargetPath"`
-	DevicePath        string                     `json:"devicePath,omitempty"`
-	DeviceSerial      string                     `json:"deviceSerial,omitempty"`
-	OpenNebulaImageID string                     `json:"opennebulaImageID,omitempty"`
-	FSType            string                     `json:"fsType,omitempty"`
-	Identity          *LocalDiskIdentity         `json:"identity,omitempty"`
-	StageMountOptions []string                   `json:"stageMountOptions,omitempty"`
-	PVCNamespace      string                     `json:"pvcNamespace,omitempty"`
-	PVCName           string                     `json:"pvcName,omitempty"`
-	PVName            string                     `json:"pvName,omitempty"`
-	PublishedTargets  []localDiskPublishedTarget `json:"publishedTargets,omitempty"`
-	LastRecoveredAt   *time.Time                 `json:"lastRecoveredAt,omitempty"`
-	LastRecoveryError string                     `json:"lastRecoveryError,omitempty"`
-	RecoveryAttempts  int                        `json:"recoveryAttempts,omitempty"`
+	VolumeID               string                     `json:"volumeID"`
+	VolumeName             string                     `json:"volumeName,omitempty"`
+	StagingTargetPath      string                     `json:"stagingTargetPath"`
+	DevicePath             string                     `json:"devicePath,omitempty"`
+	DeviceSerial           string                     `json:"deviceSerial,omitempty"`
+	OpenNebulaImageID      string                     `json:"opennebulaImageID,omitempty"`
+	FSType                 string                     `json:"fsType,omitempty"`
+	Identity               *LocalDiskIdentity         `json:"identity,omitempty"`
+	StageMountOptions      []string                   `json:"stageMountOptions,omitempty"`
+	PVCNamespace           string                     `json:"pvcNamespace,omitempty"`
+	PVCName                string                     `json:"pvcName,omitempty"`
+	PVName                 string                     `json:"pvName,omitempty"`
+	PublishedTargets       []localDiskPublishedTarget `json:"publishedTargets,omitempty"`
+	LastRecoveredAt        *time.Time                 `json:"lastRecoveredAt,omitempty"`
+	LastRecoveryError      string                     `json:"lastRecoveryError,omitempty"`
+	RecoveryAttempts       int                        `json:"recoveryAttempts,omitempty"`
+	LastRecoveryMethod     string                     `json:"lastRecoveryMethod,omitempty"`
+	LastRecoveryToken      string                     `json:"lastRecoveryToken,omitempty"`
+	ConfirmationState      string                     `json:"confirmationState,omitempty"`
+	ConfirmationDeadline   *time.Time                 `json:"confirmationDeadline,omitempty"`
+	ExpectedTarget         string                     `json:"expectedTarget,omitempty"`
+	ExpectedSerial         string                     `json:"expectedSerial,omitempty"`
+	AttachmentState        string                     `json:"attachmentState,omitempty"`
+	MetadataAttachedToNode bool                       `json:"metadataAttachedToNode,omitempty"`
+	MetadataTarget         string                     `json:"metadataTarget,omitempty"`
 }
 
 type localDiskMountHealth struct {
@@ -175,30 +184,52 @@ func (ns *NodeServer) deleteLocalDiskSession(volumeID string) {
 	}
 }
 
-func (ns *NodeServer) recordLocalDiskStageSession(req *csi.NodeStageVolumeRequest, devicePath, fsType string, mountOptions []string, identity *LocalDiskIdentity) {
+func (ns *NodeServer) recordLocalDiskStageSession(ctx context.Context, req *csi.NodeStageVolumeRequest, devicePath, fsType string, mountOptions []string, identity *LocalDiskIdentity, report *LocalDeviceMissingReport) {
 	if req == nil {
 		return
 	}
-	ctx := req.GetPublishContext()
+	publishContext := req.GetPublishContext()
 	session := localDiskSession{
 		VolumeID:          req.GetVolumeId(),
-		VolumeName:        strings.TrimSpace(ctx["volumeName"]),
+		VolumeName:        strings.TrimSpace(publishContext["volumeName"]),
 		StagingTargetPath: req.GetStagingTargetPath(),
 		DevicePath:        devicePath,
-		DeviceSerial:      strings.TrimSpace(ctx[publishContextDeviceSerial]),
-		OpenNebulaImageID: strings.TrimSpace(ctx[publishContextOpenNebulaImageID]),
+		DeviceSerial:      strings.TrimSpace(publishContext[publishContextDeviceSerial]),
+		OpenNebulaImageID: strings.TrimSpace(publishContext[publishContextOpenNebulaImageID]),
 		FSType:            fsType,
 		Identity:          identity,
 		StageMountOptions: append([]string(nil), mountOptions...),
-		PVCNamespace:      strings.TrimSpace(ctx[paramPVCNamespace]),
-		PVCName:           strings.TrimSpace(ctx[paramPVCName]),
-		PVName:            strings.TrimSpace(ctx[paramPVName]),
+		PVCNamespace:      strings.TrimSpace(publishContext[paramPVCNamespace]),
+		PVCName:           strings.TrimSpace(publishContext[paramPVCName]),
+		PVName:            strings.TrimSpace(publishContext[paramPVName]),
 	}
 	if existing, exists, err := ns.loadLocalDiskSession(session.VolumeID); err == nil && exists {
 		session.PublishedTargets = existing.PublishedTargets
 	}
+	if report == nil {
+		if current, ok := ns.currentLocalDeviceReport(context.Background(), session.VolumeID); ok {
+			report = &current
+		}
+	}
+	if report != nil {
+		session.RecoveryAttempts = report.RecoveryAttempts
+		session.LastRecoveredAt = report.LastRecoveryAt
+		session.LastRecoveryError = strings.TrimSpace(report.LastRecoveryError)
+		session.LastRecoveryMethod = strings.TrimSpace(report.RecoveryMethod)
+		session.LastRecoveryToken = strings.TrimSpace(report.RecoveryToken)
+		session.ConfirmationState = strings.TrimSpace(report.ConfirmationState)
+		session.ConfirmationDeadline = report.ConfirmationDeadline
+		session.ExpectedTarget = firstNonEmpty(strings.TrimSpace(report.ExpectedTarget), strings.TrimSpace(session.VolumeName))
+		session.ExpectedSerial = firstNonEmpty(strings.TrimSpace(report.DeviceSerial), strings.TrimSpace(session.DeviceSerial))
+		session.AttachmentState = firstNonEmpty(strings.TrimSpace(report.AttachmentState), localDeviceAttachmentStateRuntimeConfirmedByNode)
+		session.MetadataAttachedToNode = report.MetadataAttachedToNode
+		session.MetadataTarget = strings.TrimSpace(report.MetadataTarget)
+	} else {
+		session.ExpectedTarget = strings.TrimSpace(session.VolumeName)
+		session.ExpectedSerial = strings.TrimSpace(session.DeviceSerial)
+	}
 	ns.recordLocalDiskSession(session)
-	ns.recordSuccessfulLocalVolumeStage(context.Background(), session.VolumeID, ctx, identity)
+	ns.recordSuccessfulLocalVolumeStage(ctx, session.VolumeID, publishContext, identity)
 }
 
 func (ns *NodeServer) updateLocalDiskPublishedTarget(volumeID, targetPath string, options []string) {
@@ -404,16 +435,142 @@ func (ns *NodeServer) resolveLocalDiskRecoveryDevice(ctx context.Context, sessio
 
 func (ns *NodeServer) observeLocalDiskIdentity(devicePath, fsType string, publishContext map[string]string) *LocalDiskIdentity {
 	identity := &LocalDiskIdentity{
-		Version:             stateObjectVersion,
-		ObservedAt:          time.Now().UTC(),
-		DevicePath:          strings.TrimSpace(devicePath),
-		DeviceSerial:        strings.TrimSpace(publishContext[publishContextDeviceSerial]),
-		FilesystemType:      strings.TrimSpace(fsType),
-		OpenNebulaImageID:   strings.TrimSpace(publishContext[publishContextOpenNebulaImageID]),
-		DiskTarget:          strings.TrimSpace(publishContext["volumeName"]),
-		MountSourceIdentity: strings.TrimSpace(devicePath),
+		Version:              stateObjectVersion,
+		ObservedAt:           time.Now().UTC(),
+		AssertedByController: assertedLocalDiskControllerIdentity(publishContext),
 	}
-	if ns != nil && ns.mounter != nil && ns.mounter.Exec != nil && strings.TrimSpace(devicePath) != "" {
+	if block := ns.observeLocalDiskBlockIdentity(devicePath); block != nil {
+		if identity.ObservedFromDevice == nil {
+			identity.ObservedFromDevice = &LocalDiskObservedIdentity{}
+		}
+		identity.ObservedFromDevice.Block = block
+	}
+	if filesystem := ns.observeLocalDiskFilesystemIdentity(devicePath, fsType); filesystem != nil {
+		if identity.ObservedFromDevice == nil {
+			identity.ObservedFromDevice = &LocalDiskObservedIdentity{}
+		}
+		identity.ObservedFromDevice.Filesystem = filesystem
+	}
+	normalizeLocalDiskIdentity(identity)
+	return identity
+}
+
+func (ns *NodeServer) verifyRecoveredDeviceIdentity(session localDiskSession, devicePath string) (bool, string, *LocalDiskIdentity) {
+	if session.Identity == nil {
+		return true, "", nil
+	}
+	observed := ns.observeLocalDiskIdentity(devicePath, session.FSType, nil)
+	ok, reason := localDiskIdentityMatches(session.Identity, observed)
+	return ok, reason, observed
+}
+
+func localDiskIdentityMatches(expected, observed *LocalDiskIdentity) (bool, string) {
+	if expected == nil {
+		return true, ""
+	}
+	if observed == nil {
+		return false, "observed identity missing"
+	}
+	normalizeLocalDiskIdentity(expected)
+	normalizeLocalDiskIdentity(observed)
+
+	expectedFSUUID := localDiskObservedFilesystemUUID(expected)
+	expectedPartUUID := localDiskObservedPartitionUUID(expected)
+	expectedFSType := localDiskObservedFilesystemType(expected)
+	expectedSerial := localDiskObservedDeviceSerial(expected)
+	expectedByID := localDiskObservedByIDPath(expected)
+
+	observedFSUUID := localDiskObservedFilesystemUUID(observed)
+	observedPartUUID := localDiskObservedPartitionUUID(observed)
+	observedFSType := localDiskObservedFilesystemType(observed)
+	observedSerial := localDiskObservedDeviceSerial(observed)
+	observedByID := localDiskObservedByIDPath(observed)
+
+	expectedHasFilesystemEvidence := expectedFSUUID != "" || expectedPartUUID != ""
+	expectedHasBlockEvidence := expectedSerial != "" || expectedByID != ""
+	if !expectedHasFilesystemEvidence && !expectedHasBlockEvidence {
+		return false, "expected identity lacks independently observed filesystem or block-device evidence"
+	}
+
+	filesystemMatched := false
+	if expectedFSUUID != "" && observedFSUUID != "" && !strings.EqualFold(expectedFSUUID, observedFSUUID) {
+		return false, fmt.Sprintf("filesystem UUID mismatch expected=%s observed=%s", expectedFSUUID, observedFSUUID)
+	}
+	if expectedPartUUID != "" && observedPartUUID != "" && !strings.EqualFold(expectedPartUUID, observedPartUUID) {
+		return false, fmt.Sprintf("partition UUID mismatch expected=%s observed=%s", expectedPartUUID, observedPartUUID)
+	}
+	if expectedFSType != "" && observedFSType != "" && !strings.EqualFold(expectedFSType, observedFSType) {
+		return false, fmt.Sprintf("filesystem type mismatch expected=%s observed=%s", expectedFSType, observedFSType)
+	}
+	if expectedFSUUID != "" && observedFSUUID != "" && strings.EqualFold(expectedFSUUID, observedFSUUID) {
+		filesystemMatched = true
+	}
+	if expectedPartUUID != "" && observedPartUUID != "" && strings.EqualFold(expectedPartUUID, observedPartUUID) {
+		filesystemMatched = true
+	}
+
+	blockMatched := false
+	if expectedSerial != "" && observedSerial != "" && !strings.EqualFold(expectedSerial, observedSerial) {
+		return false, fmt.Sprintf("device serial mismatch expected=%s observed=%s", expectedSerial, observedSerial)
+	}
+	if expectedByID != "" && observedByID != "" && !sameObservedByIDPath(expectedByID, observedByID) {
+		return false, fmt.Sprintf("by-id path mismatch expected=%s observed=%s", expectedByID, observedByID)
+	}
+	if expectedSerial != "" && observedSerial != "" && strings.EqualFold(expectedSerial, observedSerial) {
+		blockMatched = true
+	}
+	if expectedByID != "" && observedByID != "" && sameObservedByIDPath(expectedByID, observedByID) {
+		blockMatched = true
+	}
+
+	if !filesystemMatched && !blockMatched {
+		return false, "observed identity lacks matching independently observed filesystem or block-device evidence"
+	}
+	return true, ""
+}
+
+func assertedLocalDiskControllerIdentity(publishContext map[string]string) *LocalDiskControllerAssertion {
+	if len(publishContext) == 0 {
+		return nil
+	}
+	asserted := &LocalDiskControllerAssertion{
+		DeviceSerial:      strings.TrimSpace(publishContext[publishContextDeviceSerial]),
+		OpenNebulaImageID: strings.TrimSpace(publishContext[publishContextOpenNebulaImageID]),
+		DiskTarget:        strings.TrimSpace(publishContext["volumeName"]),
+	}
+	if asserted.DeviceSerial == "" && asserted.OpenNebulaImageID == "" && asserted.DiskTarget == "" {
+		return nil
+	}
+	return asserted
+}
+
+func (ns *NodeServer) observeLocalDiskBlockIdentity(devicePath string) *LocalDiskObservedBlockIdentity {
+	devicePath = strings.TrimSpace(devicePath)
+	if devicePath == "" {
+		return nil
+	}
+	block := &LocalDiskObservedBlockIdentity{
+		DevicePath:          devicePath,
+		MountSourceIdentity: devicePath,
+	}
+	if byIDPath, ok := observedByIDPath(devicePath); ok {
+		block.ByIDPath = byIDPath
+	}
+	if serial := observedDeviceSerial(ns, devicePath); serial != "" {
+		block.DeviceSerial = serial
+	}
+	if block.DevicePath == "" && block.ByIDPath == "" && block.DeviceSerial == "" && block.MountSourceIdentity == "" {
+		return nil
+	}
+	return block
+}
+
+func (ns *NodeServer) observeLocalDiskFilesystemIdentity(devicePath, fsType string) *LocalDiskObservedFilesystemIdentity {
+	devicePath = strings.TrimSpace(devicePath)
+	identity := &LocalDiskObservedFilesystemIdentity{
+		FilesystemType: strings.TrimSpace(fsType),
+	}
+	if ns != nil && ns.mounter != nil && ns.mounter.Exec != nil && devicePath != "" {
 		if output, err := ns.mounter.Exec.Command("blkid", "-o", "export", devicePath).CombinedOutput(); err == nil {
 			for _, line := range strings.Split(string(output), "\n") {
 				key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
@@ -433,70 +590,84 @@ func (ns *NodeServer) observeLocalDiskIdentity(devicePath, fsType string, publis
 			}
 		}
 	}
-	normalizeLocalDiskIdentity(identity)
+	if identity.FilesystemUUID == "" && identity.FilesystemType == "" && identity.PartitionUUID == "" {
+		return nil
+	}
 	return identity
 }
 
-func (ns *NodeServer) verifyRecoveredDeviceIdentity(session localDiskSession, devicePath string) (bool, string, *LocalDiskIdentity) {
-	if session.Identity == nil {
-		return true, "", nil
+func observedByIDPath(devicePath string) (string, bool) {
+	devicePath = strings.TrimSpace(devicePath)
+	if devicePath == "" {
+		return "", false
 	}
-	publishContext := map[string]string{
-		publishContextDeviceSerial:      session.DeviceSerial,
-		publishContextOpenNebulaImageID: session.OpenNebulaImageID,
-		"volumeName":                    session.VolumeName,
+	resolvedDevice, err := nodeEvalSymlinks(devicePath)
+	if err != nil {
+		resolvedDevice = devicePath
 	}
-	observed := ns.observeLocalDiskIdentity(devicePath, session.FSType, publishContext)
-	ok, reason := localDiskIdentityMatches(session.Identity, observed)
-	return ok, reason, observed
+	candidates, err := nodeByIDGlob(filepath.Join(defaultDiskPath, "disk", "by-id", "*"))
+	if err != nil {
+		return "", false
+	}
+	for _, candidate := range candidates {
+		resolvedCandidate, err := nodeEvalSymlinks(candidate)
+		if err != nil {
+			continue
+		}
+		if resolvedCandidate == resolvedDevice {
+			return candidate, true
+		}
+	}
+	return "", false
 }
 
-func localDiskIdentityMatches(expected, observed *LocalDiskIdentity) (bool, string) {
-	if expected == nil {
-		return true, ""
+func observedDeviceSerial(ns *NodeServer, devicePath string) string {
+	devicePath = strings.TrimSpace(devicePath)
+	if ns == nil || ns.mounter == nil || ns.mounter.Exec == nil || devicePath == "" {
+		return ""
 	}
-	if observed == nil {
-		return false, "observed identity missing"
-	}
-	if expected.FilesystemUUID != "" {
-		if observed.FilesystemUUID == "" {
-			return false, "filesystem UUID missing"
+	if output, err := ns.mounter.Exec.Command("lsblk", "--json", "-o", "PATH,SERIAL", devicePath).CombinedOutput(); err == nil {
+		var payload struct {
+			Blockdevices []struct {
+				Path   string `json:"path"`
+				Serial string `json:"serial"`
+			} `json:"blockdevices"`
 		}
-		if !strings.EqualFold(expected.FilesystemUUID, observed.FilesystemUUID) {
-			return false, fmt.Sprintf("filesystem UUID mismatch expected=%s observed=%s", expected.FilesystemUUID, observed.FilesystemUUID)
-		}
-	}
-	if expected.PartitionUUID != "" {
-		if observed.PartitionUUID == "" {
-			return false, "partition UUID missing"
-		}
-		if !strings.EqualFold(expected.PartitionUUID, observed.PartitionUUID) {
-			return false, fmt.Sprintf("partition UUID mismatch expected=%s observed=%s", expected.PartitionUUID, observed.PartitionUUID)
-		}
-	}
-	if expected.FilesystemType != "" && observed.FilesystemType != "" && !strings.EqualFold(expected.FilesystemType, observed.FilesystemType) {
-		return false, fmt.Sprintf("filesystem type mismatch expected=%s observed=%s", expected.FilesystemType, observed.FilesystemType)
-	}
-	if expected.DeviceSerial != "" {
-		if observed.DeviceSerial == "" {
-			return false, "device serial missing"
-		}
-		if !strings.EqualFold(expected.DeviceSerial, observed.DeviceSerial) {
-			return false, fmt.Sprintf("device serial mismatch expected=%s observed=%s", expected.DeviceSerial, observed.DeviceSerial)
+		if json.Unmarshal(output, &payload) == nil {
+			for _, device := range payload.Blockdevices {
+				if strings.TrimSpace(device.Path) == "" || strings.TrimSpace(device.Path) == devicePath {
+					if serial := strings.TrimSpace(device.Serial); serial != "" {
+						return serial
+					}
+				}
+			}
 		}
 	}
-	if expected.OpenNebulaImageID != "" {
-		if observed.OpenNebulaImageID == "" {
-			return false, "opennebula image ID missing"
-		}
-		if !strings.EqualFold(expected.OpenNebulaImageID, observed.OpenNebulaImageID) {
-			return false, fmt.Sprintf("opennebula image ID mismatch expected=%s observed=%s", expected.OpenNebulaImageID, observed.OpenNebulaImageID)
+	if output, err := ns.mounter.Exec.Command("udevadm", "info", "--query=property", "--name", devicePath).CombinedOutput(); err == nil {
+		for _, line := range strings.Split(string(output), "\n") {
+			if strings.HasPrefix(line, "ID_SERIAL=") || strings.HasPrefix(line, "ID_SERIAL_SHORT=") {
+				parts := strings.SplitN(line, "=", 2)
+				if len(parts) == 2 {
+					if serial := strings.TrimSpace(parts[1]); serial != "" {
+						return serial
+					}
+				}
+			}
 		}
 	}
-	if expected.FilesystemUUID == "" && expected.PartitionUUID == "" && expected.DeviceSerial == "" && expected.OpenNebulaImageID == "" {
-		return false, "expected identity is incomplete"
+	if output, err := ns.mounter.Exec.Command("lsblk", "-ndo", "SERIAL", devicePath).CombinedOutput(); err == nil {
+		return strings.TrimSpace(string(output))
 	}
-	return true, ""
+	return ""
+}
+
+func sameObservedByIDPath(expected, observed string) bool {
+	expected = strings.TrimSpace(expected)
+	observed = strings.TrimSpace(observed)
+	if expected == "" || observed == "" {
+		return false
+	}
+	return strings.EqualFold(filepath.Base(expected), filepath.Base(observed))
 }
 
 func (ns *NodeServer) recordLocalDiskRecoveryFailure(session localDiskSession, err error) error {

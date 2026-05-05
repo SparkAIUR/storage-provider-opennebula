@@ -835,6 +835,20 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		s.driver.metrics.RecordControllerPublishDuration("disk", "failed_precondition", time.Since(started))
 		return nil, repairErr
 	}
+	if quarantine, ok := s.activeVolumeQuarantine(req.VolumeId); ok {
+		message := volumeQuarantineMessage(quarantine)
+		s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonVolumeQuarantined, message)
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "failed_precondition", time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", "failed_precondition", time.Since(started))
+		return nil, status.Error(codes.FailedPrecondition, message)
+	}
+	if s.activeHostArtifactQuarantine(req.VolumeId) {
+		message := fmt.Sprintf("host artifact quarantine is active for volume %s", req.VolumeId)
+		s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonHostArtifactQuarantined, message)
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "failed_precondition", time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", "failed_precondition", time.Since(started))
+		return nil, status.Error(codes.FailedPrecondition, message)
+	}
 
 	if protection.Protected && protection.RequiredNode != "" && strings.TrimSpace(protection.RequiredNode) != strings.TrimSpace(req.NodeId) && !protection.OverrideUsed {
 		s.driver.metrics.RecordLocalRWOProtection(protection.Reason, "blocked")
@@ -854,7 +868,6 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonHotplugCooldown, message)
 		return nil, status.Error(codes.Unavailable, message)
 	}
-
 	priority := hotplugQueuePriorityNormal
 	if _, ok := s.driver.stickyAttachments.Get(req.VolumeId); ok {
 		priority = hotplugQueuePriorityCritical
@@ -867,6 +880,14 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
 		defer release()
 
+		if handled, freshResponse, freshErr := s.precheckPublishHotplug(queueCtx, req, volumeID, nodeID, &protection, lookup.AttachmentMetadata); handled {
+			if freshErr != nil {
+				return freshErr
+			}
+			response = freshResponse
+			return nil
+		}
+
 		if reused, reusedResponse, reuseErr := s.reuseStickyAttachment(queueCtx, req, volumeID, nodeID); reused {
 			if reuseErr != nil {
 				return reuseErr
@@ -875,22 +896,6 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			s.recordSuccessfulLocalVolumePublish(queueCtx, req.VolumeId, req.NodeId, reusedResponse.GetPublishContext()["volumeName"], req.GetVolumeContext(), &protection, lookup.AttachmentMetadata)
 			s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
 			response = reusedResponse
-			return nil
-		}
-
-		target, err = s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
-		if err == nil {
-			if s.driver.volumeQuarantine != nil {
-				_ = s.driver.volumeQuarantine.Clear(queueCtx, req.VolumeId)
-			}
-			s.clearRepairStateOnSuccess(queueCtx, req.VolumeId)
-			s.clearHostArtifactQuarantineForVolume(queueCtx, req.VolumeId)
-			s.clearStickyReuseState(queueCtx, req.VolumeId, req.NodeId, "disk")
-			s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
-			s.recordSuccessfulLocalVolumePublish(queueCtx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), &protection, lookup.AttachmentMetadata)
-			response = &csi.ControllerPublishVolumeResponse{
-				PublishContext: s.publishContextForVolume(queueCtx, req.VolumeId, target, 0, req.GetVolumeContext()),
-			}
 			return nil
 		}
 
@@ -1052,7 +1057,6 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		message := s.formatHotplugGuardMessage(cooldown)
 		return nil, status.Error(codes.Unavailable, message)
 	}
-
 	queueErr := s.withQueuedHotplug(ctx, req.NodeId, "detach", req.VolumeId, hotplugQueuePriorityNormal, func(queueCtx context.Context) error {
 		nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(req.NodeId))
 		defer nodeRelease()
@@ -1060,11 +1064,8 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
 		defer release()
 
-		_, err = s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
-		if err != nil {
-			klog.V(1).InfoS("Volume does not exist in node, skipping unpublish",
-				"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
-			return nil
+		if handled, _, freshErr := s.precheckUnpublishHotplug(queueCtx, req); handled {
+			return freshErr
 		}
 
 		runtimeCtx, stickyState, stickyEligible, stickyReason := s.shouldDelayDetach(queueCtx, req)
@@ -1750,7 +1751,7 @@ func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node
 		}
 	}
 
-	_, attachedErr := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
+	attachedTarget, attachedErr := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	attached := attachedErr == nil
 	switch strings.ToLower(strings.TrimSpace(operation)) {
 	case "attach":
@@ -1780,9 +1781,10 @@ func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node
 		}
 		if attached {
 			return HotplugQueueValidation{
-				Decision: HotplugQueueValidationCompleted,
-				Reason:   "already_attached",
-				Message:  fmt.Sprintf("volume %s is already attached to node %s", volume, node),
+				Decision:         HotplugQueueValidationCompleted,
+				Reason:           "already_attached",
+				Message:          fmt.Sprintf("volume %s is already attached to node %s", volume, node),
+				AttachmentTarget: strings.TrimSpace(attachedTarget),
 			}
 		}
 		if stale, reason := s.attachRequestStale(ctx, node, volume); stale {
@@ -1818,6 +1820,87 @@ func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node
 	}
 	_ = history
 	return HotplugQueueValidation{Decision: HotplugQueueValidationValid}
+}
+
+func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.ControllerPublishVolumeRequest, volumeID, nodeID int, protection *LocalRWOProtectionDecision, metadata *opennebula.VolumeAttachmentMetadata) (bool, *csi.ControllerPublishVolumeResponse, error) {
+	if s == nil || req == nil {
+		return false, nil, nil
+	}
+	validation := s.validateHotplugQueueRequest(ctx, req.NodeId, "attach", req.VolumeId)
+	switch validation.Decision {
+	case HotplugQueueValidationCompleted:
+		target := strings.TrimSpace(validation.AttachmentTarget)
+		if target == "" {
+			return false, nil, nil
+		}
+		if s.driver.volumeQuarantine != nil {
+			_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
+		}
+		s.clearRepairStateOnSuccess(ctx, req.VolumeId)
+		s.clearHostArtifactQuarantineForVolume(ctx, req.VolumeId)
+		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
+		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
+		if protection == nil {
+			protection = &LocalRWOProtectionDecision{}
+		}
+		s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), protection, metadata)
+		return true, &csi.ControllerPublishVolumeResponse{
+			PublishContext: s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext()),
+		}, nil
+	case HotplugQueueValidationPaused:
+		s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonHotplugCooldown, validation.Message)
+		return true, nil, status.Error(codes.Unavailable, validation.Message)
+	case HotplugQueueValidationStale:
+		switch validation.Reason {
+		case queueReasonVolumeParked, queueReasonDesiredStateChanged:
+			return false, nil, nil
+		}
+		code := codes.Aborted
+		eventReason := eventReasonHotplugQueueStale
+		switch validation.Reason {
+		case queueReasonRepairRequired, queueReasonVolumeQuarantined:
+			code = codes.FailedPrecondition
+			eventReason = eventReasonVolumeRepairRequired
+		}
+		s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReason, validation.Message)
+		return true, nil, status.Error(code, validation.Message)
+	default:
+		return false, nil, nil
+	}
+}
+
+func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (bool, *csi.ControllerUnpublishVolumeResponse, error) {
+	if s == nil || req == nil {
+		return false, nil, nil
+	}
+	validation := s.validateHotplugQueueRequest(ctx, req.NodeId, "detach", req.VolumeId)
+	switch validation.Decision {
+	case HotplugQueueValidationCompleted, HotplugQueueValidationStale:
+		s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
+		return true, &csi.ControllerUnpublishVolumeResponse{}, nil
+	case HotplugQueueValidationPaused:
+		if detachPauseCanReturnSuccess(validation.Reason) {
+			s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
+			return true, &csi.ControllerUnpublishVolumeResponse{}, nil
+		}
+		s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReasonHotplugCooldown, validation.Message)
+		return true, nil, status.Error(codes.Unavailable, validation.Message)
+	default:
+		return false, nil, nil
+	}
+}
+
+func detachPauseCanReturnSuccess(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case queueReasonSameNodeReuseRequired,
+		protectionReasonMaintenance,
+		protectionReasonAutomaticMaintenance,
+		protectionReasonLocalDevice,
+		protectionReasonHistory:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *ControllerServer) attachRequestStale(ctx context.Context, node, volume string) (bool, string) {

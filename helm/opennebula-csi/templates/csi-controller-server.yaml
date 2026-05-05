@@ -3,6 +3,11 @@
 {{- $controllerLeaderElection := (get $controller "leaderElection") | default dict -}}
 {{- $controllerLogLevel := (get $controller "logLevel") | default 3 -}}
 {{- $controllerSidecarLogLevel := (get $controller "sidecarLogLevel") | default 3 -}}
+{{- $controllerAttacher := (get $controller "attacher") | default dict -}}
+{{- $controllerAttacherWorkerThreads := (get $controllerAttacher "workerThreads") | default 10 -}}
+{{- $controllerAttacherRetryIntervalStart := (get $controllerAttacher "retryIntervalStartSeconds") | default 1 -}}
+{{- $controllerAttacherRetryIntervalMax := (get $controllerAttacher "retryIntervalMaxSeconds") | default 300 -}}
+{{- $controllerAttacherHTTPEnabled := (get $controllerAttacher "httpEndpointEnabled") | default true -}}
 {{- $lastNodePreference := (get .Values.driver "lastNodePreference") | default dict -}}
 {{- $lastNodePreferenceWebhook := (get $lastNodePreference "webhook") | default dict -}}
 {{- $lastNodePreferenceWebhookEnabled := and ((get $lastNodePreference "enabled") | default true) ((get $lastNodePreferenceWebhook "enabled") | default true) -}}
@@ -151,7 +156,7 @@ spec:
         - name: csi-attacher
           image: registry.k8s.io/sig-storage/csi-attacher:v4.9.0
           imagePullPolicy: IfNotPresent
-          {{- if .Values.metrics.enabled }}
+          {{- if $controllerAttacherHTTPEnabled }}
           ports:
             - containerPort: {{ .Values.metrics.ports.attacher }}
               name: att-metrics
@@ -163,8 +168,14 @@ spec:
             - "--csi-address=$(ADDRESS)"
             - "--timeout={{ .Values.controller.sidecarTimeoutSeconds }}s"
             - "--leader-election"
-            {{- if .Values.metrics.enabled }}
+            - "--worker-threads={{ $controllerAttacherWorkerThreads }}"
+            - "--retry-interval-start={{ $controllerAttacherRetryIntervalStart }}s"
+            - "--retry-interval-max={{ $controllerAttacherRetryIntervalMax }}s"
+            {{- if $controllerAttacherHTTPEnabled }}
             - "--http-endpoint=:{{ .Values.metrics.ports.attacher }}"
+            {{- end }}
+            {{- with (get $controllerAttacher "extraArgs") }}
+{{ toYaml . | nindent 12 }}
             {{- end }}
           env:
             - name: ADDRESS

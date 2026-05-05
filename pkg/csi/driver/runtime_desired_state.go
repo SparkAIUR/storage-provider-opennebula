@@ -3,8 +3,11 @@ package driver
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
+	"time"
 
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -20,18 +23,30 @@ type KubernetesNodeIdentity struct {
 }
 
 type VolumeDesiredState struct {
-	Desired         bool
-	NodeName        string
-	Reason          string
-	PVName          string
-	PVCNamespace    string
-	PVCName         string
-	PVDeleting      bool
-	PVPhase         corev1.PersistentVolumePhase
-	PVCDeleting     bool
-	MultipleNodes   bool
-	ReferencedNodes []string
+	Desired           bool
+	NodeName          string
+	Reason            string
+	DemandSource      string
+	PVName            string
+	PVCNamespace      string
+	PVCName           string
+	PVDeleting        bool
+	PVPhase           corev1.PersistentVolumePhase
+	PVCDeleting       bool
+	MultipleNodes     bool
+	ReferencedNodes   []string
+	AttachmentResidue bool
+	AttachmentNames   []string
+	AttachmentNodes   []string
 }
+
+const (
+	volumeDemandSourceActivePod                    = "active_pod"
+	volumeDemandSourceMultipleActivePods           = "multiple_active_pods"
+	volumeDemandSourceTransitionalVolumeAttachment = "transitional_volume_attachment"
+	volumeDemandSourceStaleVolumeAttachment        = "stale_volume_attachment"
+	volumeDemandSourceVolumeParked                 = "volume_parked"
+)
 
 func (r *KubeRuntime) NodeIdentity(ctx context.Context, nodeName string) (KubernetesNodeIdentity, error) {
 	if r == nil || !r.enabled {
@@ -141,7 +156,8 @@ func (r *KubeRuntime) DesiredNodeForVolume(ctx context.Context, volumeHandle str
 		for node := range nodes {
 			state.Desired = true
 			state.NodeName = node
-			state.Reason = "active_pod"
+			state.Reason = volumeDemandSourceActivePod
+			state.DemandSource = volumeDemandSourceActivePod
 			state.ReferencedNodes = []string{node}
 			return state, nil
 		}
@@ -149,10 +165,12 @@ func (r *KubeRuntime) DesiredNodeForVolume(ctx context.Context, volumeHandle str
 	if len(nodes) > 1 {
 		state.Desired = true
 		state.MultipleNodes = true
-		state.Reason = "multiple_active_pods"
+		state.Reason = volumeDemandSourceMultipleActivePods
+		state.DemandSource = volumeDemandSourceMultipleActivePods
 		for node := range nodes {
 			state.ReferencedNodes = append(state.ReferencedNodes, node)
 		}
+		sort.Strings(state.ReferencedNodes)
 		return state, nil
 	}
 
@@ -160,6 +178,10 @@ func (r *KubeRuntime) DesiredNodeForVolume(ctx context.Context, volumeHandle str
 	if err != nil {
 		return state, err
 	}
+	attachmentNames := []string{}
+	attachmentNodes := []string{}
+	transitionalNodes := map[string]struct{}{}
+	now := time.Now().UTC()
 	for idx := range vas.Items {
 		va := &vas.Items[idx]
 		if !matchesVolumeAttachment(runtimeCtx.PVName, va) {
@@ -168,14 +190,48 @@ func (r *KubeRuntime) DesiredNodeForVolume(ctx context.Context, volumeHandle str
 		if strings.TrimSpace(va.Spec.NodeName) == "" || !va.DeletionTimestamp.IsZero() {
 			continue
 		}
+		state.AttachmentResidue = true
+		attachmentNames = append(attachmentNames, strings.TrimSpace(va.Name))
+		attachmentNodes = append(attachmentNodes, strings.TrimSpace(va.Spec.NodeName))
+		if volumeAttachmentIsTransitional(va, now, r.staleVolumeAttachmentGrace()) {
+			transitionalNodes[strings.TrimSpace(va.Spec.NodeName)] = struct{}{}
+		}
+	}
+	if len(attachmentNames) > 0 {
+		sort.Strings(attachmentNames)
+		sort.Strings(attachmentNodes)
+		state.AttachmentNames = attachmentNames
+		state.AttachmentNodes = attachmentNodes
+	}
+	if len(transitionalNodes) == 1 {
+		for node := range transitionalNodes {
+			state.Desired = true
+			state.NodeName = node
+			state.Reason = volumeDemandSourceTransitionalVolumeAttachment
+			state.DemandSource = volumeDemandSourceTransitionalVolumeAttachment
+			state.ReferencedNodes = []string{node}
+			return state, nil
+		}
+	}
+	if len(transitionalNodes) > 1 {
 		state.Desired = true
-		state.NodeName = strings.TrimSpace(va.Spec.NodeName)
-		state.Reason = "volume_attachment"
-		state.ReferencedNodes = []string{state.NodeName}
+		state.MultipleNodes = true
+		state.Reason = volumeDemandSourceTransitionalVolumeAttachment
+		state.DemandSource = volumeDemandSourceTransitionalVolumeAttachment
+		for node := range transitionalNodes {
+			state.ReferencedNodes = append(state.ReferencedNodes, node)
+		}
+		sort.Strings(state.ReferencedNodes)
+		return state, nil
+	}
+	if state.AttachmentResidue {
+		state.Reason = volumeDemandSourceVolumeParked
+		state.DemandSource = volumeDemandSourceStaleVolumeAttachment
 		return state, nil
 	}
 
-	state.Reason = "volume_parked"
+	state.Reason = volumeDemandSourceVolumeParked
+	state.DemandSource = volumeDemandSourceVolumeParked
 	return state, nil
 }
 
@@ -184,4 +240,33 @@ func matchesVolumeAttachment(pvName string, va *storagev1.VolumeAttachment) bool
 		return false
 	}
 	return strings.TrimSpace(*va.Spec.Source.PersistentVolumeName) == strings.TrimSpace(pvName)
+}
+
+func (s VolumeDesiredState) DemandSourceOrReason() string {
+	if strings.TrimSpace(s.DemandSource) != "" {
+		return strings.TrimSpace(s.DemandSource)
+	}
+	return strings.TrimSpace(s.Reason)
+}
+
+func loadStaleVolumeAttachmentGrace(cfg config.CSIPluginConfig) time.Duration {
+	seconds, ok := cfg.GetInt(config.StuckAttachmentStaleVAGraceSecondsVar)
+	if !ok || seconds <= 0 {
+		seconds = 90
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func volumeAttachmentIsTransitional(va *storagev1.VolumeAttachment, now time.Time, grace time.Duration) bool {
+	if va == nil {
+		return false
+	}
+	if grace <= 0 {
+		grace = 90 * time.Second
+	}
+	createdAt := va.CreationTimestamp.Time.UTC()
+	if createdAt.IsZero() {
+		return false
+	}
+	return now.Sub(createdAt) < grace
 }

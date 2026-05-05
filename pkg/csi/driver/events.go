@@ -48,6 +48,7 @@ const (
 	eventReasonLocalDeviceMissingReported   = "LocalDeviceMissingReported"
 	eventReasonLocalDeviceMountFailed       = "LocalDeviceMountFailed"
 	eventReasonLocalDeviceRecoveryAttempted = "LocalDeviceRecoveryAttempted"
+	eventReasonLocalDeviceRecoveryPending   = "LocalDeviceRecoveryPendingConfirmation"
 	eventReasonLocalDeviceRecoverySucceeded = "LocalDeviceRecoverySucceeded"
 	eventReasonLocalDeviceRecoveryFailed    = "LocalDeviceRecoveryFailed"
 	eventReasonLocalDeviceRecoverySkipped   = "LocalDeviceRecoverySkipped"

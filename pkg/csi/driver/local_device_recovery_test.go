@@ -28,7 +28,7 @@ func newLocalDeviceRecoveryTestDriver(t *testing.T, objects ...runtime.Object) *
 	cfg.OverrideVal(config.LocalDeviceRecoveryMaxAttemptsVar, 2)
 	cfg.OverrideVal(config.HotplugQueueEnabledVar, false)
 	runtime := &KubeRuntime{client: fake.NewSimpleClientset(objects...), enabled: true}
-	return &Driver{
+	driver := &Driver{
 		name:           DefaultDriverName,
 		PluginConfig:   cfg,
 		kubeRuntime:    runtime,
@@ -36,6 +36,9 @@ func newLocalDeviceRecoveryTestDriver(t *testing.T, objects ...runtime.Object) *
 		operationLocks: NewOperationLocks(),
 		hotplugGuard:   NewHotplugGuard(5 * time.Minute),
 	}
+	driver.volumeHistory = NewVolumeHistoryManager(runtime, namespaceFromServiceAccount())
+	driver.volumeRepairState = NewVolumeRepairStateManager(runtime, namespaceFromServiceAccount())
+	return driver
 }
 
 func TestNodeRecordsAndClearsLocalDeviceMissingReport(t *testing.T) {
@@ -64,7 +67,8 @@ func TestNodeRecordsAndClearsLocalDeviceMissingReport(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(raw), &report))
 	assert.Equal(t, "node-a", report.Node)
 	assert.Equal(t, "vol-1", report.VolumeID)
-	assert.Equal(t, localDeviceFailureClassMissingDevice, report.FailureClass)
+	assert.Equal(t, localDeviceFailureClassRuntimeAttachmentMissing, report.FailureClass)
+	assert.Equal(t, "/dev/sdd", report.ExpectedTarget)
 	assert.Equal(t, "onecsi-439", report.DeviceSerial)
 	assert.Equal(t, 2, report.Attempts)
 
@@ -119,7 +123,7 @@ func TestNodeRecordsLocalDeviceMountFailureReport(t *testing.T) {
 	assert.Equal(t, 1, report.Attempts)
 }
 
-func TestLocalDeviceRecoveryReattachesSameNodeAndClearsReport(t *testing.T) {
+func TestLocalDeviceRecoveryReattachesSameNodeAndMarksPendingRuntimeConfirmation(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-device", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 	pvc.Spec.VolumeName = pv.Name
 	pvName := pv.Name
@@ -127,6 +131,7 @@ func TestLocalDeviceRecoveryReattachesSameNodeAndClearsReport(t *testing.T) {
 		Node:              "node-a",
 		VolumeID:          "vol-device",
 		VolumeName:        "/dev/sdd",
+		ExpectedTarget:    "/dev/sdd",
 		PVCNamespace:      "default",
 		PVCName:           pvc.Name,
 		PVName:            pv.Name,
@@ -144,7 +149,10 @@ func TestLocalDeviceRecoveryReattachesSameNodeAndClearsReport(t *testing.T) {
 		Data:       map[string]string{key: string(payload)},
 	}
 	va := &storagev1.VolumeAttachment{
-		ObjectMeta: metav1.ObjectMeta{Name: "va-device"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "va-device",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-30 * time.Second)),
+		},
 		Spec: storagev1.VolumeAttachmentSpec{
 			Attacher: DefaultDriverName,
 			NodeName: "node-a",
@@ -166,7 +174,16 @@ func TestLocalDeviceRecoveryReattachesSameNodeAndClearsReport(t *testing.T) {
 	require.NoError(t, server.recoverLocalDeviceReport(context.Background(), key, report))
 	updated, err := driver.kubeRuntime.client.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(context.Background(), localDeviceStateConfigMapName, metav1.GetOptions{})
 	require.NoError(t, err)
-	assert.NotContains(t, updated.Data, key)
+	raw := updated.Data[key]
+	require.NotEmpty(t, raw)
+	require.NoError(t, json.Unmarshal([]byte(raw), &report))
+	assert.Equal(t, localDeviceConfirmationStatePending, report.ConfirmationState)
+	assert.Equal(t, localDeviceRecoveryMethodSameNodeDetachAttachFallback, report.RecoveryMethod)
+	assert.Equal(t, localDeviceAttachmentStateRuntimeUnconfirmed, report.AttachmentState)
+	assert.True(t, report.MetadataAttachedToNode)
+	assert.Equal(t, "sdd", report.MetadataTarget)
+	assert.Equal(t, 1, report.RecoveryAttempts)
+	require.NotNil(t, report.ConfirmationDeadline)
 	mockProvider.AssertExpectations(t)
 }
 

@@ -20,6 +20,7 @@ const (
 	repairClassificationHistoricalNodeTombstone    = "historical_node_tombstone"
 	repairClassificationProviderLookupInconsistent = "provider_lookup_inconsistent"
 	repairClassificationWrongDeviceIdentity        = "wrong_device_identity"
+	repairClassificationRuntimeAttachUnconfirmed   = "same_node_runtime_attach_unconfirmed"
 
 	queueReasonDesiredStateChanged   = "desired_state_changed"
 	queueReasonVolumeParked          = "volume_parked"
@@ -28,16 +29,30 @@ const (
 	queueReasonVolumeQuarantined     = "volume_quarantined"
 	queueReasonRepairRequired        = "repair_required"
 
-	protectionReasonMaintenance = "maintenance_cross_node_blocked"
-	protectionReasonSticky      = "same_node_reuse_required"
-	protectionReasonLocalDevice = "local_device_recovery_active"
-	protectionReasonHistory     = "historical_ownership_active"
+	protectionReasonMaintenance          = "maintenance_cross_node_blocked"
+	protectionReasonAutomaticMaintenance = "automatic_maintenance_cross_node_blocked"
+	protectionReasonSticky               = "same_node_reuse_required"
+	protectionReasonLocalDevice          = "local_device_recovery_active"
+	protectionReasonHistory              = "historical_ownership_active"
+
+	protectionSourceExplicitMaintenance  = "explicit_maintenance"
+	protectionSourceAutomaticMaintenance = "automatic_maintenance"
+	protectionSourceStickyReuse          = "sticky_reuse"
+	protectionSourceLocalDeviceRecovery  = "local_device_recovery"
+	protectionSourceHistoricalOwnership  = "historical_ownership"
+
+	protectionTriggerDrainInProgress            = "drain_in_progress"
+	protectionTriggerNodeUnschedulable          = "node_unschedulable"
+	protectionTriggerNodeNotReady               = "node_not_ready"
+	protectionTriggerControllerInferredSameNode = "controller_inferred_same_node_protection"
 )
 
 type LocalRWOProtectionDecision struct {
 	Protected         bool
 	RequiredNode      string
 	Reason            string
+	Source            string
+	AutomaticTrigger  string
 	Message           string
 	RuntimeContext    *VolumeRuntimeContext
 	History           VolumeHistoryRecord
@@ -81,42 +96,54 @@ func (s *ControllerServer) localRWOProtectionDecision(ctx context.Context, volum
 
 	requiredNode := ""
 	reason := ""
+	source := ""
+	automaticTrigger := ""
 	if state, ok := s.activeStickyAttachment(volumeID); ok && strings.TrimSpace(state.NodeID) != "" {
 		requiredNode = strings.TrimSpace(state.NodeID)
 		reason = protectionReasonSticky
+		source = protectionSourceStickyReuse
 		if state.Reason == maintenanceStickyReason {
 			reason = protectionReasonMaintenance
+			source = protectionSourceExplicitMaintenance
 		}
 	}
 	if requiredNode == "" {
 		if report, ok := s.latestLocalDeviceReport(ctx, volumeID); ok && strings.TrimSpace(report.Node) != "" {
 			requiredNode = strings.TrimSpace(report.Node)
 			reason = protectionReasonLocalDevice
+			source = protectionSourceLocalDeviceRecovery
 		}
 	}
 	if requiredNode == "" && s.driver.maintenanceMode != nil && s.driver.maintenanceMode.Active() {
 		requiredNode = maintenanceLastNodeForVolume(s.driver, runtimeCtx, volumeID)
 		if requiredNode != "" {
 			reason = protectionReasonMaintenance
+			source = protectionSourceExplicitMaintenance
 		}
 	}
 	if requiredNode == "" && historyRequiresSafeRelease(history) {
 		requiredNode = strings.TrimSpace(history.LastSuccessfulNodeName)
 		reason = protectionReasonHistory
+		source = protectionSourceHistoricalOwnership
 	}
 	if requiredNode == "" {
 		return decision, nil
 	}
 	if s.driver.featureGates.LocalRWOAutoProtection && reason == protectionReasonHistory && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
-		identity, err := s.driver.kubeRuntime.NodeIdentity(ctx, requiredNode)
-		if err == nil && identity.Exists && (identity.Unschedulable || !identity.Ready) {
-			reason = protectionReasonMaintenance
+		if trigger, ok, err := s.driver.kubeRuntime.AutomaticMaintenanceTrigger(ctx, requiredNode); err == nil && ok {
+			reason = protectionReasonAutomaticMaintenance
+			source = protectionSourceAutomaticMaintenance
+			automaticTrigger = trigger
+		} else if err != nil {
+			automaticTrigger = protectionTriggerControllerInferredSameNode
 		}
 	}
 
 	decision.Protected = true
 	decision.RequiredNode = requiredNode
 	decision.Reason = reason
+	decision.Source = source
+	decision.AutomaticTrigger = automaticTrigger
 	if strings.TrimSpace(requestedNode) == "" || strings.TrimSpace(requestedNode) == requiredNode {
 		return decision, nil
 	}
@@ -126,8 +153,29 @@ func (s *ControllerServer) localRWOProtectionDecision(ctx context.Context, volum
 		decision.Message = fmt.Sprintf("allowing protected cross-node attach for local RWO volume %s from %s to %s until %s because override annotation %s is active", volumeID, requiredNode, requestedNode, deadline.Format(time.RFC3339), annotationAllowCrossNodeUntil)
 		return decision, nil
 	}
-	decision.Message = fmt.Sprintf("local RWO protection is active for volume %s: refusing cross-node attach to %s while protected node is %s (%s)", volumeID, requestedNode, requiredNode, reason)
+	decision.Message = localRWOProtectionMessage(volumeID, requestedNode, requiredNode, decision)
 	return decision, nil
+}
+
+func localRWOProtectionMessage(volumeID, requestedNode, requiredNode string, decision LocalRWOProtectionDecision) string {
+	if strings.TrimSpace(decision.Source) == protectionSourceAutomaticMaintenance {
+		return fmt.Sprintf(
+			"automatic local RWO protection is active for volume %s: refusing cross-node attach to %s while protected node is %s (%s trigger=%s)",
+			volumeID,
+			requestedNode,
+			requiredNode,
+			firstNonEmpty(decision.Reason, protectionReasonAutomaticMaintenance),
+			firstNonEmpty(decision.AutomaticTrigger, protectionTriggerControllerInferredSameNode),
+		)
+	}
+	return fmt.Sprintf(
+		"local RWO protection is active for volume %s: refusing cross-node attach to %s while protected node is %s (%s source=%s)",
+		volumeID,
+		requestedNode,
+		requiredNode,
+		firstNonEmpty(decision.Reason, protectionReasonHistory),
+		firstNonEmpty(decision.Source, protectionSourceHistoricalOwnership),
+	)
 }
 
 func crossNodeOverrideDeadline(runtimeCtx *VolumeRuntimeContext) (time.Time, bool) {
@@ -310,16 +358,16 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 		state.LastSuccessfulStageTime = time.Now().UTC()
 		if identity != nil {
 			state.LastHealthyIdentity = identity
-			if identity.OpenNebulaImageID != "" && state.LastSuccessfulImageID == 0 {
-				if parsed, err := strconv.Atoi(identity.OpenNebulaImageID); err == nil {
+			if imageID := localDiskAssertedImageID(identity); imageID != "" && state.LastSuccessfulImageID == 0 {
+				if parsed, err := strconv.Atoi(imageID); err == nil {
 					state.LastSuccessfulImageID = parsed
 				}
 			}
-			if identity.DeviceSerial != "" {
-				state.LastSuccessfulDeviceSerial = identity.DeviceSerial
+			if serial := firstNonEmpty(localDiskObservedDeviceSerial(identity), localDiskAssertedDeviceSerial(identity)); serial != "" {
+				state.LastSuccessfulDeviceSerial = serial
 			}
-			if identity.DiskTarget != "" {
-				state.LastSuccessfulTarget = identity.DiskTarget
+			if target := localDiskAssertedDiskTarget(identity); target != "" {
+				state.LastSuccessfulTarget = target
 			}
 		}
 	})
@@ -343,9 +391,9 @@ func (ns *NodeServer) recordWrongDeviceIdentityRepairState(ctx context.Context, 
 		Message:               wrongDeviceIdentityMessage(session.VolumeID, expected, observed),
 		RequestedNode:         strings.TrimSpace(ns.Driver.nodeID),
 		LastKnownNodeName:     strings.TrimSpace(ns.Driver.nodeID),
-		LastKnownImageID:      parseIntOrZero(expected.OpenNebulaImageID),
-		LastKnownTarget:       expected.DiskTarget,
-		LastKnownDeviceSerial: expected.DeviceSerial,
+		LastKnownImageID:      parseIntOrZero(localDiskAssertedImageID(expected)),
+		LastKnownTarget:       localDiskAssertedDiskTarget(expected),
+		LastKnownDeviceSerial: firstNonEmpty(localDiskObservedDeviceSerial(expected), localDiskAssertedDeviceSerial(expected)),
 		EvidenceSource:        "node_stage_identity_check",
 		LastHealthyIdentity:   expected,
 		LastObservedIdentity:  observed,
@@ -357,18 +405,22 @@ func (ns *NodeServer) recordWrongDeviceIdentityRepairState(ctx context.Context, 
 
 func wrongDeviceIdentityMessage(volumeID string, expected, observed *LocalDiskIdentity) string {
 	return fmt.Sprintf(
-		"wrong device identity for local RWO volume %s: expected serial=%s fsUUID=%s partUUID=%s imageID=%s target=%s, observed serial=%s fsUUID=%s partUUID=%s imageID=%s target=%s",
+		"wrong device identity for local RWO volume %s: expected asserted(serial=%s imageID=%s target=%s) observed(serial=%s byID=%s fsUUID=%s partUUID=%s); observed asserted(serial=%s imageID=%s target=%s) observed(serial=%s byID=%s fsUUID=%s partUUID=%s)",
 		volumeID,
-		identityField(expected, func(v *LocalDiskIdentity) string { return v.DeviceSerial }),
-		identityField(expected, func(v *LocalDiskIdentity) string { return v.FilesystemUUID }),
-		identityField(expected, func(v *LocalDiskIdentity) string { return v.PartitionUUID }),
-		identityField(expected, func(v *LocalDiskIdentity) string { return v.OpenNebulaImageID }),
-		identityField(expected, func(v *LocalDiskIdentity) string { return v.DiskTarget }),
-		identityField(observed, func(v *LocalDiskIdentity) string { return v.DeviceSerial }),
-		identityField(observed, func(v *LocalDiskIdentity) string { return v.FilesystemUUID }),
-		identityField(observed, func(v *LocalDiskIdentity) string { return v.PartitionUUID }),
-		identityField(observed, func(v *LocalDiskIdentity) string { return v.OpenNebulaImageID }),
-		identityField(observed, func(v *LocalDiskIdentity) string { return v.DiskTarget }),
+		identityField(expected, localDiskAssertedDeviceSerial),
+		identityField(expected, localDiskAssertedImageID),
+		identityField(expected, localDiskAssertedDiskTarget),
+		identityField(expected, localDiskObservedDeviceSerial),
+		identityField(expected, localDiskObservedByIDPath),
+		identityField(expected, localDiskObservedFilesystemUUID),
+		identityField(expected, localDiskObservedPartitionUUID),
+		identityField(observed, localDiskAssertedDeviceSerial),
+		identityField(observed, localDiskAssertedImageID),
+		identityField(observed, localDiskAssertedDiskTarget),
+		identityField(observed, localDiskObservedDeviceSerial),
+		identityField(observed, localDiskObservedByIDPath),
+		identityField(observed, localDiskObservedFilesystemUUID),
+		identityField(observed, localDiskObservedPartitionUUID),
 	)
 }
 

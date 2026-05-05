@@ -103,9 +103,10 @@ const (
 )
 
 type HotplugQueueValidation struct {
-	Decision HotplugQueueValidationDecision
-	Reason   string
-	Message  string
+	Decision         HotplugQueueValidationDecision
+	Reason           string
+	Message          string
+	AttachmentTarget string
 }
 
 type HotplugQueueValidator func(ctx context.Context, node, operation, volume string) HotplugQueueValidation

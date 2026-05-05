@@ -1765,8 +1765,8 @@ func TestControllerPublishVolumeRejectsOpenNebulaMetadataDriftAndQuarantines(t *
 	driver.PluginConfig.OverrideVal(config.MetadataDriftQuarantineTTLSecondsVar, 1800)
 
 	provider := new(MockOpenNebulaVolumeProviderTestify)
-	provider.On("VolumeExists", mock.Anything, "vol-drift").Return(488, volumeSize, nil).Twice()
-	provider.On("NodeExists", mock.Anything, "node-new").Return(181, nil).Twice()
+	provider.On("VolumeExists", mock.Anything, "vol-drift").Return(488, volumeSize, nil)
+	provider.On("NodeExists", mock.Anything, "node-new").Return(181, nil)
 	provider.On("GetVolumeInNode", mock.Anything, 488, 181).Return("", errors.New("not attached")).Times(4)
 	provider.On("InspectVolumeAttachment", mock.Anything, "vol-drift", "node-new").Return(&opennebula.VolumeAttachmentMetadata{
 		VolumeHandle:    "vol-drift",
@@ -1832,8 +1832,8 @@ func TestControllerPublishVolumeClassifiesHostArtifactConflictAndQuarantines(t *
 	}
 
 	provider := new(MockOpenNebulaVolumeProviderTestify)
-	provider.On("VolumeExists", mock.Anything, "vol-host-artifact").Return(233, volumeSize, nil).Once()
-	provider.On("NodeExists", mock.Anything, "node-161").Return(161, nil).Once()
+	provider.On("VolumeExists", mock.Anything, "vol-host-artifact").Return(233, volumeSize, nil)
+	provider.On("NodeExists", mock.Anything, "node-161").Return(161, nil)
 	provider.On("GetVolumeInNode", mock.Anything, 233, 161).Return("", errors.New("not attached")).Twice()
 	provider.On("AttachVolume", mock.Anything, "vol-host-artifact", "node-161", false, mock.Anything).Return(conflict).Once()
 
@@ -1874,23 +1874,15 @@ func TestControllerPublishVolumeBlocksActiveHostArtifactQuarantine(t *testing.T)
 	require.True(t, active)
 
 	provider := new(MockOpenNebulaVolumeProviderTestify)
-	provider.On("VolumeExists", mock.Anything, "vol-host-artifact-active").Return(233, volumeSize, nil).Once()
-	provider.On("NodeExists", mock.Anything, "node-161").Return(161, nil).Once()
-	provider.On("GetVolumeInNode", mock.Anything, 233, 161).Return("", errors.New("not attached")).Twice()
-	provider.On("InspectHostArtifactAttachmentTarget", mock.Anything, "vol-host-artifact-active", "node-161", mock.Anything).Return(&opennebula.HostArtifactAttachmentTarget{
-		VolumeHandle: "vol-host-artifact-active",
-		ImageID:      233,
-		NodeName:     "node-161",
-		VMID:         161,
-		DiskID:       2,
-		LVName:       "lv-one-161-2",
-	}, nil).Once()
+	provider.On("VolumeExists", mock.Anything, "vol-host-artifact-active").Return(233, volumeSize, nil)
+	provider.On("NodeExists", mock.Anything, "node-161").Return(161, nil)
+	provider.On("GetVolumeInNode", mock.Anything, 233, 161).Return("", errors.New("not attached")).Once()
 
 	cs := NewControllerServer(driver, provider, &MockSharedFilesystemProviderTestify{})
 	_, err = cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-host-artifact-active", "node-161"))
 	require.Error(t, err)
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
-	assert.Contains(t, err.Error(), "host artifact quarantine active")
+	assert.Contains(t, err.Error(), "host artifact quarantine is active")
 	provider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	provider.AssertExpectations(t)
 }
@@ -1902,8 +1894,8 @@ func TestControllerUnpublishVolumeClassifiesDetachMetadataDrift(t *testing.T) {
 	driver.PluginConfig.OverrideVal(config.MetadataDriftQuarantineFailureThresholdVar, 1)
 
 	provider := new(MockOpenNebulaVolumeProviderTestify)
-	provider.On("VolumeExists", mock.Anything, "vol-detach-drift").Return(489, volumeSize, nil).Once()
-	provider.On("NodeExists", mock.Anything, "node-old").Return(160, nil).Once()
+	provider.On("VolumeExists", mock.Anything, "vol-detach-drift").Return(489, volumeSize, nil)
+	provider.On("NodeExists", mock.Anything, "node-old").Return(160, nil)
 	provider.On("GetVolumeInNode", mock.Anything, 489, 160).Return("sdd", nil).Twice()
 	provider.On("DetachVolume", mock.Anything, "vol-detach-drift", "node-old").Return(errors.New("DETACHDISK: Could not detach sdd")).Once()
 	provider.On("InspectVolumeAttachment", mock.Anything, "vol-detach-drift", "node-old").Return(&opennebula.VolumeAttachmentMetadata{
@@ -2250,8 +2242,8 @@ func TestControllerUnpublishVolumePausesHotplugAfterUnhealthyNodeFailures(t *tes
 		Cause:                errors.New("wrong state HOTPLUG"),
 	}
 	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
-	mockProvider.On("VolumeExists", mock.Anything, "vol-pause").Return(1, 1, nil).Times(3)
-	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil).Times(3)
+	mockProvider.On("VolumeExists", mock.Anything, "vol-pause").Return(1, 1, nil)
+	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdb", nil).Times(5)
 	mockProvider.On("NodeReady", mock.Anything, "node-1").Return(false, nil).Times(3)
 	mockProvider.On("DetachVolume", mock.Anything, "vol-pause", "node-1").Return(timeoutErr).Twice()

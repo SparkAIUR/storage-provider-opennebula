@@ -20,36 +20,68 @@ import (
 const localDeviceStateConfigMapName = "opennebula-csi-node-device-state"
 
 const (
-	localDeviceFailureClassMissingDevice = "device_missing"
-	localDeviceFailureClassMountFailed   = "mount_failed"
-	localDeviceFailureClassWrongIdentity = "wrong_device_identity"
+	localDeviceFailureClassMissingDevice            = "device_missing"
+	localDeviceFailureClassRuntimeAttachmentMissing = "runtime_attachment_missing"
+	localDeviceFailureClassMountFailed              = "mount_failed"
+	localDeviceFailureClassWrongIdentity            = "wrong_device_identity"
+
+	localDeviceConfirmationStatePending        = "pending_runtime_confirmation"
+	localDeviceConfirmationStateConfirmed      = "confirmed_by_node"
+	localDeviceConfirmationStateTimedOut       = "timed_out_waiting_for_node_confirmation"
+	localDeviceConfirmationStateRepairRequired = "repair_required_runtime_attach_unconfirmed"
+
+	localDeviceRecoveryMethodRuntimeRepublish             = "runtime_republish"
+	localDeviceRecoveryMethodSameNodeDetachAttachFallback = "same_node_detach_attach_fallback"
+	localDeviceAttachmentStateMetadataAttached            = "metadata_attached"
+	localDeviceAttachmentStateMetadataDetached            = "metadata_detached"
+	localDeviceAttachmentStateRuntimeConfirmedByNode      = "runtime_confirmed_by_node"
+	localDeviceAttachmentStateRuntimeUnconfirmed          = "runtime_unconfirmed"
 )
 
 type LocalDeviceMissingReport struct {
-	Node                  string             `json:"node"`
-	VolumeID              string             `json:"volumeID"`
-	VolumeName            string             `json:"volumeName,omitempty"`
-	FailureClass          string             `json:"failureClass,omitempty"`
-	DevicePath            string             `json:"devicePath,omitempty"`
-	DeviceSerial          string             `json:"deviceSerial,omitempty"`
-	OpenNebulaImageID     string             `json:"openNebulaImageID,omitempty"`
-	FsType                string             `json:"fsType,omitempty"`
-	ResolvedBy            string             `json:"resolvedBy,omitempty"`
-	ExpectedIdentity      *LocalDiskIdentity `json:"expectedIdentity,omitempty"`
-	ObservedIdentity      *LocalDiskIdentity `json:"observedIdentity,omitempty"`
-	PVCNamespace          string             `json:"pvcNamespace,omitempty"`
-	PVCName               string             `json:"pvcName,omitempty"`
-	PVName                string             `json:"pvName,omitempty"`
-	StagingTargetPath     string             `json:"stagingTargetPath,omitempty"`
-	FirstObservedAt       time.Time          `json:"firstObservedAt"`
-	LastObservedAt        time.Time          `json:"lastObservedAt"`
-	Attempts              int                `json:"attempts"`
-	LastError             string             `json:"lastError,omitempty"`
-	RecoveryAttempts      int                `json:"recoveryAttempts,omitempty"`
-	LastRecoveryAt        *time.Time         `json:"lastRecoveryAt,omitempty"`
-	LastRecoveryError     string             `json:"lastRecoveryError,omitempty"`
-	LastRecoveryOutcome   string             `json:"lastRecoveryOutcome,omitempty"`
-	LastRecoverySignature string             `json:"lastRecoverySignature,omitempty"`
+	Node                   string             `json:"node"`
+	VolumeID               string             `json:"volumeID"`
+	VolumeName             string             `json:"volumeName,omitempty"`
+	FailureClass           string             `json:"failureClass,omitempty"`
+	ExpectedTarget         string             `json:"expectedTarget,omitempty"`
+	DevicePath             string             `json:"devicePath,omitempty"`
+	DeviceSerial           string             `json:"deviceSerial,omitempty"`
+	OpenNebulaImageID      string             `json:"openNebulaImageID,omitempty"`
+	FsType                 string             `json:"fsType,omitempty"`
+	ResolvedBy             string             `json:"resolvedBy,omitempty"`
+	ExpectedIdentity       *LocalDiskIdentity `json:"expectedIdentity,omitempty"`
+	ObservedIdentity       *LocalDiskIdentity `json:"observedIdentity,omitempty"`
+	PVCNamespace           string             `json:"pvcNamespace,omitempty"`
+	PVCName                string             `json:"pvcName,omitempty"`
+	PVName                 string             `json:"pvName,omitempty"`
+	StagingTargetPath      string             `json:"stagingTargetPath,omitempty"`
+	FirstObservedAt        time.Time          `json:"firstObservedAt"`
+	LastObservedAt         time.Time          `json:"lastObservedAt"`
+	Attempts               int                `json:"attempts"`
+	LastError              string             `json:"lastError,omitempty"`
+	RecoveryAttempts       int                `json:"recoveryAttempts,omitempty"`
+	LastRecoveryAt         *time.Time         `json:"lastRecoveryAt,omitempty"`
+	RecoveryMethod         string             `json:"recoveryMethod,omitempty"`
+	RecoveryToken          string             `json:"recoveryToken,omitempty"`
+	LastRecoveryError      string             `json:"lastRecoveryError,omitempty"`
+	LastRecoveryOutcome    string             `json:"lastRecoveryOutcome,omitempty"`
+	LastRecoverySignature  string             `json:"lastRecoverySignature,omitempty"`
+	ConfirmationState      string             `json:"confirmationState,omitempty"`
+	ConfirmationDeadline   *time.Time         `json:"confirmationDeadline,omitempty"`
+	ConfirmationObservedAt *time.Time         `json:"confirmationObservedAt,omitempty"`
+	AttachmentState        string             `json:"attachmentState,omitempty"`
+	MetadataAttachedToNode bool               `json:"metadataAttachedToNode,omitempty"`
+	MetadataNode           string             `json:"metadataNode,omitempty"`
+	MetadataTarget         string             `json:"metadataTarget,omitempty"`
+}
+
+type localDeviceRecoveryAttempt struct {
+	Method           string
+	ExpectedTarget   string
+	AttachmentState  string
+	MetadataAttached bool
+	MetadataNode     string
+	MetadataTarget   string
 }
 
 type localDeviceReportIdentity struct {
@@ -86,7 +118,8 @@ func (ns *NodeServer) recordLocalDeviceMissing(ctx context.Context, volumeID, vo
 		report.Node = node
 		report.VolumeID = volumeID
 		report.VolumeName = strings.TrimSpace(volumeName)
-		report.FailureClass = localDeviceFailureClassMissingDevice
+		report.FailureClass = localDeviceFailureClassRuntimeAttachmentMissing
+		report.ExpectedTarget = strings.TrimSpace(volumeName)
 		report.DevicePath = ""
 		report.DeviceSerial = strings.TrimSpace(publishContext[publishContextDeviceSerial])
 		report.OpenNebulaImageID = strings.TrimSpace(publishContext[publishContextOpenNebulaImageID])
@@ -99,6 +132,9 @@ func (ns *NodeServer) recordLocalDeviceMissing(ctx context.Context, volumeID, vo
 		report.LastObservedAt = now
 		report.Attempts++
 		attempts = report.Attempts
+		if report.ConfirmationState == "" {
+			report.AttachmentState = localDeviceAttachmentStateRuntimeUnconfirmed
+		}
 		if cause != nil {
 			report.LastError = cause.Error()
 		}
@@ -150,6 +186,7 @@ func (ns *NodeServer) recordLocalDeviceMountFailure(ctx context.Context, volumeI
 		report.VolumeID = volumeID
 		report.VolumeName = strings.TrimSpace(volumeName)
 		report.FailureClass = localDeviceFailureClassMountFailed
+		report.ExpectedTarget = strings.TrimSpace(volumeName)
 		report.DevicePath = strings.TrimSpace(devicePath)
 		report.DeviceSerial = strings.TrimSpace(publishContext[publishContextDeviceSerial])
 		report.OpenNebulaImageID = strings.TrimSpace(publishContext[publishContextOpenNebulaImageID])
@@ -162,6 +199,10 @@ func (ns *NodeServer) recordLocalDeviceMountFailure(ctx context.Context, volumeI
 		report.LastObservedAt = now
 		report.Attempts++
 		attempts = report.Attempts
+		report.AttachmentState = localDeviceAttachmentStateRuntimeConfirmedByNode
+		report.ConfirmationState = ""
+		report.ConfirmationDeadline = nil
+		report.RecoveryToken = ""
 		if cause != nil {
 			report.LastError = cause.Error()
 		}
@@ -204,6 +245,7 @@ func (ns *NodeServer) recordWrongDeviceIdentityReport(ctx context.Context, sessi
 		report.VolumeID = volumeID
 		report.VolumeName = strings.TrimSpace(session.VolumeName)
 		report.FailureClass = localDeviceFailureClassWrongIdentity
+		report.ExpectedTarget = strings.TrimSpace(localDiskAssertedDiskTarget(session.Identity))
 		report.DevicePath = strings.TrimSpace(session.DevicePath)
 		report.DeviceSerial = strings.TrimSpace(session.DeviceSerial)
 		report.OpenNebulaImageID = strings.TrimSpace(session.OpenNebulaImageID)
@@ -216,6 +258,10 @@ func (ns *NodeServer) recordWrongDeviceIdentityReport(ctx context.Context, sessi
 		report.ObservedIdentity = observed
 		report.LastObservedAt = now
 		report.Attempts++
+		report.AttachmentState = localDeviceAttachmentStateRuntimeConfirmedByNode
+		report.ConfirmationState = localDeviceConfirmationStateConfirmed
+		report.ConfirmationDeadline = nil
+		report.RecoveryToken = ""
 		if cause != nil {
 			report.LastError = cause.Error()
 		}
@@ -242,6 +288,71 @@ func (ns *NodeServer) clearLocalDeviceMissing(ctx context.Context, volumeID stri
 	if err := ns.Driver.kubeRuntime.DeleteConfigMapKey(ctx, namespaceFromServiceAccount(), localDeviceStateConfigMapName, localDeviceReportKey(node, volumeID)); err != nil {
 		klog.V(3).InfoS("Failed to clear local device missing report", "node", node, "volumeID", volumeID, "err", err)
 	}
+}
+
+func (ns *NodeServer) currentLocalDeviceReport(ctx context.Context, volumeID string) (LocalDeviceMissingReport, bool) {
+	if ns == nil || ns.Driver == nil || ns.Driver.kubeRuntime == nil || !ns.Driver.kubeRuntime.enabled {
+		return LocalDeviceMissingReport{}, false
+	}
+	node := strings.TrimSpace(ns.Driver.nodeID)
+	volumeID = strings.TrimSpace(volumeID)
+	if node == "" || volumeID == "" {
+		return LocalDeviceMissingReport{}, false
+	}
+	cm, err := ns.Driver.kubeRuntime.GetConfigMap(ctx, namespaceFromServiceAccount(), localDeviceStateConfigMapName)
+	if err != nil {
+		return LocalDeviceMissingReport{}, false
+	}
+	raw := strings.TrimSpace(cm.Data[localDeviceReportKey(node, volumeID)])
+	if raw == "" {
+		return LocalDeviceMissingReport{}, false
+	}
+	var report LocalDeviceMissingReport
+	if err := json.Unmarshal([]byte(raw), &report); err != nil {
+		return LocalDeviceMissingReport{}, false
+	}
+	return report, true
+}
+
+func (ns *NodeServer) confirmLocalDeviceRecovery(ctx context.Context, report *LocalDeviceMissingReport, volumeID, devicePath string, observed *LocalDiskIdentity, publishContext map[string]string) {
+	if ns == nil || ns.Driver == nil || ns.Driver.kubeRuntime == nil || !ns.Driver.kubeRuntime.enabled {
+		return
+	}
+	volumeID = strings.TrimSpace(volumeID)
+	node := strings.TrimSpace(ns.Driver.nodeID)
+	if node == "" || volumeID == "" {
+		return
+	}
+	if report == nil {
+		ns.clearLocalDeviceMissing(ctx, volumeID)
+		return
+	}
+	key := localDeviceReportKey(node, volumeID)
+	now := time.Now().UTC()
+	_ = updateLocalDeviceReport(ctx, ns.Driver.kubeRuntime, namespaceFromServiceAccount(), key, func(current *LocalDeviceMissingReport) {
+		if strings.TrimSpace(current.Node) == "" {
+			*current = *report
+		}
+		current.DevicePath = firstNonEmpty(strings.TrimSpace(devicePath), current.DevicePath)
+		current.ExpectedTarget = firstNonEmpty(current.ExpectedTarget, strings.TrimSpace(publishContext["volumeName"]), strings.TrimSpace(current.VolumeName))
+		current.AttachmentState = localDeviceAttachmentStateRuntimeConfirmedByNode
+		current.ConfirmationState = localDeviceConfirmationStateConfirmed
+		current.ConfirmationDeadline = nil
+		current.RecoveryToken = ""
+		current.MetadataAttachedToNode = true
+		current.MetadataNode = node
+		current.LastObservedAt = now
+		current.LastRecoveryOutcome = localDeviceConfirmationStateConfirmed
+		current.LastRecoveryError = ""
+		current.ConfirmationObservedAt = &now
+		if observed != nil {
+			current.ObservedIdentity = observed
+		}
+	})
+	if strings.TrimSpace(report.RecoveryMethod) != "" || strings.TrimSpace(report.ConfirmationState) != "" {
+		ns.recordPVCEventFromPublishContext(ctx, publishContext, eventReasonLocalDeviceRecoverySucceeded, fmt.Sprintf("node confirmed local device visibility for volume %s on node %s after controller recovery using %s", volumeID, node, firstNonEmpty(strings.TrimSpace(report.RecoveryMethod), localDeviceRecoveryMethodRuntimeRepublish)))
+	}
+	ns.clearLocalDeviceMissing(ctx, volumeID)
 }
 
 func (ns *NodeServer) localDeviceReportIdentity(ctx context.Context, volumeID string, publishContext map[string]string) localDeviceReportIdentity {
@@ -323,7 +434,20 @@ func (s *ControllerServer) reconcileLocalDeviceRecovery(ctx context.Context) {
 			klog.V(2).InfoS("Skipping malformed local device recovery report", "key", key, "err", err)
 			continue
 		}
+		if refreshed, changed, refreshErr := s.refreshLocalDeviceReportConfirmationState(ctx, key, report, now); refreshErr != nil {
+			klog.V(3).InfoS("Failed to refresh local device recovery confirmation state", "key", key, "err", refreshErr)
+		} else {
+			report = refreshed
+			if changed {
+				continue
+			}
+		}
 		if ready, reason := s.localDeviceReportReady(report, now); !ready {
+			if reason == "repair_required_wrong_identity" || reason == "repair_required_runtime_attach_unconfirmed" {
+				if err := s.markLocalDeviceRecoverySkipped(ctx, key, report, reason, nil); err != nil {
+					klog.V(3).InfoS("Failed to persist local device recovery skip", "key", key, "reason", reason, "err", err)
+				}
+			}
 			klog.V(5).InfoS("Local device recovery report is not ready", "key", key, "reason", reason)
 			continue
 		}
@@ -396,7 +520,8 @@ func (s *ControllerServer) recoverLocalDeviceReport(ctx context.Context, key str
 		s.driver.metrics.RecordLocalVolumeHealth("device_recovery", "attempted")
 	}
 
-	if err := s.executeLocalDeviceRecovery(ctx, report, runtimeCtx, volumeNumericID, nodeNumericID); err != nil {
+	attempt, err := s.executeLocalDeviceRecovery(ctx, report, runtimeCtx, volumeNumericID, nodeNumericID)
+	if err != nil {
 		if s.driver.metrics != nil {
 			s.driver.metrics.RecordLocalVolumeHealth("device_recovery", "failed")
 		}
@@ -405,17 +530,27 @@ func (s *ControllerServer) recoverLocalDeviceReport(ctx context.Context, key str
 	}
 
 	if s.driver.metrics != nil {
-		s.driver.metrics.RecordLocalVolumeHealth("device_recovery", "succeeded")
+		s.driver.metrics.RecordLocalVolumeHealth("device_recovery", "pending_runtime_confirmation")
 	}
-	s.recordLocalDeviceRecoveryEvent(ctx, report, runtimeCtx, eventReasonLocalDeviceRecoverySucceeded, fmt.Sprintf("same-node device recovery for volume %s on node %s completed; node staging can retry device discovery", volumeID, node))
-	return s.clearLocalDeviceReport(ctx, key)
+	window := s.localDeviceRecoveryConfirmationWindow(report)
+	deadline := time.Now().UTC().Add(window)
+	if err := s.markLocalDeviceRecoveryPendingConfirmation(ctx, key, report, attempt, deadline); err != nil {
+		return err
+	}
+	s.recordLocalDeviceRecoveryEvent(ctx, report, runtimeCtx, eventReasonLocalDeviceRecoveryPending, fmt.Sprintf("same-node device recovery for volume %s on node %s completed at the controller; waiting until %s for node runtime confirmation", volumeID, node, deadline.Format(time.RFC3339)))
+	return nil
 }
 
-func (s *ControllerServer) executeLocalDeviceRecovery(ctx context.Context, report LocalDeviceMissingReport, runtimeCtx *VolumeRuntimeContext, volumeNumericID, nodeNumericID int) error {
+func (s *ControllerServer) executeLocalDeviceRecovery(ctx context.Context, report LocalDeviceMissingReport, runtimeCtx *VolumeRuntimeContext, volumeNumericID, nodeNumericID int) (*localDeviceRecoveryAttempt, error) {
 	node := strings.TrimSpace(report.Node)
 	volumeID := strings.TrimSpace(report.VolumeID)
 	params := localDeviceRecoveryParams(report, runtimeCtx)
-	return s.withQueuedHotplug(ctx, node, "reattach", volumeID, hotplugQueuePriorityCritical, func(queueCtx context.Context) error {
+	attempt := &localDeviceRecoveryAttempt{
+		ExpectedTarget:  firstNonEmpty(strings.TrimSpace(report.ExpectedTarget), strings.TrimSpace(report.VolumeName)),
+		AttachmentState: localDeviceAttachmentStateMetadataDetached,
+		MetadataNode:    node,
+	}
+	err := s.withQueuedHotplug(ctx, node, "reattach", volumeID, hotplugQueuePriorityCritical, func(queueCtx context.Context) error {
 		nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(node))
 		defer nodeRelease()
 
@@ -433,6 +568,13 @@ func (s *ControllerServer) executeLocalDeviceRecovery(ctx context.Context, repor
 		target, attachedErr := s.volumeProvider.GetVolumeInNode(queueCtx, volumeNumericID, nodeNumericID)
 		sizeBytes, sizeErr := s.volumeProvider.ResolveVolumeSizeBytes(queueCtx, volumeID)
 		if attachedErr == nil {
+			// OpenNebula does not expose a safe runtime-only re-hotplug for an already-declared VM disk.
+			// When metadata still shows the disk attached, the narrowest available repair is a same-node
+			// detach/attach sequence followed by node-side runtime confirmation.
+			attempt.Method = localDeviceRecoveryMethodSameNodeDetachAttachFallback
+			attempt.AttachmentState = localDeviceAttachmentStateMetadataAttached
+			attempt.MetadataAttached = true
+			attempt.MetadataTarget = strings.TrimSpace(target)
 			detachStarted := time.Now()
 			if err := s.volumeProvider.DetachVolume(queueCtx, volumeID, node); err != nil {
 				s.handleHotplugTimeout(queueCtx, node, volumeID, params, "detach", "disk", err)
@@ -442,6 +584,7 @@ func (s *ControllerServer) executeLocalDeviceRecovery(ctx context.Context, repor
 				s.driver.observeAdaptiveTimeout(queueCtx, "detach", "disk", sizeBytes, time.Since(detachStarted))
 			}
 		} else {
+			attempt.Method = localDeviceRecoveryMethodRuntimeRepublish
 			klog.V(2).InfoS("Local device recovery found no existing OpenNebula attachment; attaching directly",
 				"volumeID", volumeID, "node", node, "err", attachedErr)
 			if s.driver.metrics != nil {
@@ -458,6 +601,9 @@ func (s *ControllerServer) executeLocalDeviceRecovery(ctx context.Context, repor
 		if err != nil {
 			return fmt.Errorf("failed to confirm recovered same-node attachment: %w", err)
 		}
+		attempt.AttachmentState = localDeviceAttachmentStateRuntimeUnconfirmed
+		attempt.MetadataAttached = true
+		attempt.MetadataTarget = strings.TrimSpace(target)
 		if sizeErr == nil {
 			s.driver.observeAdaptiveTimeout(queueCtx, "attach", "disk", sizeBytes, time.Since(attachStarted))
 		}
@@ -468,11 +614,26 @@ func (s *ControllerServer) executeLocalDeviceRecovery(ctx context.Context, repor
 			"volumeID", volumeID, "node", node, "target", target)
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return attempt, nil
 }
 
 func (s *ControllerServer) localDeviceReportReady(report LocalDeviceMissingReport, now time.Time) (bool, string) {
 	if strings.TrimSpace(report.Node) == "" || strings.TrimSpace(report.VolumeID) == "" {
 		return false, "missing_identity"
+	}
+	if localDeviceFailureClass(report) == localDeviceFailureClassWrongIdentity {
+		return false, "repair_required_wrong_identity"
+	}
+	if strings.TrimSpace(report.ConfirmationState) == localDeviceConfirmationStateRepairRequired {
+		return false, "repair_required_runtime_attach_unconfirmed"
+	}
+	if strings.TrimSpace(report.ConfirmationState) == localDeviceConfirmationStatePending {
+		if report.ConfirmationDeadline == nil || report.ConfirmationDeadline.After(now) {
+			return false, "pending_runtime_confirmation"
+		}
 	}
 	if report.Attempts < s.localDeviceRecoveryMinAttempts() {
 		return false, "min_attempts"
@@ -499,6 +660,74 @@ func (s *ControllerServer) localDeviceReportReady(report LocalDeviceMissingRepor
 	return true, ""
 }
 
+func (s *ControllerServer) refreshLocalDeviceReportConfirmationState(ctx context.Context, key string, report LocalDeviceMissingReport, now time.Time) (LocalDeviceMissingReport, bool, error) {
+	if strings.TrimSpace(report.ConfirmationState) != localDeviceConfirmationStatePending || report.ConfirmationDeadline == nil || report.ConfirmationDeadline.IsZero() || report.ConfirmationDeadline.After(now) {
+		return report, false, nil
+	}
+	message := fmt.Sprintf("same-node runtime attach for volume %s on node %s was not confirmed by NodeStageVolume before %s", report.VolumeID, report.Node, report.ConfirmationDeadline.Format(time.RFC3339))
+	if maxAttempts := s.localDeviceRecoveryMaxAttempts(); maxAttempts > 0 && report.RecoveryAttempts >= maxAttempts {
+		if err := s.recordRuntimeAttachRepairState(ctx, report, message); err != nil {
+			return report, false, err
+		}
+		if err := updateLocalDeviceReport(ctx, s.driver.kubeRuntime, namespaceFromServiceAccount(), key, func(current *LocalDeviceMissingReport) {
+			if strings.TrimSpace(current.Node) == "" {
+				*current = report
+			}
+			current.AttachmentState = localDeviceAttachmentStateRuntimeUnconfirmed
+			current.ConfirmationState = localDeviceConfirmationStateRepairRequired
+			current.ConfirmationDeadline = nil
+			current.RecoveryToken = ""
+			current.MetadataNode = report.Node
+			current.LastRecoveryError = message
+			current.LastRecoveryOutcome = localDeviceConfirmationStateRepairRequired
+			current.ConfirmationObservedAt = &now
+		}); err != nil {
+			return report, false, err
+		}
+		report.AttachmentState = localDeviceAttachmentStateRuntimeUnconfirmed
+		report.ConfirmationState = localDeviceConfirmationStateRepairRequired
+		report.ConfirmationDeadline = nil
+		report.RecoveryToken = ""
+		report.MetadataNode = report.Node
+		report.LastRecoveryError = message
+		report.LastRecoveryOutcome = localDeviceConfirmationStateRepairRequired
+		report.ConfirmationObservedAt = &now
+		s.recordLocalDeviceRecoveryEvent(ctx, report, nil, eventReasonLocalDeviceRecoveryFailed, message+"; automatic same-node recovery is now blocked pending manual repair")
+		if s.driver != nil && s.driver.metrics != nil {
+			s.driver.metrics.RecordLocalVolumeHealth("device_recovery", localDeviceConfirmationStateRepairRequired)
+		}
+		return report, true, nil
+	}
+	if err := updateLocalDeviceReport(ctx, s.driver.kubeRuntime, namespaceFromServiceAccount(), key, func(current *LocalDeviceMissingReport) {
+		if strings.TrimSpace(current.Node) == "" {
+			*current = report
+		}
+		current.AttachmentState = localDeviceAttachmentStateRuntimeUnconfirmed
+		current.ConfirmationState = localDeviceConfirmationStateTimedOut
+		current.ConfirmationDeadline = nil
+		current.RecoveryToken = ""
+		current.MetadataNode = report.Node
+		current.LastRecoveryError = message
+		current.LastRecoveryOutcome = localDeviceConfirmationStateTimedOut
+		current.ConfirmationObservedAt = &now
+	}); err != nil {
+		return report, false, err
+	}
+	report.AttachmentState = localDeviceAttachmentStateRuntimeUnconfirmed
+	report.ConfirmationState = localDeviceConfirmationStateTimedOut
+	report.ConfirmationDeadline = nil
+	report.RecoveryToken = ""
+	report.MetadataNode = report.Node
+	report.LastRecoveryError = message
+	report.LastRecoveryOutcome = localDeviceConfirmationStateTimedOut
+	report.ConfirmationObservedAt = &now
+	s.recordLocalDeviceRecoveryEvent(ctx, report, nil, eventReasonLocalDeviceRecoveryFailed, message+"; controller will re-evaluate the same-node recovery episode")
+	if s.driver != nil && s.driver.metrics != nil {
+		s.driver.metrics.RecordLocalVolumeHealth("device_recovery", localDeviceConfirmationStateTimedOut)
+	}
+	return report, true, nil
+}
+
 func (s *ControllerServer) updateLocalDeviceRecoveryFailure(ctx context.Context, key string, report LocalDeviceMissingReport, cause error) error {
 	now := time.Now().UTC()
 	message := "unknown error"
@@ -522,6 +751,7 @@ func (s *ControllerServer) updateLocalDeviceRecoveryFailure(ctx context.Context,
 		current.VolumeID = report.VolumeID
 		current.VolumeName = report.VolumeName
 		current.FailureClass = localDeviceFailureClass(report)
+		current.ExpectedTarget = report.ExpectedTarget
 		current.DevicePath = report.DevicePath
 		current.DeviceSerial = report.DeviceSerial
 		current.OpenNebulaImageID = report.OpenNebulaImageID
@@ -533,6 +763,15 @@ func (s *ControllerServer) updateLocalDeviceRecoveryFailure(ctx context.Context,
 		current.StagingTargetPath = report.StagingTargetPath
 		current.RecoveryAttempts++
 		current.LastRecoveryAt = &now
+		current.RecoveryMethod = ""
+		current.RecoveryToken = ""
+		current.ConfirmationState = ""
+		current.ConfirmationDeadline = nil
+		current.ConfirmationObservedAt = nil
+		current.AttachmentState = localDeviceAttachmentStateRuntimeUnconfirmed
+		current.MetadataAttachedToNode = false
+		current.MetadataNode = report.Node
+		current.MetadataTarget = ""
 		current.LastRecoveryError = message
 		current.LastRecoveryOutcome = "failed"
 		current.LastRecoverySignature = localDeviceRecoverySignature(*current)
@@ -548,12 +787,77 @@ func (s *ControllerServer) markLocalDeviceRecoverySkipped(ctx context.Context, k
 	if s.driver != nil && s.driver.metrics != nil {
 		s.driver.metrics.RecordLocalVolumeHealth("device_recovery", "skipped_"+reason)
 	}
+	if strings.TrimSpace(report.LastRecoveryOutcome) != "skipped" || strings.TrimSpace(report.LastRecoveryError) != message {
+		s.recordLocalDeviceRecoveryEvent(ctx, report, nil, eventReasonLocalDeviceRecoverySkipped, fmt.Sprintf("skipped local device recovery for volume %s on node %s: %s", report.VolumeID, report.Node, message))
+	}
 	return updateLocalDeviceReport(ctx, s.driver.kubeRuntime, namespaceFromServiceAccount(), key, func(current *LocalDeviceMissingReport) {
 		if strings.TrimSpace(current.Node) == "" {
 			*current = report
 		}
 		current.LastRecoveryError = message
 		current.LastRecoveryOutcome = "skipped"
+	})
+}
+
+func (s *ControllerServer) recordRuntimeAttachRepairState(ctx context.Context, report LocalDeviceMissingReport, message string) error {
+	if s == nil || s.driver == nil || s.driver.volumeRepairState == nil {
+		return nil
+	}
+	state := VolumeRepairState{
+		Version:               stateObjectVersion,
+		VolumeID:              strings.TrimSpace(report.VolumeID),
+		Classification:        repairClassificationRuntimeAttachUnconfirmed,
+		Reason:                localDeviceFailureClass(report),
+		Message:               strings.TrimSpace(message),
+		RequestedNode:         strings.TrimSpace(report.Node),
+		LastKnownNodeName:     strings.TrimSpace(report.Node),
+		LastKnownTarget:       firstNonEmpty(strings.TrimSpace(report.MetadataTarget), strings.TrimSpace(report.ExpectedTarget), strings.TrimSpace(report.VolumeName)),
+		LastKnownDeviceSerial: strings.TrimSpace(report.DeviceSerial),
+		EvidenceSource:        "local_device_report",
+		LastObservedIdentity:  report.ObservedIdentity,
+	}
+	if s.driver.volumeHistory != nil {
+		if history, ok := s.driver.volumeHistory.Get(report.VolumeID); ok {
+			state.LastKnownNodeUID = history.LastSuccessfulNodeUID
+			state.LastKnownOpenNebulaVMID = history.LastSuccessfulOpenNebulaVMID
+			state.LastKnownImageID = history.LastSuccessfulImageID
+			state.LastKnownDiskID = history.LastSuccessfulDiskID
+			state.LastHealthyIdentity = history.LastHealthyIdentity
+		}
+	}
+	if persisted, err := s.driver.volumeRepairState.Mark(ctx, state); err == nil {
+		s.driver.metrics.RecordVolumeRepairState(persisted.Classification, "persisted")
+	} else {
+		return err
+	}
+	return nil
+}
+
+func (s *ControllerServer) markLocalDeviceRecoveryPendingConfirmation(ctx context.Context, key string, report LocalDeviceMissingReport, attempt *localDeviceRecoveryAttempt, deadline time.Time) error {
+	if attempt == nil {
+		return fmt.Errorf("local device recovery attempt is required")
+	}
+	now := time.Now().UTC()
+	token := fmt.Sprintf("%s-%d", sanitizeLocalDeviceReportKey(report.VolumeID), now.UnixNano())
+	return updateLocalDeviceReport(ctx, s.driver.kubeRuntime, namespaceFromServiceAccount(), key, func(current *LocalDeviceMissingReport) {
+		if strings.TrimSpace(current.Node) == "" {
+			*current = report
+		}
+		current.ExpectedTarget = firstNonEmpty(strings.TrimSpace(attempt.ExpectedTarget), current.ExpectedTarget, strings.TrimSpace(current.VolumeName))
+		current.RecoveryAttempts++
+		current.LastRecoveryAt = &now
+		current.RecoveryMethod = strings.TrimSpace(attempt.Method)
+		current.RecoveryToken = token
+		current.ConfirmationState = localDeviceConfirmationStatePending
+		current.ConfirmationDeadline = &deadline
+		current.ConfirmationObservedAt = nil
+		current.AttachmentState = localDeviceAttachmentStateRuntimeUnconfirmed
+		current.MetadataAttachedToNode = attempt.MetadataAttached
+		current.MetadataNode = firstNonEmpty(strings.TrimSpace(attempt.MetadataNode), current.Node)
+		current.MetadataTarget = strings.TrimSpace(attempt.MetadataTarget)
+		current.LastRecoveryError = ""
+		current.LastRecoveryOutcome = localDeviceConfirmationStatePending
+		current.LastRecoverySignature = localDeviceRecoverySignature(*current)
 	})
 }
 
@@ -669,8 +973,12 @@ func localDeviceRecoveryParams(report LocalDeviceMissingReport, runtimeCtx *Volu
 
 func localDeviceFailureClass(report LocalDeviceMissingReport) string {
 	switch strings.TrimSpace(report.FailureClass) {
+	case localDeviceFailureClassRuntimeAttachmentMissing:
+		return localDeviceFailureClassRuntimeAttachmentMissing
 	case localDeviceFailureClassMountFailed:
 		return localDeviceFailureClassMountFailed
+	case localDeviceFailureClassWrongIdentity:
+		return localDeviceFailureClassWrongIdentity
 	default:
 		return localDeviceFailureClassMissingDevice
 	}
@@ -680,6 +988,7 @@ func localDeviceRecoverySignature(report LocalDeviceMissingReport) string {
 	parts := []string{
 		localDeviceFailureClass(report),
 		strings.TrimSpace(report.VolumeName),
+		strings.TrimSpace(report.ExpectedTarget),
 		strings.TrimSpace(report.DevicePath),
 		strings.TrimSpace(report.DeviceSerial),
 		strings.TrimSpace(report.OpenNebulaImageID),
@@ -749,4 +1058,18 @@ func (s *ControllerServer) localDeviceRecoveryMaxAttempts() int {
 		return 2
 	}
 	return attempts
+}
+
+func (s *ControllerServer) localDeviceRecoveryConfirmationWindow(report LocalDeviceMissingReport) time.Duration {
+	window := s.localDeviceRecoveryCooldown()
+	if window <= 0 {
+		window = 45 * time.Second
+	}
+	if window < 30*time.Second {
+		window = 30 * time.Second
+	}
+	if strings.TrimSpace(report.LastRecoveryOutcome) == localDeviceConfirmationStateTimedOut && window < time.Minute {
+		window = time.Minute
+	}
+	return window
 }

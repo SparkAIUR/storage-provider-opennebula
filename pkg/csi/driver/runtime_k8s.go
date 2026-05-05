@@ -87,6 +87,7 @@ type KubeRuntime struct {
 	inventoryClient ctrlclient.Client
 	recorder        record.EventRecorder
 	enabled         bool
+	staleVAGrace    time.Duration
 
 	inventoryNodeCacheMu sync.Mutex
 	inventoryNodeCache   map[string]inventoryNodeCacheEntry
@@ -128,6 +129,7 @@ func NewKubeRuntime(component string) *KubeRuntime {
 		inventoryClient: inventoryClient,
 		recorder:        recorder,
 		enabled:         true,
+		staleVAGrace:    90 * time.Second,
 	}
 }
 
@@ -513,52 +515,93 @@ func (r *KubeRuntime) VolumeDesiredOnNode(ctx context.Context, volumeHandle, nod
 	if strings.TrimSpace(volumeHandle) == "" || nodeName == "" {
 		return false, "", nil
 	}
-	runtimeCtx, err := r.ResolveVolumeRuntimeContext(ctx, volumeHandle)
+	state, err := r.DesiredNodeForVolume(ctx, volumeHandle)
 	if err != nil {
 		return false, "", err
 	}
+	if !state.Desired {
+		return false, state.DemandSourceOrReason(), nil
+	}
+	if state.MultipleNodes {
+		for _, referencedNode := range state.ReferencedNodes {
+			if strings.TrimSpace(referencedNode) == nodeName {
+				return true, state.DemandSourceOrReason(), nil
+			}
+		}
+		return false, state.DemandSourceOrReason(), nil
+	}
+	if strings.TrimSpace(state.NodeName) == nodeName {
+		return true, state.DemandSourceOrReason(), nil
+	}
+	return false, state.DemandSourceOrReason(), nil
+}
 
-	if runtimeCtx.PVName != "" {
-		vas, err := r.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
+func (r *KubeRuntime) staleVolumeAttachmentGrace() time.Duration {
+	if r == nil || r.staleVAGrace <= 0 {
+		return 90 * time.Second
+	}
+	return r.staleVAGrace
+}
+
+func (r *KubeRuntime) AutomaticMaintenanceTrigger(ctx context.Context, nodeName string) (string, bool, error) {
+	identity, err := r.NodeIdentity(ctx, nodeName)
+	if err != nil {
+		return "", false, err
+	}
+	if !identity.Exists {
+		return "", false, nil
+	}
+	if identity.Unschedulable {
+		draining, err := r.nodeHasTerminatingWorkloadPods(ctx, nodeName)
 		if err != nil {
-			return false, "", err
+			return "", false, err
 		}
-		for idx := range vas.Items {
-			va := &vas.Items[idx]
-			if va.Spec.Source.PersistentVolumeName == nil || strings.TrimSpace(*va.Spec.Source.PersistentVolumeName) != runtimeCtx.PVName {
-				continue
-			}
-			if strings.TrimSpace(va.Spec.NodeName) == nodeName && va.DeletionTimestamp.IsZero() {
-				return true, "volume_attachment", nil
-			}
+		if draining {
+			return protectionTriggerDrainInProgress, true, nil
 		}
+		return protectionTriggerNodeUnschedulable, true, nil
 	}
+	if !identity.Ready {
+		return protectionTriggerNodeNotReady, true, nil
+	}
+	return "", false, nil
+}
 
-	if runtimeCtx.PVCNamespace == "" || runtimeCtx.PVCName == "" {
-		return false, "", nil
+func (r *KubeRuntime) nodeHasTerminatingWorkloadPods(ctx context.Context, nodeName string) (bool, error) {
+	if r == nil || !r.enabled {
+		return false, fmt.Errorf("kubernetes runtime is not enabled")
 	}
-	pods, err := r.client.CoreV1().Pods(runtimeCtx.PVCNamespace).List(ctx, metav1.ListOptions{})
+	nodeName = strings.TrimSpace(nodeName)
+	if nodeName == "" {
+		return false, nil
+	}
+	pods, err := r.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: "spec.nodeName=" + nodeName})
 	if err != nil {
-		return false, "", err
+		return false, err
 	}
 	for idx := range pods.Items {
 		pod := &pods.Items[idx]
-		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		if pod.DeletionTimestamp == nil {
 			continue
 		}
-		if strings.TrimSpace(pod.Spec.NodeName) != nodeName {
+		if podControllerKind(pod) == "DaemonSet" {
 			continue
 		}
-		for _, volume := range pod.Spec.Volumes {
-			if volume.PersistentVolumeClaim == nil {
-				continue
-			}
-			if strings.TrimSpace(volume.PersistentVolumeClaim.ClaimName) == runtimeCtx.PVCName {
-				return true, "active_pod", nil
-			}
+		return true, nil
+	}
+	return false, nil
+}
+
+func podControllerKind(pod *corev1.Pod) string {
+	if pod == nil {
+		return ""
+	}
+	for _, owner := range pod.OwnerReferences {
+		if owner.Controller != nil && *owner.Controller {
+			return strings.TrimSpace(owner.Kind)
 		}
 	}
-	return false, "", nil
+	return ""
 }
 
 func (r *KubeRuntime) emitNamespacedEvent(ctx context.Context, namespace, name string, uid types.UID, kind, eventType, reason, message string) {

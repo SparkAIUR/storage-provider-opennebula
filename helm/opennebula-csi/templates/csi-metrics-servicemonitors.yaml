@@ -1,3 +1,6 @@
+{{- $controller := (get .Values "controller") | default dict -}}
+{{- $controllerAttacher := (get $controller "attacher") | default dict -}}
+{{- $controllerAttacherHTTPEnabled := (get $controllerAttacher "httpEndpointEnabled") | default true -}}
 {{- if and .Values.metrics.enabled .Values.metrics.controller.serviceMonitor.enabled }}
 ---
 apiVersion: monitoring.coreos.com/v1
@@ -36,10 +39,12 @@ spec:
       path: {{ .Values.metrics.path }}
       interval: {{ .Values.metrics.controller.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.metrics.controller.serviceMonitor.scrapeTimeout }}
+    {{- if $controllerAttacherHTTPEnabled }}
     - port: att-metrics
       path: {{ .Values.metrics.path }}
       interval: {{ .Values.metrics.controller.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.metrics.controller.serviceMonitor.scrapeTimeout }}
+    {{- end }}
     - port: res-metrics
       path: {{ .Values.metrics.path }}
       interval: {{ .Values.metrics.controller.serviceMonitor.interval }}

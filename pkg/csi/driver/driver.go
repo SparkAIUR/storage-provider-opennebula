@@ -117,6 +117,7 @@ func (d *Driver) Run(ctx context.Context) error {
 
 	d.metrics = NewDriverMetrics(d.version, d.commit)
 	d.kubeRuntime = NewKubeRuntime(d.name)
+	d.kubeRuntime.staleVAGrace = loadStaleVolumeAttachmentGrace(d.PluginConfig)
 	d.volumeHistory = NewVolumeHistoryManager(d.kubeRuntime, "")
 	if err := d.volumeHistory.LoadFromConfigMap(ctx); err != nil {
 		klog.V(2).InfoS("Failed to load volume history state", "err", err)

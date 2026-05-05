@@ -262,13 +262,27 @@ func TestRecordLocalDiskStageSessionClearsPreviousRecoveryFailure(t *testing.T) 
 		RecoveryAttempts:  3,
 	})
 
-	ns.recordLocalDiskStageSession(&csi.NodeStageVolumeRequest{
+	ns.recordLocalDiskStageSession(context.Background(), &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-1",
 		StagingTargetPath: "/stage/vol-1",
 		PublishContext: map[string]string{
 			"volumeName": "sdg",
 		},
-	}, "/dev/sdg", "xfs", []string{"rw"}, &LocalDiskIdentity{Version: stateObjectVersion, DevicePath: "/dev/sdg", DiskTarget: "sdg"})
+	}, "/dev/sdg", "xfs", []string{"rw"}, &LocalDiskIdentity{
+		Version: stateObjectVersion,
+		AssertedByController: &LocalDiskControllerAssertion{
+			DiskTarget: "sdg",
+		},
+		ObservedFromDevice: &LocalDiskObservedIdentity{
+			Block: &LocalDiskObservedBlockIdentity{
+				DevicePath:          "/dev/sdg",
+				MountSourceIdentity: "/dev/sdg",
+			},
+			Filesystem: &LocalDiskObservedFilesystemIdentity{
+				FilesystemType: "xfs",
+			},
+		},
+	}, nil)
 
 	session, exists, err := ns.loadLocalDiskSession("vol-1")
 	assert.NoError(t, err)

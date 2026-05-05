@@ -1,3 +1,6 @@
+{{- $controller := (get .Values "controller") | default dict -}}
+{{- $controllerAttacher := (get $controller "attacher") | default dict -}}
+{{- $controllerAttacherHTTPEnabled := (get $controllerAttacher "httpEndpointEnabled") | default true -}}
 {{- if .Values.metrics.enabled }}
 ---
 apiVersion: v1
@@ -33,10 +36,12 @@ spec:
       port: {{ .Values.metrics.ports.provisioner }}
       protocol: TCP
       targetPort: prov-metrics
+    {{- if $controllerAttacherHTTPEnabled }}
     - name: att-metrics
       port: {{ .Values.metrics.ports.attacher }}
       protocol: TCP
       targetPort: att-metrics
+    {{- end }}
     - name: res-metrics
       port: {{ .Values.metrics.ports.resizer }}
       protocol: TCP

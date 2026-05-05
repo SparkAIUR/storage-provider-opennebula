@@ -20,16 +20,43 @@ const (
 )
 
 type LocalDiskIdentity struct {
-	Version             int       `json:"version"`
-	ObservedAt          time.Time `json:"observedAt,omitempty"`
-	DevicePath          string    `json:"devicePath,omitempty"`
-	DeviceSerial        string    `json:"deviceSerial,omitempty"`
-	FilesystemUUID      string    `json:"filesystemUUID,omitempty"`
-	FilesystemType      string    `json:"filesystemType,omitempty"`
-	PartitionUUID       string    `json:"partitionUUID,omitempty"`
-	OpenNebulaImageID   string    `json:"openNebulaImageID,omitempty"`
-	DiskTarget          string    `json:"diskTarget,omitempty"`
-	MountSourceIdentity string    `json:"mountSourceIdentity,omitempty"`
+	Version              int                           `json:"version"`
+	ObservedAt           time.Time                     `json:"observedAt,omitempty"`
+	AssertedByController *LocalDiskControllerAssertion `json:"assertedByController,omitempty"`
+	ObservedFromDevice   *LocalDiskObservedIdentity    `json:"observedFromDevice,omitempty"`
+
+	LegacyDevicePath          string `json:"devicePath,omitempty"`
+	LegacyDeviceSerial        string `json:"deviceSerial,omitempty"`
+	LegacyFilesystemUUID      string `json:"filesystemUUID,omitempty"`
+	LegacyFilesystemType      string `json:"filesystemType,omitempty"`
+	LegacyPartitionUUID       string `json:"partitionUUID,omitempty"`
+	LegacyOpenNebulaImageID   string `json:"openNebulaImageID,omitempty"`
+	LegacyDiskTarget          string `json:"diskTarget,omitempty"`
+	LegacyMountSourceIdentity string `json:"mountSourceIdentity,omitempty"`
+}
+
+type LocalDiskControllerAssertion struct {
+	DeviceSerial      string `json:"deviceSerial,omitempty"`
+	OpenNebulaImageID string `json:"openNebulaImageID,omitempty"`
+	DiskTarget        string `json:"diskTarget,omitempty"`
+}
+
+type LocalDiskObservedBlockIdentity struct {
+	DevicePath          string `json:"devicePath,omitempty"`
+	ByIDPath            string `json:"byIDPath,omitempty"`
+	DeviceSerial        string `json:"deviceSerial,omitempty"`
+	MountSourceIdentity string `json:"mountSourceIdentity,omitempty"`
+}
+
+type LocalDiskObservedFilesystemIdentity struct {
+	FilesystemUUID string `json:"filesystemUUID,omitempty"`
+	FilesystemType string `json:"filesystemType,omitempty"`
+	PartitionUUID  string `json:"partitionUUID,omitempty"`
+}
+
+type LocalDiskObservedIdentity struct {
+	Block      *LocalDiskObservedBlockIdentity      `json:"block,omitempty"`
+	Filesystem *LocalDiskObservedFilesystemIdentity `json:"filesystem,omitempty"`
 }
 
 type VolumeHistoryRecord struct {
@@ -346,14 +373,135 @@ func normalizeLocalDiskIdentity(identity *LocalDiskIdentity) {
 		return
 	}
 	identity.Version = stateObjectVersion
-	identity.DevicePath = strings.TrimSpace(identity.DevicePath)
-	identity.DeviceSerial = strings.TrimSpace(identity.DeviceSerial)
-	identity.FilesystemUUID = strings.TrimSpace(identity.FilesystemUUID)
-	identity.FilesystemType = strings.TrimSpace(identity.FilesystemType)
-	identity.PartitionUUID = strings.TrimSpace(identity.PartitionUUID)
-	identity.OpenNebulaImageID = strings.TrimSpace(identity.OpenNebulaImageID)
-	identity.DiskTarget = strings.TrimSpace(identity.DiskTarget)
-	identity.MountSourceIdentity = strings.TrimSpace(identity.MountSourceIdentity)
+	if identity.AssertedByController == nil && (identity.LegacyDeviceSerial != "" || identity.LegacyOpenNebulaImageID != "" || identity.LegacyDiskTarget != "") {
+		identity.AssertedByController = &LocalDiskControllerAssertion{
+			DeviceSerial:      identity.LegacyDeviceSerial,
+			OpenNebulaImageID: identity.LegacyOpenNebulaImageID,
+			DiskTarget:        identity.LegacyDiskTarget,
+		}
+	}
+	if identity.ObservedFromDevice == nil && (identity.LegacyDevicePath != "" || identity.LegacyDeviceSerial != "" || identity.LegacyFilesystemUUID != "" || identity.LegacyFilesystemType != "" || identity.LegacyPartitionUUID != "" || identity.LegacyMountSourceIdentity != "") {
+		identity.ObservedFromDevice = &LocalDiskObservedIdentity{
+			Block: &LocalDiskObservedBlockIdentity{
+				DevicePath:          identity.LegacyDevicePath,
+				DeviceSerial:        identity.LegacyDeviceSerial,
+				MountSourceIdentity: identity.LegacyMountSourceIdentity,
+			},
+			Filesystem: &LocalDiskObservedFilesystemIdentity{
+				FilesystemUUID: identity.LegacyFilesystemUUID,
+				FilesystemType: identity.LegacyFilesystemType,
+				PartitionUUID:  identity.LegacyPartitionUUID,
+			},
+		}
+	}
+	if identity.AssertedByController != nil {
+		identity.AssertedByController.DeviceSerial = strings.TrimSpace(identity.AssertedByController.DeviceSerial)
+		identity.AssertedByController.OpenNebulaImageID = strings.TrimSpace(identity.AssertedByController.OpenNebulaImageID)
+		identity.AssertedByController.DiskTarget = strings.TrimSpace(identity.AssertedByController.DiskTarget)
+		if identity.AssertedByController.DeviceSerial == "" && identity.AssertedByController.OpenNebulaImageID == "" && identity.AssertedByController.DiskTarget == "" {
+			identity.AssertedByController = nil
+		}
+	}
+	if identity.ObservedFromDevice != nil {
+		if identity.ObservedFromDevice.Block != nil {
+			identity.ObservedFromDevice.Block.DevicePath = strings.TrimSpace(identity.ObservedFromDevice.Block.DevicePath)
+			identity.ObservedFromDevice.Block.ByIDPath = strings.TrimSpace(identity.ObservedFromDevice.Block.ByIDPath)
+			identity.ObservedFromDevice.Block.DeviceSerial = strings.TrimSpace(identity.ObservedFromDevice.Block.DeviceSerial)
+			identity.ObservedFromDevice.Block.MountSourceIdentity = strings.TrimSpace(identity.ObservedFromDevice.Block.MountSourceIdentity)
+			if identity.ObservedFromDevice.Block.DevicePath == "" && identity.ObservedFromDevice.Block.ByIDPath == "" && identity.ObservedFromDevice.Block.DeviceSerial == "" && identity.ObservedFromDevice.Block.MountSourceIdentity == "" {
+				identity.ObservedFromDevice.Block = nil
+			}
+		}
+		if identity.ObservedFromDevice.Filesystem != nil {
+			identity.ObservedFromDevice.Filesystem.FilesystemUUID = strings.TrimSpace(identity.ObservedFromDevice.Filesystem.FilesystemUUID)
+			identity.ObservedFromDevice.Filesystem.FilesystemType = strings.TrimSpace(identity.ObservedFromDevice.Filesystem.FilesystemType)
+			identity.ObservedFromDevice.Filesystem.PartitionUUID = strings.TrimSpace(identity.ObservedFromDevice.Filesystem.PartitionUUID)
+			if identity.ObservedFromDevice.Filesystem.FilesystemUUID == "" && identity.ObservedFromDevice.Filesystem.FilesystemType == "" && identity.ObservedFromDevice.Filesystem.PartitionUUID == "" {
+				identity.ObservedFromDevice.Filesystem = nil
+			}
+		}
+		if identity.ObservedFromDevice.Block == nil && identity.ObservedFromDevice.Filesystem == nil {
+			identity.ObservedFromDevice = nil
+		}
+	}
+	identity.LegacyDevicePath = ""
+	identity.LegacyDeviceSerial = ""
+	identity.LegacyFilesystemUUID = ""
+	identity.LegacyFilesystemType = ""
+	identity.LegacyPartitionUUID = ""
+	identity.LegacyOpenNebulaImageID = ""
+	identity.LegacyDiskTarget = ""
+	identity.LegacyMountSourceIdentity = ""
+}
+
+func localDiskAssertedDeviceSerial(identity *LocalDiskIdentity) string {
+	if identity == nil || identity.AssertedByController == nil {
+		return ""
+	}
+	return strings.TrimSpace(identity.AssertedByController.DeviceSerial)
+}
+
+func localDiskAssertedImageID(identity *LocalDiskIdentity) string {
+	if identity == nil || identity.AssertedByController == nil {
+		return ""
+	}
+	return strings.TrimSpace(identity.AssertedByController.OpenNebulaImageID)
+}
+
+func localDiskAssertedDiskTarget(identity *LocalDiskIdentity) string {
+	if identity == nil || identity.AssertedByController == nil {
+		return ""
+	}
+	return strings.TrimSpace(identity.AssertedByController.DiskTarget)
+}
+
+func localDiskObservedDevicePath(identity *LocalDiskIdentity) string {
+	if identity == nil || identity.ObservedFromDevice == nil || identity.ObservedFromDevice.Block == nil {
+		return ""
+	}
+	return strings.TrimSpace(identity.ObservedFromDevice.Block.DevicePath)
+}
+
+func localDiskObservedByIDPath(identity *LocalDiskIdentity) string {
+	if identity == nil || identity.ObservedFromDevice == nil || identity.ObservedFromDevice.Block == nil {
+		return ""
+	}
+	return strings.TrimSpace(identity.ObservedFromDevice.Block.ByIDPath)
+}
+
+func localDiskObservedDeviceSerial(identity *LocalDiskIdentity) string {
+	if identity == nil || identity.ObservedFromDevice == nil || identity.ObservedFromDevice.Block == nil {
+		return ""
+	}
+	return strings.TrimSpace(identity.ObservedFromDevice.Block.DeviceSerial)
+}
+
+func localDiskObservedMountSourceIdentity(identity *LocalDiskIdentity) string {
+	if identity == nil || identity.ObservedFromDevice == nil || identity.ObservedFromDevice.Block == nil {
+		return ""
+	}
+	return strings.TrimSpace(identity.ObservedFromDevice.Block.MountSourceIdentity)
+}
+
+func localDiskObservedFilesystemUUID(identity *LocalDiskIdentity) string {
+	if identity == nil || identity.ObservedFromDevice == nil || identity.ObservedFromDevice.Filesystem == nil {
+		return ""
+	}
+	return strings.TrimSpace(identity.ObservedFromDevice.Filesystem.FilesystemUUID)
+}
+
+func localDiskObservedFilesystemType(identity *LocalDiskIdentity) string {
+	if identity == nil || identity.ObservedFromDevice == nil || identity.ObservedFromDevice.Filesystem == nil {
+		return ""
+	}
+	return strings.TrimSpace(identity.ObservedFromDevice.Filesystem.FilesystemType)
+}
+
+func localDiskObservedPartitionUUID(identity *LocalDiskIdentity) string {
+	if identity == nil || identity.ObservedFromDevice == nil || identity.ObservedFromDevice.Filesystem == nil {
+		return ""
+	}
+	return strings.TrimSpace(identity.ObservedFromDevice.Filesystem.PartitionUUID)
 }
 
 func historyRequiresSafeRelease(state VolumeHistoryRecord) bool {
