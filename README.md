@@ -263,6 +263,7 @@ Behavior:
 - invalid or conflicting explicit `required-node` values return `FailedPrecondition`. Validation checks that the Kubernetes node exists, is not tombstoned in OpenNebula inventory, and belongs to a compatible system datastore for the volume.
 - `required-node-until` uses RFC3339 UTC. After expiry, the driver ignores the manual requirement, keeps the annotation in place, and surfaces the expired state in warnings, events, and support-bundle output.
 - `preferred-node` is soft. It injects preferred hostname affinity even when pod-level `last-node-preference: disabled` opt-out is set, because this is an explicit operator decision rather than an automatic heuristic.
+- historical `last-attached-node` is also soft. If the node is missing, tombstoned, or topology-incompatible, the driver downgrades it to warnings and skips the hint instead of blocking admission or maintenance reconciliation.
 - `storage-provider.opennebula.sparkaiur.io/allow-cross-node-until` remains the only cross-node override. It can authorize an explicit `required-node` that conflicts with inferred protected ownership, but it does not bypass topology validation, repair-required states, or quarantine.
 - `storage-provider.opennebula.sparkaiur.io/preferred-last-node` is deprecated on PVs and will be removed in `v0.6.0`. The driver still reads it as a fallback through `v0.5.x` and reports it in annotation audits.
 

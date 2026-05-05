@@ -2209,7 +2209,7 @@ func (s *ControllerServer) maintenanceBlocksPublish(ctx context.Context, req *cs
 	if err != nil || !runtimeContextEligibleForMaintenance(runtimeCtx, req.VolumeId) {
 		return false, ""
 	}
-	lastNode := maintenanceLastNodeForVolume(s.driver, runtimeCtx, req.VolumeId)
+	lastNode := maintenanceLastNodeForVolume(ctx, s.driver, runtimeCtx, req.VolumeId)
 	if strings.TrimSpace(lastNode) == "" || strings.TrimSpace(lastNode) == strings.TrimSpace(req.NodeId) {
 		return false, ""
 	}

@@ -318,25 +318,40 @@ func (m *MaintenanceModeManager) preferredMaintenanceNode(ctx context.Context, p
 	}
 	runtimeCtx := volumeRuntimeContextFromPVAndPVC(pv, pvc)
 	explicitPlacement := explicitNodePlacementForRuntimeContext(runtimeCtx)
+	if explicitPlacement.RequiredNodeParseError != nil {
+		m.emitMaintenanceHintIgnored(ctx, pv, explicitPlacement.RequiredNodeParseError.Error())
+	}
 	if explicitPlacement.RequiredNodeParseError == nil && explicitPlacement.RequiredNode != "" && !explicitPlacement.RequiredNodeExpired {
-		return explicitPlacement.RequiredNode, false
+		if node := m.validatedMaintenanceCandidate(ctx, pv, runtimeCtx, explicitPlacement.RequiredNode, "required-node", explicitPlacement.RequiredNodeSource); node != "" {
+			return node, false
+		}
 	}
 	if explicitPlacement.PreferredNode != "" && explicitPlacement.PreferredNodeSource != placementSourceLegacyPreferredLastNode {
-		return explicitPlacement.PreferredNode, false
+		if node := m.validatedMaintenanceCandidate(ctx, pv, runtimeCtx, explicitPlacement.PreferredNode, "preferred-node", explicitPlacement.PreferredNodeSource); node != "" {
+			return node, false
+		}
 	}
 	if explicitPlacement.LegacyPreferredNode != "" {
-		return explicitPlacement.LegacyPreferredNode, false
+		if node := m.validatedMaintenanceCandidate(ctx, pv, runtimeCtx, explicitPlacement.LegacyPreferredNode, "preferred-last-node", placementSourceLegacyPreferredLastNode); node != "" {
+			return node, false
+		}
 	}
 	if pv.Spec.CSI != nil && m != nil && m.driver != nil && m.driver.stickyAttachments != nil {
 		if state, ok := m.driver.stickyAttachments.Get(pv.Spec.CSI.VolumeHandle); ok && strings.TrimSpace(state.NodeID) != "" {
-			return strings.TrimSpace(state.NodeID), false
+			if node := m.validatedMaintenanceCandidate(ctx, pv, runtimeCtx, strings.TrimSpace(state.NodeID), "sticky-attachment-node", protectionSourceStickyReuse); node != "" {
+				return node, false
+			}
 		}
 	}
 	if attached := strings.TrimSpace(attachedByPV[pv.Name]); attached != "" {
-		return attached, false
+		if node := m.validatedMaintenanceCandidate(ctx, pv, runtimeCtx, attached, "attached-node", "live_attachment"); node != "" {
+			return node, false
+		}
 	}
 	if pv.Annotations != nil {
-		return strings.TrimSpace(pv.Annotations[annotationLastAttachedNode]), false
+		if node := m.validatedMaintenanceCandidate(ctx, pv, runtimeCtx, strings.TrimSpace(pv.Annotations[annotationLastAttachedNode]), "last-attached-node", placementSourceLastAttachedNode); node != "" {
+			return node, false
+		}
 	}
 	return "", false
 }
@@ -450,23 +465,80 @@ func maintenanceStickyGraceSeconds(cfg config.CSIPluginConfig) int {
 	return seconds
 }
 
-func maintenanceLastNodeForVolume(driver *Driver, runtimeCtx *VolumeRuntimeContext, volumeID string) string {
+func (m *MaintenanceModeManager) validatedMaintenanceCandidate(ctx context.Context, pv *corev1.PersistentVolume, runtimeCtx *VolumeRuntimeContext, nodeName, targetKind, source string) string {
+	nodeName = strings.TrimSpace(nodeName)
+	if nodeName == "" {
+		return ""
+	}
+	if m == nil || m.runtime == nil || !m.runtime.enabled {
+		return nodeName
+	}
+	validation := m.runtime.inspectNodeCandidate(ctx, runtimeCtx, nodeName, targetKind)
+	if validation.Valid() {
+		return nodeName
+	}
+	m.emitMaintenanceHintIgnored(ctx, pv, maintenanceHintWarning(source, validation))
+	return ""
+}
+
+func (m *MaintenanceModeManager) emitMaintenanceHintIgnored(ctx context.Context, pv *corev1.PersistentVolume, message string) {
+	if m == nil || m.runtime == nil || strings.TrimSpace(message) == "" {
+		return
+	}
+	m.recordMaintenanceOutcome("prepare", "ignored_invalid_hint")
+	klog.V(2).InfoS("Maintenance mode ignored invalid node hint", "pv", pvNameForLog(pv), "message", message)
+	if pv != nil && pv.Spec.ClaimRef != nil {
+		m.runtime.EmitPVCEvent(ctx, pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name, eventReasonMaintenanceHintIgnored, message)
+	}
+}
+
+func maintenanceLastNodeForVolume(ctx context.Context, driver *Driver, runtimeCtx *VolumeRuntimeContext, volumeID string) string {
 	explicitPlacement := explicitNodePlacementForRuntimeContext(runtimeCtx)
 	if explicitPlacement.RequiredNodeParseError == nil && explicitPlacement.RequiredNode != "" && !explicitPlacement.RequiredNodeExpired {
-		return explicitPlacement.RequiredNode
+		if validated := validatedMaintenanceLastNodeCandidate(ctx, driver, runtimeCtx, explicitPlacement.RequiredNode, "required-node"); validated != "" {
+			return validated
+		}
 	}
 	if explicitPlacement.PreferredNode != "" {
-		return explicitPlacement.PreferredNode
+		if validated := validatedMaintenanceLastNodeCandidate(ctx, driver, runtimeCtx, explicitPlacement.PreferredNode, "preferred-node"); validated != "" {
+			return validated
+		}
 	}
 	if driver != nil && driver.stickyAttachments != nil {
 		if state, ok := driver.stickyAttachments.Get(volumeID); ok && strings.TrimSpace(state.NodeID) != "" {
-			return strings.TrimSpace(state.NodeID)
+			if validated := validatedMaintenanceLastNodeCandidate(ctx, driver, runtimeCtx, strings.TrimSpace(state.NodeID), "sticky-attachment-node"); validated != "" {
+				return validated
+			}
 		}
 	}
 	if runtimeCtx != nil && runtimeCtx.PVAnnotations != nil {
-		return strings.TrimSpace(runtimeCtx.PVAnnotations[annotationLastAttachedNode])
+		if validated := validatedMaintenanceLastNodeCandidate(ctx, driver, runtimeCtx, strings.TrimSpace(runtimeCtx.PVAnnotations[annotationLastAttachedNode]), "last-attached-node"); validated != "" {
+			return validated
+		}
 	}
 	return ""
+}
+
+func validatedMaintenanceLastNodeCandidate(ctx context.Context, driver *Driver, runtimeCtx *VolumeRuntimeContext, nodeName, targetKind string) string {
+	nodeName = strings.TrimSpace(nodeName)
+	if nodeName == "" {
+		return ""
+	}
+	if driver == nil || driver.kubeRuntime == nil || !driver.kubeRuntime.enabled {
+		return nodeName
+	}
+	validation := driver.kubeRuntime.inspectNodeCandidate(ctx, runtimeCtx, nodeName, targetKind)
+	if !validation.Valid() {
+		return ""
+	}
+	return nodeName
+}
+
+func pvNameForLog(pv *corev1.PersistentVolume) string {
+	if pv == nil {
+		return ""
+	}
+	return pv.Name
 }
 
 func runtimeContextEligibleForMaintenance(runtimeCtx *VolumeRuntimeContext, volumeID string) bool {

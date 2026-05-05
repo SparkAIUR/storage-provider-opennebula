@@ -510,6 +510,10 @@ func collectVolumeHealthReports(ctx context.Context, kubeClient kubernetes.Inter
 	sharedSessions, _ := newSharedFilesystemSessionStore(sharedFilesystemSessionRootPath).List()
 	mountSources := currentMountSources()
 	openNebulaMetadata := openNebulaAttachmentMetadataSnapshot(ctx, cfg, pvs.Items, vas.Items)
+	auditRuntime := &KubeRuntime{client: kubeClient, enabled: true}
+	if restConfig, err := loadKubeRestConfig(); err == nil {
+		auditRuntime.inventoryClient = newInventoryRuntimeClient(restConfig)
+	}
 
 	reports := make([]VolumeHealthReport, 0)
 	for _, pv := range pvs.Items {
@@ -525,8 +529,14 @@ func collectVolumeHealthReports(ctx context.Context, kubeClient kubernetes.Inter
 			report.PVCNamespace = pv.Spec.ClaimRef.Namespace
 			report.PVCName = pv.Spec.ClaimRef.Name
 			if pvc, pvcErr := kubeClient.CoreV1().PersistentVolumeClaims(report.PVCNamespace).Get(ctx, report.PVCName, metav1.GetOptions{}); pvcErr == nil {
+				pvcCopy := pvc
+				report.AnnotationAudit = append(report.AnnotationAudit, auditSoftPlacementAnnotations(ctx, auditRuntime, &pv, pvcCopy)...)
 				report.AnnotationAudit = append(report.AnnotationAudit, auditVolumeAnnotations("pvc", pvc.Annotations)...)
+			} else {
+				report.AnnotationAudit = append(report.AnnotationAudit, auditSoftPlacementAnnotations(ctx, auditRuntime, &pv, nil)...)
 			}
+		} else {
+			report.AnnotationAudit = append(report.AnnotationAudit, auditSoftPlacementAnnotations(ctx, auditRuntime, &pv, nil)...)
 		}
 		report.AnnotationAudit = append(report.AnnotationAudit, auditVolumeAnnotations("pv", pv.Annotations)...)
 		for _, va := range vas.Items {
@@ -1071,7 +1081,7 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 			}
 			continue
 		}
-		if decision.Protected || strings.TrimSpace(decision.Reason) != "" || strings.TrimSpace(decision.PreferredNode) != "" || strings.TrimSpace(decision.ExplicitRequiredNode) != "" || strings.TrimSpace(decision.ExplicitPreferredNode) != "" || strings.TrimSpace(decision.PlacementDecision) != "" {
+		if decision.Protected || strings.TrimSpace(decision.Reason) != "" || strings.TrimSpace(decision.PreferredNode) != "" || strings.TrimSpace(decision.ExplicitRequiredNode) != "" || strings.TrimSpace(decision.ExplicitPreferredNode) != "" || strings.TrimSpace(decision.PlacementDecision) != "" || len(decision.Warnings) > 0 {
 			protectionSnapshot[pv.Spec.CSI.VolumeHandle] = decision
 		}
 	}

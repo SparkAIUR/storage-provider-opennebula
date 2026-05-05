@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
@@ -140,5 +141,60 @@ func TestCollectVolumeHealthReportsFlagsLegacyLastAttachedNodeAnnotation(t *test
 		if finding.CanonicalKey != annotationLastAttachedNode {
 			t.Fatalf("expected canonical annotation key %q, got %#v", annotationLastAttachedNode, finding)
 		}
+	}
+}
+
+func TestCollectVolumeHealthReportsFlagsStaleLastAttachedNodeAnnotation(t *testing.T) {
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pv-stale-last",
+			Annotations: map[string]string{
+				annotationLastAttachedNode: "node-missing",
+				annotationBackend:          "local",
+			},
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			ClaimRef: &corev1.ObjectReference{
+				Namespace: "default",
+				Name:      "pvc-stale-last",
+			},
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{
+					Driver:       DefaultDriverName,
+					VolumeHandle: "vol-stale-last",
+				},
+			},
+		},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pvc-stale-last",
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{VolumeName: pv.Name},
+	}
+	kubeClient := fake.NewSimpleClientset(pv, pvc)
+	cfg := config.LoadConfiguration()
+	cfg.OverrideVal(config.OpenNebulaCredentialsVar, "")
+
+	reports, err := collectVolumeHealthReports(context.Background(), kubeClient, cfg, VolumeHealthOptions{VolumeID: "vol-stale-last"})
+	if err != nil {
+		t.Fatalf("collectVolumeHealthReports returned error: %v", err)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("expected 1 report, got %d", len(reports))
+	}
+	found := false
+	for _, finding := range reports[0].AnnotationAudit {
+		if finding.Key == annotationLastAttachedNode {
+			found = true
+			if !strings.Contains(finding.Message, "stale soft-placement hint") {
+				t.Fatalf("expected stale soft-placement audit message, got %#v", finding)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected stale last-attached-node audit finding, got %#v", reports[0].AnnotationAudit)
 	}
 }

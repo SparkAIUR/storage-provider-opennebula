@@ -201,8 +201,8 @@ func (s *ControllerServer) localRWOProtectionDecision(ctx context.Context, volum
 		decision.PlacementReason = firstNonEmpty(explicitPlacement.PlacementReason, decision.PlacementReason)
 		if s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
 			decision.Warnings = append(decision.Warnings, "manual preferred-node was ignored because kubernetes runtime is not enabled")
-		} else if err := s.driver.kubeRuntime.ValidateManualNodeTarget(ctx, runtimeCtx, explicitPlacement.PreferredNode, "preferred-node"); err != nil {
-			decision.Warnings = append(decision.Warnings, err.Error())
+		} else if validation := s.driver.kubeRuntime.inspectNodeCandidate(ctx, runtimeCtx, explicitPlacement.PreferredNode, "preferred-node"); !validation.Valid() {
+			decision.Warnings = append(decision.Warnings, softPlacementWarning(explicitPlacement.PreferredNodeSource, validation))
 		} else {
 			decision.PreferredNode = explicitPlacement.PreferredNode
 			decision.Source = protectionSourceExplicitPreferredNode
@@ -213,14 +213,31 @@ func (s *ControllerServer) localRWOProtectionDecision(ctx context.Context, volum
 	}
 
 	if runtimeCtx != nil && strings.TrimSpace(runtimeCtx.PVAnnotations[annotationLastAttachedNode]) != "" {
-		decision.PreferredNode = strings.TrimSpace(runtimeCtx.PVAnnotations[annotationLastAttachedNode])
-		decision.PlacementSource = placementSourceLastAttachedNode
-		decision.PlacementDecision = placementDecisionPreferred
+		lastAttachedNode := strings.TrimSpace(runtimeCtx.PVAnnotations[annotationLastAttachedNode])
+		if s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
+			decision.PreferredNode = lastAttachedNode
+			decision.PlacementSource = placementSourceLastAttachedNode
+			decision.PlacementDecision = placementDecisionPreferred
+		} else if validation := s.driver.kubeRuntime.inspectNodeCandidate(ctx, runtimeCtx, lastAttachedNode, "last-attached-node"); !validation.Valid() {
+			decision.Warnings = append(decision.Warnings, softPlacementWarning(placementSourceLastAttachedNode, validation))
+		} else {
+			decision.PreferredNode = lastAttachedNode
+			decision.PlacementSource = placementSourceLastAttachedNode
+			decision.PlacementDecision = placementDecisionPreferred
+		}
 	}
 	if decision.PreferredNode == "" && explicitPlacement.LegacyPreferredNode != "" {
-		decision.PreferredNode = explicitPlacement.LegacyPreferredNode
-		decision.PlacementSource = placementSourceLegacyPreferredLastNode
-		decision.PlacementDecision = placementDecisionPreferred
+		if s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
+			decision.PreferredNode = explicitPlacement.LegacyPreferredNode
+			decision.PlacementSource = placementSourceLegacyPreferredLastNode
+			decision.PlacementDecision = placementDecisionPreferred
+		} else if validation := s.driver.kubeRuntime.inspectNodeCandidate(ctx, runtimeCtx, explicitPlacement.LegacyPreferredNode, "preferred-last-node"); !validation.Valid() {
+			decision.Warnings = append(decision.Warnings, softPlacementWarning(placementSourceLegacyPreferredLastNode, validation))
+		} else {
+			decision.PreferredNode = explicitPlacement.LegacyPreferredNode
+			decision.PlacementSource = placementSourceLegacyPreferredLastNode
+			decision.PlacementDecision = placementDecisionPreferred
+		}
 	}
 	return decision, nil
 }
@@ -247,7 +264,7 @@ func (s *ControllerServer) inferredLocalRWORequiredNode(ctx context.Context, vol
 		}
 	}
 	if requiredNode == "" && s.driver.maintenanceMode != nil && s.driver.maintenanceMode.Active() {
-		requiredNode = maintenanceLastNodeForVolume(s.driver, runtimeCtx, volumeID)
+		requiredNode = maintenanceLastNodeForVolume(ctx, s.driver, runtimeCtx, volumeID)
 		if requiredNode != "" {
 			reason = protectionReasonMaintenance
 			source = protectionSourceExplicitMaintenance

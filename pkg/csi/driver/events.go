@@ -34,6 +34,7 @@ const (
 	eventReasonRequiredNodeInvalid          = "RequiredNodeInvalid"
 	eventReasonMaintenanceModePrepared      = "MaintenanceModePrepared"
 	eventReasonMaintenanceModeBlocked       = "MaintenanceModeBlocked"
+	eventReasonMaintenanceHintIgnored       = "MaintenanceHintIgnored"
 	eventReasonMaintenanceModeReady         = "MaintenanceModeReady"
 	eventReasonMaintenanceModeReleased      = "MaintenanceModeReleased"
 	eventReasonCrossNodeOverrideUsed        = "CrossNodeOverrideUsed"

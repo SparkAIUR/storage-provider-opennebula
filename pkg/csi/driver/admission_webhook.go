@@ -14,6 +14,7 @@ import (
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -190,10 +191,29 @@ func (w *LastNodePreferenceWebhook) buildPatch(ctx context.Context, pod *corev1.
 		w.driver.metrics.RecordLastNodePreference("skipped", "pod_opt_out")
 		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
 	}
-	hostname, err := w.driver.kubeRuntime.GetNodeHostname(ctx, placement.TargetNode)
+	node, err := w.driver.kubeRuntime.GetNode(ctx, placement.TargetNode)
 	if err != nil {
-		w.driver.metrics.RecordLastNodePreference("error", "node_lookup_failed")
-		return nil, warnings, err
+		validation := nodeCandidateValidation{
+			Node:   strings.TrimSpace(placement.TargetNode),
+			Status: nodeCandidateValidationKubernetesLookupFailed,
+			Message: fmt.Sprintf(
+				"failed to look up %s %s in Kubernetes: %v",
+				placementSourceTargetKind(placement.Source),
+				strings.TrimSpace(placement.TargetNode),
+				err,
+			),
+		}
+		if apierrors.IsNotFound(err) {
+			validation.Status = nodeCandidateValidationMissingKubernetesNode
+			validation.Message = fmt.Sprintf("%s %s does not exist in Kubernetes", placementSourceTargetKind(placement.Source), strings.TrimSpace(placement.TargetNode))
+		}
+		warnings = append(warnings, softPlacementWarning(placement.Source, validation))
+		w.driver.metrics.RecordLastNodePreference("skipped", softPlacementMetricReason(validation.Status))
+		return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
+	}
+	hostname := strings.TrimSpace(node.Labels[corev1.LabelHostname])
+	if hostname == "" {
+		hostname = strings.TrimSpace(placement.TargetNode)
 	}
 	if hasPreferredHostnameAffinity(pod, hostname) {
 		w.driver.metrics.RecordLastNodePreference("skipped", "already_present")

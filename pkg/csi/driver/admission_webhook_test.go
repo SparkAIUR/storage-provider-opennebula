@@ -148,7 +148,9 @@ func TestLastNodePreferenceWebhookRejectsConflictingNodesDuringMaintenance(t *te
 	pv2.Annotations[annotationLastAttachedNode] = "node-b"
 	pvc1.Spec.VolumeName = pv1.Name
 	pvc2.Spec.VolumeName = pv2.Name
-	driver := newWebhookTestDriver(pv1, pvc1, pv2, pvc2)
+	nodeA := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{corev1.LabelHostname: hostLabel("a")}}}
+	nodeB := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-b", Labels: map[string]string{corev1.LabelHostname: hostLabel("b")}}}
+	driver := newWebhookTestDriver(pv1, pvc1, pv2, pvc2, nodeA, nodeB)
 	driver.maintenanceMode = NewMaintenanceModeManager(driver, "default")
 	driver.maintenanceMode.setState(true, true, false)
 	webhook := NewLastNodePreferenceWebhook(driver)
@@ -195,7 +197,8 @@ func TestLastNodePreferenceWebhookHonorsOptOut(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-1", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 	pv.Annotations[annotationLastAttachedNode] = "node-a"
 	pvc.Spec.VolumeName = pv.Name
-	driver := newWebhookTestDriver(pv, pvc)
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{corev1.LabelHostname: hostLabel("a")}}}
+	driver := newWebhookTestDriver(pv, pvc, node)
 	webhook := NewLastNodePreferenceWebhook(driver)
 
 	patch, warnings, err := webhook.buildPatch(context.Background(), &corev1.Pod{
@@ -228,7 +231,7 @@ func TestLastNodePreferenceWebhookInjectsExplicitRequiredNode(t *testing.T) {
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
 		Name: "node-b",
 		Labels: map[string]string{
-			corev1.LabelHostname: hostLabel("b"),
+			corev1.LabelHostname:  hostLabel("b"),
 			topologySystemDSLabel: "104",
 		},
 	}}
@@ -288,14 +291,14 @@ func TestLastNodePreferenceWebhookRejectsConflictingExplicitRequiredNode(t *test
 	nodeA := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
 		Name: "node-a",
 		Labels: map[string]string{
-			corev1.LabelHostname: hostLabel("a"),
+			corev1.LabelHostname:  hostLabel("a"),
 			topologySystemDSLabel: "104",
 		},
 	}}
 	nodeB := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
 		Name: "node-b",
 		Labels: map[string]string{
-			corev1.LabelHostname: hostLabel("b"),
+			corev1.LabelHostname:  hostLabel("b"),
 			topologySystemDSLabel: "104",
 		},
 	}}
@@ -354,7 +357,7 @@ func TestLastNodePreferenceWebhookInjectsExplicitPreferredNodeWhenSoftPreference
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
 		Name: "node-b",
 		Labels: map[string]string{
-			corev1.LabelHostname: hostLabel("b"),
+			corev1.LabelHostname:  hostLabel("b"),
 			topologySystemDSLabel: "104",
 		},
 	}}
@@ -397,6 +400,136 @@ func TestLastNodePreferenceWebhookInjectsExplicitPreferredNodeWhenSoftPreference
 	require.NoError(t, err)
 	assert.Contains(t, string(raw), jsonPointerEscape(annotationPreferredNodeInjected))
 	assert.Contains(t, string(raw), hostLabel("b"))
+}
+
+func TestLastNodePreferenceWebhookSkipsMissingHistoricalLastAttachedNode(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-missing-last", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv.Annotations[annotationLastAttachedNode] = "node-missing"
+	pvc.Spec.VolumeName = pv.Name
+	driver := newWebhookTestDriver(pv, pvc)
+	webhook := NewLastNodePreferenceWebhook(driver)
+
+	patch, warnings, err := webhook.buildPatch(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-0", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc.Name},
+				},
+			}},
+		},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, patch)
+	assert.NotEmpty(t, warnings)
+	assert.Contains(t, warnings[0], "historical last-attached-node was ignored")
+}
+
+func TestLastNodePreferenceWebhookSkipsTombstonedHistoricalLastAttachedNode(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-tombstoned-last", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationDatastoreID: "111",
+	})
+	pv.Annotations[annotationLastAttachedNode] = "node-a"
+	pvc.Spec.VolumeName = pv.Name
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "node-a",
+		Labels: map[string]string{
+			corev1.LabelHostname:  hostLabel("a"),
+			topologySystemDSLabel: "104",
+		},
+	}}
+	driver := newWebhookTestDriver(pv, pvc, node)
+	driver.kubeRuntime.inventoryClient = newInventoryFakeClient(t,
+		&inventoryv1alpha1.OpenNebulaDatastore{
+			ObjectMeta: metav1.ObjectMeta{Name: "ds-111"},
+			Spec:       inventoryv1alpha1.OpenNebulaDatastoreSpec{Discovery: inventoryv1alpha1.OpenNebulaDatastoreDiscoverySpec{OpenNebulaDatastoreID: 111}},
+			Status: inventoryv1alpha1.OpenNebulaDatastoreStatus{
+				ID:      111,
+				Backend: "local",
+				OpenNebula: inventoryv1alpha1.OpenNebulaDatastoreOpenNebulaStatus{
+					CompatibleSystemDatastores: []int{104},
+				},
+			},
+		},
+		&inventoryv1alpha1.OpenNebulaNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+			Status: inventoryv1alpha1.OpenNebulaNodeStatus{
+				Phase: inventoryv1alpha1.NodePhaseNotFound,
+				OpenNebula: inventoryv1alpha1.OpenNebulaNodeOpenNebulaStatus{
+					SystemDatastoreID: 104,
+				},
+			},
+		},
+	)
+	webhook := NewLastNodePreferenceWebhook(driver)
+
+	patch, warnings, err := webhook.buildPatch(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-0", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc.Name},
+				},
+			}},
+		},
+	})
+	require.NoError(t, err)
+	assert.NotEmpty(t, warnings)
+	raw, err := json.Marshal(patch)
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), jsonPointerEscape(annotationPreferredNodeInjected))
+	assert.Contains(t, warnings[0], "historical last-attached-node was ignored")
+	assert.Contains(t, warnings[0], "tombstoned")
+}
+
+func TestLastNodePreferenceWebhookSkipsMissingExplicitPreferredNode(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-missing-preferred", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pvc.Spec.VolumeName = pv.Name
+	pvc.Annotations[annotationPreferredNode] = "node-missing"
+	driver := newWebhookTestDriver(pv, pvc)
+	webhook := NewLastNodePreferenceWebhook(driver)
+
+	patch, warnings, err := webhook.buildPatch(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-0", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc.Name},
+				},
+			}},
+		},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, patch)
+	assert.NotEmpty(t, warnings)
+	assert.Contains(t, warnings[0], "soft preferred-node was ignored")
+}
+
+func TestLastNodePreferenceWebhookRejectsMissingExplicitRequiredNode(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-missing-required", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pvc.Spec.VolumeName = pv.Name
+	pvc.Annotations[annotationRequiredNode] = "node-missing"
+	driver := newWebhookTestDriver(pv, pvc)
+	webhook := NewLastNodePreferenceWebhook(driver)
+
+	patch, warnings, err := webhook.buildPatch(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-0", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc.Name},
+				},
+			}},
+		},
+	})
+	require.Error(t, err)
+	assert.Empty(t, patch)
+	assert.NotEmpty(t, warnings)
+	assert.Contains(t, err.Error(), "required-node node-missing does not exist in Kubernetes")
 }
 
 func TestLastNodePreferenceWebhookIgnoresExpiredExplicitRequiredNode(t *testing.T) {

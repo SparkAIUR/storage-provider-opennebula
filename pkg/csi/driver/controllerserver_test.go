@@ -1741,7 +1741,8 @@ func TestControllerUnpublishVolumeStartsMaintenanceHold(t *testing.T) {
 func TestControllerPublishVolumeBlocksCrossNodeDuringMaintenance(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-maint-block", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 	pv.Annotations[annotationLastAttachedNode] = "node-old"
-	driver := newStickyTestDriver(t, pv, pvc)
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-old"}}
+	driver := newStickyTestDriver(t, pv, pvc, node)
 	driver.maintenanceMode = NewMaintenanceModeManager(driver, "default")
 	driver.maintenanceMode.setState(true, true, false)
 

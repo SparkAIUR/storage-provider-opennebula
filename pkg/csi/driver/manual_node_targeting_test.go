@@ -153,3 +153,69 @@ func TestLocalRWOProtectionDecisionFallsBackAfterExpiredRequiredNode(t *testing.
 	assert.Equal(t, placementSourceLastAttachedNode, decision.PlacementSource)
 	assert.NotEmpty(t, decision.Warnings)
 }
+
+func TestLocalRWOProtectionDecisionSkipsMissingHistoricalLastAttachedNode(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-missing-last", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv.Annotations[annotationLastAttachedNode] = "node-missing"
+	pvc.Spec.VolumeName = pv.Name
+	driver := newWebhookTestDriver(pv, pvc)
+
+	decision, err := localRWOProtectionDecisionForDriver(context.Background(), driver, "vol-missing-last", "")
+	require.NoError(t, err)
+	assert.Empty(t, decision.PreferredNode)
+	assert.False(t, decision.Invalid)
+	assert.NotEmpty(t, decision.Warnings)
+	assert.Contains(t, decision.Warnings[0], "historical last-attached-node was ignored")
+}
+
+func TestLocalRWOProtectionDecisionSkipsTopologyIncompatibleHistoricalLastAttachedNode(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-incompatible-last", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationDatastoreID: "111",
+	})
+	pv.Annotations[annotationLastAttachedNode] = "node-a"
+	pvc.Spec.VolumeName = pv.Name
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "node-a",
+		Labels: map[string]string{
+			corev1.LabelHostname:  hostLabel("a"),
+			topologySystemDSLabel: "999",
+		},
+	}}
+	driver := newWebhookTestDriver(pv, pvc, node)
+	driver.kubeRuntime.inventoryClient = newInventoryFakeClient(t,
+		&inventoryv1alpha1.OpenNebulaDatastore{
+			ObjectMeta: metav1.ObjectMeta{Name: "ds-111"},
+			Spec:       inventoryv1alpha1.OpenNebulaDatastoreSpec{Discovery: inventoryv1alpha1.OpenNebulaDatastoreDiscoverySpec{OpenNebulaDatastoreID: 111}},
+			Status: inventoryv1alpha1.OpenNebulaDatastoreStatus{
+				ID:      111,
+				Backend: "local",
+				OpenNebula: inventoryv1alpha1.OpenNebulaDatastoreOpenNebulaStatus{
+					CompatibleSystemDatastores: []int{104},
+				},
+			},
+		},
+		&inventoryv1alpha1.OpenNebulaNode{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}, Status: inventoryv1alpha1.OpenNebulaNodeStatus{Phase: inventoryv1alpha1.NodePhaseReady, OpenNebula: inventoryv1alpha1.OpenNebulaNodeOpenNebulaStatus{SystemDatastoreID: 999}}},
+	)
+
+	decision, err := localRWOProtectionDecisionForDriver(context.Background(), driver, "vol-incompatible-last", "")
+	require.NoError(t, err)
+	assert.Empty(t, decision.PreferredNode)
+	assert.False(t, decision.Invalid)
+	assert.NotEmpty(t, decision.Warnings)
+	assert.Contains(t, decision.Warnings[0], "historical last-attached-node was ignored")
+	assert.Contains(t, decision.Warnings[0], "incompatible")
+}
+
+func TestLocalRWOProtectionDecisionWarnsOnInvalidExplicitPreferredNode(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-invalid-preferred", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pvc.Spec.VolumeName = pv.Name
+	pvc.Annotations[annotationPreferredNode] = "node-missing"
+	driver := newWebhookTestDriver(pv, pvc)
+
+	decision, err := localRWOProtectionDecisionForDriver(context.Background(), driver, "vol-invalid-preferred", "")
+	require.NoError(t, err)
+	assert.False(t, decision.Invalid)
+	assert.Empty(t, decision.PreferredNode)
+	assert.NotEmpty(t, decision.Warnings)
+	assert.Contains(t, decision.Warnings[0], "soft preferred-node was ignored")
+}

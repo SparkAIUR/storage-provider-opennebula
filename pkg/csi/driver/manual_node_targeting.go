@@ -28,6 +28,13 @@ const (
 	placementDecisionIgnored     = "ignored"
 	placementDecisionInvalid     = "invalid"
 	placementDecisionConflicting = "conflicting"
+
+	nodeCandidateValidationValid                   = "valid"
+	nodeCandidateValidationMissingKubernetesNode   = "missing_k8s_node"
+	nodeCandidateValidationTombstonedInventoryNode = "tombstoned_inventory_node"
+	nodeCandidateValidationTopologyIncompatible    = "topology_incompatible"
+	nodeCandidateValidationInventoryLookupFailed   = "inventory_lookup_failed"
+	nodeCandidateValidationKubernetesLookupFailed  = "kubernetes_lookup_failed"
 )
 
 type explicitNodePlacement struct {
@@ -42,6 +49,17 @@ type explicitNodePlacement struct {
 	Warnings               []string
 	RequiredNodeParseError error
 	ExplicitPreferredNode  string
+}
+
+type nodeCandidateValidation struct {
+	Node     string
+	Hostname string
+	Status   string
+	Message  string
+}
+
+func (v nodeCandidateValidation) Valid() bool {
+	return strings.TrimSpace(v.Status) == nodeCandidateValidationValid
 }
 
 func hasManualNodeTargetingAnnotations(runtimeCtx *VolumeRuntimeContext) bool {
@@ -292,46 +310,152 @@ func (r *KubeRuntime) NodeSystemDatastore(ctx context.Context, nodeName string) 
 }
 
 func (r *KubeRuntime) ValidateManualNodeTarget(ctx context.Context, runtimeCtx *VolumeRuntimeContext, nodeName, targetKind string) error {
-	if r == nil || !r.enabled {
-		return fmt.Errorf("kubernetes runtime is not enabled")
-	}
-	nodeName = strings.TrimSpace(nodeName)
-	if nodeName == "" {
-		return fmt.Errorf("%s is empty", targetKind)
-	}
-	if _, err := r.GetNode(ctx, nodeName); err != nil {
-		return fmt.Errorf("%s %s does not exist: %w", targetKind, nodeName, err)
-	}
-	if r.inventoryClient != nil {
-		openNebulaNode, err := r.OpenNebulaNode(ctx, nodeName)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return fmt.Errorf("%s %s is missing from OpenNebula inventory", targetKind, nodeName)
-			}
-			return fmt.Errorf("failed to look up %s %s in OpenNebula inventory: %w", targetKind, nodeName, err)
-		}
-		if strings.EqualFold(strings.TrimSpace(openNebulaNode.Status.Phase), inventoryv1alpha1.NodePhaseNotFound) {
-			return fmt.Errorf("%s %s is tombstoned in OpenNebula inventory", targetKind, nodeName)
-		}
-	}
-	compatibleSystemDatastores, reason, err := r.CompatibleSystemDatastoresForRuntimeContext(ctx, runtimeCtx)
-	if err != nil {
-		return fmt.Errorf("failed to resolve compatible system datastores for %s %s: %w", targetKind, nodeName, err)
-	}
-	if len(compatibleSystemDatastores) == 0 {
+	validation := r.inspectNodeCandidate(ctx, runtimeCtx, nodeName, targetKind)
+	if validation.Valid() {
 		return nil
 	}
-	nodeSystemDatastore, err := r.NodeSystemDatastore(ctx, nodeName)
+	if strings.TrimSpace(validation.Message) == "" {
+		return fmt.Errorf("%s %s is invalid", targetKind, nodeName)
+	}
+	return fmt.Errorf("%s", validation.Message)
+}
+
+func (r *KubeRuntime) inspectNodeCandidate(ctx context.Context, runtimeCtx *VolumeRuntimeContext, nodeName, targetKind string) nodeCandidateValidation {
+	validation := nodeCandidateValidation{
+		Node:   strings.TrimSpace(nodeName),
+		Status: nodeCandidateValidationValid,
+	}
+	if r == nil || !r.enabled {
+		validation.Status = nodeCandidateValidationKubernetesLookupFailed
+		validation.Message = "kubernetes runtime is not enabled"
+		return validation
+	}
+	if validation.Node == "" {
+		validation.Status = nodeCandidateValidationMissingKubernetesNode
+		validation.Message = fmt.Sprintf("%s is empty", targetKind)
+		return validation
+	}
+
+	node, err := r.GetNode(ctx, validation.Node)
 	if err != nil {
-		return fmt.Errorf("failed to resolve system datastore for %s %s: %w", targetKind, nodeName, err)
+		if apierrors.IsNotFound(err) {
+			validation.Status = nodeCandidateValidationMissingKubernetesNode
+			validation.Message = fmt.Sprintf("%s %s does not exist in Kubernetes", targetKind, validation.Node)
+			return validation
+		}
+		validation.Status = nodeCandidateValidationKubernetesLookupFailed
+		validation.Message = fmt.Sprintf("failed to look up %s %s in Kubernetes: %v", targetKind, validation.Node, err)
+		return validation
+	}
+	validation.Hostname = strings.TrimSpace(node.Labels[corev1.LabelHostname])
+	if validation.Hostname == "" {
+		validation.Hostname = validation.Node
+	}
+
+	if r.inventoryClient != nil {
+		openNebulaNode, err := r.OpenNebulaNode(ctx, validation.Node)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				validation.Status = nodeCandidateValidationTombstonedInventoryNode
+				validation.Message = fmt.Sprintf("%s %s is missing from OpenNebula inventory", targetKind, validation.Node)
+				return validation
+			}
+			validation.Status = nodeCandidateValidationInventoryLookupFailed
+			validation.Message = fmt.Sprintf("failed to look up %s %s in OpenNebula inventory: %v", targetKind, validation.Node, err)
+			return validation
+		}
+		if strings.EqualFold(strings.TrimSpace(openNebulaNode.Status.Phase), inventoryv1alpha1.NodePhaseNotFound) {
+			validation.Status = nodeCandidateValidationTombstonedInventoryNode
+			validation.Message = fmt.Sprintf("%s %s is tombstoned in OpenNebula inventory", targetKind, validation.Node)
+			return validation
+		}
+	}
+
+	if r.inventoryClient == nil {
+		return validation
+	}
+
+	compatibleSystemDatastores, reason, err := r.CompatibleSystemDatastoresForRuntimeContext(ctx, runtimeCtx)
+	if err != nil {
+		validation.Status = nodeCandidateValidationInventoryLookupFailed
+		validation.Message = fmt.Sprintf("failed to resolve compatible system datastores for %s %s: %v", targetKind, validation.Node, err)
+		return validation
+	}
+	if len(compatibleSystemDatastores) == 0 {
+		return validation
+	}
+	nodeSystemDatastore, err := r.NodeSystemDatastore(ctx, validation.Node)
+	if err != nil {
+		validation.Status = nodeCandidateValidationInventoryLookupFailed
+		validation.Message = fmt.Sprintf("failed to resolve system datastore for %s %s: %v", targetKind, validation.Node, err)
+		return validation
 	}
 	if strings.TrimSpace(nodeSystemDatastore) == "" {
-		return fmt.Errorf("%s %s does not report topology system datastore compatibility (%s)", targetKind, nodeName, reason)
+		validation.Status = nodeCandidateValidationTopologyIncompatible
+		validation.Message = fmt.Sprintf("%s %s does not report topology system datastore compatibility (%s)", targetKind, validation.Node, reason)
+		return validation
 	}
 	if !containsString(compatibleSystemDatastores, nodeSystemDatastore) {
-		return fmt.Errorf("%s %s is incompatible with compatible system datastores %v (node system datastore=%s)", targetKind, nodeName, compatibleSystemDatastores, nodeSystemDatastore)
+		validation.Status = nodeCandidateValidationTopologyIncompatible
+		validation.Message = fmt.Sprintf("%s %s is incompatible with compatible system datastores %v (node system datastore=%s)", targetKind, validation.Node, compatibleSystemDatastores, nodeSystemDatastore)
+		return validation
 	}
-	return nil
+	return validation
+}
+
+func softPlacementWarning(source string, validation nodeCandidateValidation) string {
+	switch strings.TrimSpace(source) {
+	case placementSourcePVPreferredNode, placementSourcePVCPreferredNode:
+		return fmt.Sprintf("soft preferred-node was ignored: %s", validation.Message)
+	case placementSourceLegacyPreferredLastNode:
+		return fmt.Sprintf("soft preferred-last-node was ignored: %s", validation.Message)
+	case placementSourceLastAttachedNode:
+		return fmt.Sprintf("historical last-attached-node was ignored: %s", validation.Message)
+	default:
+		return fmt.Sprintf("soft placement hint was ignored: %s", validation.Message)
+	}
+}
+
+func maintenanceHintWarning(source string, validation nodeCandidateValidation) string {
+	switch strings.TrimSpace(source) {
+	case placementSourcePVRequiredNode, placementSourcePVCRequiredNode:
+		return fmt.Sprintf("maintenance ignored required-node hint: %s", validation.Message)
+	case placementSourcePVPreferredNode, placementSourcePVCPreferredNode:
+		return fmt.Sprintf("maintenance ignored preferred-node hint: %s", validation.Message)
+	case placementSourceLegacyPreferredLastNode:
+		return fmt.Sprintf("maintenance ignored preferred-last-node hint: %s", validation.Message)
+	case placementSourceLastAttachedNode:
+		return fmt.Sprintf("maintenance ignored historical last-attached-node hint: %s", validation.Message)
+	case protectionSourceStickyReuse, protectionSourceExplicitMaintenance:
+		return fmt.Sprintf("maintenance ignored sticky attachment hint: %s", validation.Message)
+	case "live_attachment":
+		return fmt.Sprintf("maintenance ignored live attachment hint: %s", validation.Message)
+	default:
+		return fmt.Sprintf("maintenance ignored node hint: %s", validation.Message)
+	}
+}
+
+func placementSourceTargetKind(source string) string {
+	switch strings.TrimSpace(source) {
+	case placementSourcePVRequiredNode, placementSourcePVCRequiredNode:
+		return "required-node"
+	case placementSourcePVPreferredNode, placementSourcePVCPreferredNode:
+		return "preferred-node"
+	case placementSourceLegacyPreferredLastNode:
+		return "preferred-last-node"
+	case placementSourceLastAttachedNode:
+		return "last-attached-node"
+	default:
+		return "node"
+	}
+}
+
+func softPlacementMetricReason(status string) string {
+	status = strings.TrimSpace(status)
+	if status == "" {
+		status = "unknown"
+	}
+	return "stale_soft_placement_" + status
 }
 
 func containsString(values []string, target string) bool {
