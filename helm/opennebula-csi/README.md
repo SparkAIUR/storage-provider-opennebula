@@ -287,11 +287,43 @@ Repeated matching failures are persisted in `opennebula-csi-volume-quarantine-st
 
 ### Local Device Recovery
 
-When an OpenNebula VM reports a disk attached but the node plugin cannot discover the device inside the guest, the node records a missing-device report in `opennebula-csi-node-device-state`. The controller leader watches those reports and, after the configured threshold, performs a same-node recovery for eligible local non-CephFS `ReadWriteOnce` volumes: detach from the reporting node, attach back to that same node, confirm the OpenNebula attachment, and clear the report once the node can retry staging.
+When an OpenNebula VM still reports the PVC disk in template metadata but the node plugin cannot discover the device inside the guest, the node records a typed missing-device report in `opennebula-csi-node-device-state`. The controller leader watches those reports and, after the configured threshold, performs same-node-only recovery for eligible local non-CephFS `ReadWriteOnce` volumes.
 
-This recovery path never moves a volume to a different node. It skips CephFS, RWX, non-local backends, missing desired state, NotReady Kubernetes nodes, and non-running OpenNebula VMs. Failed recovery attempts are rate-limited with `driver.localDeviceRecovery.cooldownSeconds` and capped with `driver.localDeviceRecovery.maxAttemptsPerVolume`.
+Recovery now has an explicit runtime-confirmation state machine:
+
+- provider-side attach success leaves the report in `pending_runtime_confirmation`
+- only a later successful `NodeStageVolume` clears the active recovery episode
+- if the node never confirms device visibility before the confirmation deadline, the episode transitions to `timed_out_waiting_for_node_confirmation`
+- once the episode exhausts its configured budget, the driver records `same_node_runtime_attach_unconfirmed` in `opennebula-csi-volume-repair-state` and blocks further automatic same-node recovery with `repair_required_runtime_attach_unconfirmed`
+
+This recovery path never moves a volume to a different node. It skips CephFS, RWX, non-local backends, missing desired state, NotReady Kubernetes nodes, and non-running OpenNebula VMs. Failed recovery attempts are rate-limited with `driver.localDeviceRecovery.cooldownSeconds` and capped with `driver.localDeviceRecovery.maxAttemptsPerVolume`. Repeated missing-device reports for the same `(volume, node, failure-class)` attach to the active recovery episode instead of resetting the counters.
+
+The driver distinguishes two same-node repair methods:
+
+- `runtime_republish`: used only when OpenNebula metadata no longer shows the disk attached and the controller can safely reissue same-node attach
+- `same_node_detach_attach_fallback`: used when metadata still shows the disk attached, because OpenNebula does not expose a safe runtime-only re-hotplug primitive for an already-declared VM disk
+
+OpenNebula metadata attachment is no longer treated as final proof of healing. It is sequencing evidence only.
 
 If same-node restage observes a different local block device identity than the last healthy stage, the driver records `wrong_device_identity` in `opennebula-csi-volume-repair-state` and returns `FailedPrecondition`. Clear the matching ConfigMap key only after external repair or after a later healthy publish/stage path clears it automatically.
+
+`wrong_device_identity` is repair-required only. The controller preserves that failure class in `opennebula-csi-node-device-state`, emits a dedicated skipped-recovery signal, and never re-enters automatic detach/attach recovery for that report. Support bundles now surface asserted controller hints separately from independently observed device evidence, and node-side persisted session identity is available through `--mode=local-disk-sessions`.
+
+Stale late `ControllerPublishVolume` and `ControllerUnpublishVolume` calls are fenced twice: once before queue admission and again inside queued work immediately before any OpenNebula mutation. When fresh API state shows the request is dead, the driver drops or short-circuits the late request instead of issuing physical attach/detach churn.
+
+### Attacher freshness and stale work
+
+The chart now exposes attacher-specific queue tuning:
+
+- `controller.attacher.workerThreads`
+- `controller.attacher.retryIntervalStartSeconds`
+- `controller.attacher.retryIntervalMaxSeconds`
+- `controller.attacher.httpEndpointEnabled`
+- `controller.attacher.extraArgs`
+
+Use the attacher HTTP endpoint and Prometheus workqueue metrics to watch for long-lived stale memory after `VolumeAttachment` deletion. The most actionable signals are rising `workqueue_depth`, `workqueue_unfinished_work_seconds`, `workqueue_longest_running_processor_seconds`, and repeated `timed out waiting for external-attacher` events or logs with no matching live `VolumeAttachment` in the API.
+
+The sanctioned mitigation for stale attacher in-memory work remains a controller pod restart. Driver-side stale-request fencing prevents physical churn, but a restart is still the bounded way to flush dead sidecar queue state quickly when metrics and events show it is stuck.
 
 `v0.4.7` adds four supporting behaviors on top of that restart fast path:
 
@@ -350,7 +382,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
-| `image.tag` | Driver image tag. | `"v0.5.16"` | No |
+| `image.tag` | Driver image tag. | `"v0.5.17"` | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
 
 ### Driver
@@ -443,7 +475,7 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | `featureGates.cephfsPersistentRecovery` | Persist node-local CephFS session state, scan for stale mounts after node-plugin restart, and enqueue async recovery when volume stats detect a stale CephFS mount. | `true` | No |
 | `featureGates.cephfsKernelMounts` | Allow CephFS StorageClasses to request `cephfsMounter=kernel`. Host kernel CephFS client support is still required. | `false` | No |
 | `featureGates.localRWOStaleMountRecovery` | Enable local RWO stale mount detection and recovery from persisted node-side disk sessions. Active-pod recovery also requires `driver.localRWOStaleMountRecovery.activePodRecovery=true`. | `false` | No |
-| `featureGates.localRWOAutoProtection` | When a local RWO volume has last-known-good history, treat the protected node being `NotReady` or `unschedulable` the same way as explicit maintenance mode for cross-node movement decisions. | `false` | No |
+| `featureGates.localRWOAutoProtection` | Enable protect-only inferred maintenance for local RWO volumes. When the last-good node is `NotReady`, `unschedulable`, or actively draining, cross-node publish is blocked and the webhook forces required affinity. This does not publish maintenance-ready keys or create/release maintenance holds. | `false` | No |
 | `featureGates.topologyAccessibility` | Enable topology capability advertisement and `accessible_topology` handling. | `false` | No |
 
 ### Controller
@@ -452,6 +484,11 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | --- | --- | --- | --- |
 | `controller.replicaCount` | Number of controller replicas. | `1` | No |
 | `controller.sidecarTimeoutSeconds` | CSI sidecar RPC timeout used for the provisioner, attacher, and resizer. Set this above the maximum hotplug timeout budget. | `960` | No |
+| `controller.attacher.workerThreads` | `csi-attacher` worker concurrency. Tune down to reduce replay pressure or up to clear healthy backlog faster. | `10` | No |
+| `controller.attacher.retryIntervalStartSeconds` | Initial `csi-attacher` retry backoff for failed work items. | `1` | No |
+| `controller.attacher.retryIntervalMaxSeconds` | Maximum `csi-attacher` retry backoff for failed work items. | `300` | No |
+| `controller.attacher.httpEndpointEnabled` | Enable the `csi-attacher` HTTP metrics endpoint and expose the `att-metrics` container port and Service/ServiceMonitor target when `metrics.enabled=true`. | `true` | No |
+| `controller.attacher.extraArgs` | Extra CLI args appended only to the `csi-attacher` sidecar. | `[]` | No |
 | `controller.podAnnotations` | Extra annotations for the controller pod template. | `{}` | No |
 | `controller.resources` | Controller pod resource requests and limits. | `{}` | No |
 | `controller.nodeSelector` | Node selector for the controller StatefulSet. | `{}` | No |
@@ -581,7 +618,9 @@ The driver image includes cluster-operator modes that work well with a kubeconfi
   - triggers a manual datastore validation run and waits for the result
   - accepts `--access-modes=ReadWriteOnce` or `--access-modes=ReadWriteMany` when the benchmark PVC mode must be explicit
 - `--mode=support-bundle`
-  - emits a JSON support bundle with inventory, hotplug, local-device recovery, durable `volumeHistory`, active `volumeRepairState`, `lastNodeProtection`, queue reason summaries, StorageClass, volume-health, VolumeAttachment, and event data
+  - emits a JSON support bundle with inventory, hotplug, local-device recovery, durable `volumeHistory`, active `volumeRepairState`, `volumeDemand`, `lastNodeProtection`, controller pod age/restart diagnostics, node-local disk sessions when readable, queue reason summaries, StorageClass, volume-health, VolumeAttachment, and event data
+- `--mode=local-disk-sessions`
+  - emits sanitized node-local local-disk session state with stage path, published targets, last healthy identity, pending confirmation state, expected target/serial, and recovery metadata
 - `--mode=volume-health`
   - emits focused JSON diagnostics for a volume selected by `--volume-id`, `--pv`, or `--pvc namespace/name`
 

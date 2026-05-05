@@ -52,7 +52,7 @@ Features that remain gated by default:
 - Container images:
   `ghcr.io/sparkaiur/opennebula-csi:<tag>`
   `docker.io/nudevco/opennebula-csi:<tag>`
-- Latest release: `v0.5.16`
+- Latest release: `v0.5.17`
 - Helm repo: `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
 - Chart name: `opennebula-csi`
 - Source repo: `https://github.com/SparkAIUR/storage-provider-opennebula`
@@ -92,7 +92,7 @@ All other StorageClass parameters are passed through to the existing disk/image 
 - `ONE_CSI_LOCAL_RESTART_DETACH_GRACE_SECONDS`: default delayed-detach grace for opted-in local PVCs, default `90`
 - `ONE_CSI_LOCAL_RESTART_DETACH_GRACE_MAX_SECONDS`: maximum delayed-detach grace allowed by per-PVC override, default `300`
 - `ONE_CSI_LOCAL_RESTART_REQUIRE_NODE_READY`: require Kubernetes node and OpenNebula VM readiness before using delayed detach, default `true`
-- `ONE_CSI_FEATURE_GATES=...localRWOAutoProtection=false...`: optional protection gate that treats the last good node being `NotReady` or `unschedulable` the same way as explicit maintenance mode for local `RWO` movement
+- `ONE_CSI_FEATURE_GATES=...localRWOAutoProtection=false...`: optional protect-only inferred maintenance gate for local `RWO` volumes. When enabled, a last-good node that is `NotReady`, `unschedulable`, or actively draining blocks cross-node publish and forces required affinity, but it does not publish maintenance-ready keys or create/release maintenance holds.
 
 ### Policy behavior
 
@@ -183,6 +183,8 @@ The local restart path includes a broader CSI performance and stability layer:
 
 - the node plugin now prefers stable `/dev/disk/by-id` resolution using an explicit OpenNebula disk serial and keeps a short-lived in-memory device cache
 - same-node hotplug work is queued fairly instead of failing fast with `node_busy`
+- local-device self-heal no longer treats OpenNebula template metadata as proof of recovery success; same-node repair stays pending until a later `NodeStageVolume` proves the guest can see the disk again
+- when metadata still says the disk is attached but the guest runtime cannot see it, the controller keeps recovery same-node only and falls back to detach/attach because OpenNebula does not expose a safe runtime-only re-hotplug primitive for an already-declared VM disk
 - the controller can inject a soft last-node scheduling preference for local single-writer pods so StatefulSet restarts are more likely to land back on the previous node
 - a conservative stuck-attachment reconciler repairs orphaned OpenNebula attachments and stale `VolumeAttachment` objects
 - OpenNebulaNode `HotplugStuck` inventory status immediately pauses new hotplug work for that node until readiness gates and inventory diagnosis clear
@@ -237,6 +239,8 @@ New workload controls:
 New support signals:
 
 - support bundles now include sticky attachment state, durable `volumeHistory`, active `volumeRepairState`, `lastNodeProtection`, hotplug queue reason summaries, volume quarantine state, host artifact quarantine state, OpenNebula metadata drift details, and adaptive timeout observations/recommendations
+- support bundles now also include `volumeDemand`, typed local-device recovery reports, controller pod age/restart diagnostics, node-local disk session diagnostics when readable, and a node-session reference that points operators to `opennebula-csi --mode=local-disk-sessions` when that evidence must be gathered from a node plugin pod
+- pending runtime confirmation, timed-out same-node repair episodes, and stale attach/detach suspicion remain visible through `volumeRepairState`, recent queue reasons, local-device reports, and node-local session metadata instead of being cleared on controller-side metadata attach alone
 - controller/node metrics expose queue depth, device-resolution methods, last-node preference outcomes, reconciler actions, and adaptive timeout recommendations
 
 Canonical annotation namespace:
@@ -579,6 +583,7 @@ Current gates:
 - `cephfsPersistentRecovery=true`
 - `cephfsKernelMounts=false`
 - `localRWOStaleMountRecovery=false`
+- `localRWOAutoProtection=false`
 - `topologyAccessibility=false`
 
 The chart renders these into `ONE_CSI_FEATURE_GATES`.
@@ -590,6 +595,7 @@ The chart renders these into `ONE_CSI_FEATURE_GATES`.
 - `cephfsSelfHealing` controls stale CephFS remount attempts after a stale mount is detected during node stage
 - `cephfsPersistentRecovery` controls node-local CephFS session persistence, startup recovery scans, and async stale-mount repair attempts
 - `cephfsKernelMounts` allows StorageClasses to request `cephfsMounter=kernel`
+- `localRWOAutoProtection` enables protect-only inferred maintenance for local RWO volumes when the last-good node is `NotReady`, `unschedulable`, or actively draining
 - `topologyAccessibility` enables node topology lookup and `accessible_topology` responses
 
 ## Helm installation
@@ -648,6 +654,11 @@ The chart no longer renders a fixed set of StorageClasses. Instead it accepts a 
 - `controller.tolerations`
 - `controller.affinity`
 - `controller.podAnnotations`
+- `controller.attacher.workerThreads`
+- `controller.attacher.retryIntervalStartSeconds`
+- `controller.attacher.retryIntervalMaxSeconds`
+- `controller.attacher.httpEndpointEnabled`
+- `controller.attacher.extraArgs`
 - `controller.extraArgs`
 - `controller.extraEnv`
 - `node.resources`
@@ -812,7 +823,7 @@ At minimum, release validation should include:
 - `bash hack/validate-release-lab.sh`
 - a live lab validation for the feature or hotfix being released, including local attach/mount, local expansion, inventory CRDs, and workload bootstrap/init smoke checks when touching fast-path mount behavior
 
-Push the semantic tag for the release being cut, for example `v0.5.16`, only after that validation to trigger the release workflow.
+Push the semantic tag for the release being cut, for example `v0.5.17`, only after that validation to trigger the release workflow.
 
 The workflow will:
 
