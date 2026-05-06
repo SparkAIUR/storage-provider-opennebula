@@ -108,6 +108,97 @@ func (m *HostArtifactQuarantineManager) GetActive(key string, now time.Time) (Ho
 	return state, true
 }
 
+func (m *HostArtifactQuarantineManager) RefreshKey(ctx context.Context, key string) error {
+	if m == nil || m.runtime == nil || !m.runtime.enabled || strings.TrimSpace(key) == "" {
+		return nil
+	}
+	key = strings.TrimSpace(key)
+	cm, err := m.runtime.GetConfigMap(ctx, m.namespace, hostArtifactStateConfigMapName)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			m.mu.Lock()
+			delete(m.entries, key)
+			m.mu.Unlock()
+			return nil
+		}
+		return err
+	}
+	raw := strings.TrimSpace(cm.Data[key])
+	if raw == "" {
+		m.mu.Lock()
+		delete(m.entries, key)
+		m.mu.Unlock()
+		return nil
+	}
+	var state HostArtifactQuarantineState
+	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		return err
+	}
+	if strings.TrimSpace(state.Key) == "" {
+		state.Key = key
+	}
+	if !state.ExpiresAt.IsZero() && !state.ExpiresAt.After(time.Now().UTC()) {
+		m.mu.Lock()
+		delete(m.entries, key)
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Lock()
+	m.entries[key] = state
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *HostArtifactQuarantineManager) RefreshVolume(ctx context.Context, volumeID string) error {
+	if m == nil || m.runtime == nil || !m.runtime.enabled || strings.TrimSpace(volumeID) == "" {
+		return nil
+	}
+	volumeID = strings.TrimSpace(volumeID)
+	cm, err := m.runtime.GetConfigMap(ctx, m.namespace, hostArtifactStateConfigMapName)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			m.mu.Lock()
+			for key, state := range m.entries {
+				if strings.TrimSpace(state.VolumeID) == volumeID {
+					delete(m.entries, key)
+				}
+			}
+			m.mu.Unlock()
+			return nil
+		}
+		return err
+	}
+	updated := map[string]HostArtifactQuarantineState{}
+	now := time.Now().UTC()
+	for key, raw := range cm.Data {
+		var state HostArtifactQuarantineState
+		if err := json.Unmarshal([]byte(raw), &state); err != nil {
+			continue
+		}
+		if strings.TrimSpace(state.Key) == "" {
+			state.Key = key
+		}
+		if strings.TrimSpace(state.VolumeID) != volumeID {
+			continue
+		}
+		if !state.ExpiresAt.IsZero() && !state.ExpiresAt.After(now) {
+			continue
+		}
+		updated[state.Key] = state
+	}
+	m.mu.Lock()
+	for key, state := range m.entries {
+		if strings.TrimSpace(state.VolumeID) == volumeID {
+			delete(m.entries, key)
+		}
+	}
+	for key, state := range updated {
+		m.entries[key] = state
+	}
+	m.mu.Unlock()
+	return nil
+}
+
 func (m *HostArtifactQuarantineManager) MarkFailure(ctx context.Context, state HostArtifactQuarantineState, threshold int, ttl time.Duration) (HostArtifactQuarantineState, bool, error) {
 	if m == nil {
 		return state, false, nil

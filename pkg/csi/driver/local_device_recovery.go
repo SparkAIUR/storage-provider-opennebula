@@ -475,6 +475,17 @@ func (s *ControllerServer) recoverLocalDeviceReport(ctx context.Context, key str
 	if !runtimeContextEligibleForMaintenance(runtimeCtx, volumeID) {
 		return s.clearLocalDeviceReportWithEvent(ctx, key, report, runtimeCtx, "volume is not an eligible local single-writer disk")
 	}
+	recoveryControl, recoveryErr := s.recoveryControlState(ctx, volumeID, runtimeCtx)
+	if recoveryErr != nil {
+		return s.markLocalDeviceRecoverySkipped(ctx, key, report, "recovery_control_unavailable", recoveryErr)
+	}
+	s.recordRecoveryModeExpiryWarning(ctx, runtimeCtx, recoveryControl)
+	if recoveryControl.Invalid {
+		return s.markLocalDeviceRecoverySkipped(ctx, key, report, "recovery_control_invalid", fmt.Errorf("%s", recoveryControl.Message))
+	}
+	if recoveryControl.Active() && recoveryControl.SuppressRepairActions {
+		return s.markLocalDeviceRecoverySkipped(ctx, key, report, recoveryControl.QueueBlockReason(), nil)
+	}
 	desired, desiredReason, err := s.driver.kubeRuntime.VolumeDesiredOnNode(ctx, volumeID, node)
 	if err != nil {
 		return s.markLocalDeviceRecoverySkipped(ctx, key, report, "desired_state_unavailable", err)

@@ -57,6 +57,9 @@ var (
 
 const publishContextHotplugTimeoutSeconds = "hotplugTimeoutSeconds"
 const publishContextDeviceDiscoveryTimeoutSeconds = "deviceDiscoveryTimeoutSeconds"
+const publishContextRecoveryMode = "recoveryMode"
+const publishContextRecoveryTicket = "recoveryTicket"
+const publishContextRecoveryAdoptedDevice = "recoveryAdoptedDevice"
 const volumeContextUUID = "uuid"
 const stickyDetachReaperInterval = 5 * time.Second
 const hotplugGuardCleanupInterval = 30 * time.Second
@@ -823,7 +826,48 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.FailedPrecondition, protection.Message)
 	}
 
+	recoveryControl, recoveryErr := s.recoveryControlState(ctx, req.VolumeId, runtimeCtx)
+	if recoveryErr != nil {
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "internal", time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", "internal", time.Since(started))
+		return nil, recoveryErr
+	}
+	s.recordRecoveryModeExpiryWarning(ctx, runtimeCtx, recoveryControl)
+	if recoveryControl.Invalid {
+		s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonRecoveryAdoptionRejected, recoveryControl.Message)
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "failed_precondition", time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", "failed_precondition", time.Since(started))
+		return nil, status.Error(codes.FailedPrecondition, recoveryControl.Message)
+	}
+
 	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
+	if recoveryControl.AdoptionRequested() {
+		manualTarget, adoptErr := s.manualRecoveryAdoptionTarget(ctx, req.VolumeId, req.NodeId, protection.History, runtimeCtx, lookup, recoveryControl)
+		if adoptErr != nil {
+			message := adoptErr.Error()
+			s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonRecoveryAdoptionRejected, message)
+			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "failed_precondition", time.Since(started))
+			s.driver.metrics.RecordControllerPublishDuration("disk", "failed_precondition", time.Since(started))
+			return nil, status.Error(codes.FailedPrecondition, message)
+		}
+		if manualTarget != "" {
+			if s.driver.volumeRecoveryControl != nil {
+				if _, markErr := s.driver.volumeRecoveryControl.MarkAdopted(ctx, req.VolumeId, req.NodeId, recoveryControl.ConfirmedDeviceSerial, manualTarget); markErr != nil {
+					klog.V(2).InfoS("Failed to persist manual recovery adoption state", "volumeID", req.VolumeId, "nodeID", req.NodeId, "err", markErr)
+				}
+			}
+			s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
+			s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
+			s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, req.NodeId, manualTarget, req.GetVolumeContext(), &protection, lookup.AttachmentMetadata)
+			s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonRecoveryAdoptionAccepted, fmt.Sprintf("accepted manual recovery adoption for volume %s on node %s using guest-visible device %s and serial %s", req.VolumeId, req.NodeId, manualTarget, recoveryControl.ConfirmedDeviceSerial))
+			deviceDiscoveryTimeout := s.nodeDeviceDiscoveryTimeout("disk", lookup.SizeBytes, 0)
+			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
+			s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
+			return &csi.ControllerPublishVolumeResponse{
+				PublishContext: s.publishContextForRecoveryAdoption(ctx, req.VolumeId, req.GetVolumeContext(), recoveryControl, deviceDiscoveryTimeout),
+			}, nil
+		}
+	}
 	if err == nil {
 		if s.driver.volumeQuarantine != nil {
 			_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
@@ -842,20 +886,27 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			PublishContext: publishContext,
 		}, nil
 	}
+	if recoveryControl.ManualActive() {
+		message := recoveryControl.QueueBlockMessage(req.VolumeId, req.NodeId, "attach")
+		s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonRecoveryModeActive, message)
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "unavailable", time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", "unavailable", time.Since(started))
+		return nil, status.Error(codes.Unavailable, message)
+	}
 
 	if repairErr := s.rejectIfActiveRepairState(ctx, req.VolumeId, runtimeCtx); repairErr != nil {
 		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "failed_precondition", time.Since(started))
 		s.driver.metrics.RecordControllerPublishDuration("disk", "failed_precondition", time.Since(started))
 		return nil, repairErr
 	}
-	if quarantine, ok := s.activeVolumeQuarantine(req.VolumeId); ok {
+	if quarantine, ok := s.activeVolumeQuarantine(ctx, req.VolumeId); ok {
 		message := volumeQuarantineMessage(quarantine)
 		s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonVolumeQuarantined, message)
 		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "failed_precondition", time.Since(started))
 		s.driver.metrics.RecordControllerPublishDuration("disk", "failed_precondition", time.Since(started))
 		return nil, status.Error(codes.FailedPrecondition, message)
 	}
-	if s.activeHostArtifactQuarantine(req.VolumeId) {
+	if s.activeHostArtifactQuarantine(ctx, req.VolumeId) {
 		message := fmt.Sprintf("host artifact quarantine is active for volume %s", req.VolumeId)
 		s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonHostArtifactQuarantined, message)
 		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "failed_precondition", time.Since(started))
@@ -1067,6 +1118,28 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 
 	if held, response, holdErr := s.startMaintenanceDetachHold(ctx, req); held {
 		return response, holdErr
+	}
+
+	var recoveryRuntimeCtx *VolumeRuntimeContext
+	if s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
+		if resolved, runtimeErr := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId); runtimeErr == nil {
+			recoveryRuntimeCtx = resolved
+		}
+	}
+	recoveryControl, recoveryErr := s.recoveryControlState(ctx, req.VolumeId, recoveryRuntimeCtx)
+	if recoveryErr != nil {
+		return nil, recoveryErr
+	}
+	s.recordRecoveryModeExpiryWarning(ctx, recoveryRuntimeCtx, recoveryControl)
+	if recoveryControl.Invalid {
+		s.recordPVCWarningFromRuntimeContext(ctx, recoveryRuntimeCtx, eventReasonRecoveryAdoptionRejected, recoveryControl.Message)
+		return nil, status.Error(codes.FailedPrecondition, recoveryControl.Message)
+	}
+	if recoveryControl.ManualActive() {
+		message := recoveryControl.QueueBlockMessage(req.VolumeId, req.NodeId, "detach")
+		s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReasonRecoveryModeActive, message)
+		s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
+		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 
 	if cooldown, ok := s.hotplugCooldownState(ctx, req.NodeId); ok {
@@ -1660,6 +1733,12 @@ func (s *ControllerServer) publishContextForVolume(ctx context.Context, volumeID
 			if backend := strings.TrimSpace(runtimeCtx.Backend); backend != "" {
 				publishContext[annotationBackend] = backend
 			}
+			if recoveryMode, _ := runtimeAnnotationValue(runtimeCtx, annotationRecoveryMode); recoveryMode != "" {
+				publishContext[publishContextRecoveryMode] = recoveryMode
+			}
+			if recoveryTicket, _ := runtimeAnnotationValue(runtimeCtx, annotationRecoveryTicket); recoveryTicket != "" {
+				publishContext[publishContextRecoveryTicket] = recoveryTicket
+			}
 		}
 	}
 
@@ -1768,32 +1847,44 @@ func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node
 		}
 	}
 
+	recoveryControl, recoveryErr := s.recoveryControlState(ctx, volume, runtimeCtx)
+	if recoveryErr != nil {
+		klog.V(3).InfoS("Failed to resolve recovery control state during queue validation", "volume", volume, "node", node, "operation", operation, "err", recoveryErr)
+	} else if recoveryControl.Invalid {
+		return HotplugQueueValidation{
+			Decision: HotplugQueueValidationStale,
+			Reason:   queueReasonRecoveryControlInvalid,
+			Message:  recoveryControl.Message,
+		}
+	}
+
 	attachedTarget, attachedErr := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	attached := attachedErr == nil
 	switch strings.ToLower(strings.TrimSpace(operation)) {
 	case "attach":
-		if state, ok := s.repairStateForQueue(volume); ok {
-			if runtimeCtx != nil {
-				s.recordActiveRepairStateEvent(ctx, runtimeCtx, state)
+		if recoveryControl.AdoptionRequested() {
+			manualTarget, adoptErr := s.manualRecoveryAdoptionTarget(ctx, volume, node, history, runtimeCtx, lookup, recoveryControl)
+			if adoptErr != nil {
+				return HotplugQueueValidation{
+					Decision: HotplugQueueValidationStale,
+					Reason:   queueReasonRecoveryControlInvalid,
+					Message:  adoptErr.Error(),
+				}
 			}
-			return HotplugQueueValidation{
-				Decision: HotplugQueueValidationStale,
-				Reason:   queueReasonRepairRequired,
-				Message:  firstNonEmpty(state.Message, fmt.Sprintf("repair-required state %s is active for volume %s", state.Classification, volume)),
+			if manualTarget != "" {
+				return HotplugQueueValidation{
+					Decision:         HotplugQueueValidationCompleted,
+					Reason:           queueReasonManualRecoveryAdopted,
+					Message:          fmt.Sprintf("manual recovery adoption is ready for volume %s on node %s using guest-visible device %s", volume, node, manualTarget),
+					AttachmentTarget: manualTarget,
+				}
 			}
 		}
-		if quarantine, ok := s.activeVolumeQuarantine(volume); ok {
+		if recoveryControl.ManualActive() && !attached {
 			return HotplugQueueValidation{
-				Decision: HotplugQueueValidationStale,
-				Reason:   queueReasonVolumeQuarantined,
-				Message:  volumeQuarantineMessage(quarantine),
-			}
-		}
-		if s.activeHostArtifactQuarantine(volume) {
-			return HotplugQueueValidation{
-				Decision: HotplugQueueValidationStale,
-				Reason:   queueReasonRepairRequired,
-				Message:  fmt.Sprintf("host artifact quarantine is active for volume %s", volume),
+				Decision: HotplugQueueValidationPaused,
+				Reason:   queueReasonRecoveryModeManual,
+				Message:  recoveryControl.QueueBlockMessage(volume, node, operation),
 			}
 		}
 		if attached {
@@ -1804,6 +1895,30 @@ func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node
 				AttachmentTarget: strings.TrimSpace(attachedTarget),
 			}
 		}
+		if state, ok := s.repairStateForQueue(volume); ok {
+			if runtimeCtx != nil {
+				s.recordActiveRepairStateEvent(ctx, runtimeCtx, state)
+			}
+			return HotplugQueueValidation{
+				Decision: HotplugQueueValidationStale,
+				Reason:   queueReasonRepairRequired,
+				Message:  firstNonEmpty(state.Message, fmt.Sprintf("repair-required state %s is active for volume %s", state.Classification, volume)),
+			}
+		}
+		if quarantine, ok := s.activeVolumeQuarantine(ctx, volume); ok {
+			return HotplugQueueValidation{
+				Decision: HotplugQueueValidationStale,
+				Reason:   queueReasonVolumeQuarantined,
+				Message:  volumeQuarantineMessage(quarantine),
+			}
+		}
+		if s.activeHostArtifactQuarantine(ctx, volume) {
+			return HotplugQueueValidation{
+				Decision: HotplugQueueValidationStale,
+				Reason:   queueReasonRepairRequired,
+				Message:  fmt.Sprintf("host artifact quarantine is active for volume %s", volume),
+			}
+		}
 		if stale, reason := s.attachRequestStale(ctx, node, volume); stale {
 			return HotplugQueueValidation{
 				Decision: HotplugQueueValidationStale,
@@ -1812,6 +1927,13 @@ func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node
 			}
 		}
 	case "detach":
+		if recoveryControl.ManualActive() {
+			return HotplugQueueValidation{
+				Decision: HotplugQueueValidationPaused,
+				Reason:   queueReasonRecoveryModeManual,
+				Message:  recoveryControl.QueueBlockMessage(volume, node, operation),
+			}
+		}
 		if !attached {
 			return HotplugQueueValidation{
 				Decision: HotplugQueueValidationCompleted,
@@ -1850,22 +1972,38 @@ func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.
 		if target == "" {
 			return false, nil, nil
 		}
-		if s.driver.volumeQuarantine != nil {
-			_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
-		}
-		s.clearRepairStateOnSuccess(ctx, req.VolumeId)
-		s.clearHostArtifactQuarantineForVolume(ctx, req.VolumeId)
-		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
-		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
 		if protection == nil {
 			protection = &LocalRWOProtectionDecision{}
 		}
+		if validation.Reason != queueReasonManualRecoveryAdopted {
+			if s.driver.volumeQuarantine != nil {
+				_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
+			}
+			s.clearRepairStateOnSuccess(ctx, req.VolumeId)
+			s.clearHostArtifactQuarantineForVolume(ctx, req.VolumeId)
+		} else if s.driver.volumeRecoveryControl != nil {
+			recoveryControl, _ := s.recoveryControlState(ctx, req.VolumeId, protection.RuntimeContext)
+			if _, err := s.driver.volumeRecoveryControl.MarkAdopted(ctx, req.VolumeId, req.NodeId, recoveryControl.ConfirmedDeviceSerial, target); err != nil {
+				klog.V(2).InfoS("Failed to persist queue-driven manual recovery adoption state", "volumeID", req.VolumeId, "nodeID", req.NodeId, "err", err)
+			}
+		}
+		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
+		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
 		s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), protection, metadata)
+		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext())
+		if validation.Reason == queueReasonManualRecoveryAdopted {
+			recoveryControl, _ := s.recoveryControlState(ctx, req.VolumeId, protection.RuntimeContext)
+			publishContext = s.publishContextForRecoveryAdoption(ctx, req.VolumeId, req.GetVolumeContext(), recoveryControl, 0)
+		}
 		return true, &csi.ControllerPublishVolumeResponse{
-			PublishContext: s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext()),
+			PublishContext: publishContext,
 		}, nil
 	case HotplugQueueValidationPaused:
-		s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonHotplugCooldown, validation.Message)
+		eventReason := eventReasonHotplugCooldown
+		if validation.Reason == queueReasonRecoveryModeManual || validation.Reason == queueReasonRecoveryModeObserve {
+			eventReason = eventReasonRecoveryModeActive
+		}
+		s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReason, validation.Message)
 		return true, nil, status.Error(codes.Unavailable, validation.Message)
 	case HotplugQueueValidationStale:
 		switch validation.Reason {
@@ -1875,9 +2013,12 @@ func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.
 		code := codes.Aborted
 		eventReason := eventReasonHotplugQueueStale
 		switch validation.Reason {
-		case queueReasonRepairRequired, queueReasonVolumeQuarantined:
+		case queueReasonRepairRequired, queueReasonVolumeQuarantined, queueReasonRecoveryControlInvalid:
 			code = codes.FailedPrecondition
 			eventReason = eventReasonVolumeRepairRequired
+			if validation.Reason == queueReasonRecoveryControlInvalid {
+				eventReason = eventReasonRecoveryAdoptionRejected
+			}
 		}
 		s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReason, validation.Message)
 		return true, nil, status.Error(code, validation.Message)
@@ -1900,7 +2041,11 @@ func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *cs
 			s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
 			return true, &csi.ControllerUnpublishVolumeResponse{}, nil
 		}
-		s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReasonHotplugCooldown, validation.Message)
+		eventReason := eventReasonHotplugCooldown
+		if validation.Reason == queueReasonRecoveryModeManual || validation.Reason == queueReasonRecoveryModeObserve {
+			eventReason = eventReasonRecoveryModeActive
+		}
+		s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReason, validation.Message)
 		return true, nil, status.Error(codes.Unavailable, validation.Message)
 	default:
 		return false, nil, nil
@@ -1910,6 +2055,7 @@ func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *cs
 func detachPauseCanReturnSuccess(reason string) bool {
 	switch strings.TrimSpace(reason) {
 	case queueReasonSameNodeReuseRequired,
+		queueReasonRecoveryModeManual,
 		protectionReasonMaintenance,
 		protectionReasonAutomaticMaintenance,
 		protectionReasonLocalDevice,

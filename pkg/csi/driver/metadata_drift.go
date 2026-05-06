@@ -28,14 +28,21 @@ func (s *ControllerServer) rejectIfOpenNebulaMetadataDrift(ctx context.Context, 
 	if !eligible {
 		return nil
 	}
+	recoveryControl, recoveryErr := s.recoveryControlState(ctx, req.VolumeId, runtimeCtx)
+	if recoveryErr == nil {
+		s.recordRecoveryModeExpiryWarning(ctx, runtimeCtx, recoveryControl)
+	}
 	inspector, ok := s.volumeProvider.(opennebula.VolumeAttachmentInspector)
 	if !ok {
 		return nil
 	}
 
-	activeState, quarantined := s.driver.volumeQuarantine.GetActive(req.VolumeId, time.Now().UTC())
+	activeState, quarantined := s.activeVolumeQuarantine(ctx, req.VolumeId)
 	metadata, inspectErr := inspector.InspectVolumeAttachment(ctx, req.VolumeId, req.NodeId)
 	if inspectErr != nil {
+		if recoveryControl.Active() && recoveryControl.SuppressRepairActions {
+			return nil
+		}
 		if quarantined {
 			message := volumeQuarantineMessage(activeState)
 			s.driver.metrics.RecordVolumeQuarantine(activeState.Reason, "active_inspection_failed")
@@ -54,6 +61,11 @@ func (s *ControllerServer) rejectIfOpenNebulaMetadataDrift(ctx context.Context, 
 				s.driver.metrics.RecordVolumeQuarantine(activeState.Reason, "cleared")
 			}
 		}
+		return nil
+	}
+	if recoveryControl.Active() && recoveryControl.SuppressRepairActions {
+		message := metadataDriftMessage(metadata, req.VolumeId, req.NodeId)
+		s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonOpenNebulaMetadataDrift, message)
 		return nil
 	}
 
@@ -93,6 +105,13 @@ func (s *ControllerServer) detachMetadataDriftError(ctx context.Context, volumeI
 	}
 	runtimeCtx, eligible := s.metadataDriftGuardEligible(ctx, volumeID)
 	if !eligible {
+		return nil
+	}
+	recoveryControl, recoveryErr := s.recoveryControlState(ctx, volumeID, runtimeCtx)
+	if recoveryErr == nil {
+		s.recordRecoveryModeExpiryWarning(ctx, runtimeCtx, recoveryControl)
+	}
+	if recoveryControl.Active() && recoveryControl.SuppressRepairActions {
 		return nil
 	}
 	inspector, ok := s.volumeProvider.(opennebula.VolumeAttachmentInspector)

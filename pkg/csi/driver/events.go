@@ -58,4 +58,8 @@ const (
 	eventReasonLocalDeviceRecoveryFailed    = "LocalDeviceRecoveryFailed"
 	eventReasonLocalDeviceRecoverySkipped   = "LocalDeviceRecoverySkipped"
 	eventReasonWrongDeviceIdentity          = "WrongDeviceIdentity"
+	eventReasonRecoveryModeActive           = "RecoveryModeActive"
+	eventReasonRecoveryModeExpired          = "RecoveryModeExpired"
+	eventReasonRecoveryAdoptionAccepted     = "RecoveryAdoptionAccepted"
+	eventReasonRecoveryAdoptionRejected     = "RecoveryAdoptionRejected"
 )

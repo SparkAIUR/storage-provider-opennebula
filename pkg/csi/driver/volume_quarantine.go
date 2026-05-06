@@ -94,6 +94,47 @@ func (m *VolumeQuarantineManager) GetActive(volumeID string, now time.Time) (Vol
 	return state, true
 }
 
+func (m *VolumeQuarantineManager) RefreshEntry(ctx context.Context, volumeID string) error {
+	if m == nil || m.runtime == nil || !m.runtime.enabled || strings.TrimSpace(volumeID) == "" {
+		return nil
+	}
+	volumeID = strings.TrimSpace(volumeID)
+	cm, err := m.runtime.GetConfigMap(ctx, m.namespace, volumeQuarantineStateConfigMapName)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			m.mu.Lock()
+			delete(m.entries, volumeID)
+			m.mu.Unlock()
+			return nil
+		}
+		return err
+	}
+	raw := strings.TrimSpace(cm.Data[volumeID])
+	if raw == "" {
+		m.mu.Lock()
+		delete(m.entries, volumeID)
+		m.mu.Unlock()
+		return nil
+	}
+	var state VolumeQuarantineState
+	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		return err
+	}
+	if strings.TrimSpace(state.VolumeID) == "" {
+		state.VolumeID = volumeID
+	}
+	if !state.ExpiresAt.IsZero() && !state.ExpiresAt.After(time.Now().UTC()) {
+		m.mu.Lock()
+		delete(m.entries, volumeID)
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Lock()
+	m.entries[volumeID] = state
+	m.mu.Unlock()
+	return nil
+}
+
 func (m *VolumeQuarantineManager) MarkFailure(ctx context.Context, state VolumeQuarantineState, threshold int, ttl time.Duration) (VolumeQuarantineState, bool, error) {
 	if m == nil || strings.TrimSpace(state.VolumeID) == "" {
 		return state, false, nil

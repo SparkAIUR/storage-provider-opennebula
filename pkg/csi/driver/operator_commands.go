@@ -54,27 +54,36 @@ type LocalDiskSessionsReport struct {
 }
 
 type LocalDiskSessionDiagnostic struct {
-	VolumeID               string             `json:"volumeID"`
-	PVName                 string             `json:"pvName,omitempty"`
-	PVCNamespace           string             `json:"pvcNamespace,omitempty"`
-	PVCName                string             `json:"pvcName,omitempty"`
-	StagingTargetPath      string             `json:"stagingTargetPath,omitempty"`
-	PublishedTargets       []string           `json:"publishedTargets,omitempty"`
-	LastHealthyIdentity    *LocalDiskIdentity `json:"lastHealthyIdentity,omitempty"`
-	FailureClass           string             `json:"failureClass,omitempty"`
-	RecoveryAttempts       int                `json:"recoveryAttempts,omitempty"`
-	LastRecoveredAt        *time.Time         `json:"lastRecoveredAt,omitempty"`
-	LastRecoveryMethod     string             `json:"lastRecoveryMethod,omitempty"`
-	LastRecoveryToken      string             `json:"lastRecoveryToken,omitempty"`
-	LastRecoveryError      string             `json:"lastRecoveryError,omitempty"`
-	ConfirmationState      string             `json:"confirmationState,omitempty"`
-	ConfirmationDeadline   *time.Time         `json:"confirmationDeadline,omitempty"`
-	ExpectedTarget         string             `json:"expectedTarget,omitempty"`
-	ExpectedSerial         string             `json:"expectedSerial,omitempty"`
-	AttachmentState        string             `json:"attachmentState,omitempty"`
-	MetadataAttachedToNode bool               `json:"metadataAttachedToNode,omitempty"`
-	MetadataTarget         string             `json:"metadataTarget,omitempty"`
-	LastObservedDevicePath string             `json:"lastObservedDevicePath,omitempty"`
+	VolumeID                         string             `json:"volumeID"`
+	PVName                           string             `json:"pvName,omitempty"`
+	PVCNamespace                     string             `json:"pvcNamespace,omitempty"`
+	PVCName                          string             `json:"pvcName,omitempty"`
+	StagingTargetPath                string             `json:"stagingTargetPath,omitempty"`
+	PublishedTargets                 []string           `json:"publishedTargets,omitempty"`
+	LastHealthyIdentity              *LocalDiskIdentity `json:"lastHealthyIdentity,omitempty"`
+	FailureClass                     string             `json:"failureClass,omitempty"`
+	RecoveryAttempts                 int                `json:"recoveryAttempts,omitempty"`
+	LastRecoveredAt                  *time.Time         `json:"lastRecoveredAt,omitempty"`
+	LastRecoveryMethod               string             `json:"lastRecoveryMethod,omitempty"`
+	LastRecoveryToken                string             `json:"lastRecoveryToken,omitempty"`
+	LastRecoveryError                string             `json:"lastRecoveryError,omitempty"`
+	ConfirmationState                string             `json:"confirmationState,omitempty"`
+	ConfirmationDeadline             *time.Time         `json:"confirmationDeadline,omitempty"`
+	ExpectedTarget                   string             `json:"expectedTarget,omitempty"`
+	ExpectedSerial                   string             `json:"expectedSerial,omitempty"`
+	ExpectedVolumeName               string             `json:"expectedVolumeName,omitempty"`
+	AttachmentState                  string             `json:"attachmentState,omitempty"`
+	MetadataAttachedToNode           bool               `json:"metadataAttachedToNode,omitempty"`
+	MetadataTarget                   string             `json:"metadataTarget,omitempty"`
+	LastObservedDevicePath           string             `json:"lastObservedDevicePath,omitempty"`
+	LastObservedByIDPath             string             `json:"lastObservedByIDPath,omitempty"`
+	CurrentStageMountSource          string             `json:"currentStageMountSource,omitempty"`
+	CurrentStageMountState           string             `json:"currentStageMountState,omitempty"`
+	CurrentStageMountMessage         string             `json:"currentStageMountMessage,omitempty"`
+	CurrentStageMountMatchesExpected bool               `json:"currentStageMountMatchesExpected,omitempty"`
+	RecoveryMode                     string             `json:"recoveryMode,omitempty"`
+	RecoveryTicket                   string             `json:"recoveryTicket,omitempty"`
+	RecoveryAdoptedDevice            bool               `json:"recoveryAdoptedDevice,omitempty"`
 }
 
 type ControllerContainerDiagnostic struct {
@@ -178,6 +187,7 @@ type SupportBundle struct {
 	StickyAttachments         map[string]any                                      `json:"stickyAttachments"`
 	VolumeHistory             map[string]VolumeHistoryRecord                      `json:"volumeHistory"`
 	VolumeRepairState         map[string]VolumeRepairState                        `json:"volumeRepairState"`
+	VolumeRecoveryControl     map[string]VolumeRecoveryControlState               `json:"volumeRecoveryControl"`
 	VolumeDemand              map[string]VolumeDesiredState                       `json:"volumeDemand"`
 	LastNodeProtection        map[string]LocalRWOProtectionDecision               `json:"lastNodeProtection"`
 	VolumeQuarantine          map[string]any                                      `json:"volumeQuarantine"`
@@ -402,8 +412,9 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 	hotplugDiagnostics := hotplugDiagnosticSnapshot(ctx, kubeClient, cfg)
 	adaptiveSnapshot := configMapJSONSnapshot(ctx, kubeClient, adaptiveTimeoutObservationsConfigMapName)
 	adaptiveRecommendations := adaptiveRecommendationSnapshot(cfg, adaptiveSnapshot)
-	volumeHistorySnapshot, volumeRepairSnapshot, volumeDemandSnapshot, protectionSnapshot := collectSupportBundleLocalRWOSnapshot(ctx, cfg, kubeClient, pvList.Items)
+	volumeHistorySnapshot, volumeRepairSnapshot, volumeRecoverySnapshot, volumeDemandSnapshot, protectionSnapshot := collectSupportBundleLocalRWOSnapshot(ctx, cfg, kubeClient, pvList.Items)
 	nodeLocalDiskSessions, nodeLocalSessionReference := supportBundleLocalDiskSessionDiagnostics(ctx, kubeClient)
+	volumeRecoverySnapshot = enrichRecoveryControlSupportSnapshot(volumeRecoverySnapshot, volumeDemandSnapshot, nodeLocalDiskSessions, volumeQuarantineSnapshot, hostArtifactSnapshot)
 
 	bundle := SupportBundle{
 		Timestamp:    time.Now().UTC(),
@@ -422,6 +433,7 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 		StickyAttachments:         stickySnapshot,
 		VolumeHistory:             volumeHistorySnapshot,
 		VolumeRepairState:         volumeRepairSnapshot,
+		VolumeRecoveryControl:     volumeRecoverySnapshot,
 		VolumeDemand:              volumeDemandSnapshot,
 		LastNodeProtection:        protectionSnapshot,
 		VolumeQuarantine:          volumeQuarantineSnapshot,
@@ -722,6 +734,7 @@ func collectLocalDiskSessionDiagnosticsWithKube(ctx context.Context, kubeClient 
 	if err != nil {
 		return nil, err
 	}
+	mountSources := currentMountSources()
 	reports := map[string]LocalDeviceMissingReport{}
 	if kubeClient != nil {
 		reports = localDeviceReportSnapshot(ctx, kubeClient)
@@ -729,14 +742,14 @@ func collectLocalDiskSessionDiagnosticsWithKube(ctx context.Context, kubeClient 
 	diagnostics := make([]LocalDiskSessionDiagnostic, 0, len(sessions)+len(reports))
 	seen := map[string]struct{}{}
 	for _, session := range sessions {
-		diagnostics = append(diagnostics, localDiskSessionDiagnostic(session, reports[session.VolumeID]))
+		diagnostics = append(diagnostics, localDiskSessionDiagnostic(session, reports[session.VolumeID], mountSources))
 		seen[strings.TrimSpace(session.VolumeID)] = struct{}{}
 	}
 	for volumeID, report := range reports {
 		if _, ok := seen[volumeID]; ok {
 			continue
 		}
-		diagnostics = append(diagnostics, localDiskReportDiagnostic(report))
+		diagnostics = append(diagnostics, localDiskReportDiagnostic(report, mountSources))
 	}
 	sort.Slice(diagnostics, func(i, j int) bool {
 		if diagnostics[i].PVCNamespace != diagnostics[j].PVCNamespace {
@@ -767,7 +780,7 @@ func supportBundleLocalDiskSessionDiagnostics(ctx context.Context, kubeClient ku
 	return nil, "node-local disk sessions are not readable from this container; run opennebula-csi --mode=local-disk-sessions on a node plugin pod for node-side session evidence"
 }
 
-func localDiskSessionDiagnostic(session localDiskSession, report LocalDeviceMissingReport) LocalDiskSessionDiagnostic {
+func localDiskSessionDiagnostic(session localDiskSession, report LocalDeviceMissingReport, mountSources map[string]string) LocalDiskSessionDiagnostic {
 	targets := make([]string, 0, len(session.PublishedTargets))
 	for _, target := range session.PublishedTargets {
 		if trimmed := strings.TrimSpace(target.TargetPath); trimmed != "" {
@@ -794,16 +807,22 @@ func localDiskSessionDiagnostic(session localDiskSession, report LocalDeviceMiss
 		ConfirmationDeadline:   session.ConfirmationDeadline,
 		ExpectedTarget:         strings.TrimSpace(session.ExpectedTarget),
 		ExpectedSerial:         strings.TrimSpace(session.ExpectedSerial),
+		ExpectedVolumeName:     strings.TrimSpace(session.VolumeName),
 		AttachmentState:        strings.TrimSpace(session.AttachmentState),
 		MetadataAttachedToNode: session.MetadataAttachedToNode,
 		MetadataTarget:         strings.TrimSpace(session.MetadataTarget),
 		LastObservedDevicePath: strings.TrimSpace(session.DevicePath),
+		LastObservedByIDPath:   localDiskObservedByIDPath(identity),
+		RecoveryMode:           strings.TrimSpace(session.RecoveryMode),
+		RecoveryTicket:         strings.TrimSpace(session.RecoveryTicket),
+		RecoveryAdoptedDevice:  session.RecoveryAdoptedDevice,
 	}
-	return mergeLocalDiskReportDiagnostic(diagnostic, report)
+	diagnostic = mergeLocalDiskReportDiagnostic(diagnostic, report)
+	return enrichLocalDiskSessionMountDiagnostic(diagnostic, mountSources)
 }
 
-func localDiskReportDiagnostic(report LocalDeviceMissingReport) LocalDiskSessionDiagnostic {
-	return mergeLocalDiskReportDiagnostic(LocalDiskSessionDiagnostic{
+func localDiskReportDiagnostic(report LocalDeviceMissingReport, mountSources map[string]string) LocalDiskSessionDiagnostic {
+	diagnostic := mergeLocalDiskReportDiagnostic(LocalDiskSessionDiagnostic{
 		VolumeID:               strings.TrimSpace(report.VolumeID),
 		PVName:                 strings.TrimSpace(report.PVName),
 		PVCNamespace:           strings.TrimSpace(report.PVCNamespace),
@@ -819,11 +838,13 @@ func localDiskReportDiagnostic(report LocalDeviceMissingReport) LocalDiskSession
 		ConfirmationDeadline:   report.ConfirmationDeadline,
 		ExpectedTarget:         strings.TrimSpace(report.ExpectedTarget),
 		ExpectedSerial:         strings.TrimSpace(report.DeviceSerial),
+		ExpectedVolumeName:     strings.TrimSpace(report.VolumeName),
 		AttachmentState:        strings.TrimSpace(report.AttachmentState),
 		MetadataAttachedToNode: report.MetadataAttachedToNode,
 		MetadataTarget:         strings.TrimSpace(report.MetadataTarget),
 		LastObservedDevicePath: strings.TrimSpace(report.DevicePath),
 	}, report)
+	return enrichLocalDiskSessionMountDiagnostic(diagnostic, mountSources)
 }
 
 func mergeLocalDiskReportDiagnostic(diagnostic LocalDiskSessionDiagnostic, report LocalDeviceMissingReport) LocalDiskSessionDiagnostic {
@@ -844,10 +865,42 @@ func mergeLocalDiskReportDiagnostic(diagnostic LocalDiskSessionDiagnostic, repor
 	}
 	diagnostic.ExpectedTarget = firstNonEmpty(diagnostic.ExpectedTarget, strings.TrimSpace(report.ExpectedTarget), strings.TrimSpace(report.VolumeName))
 	diagnostic.ExpectedSerial = firstNonEmpty(diagnostic.ExpectedSerial, strings.TrimSpace(report.DeviceSerial))
+	diagnostic.ExpectedVolumeName = firstNonEmpty(diagnostic.ExpectedVolumeName, strings.TrimSpace(report.VolumeName))
 	diagnostic.AttachmentState = firstNonEmpty(diagnostic.AttachmentState, strings.TrimSpace(report.AttachmentState))
 	diagnostic.MetadataAttachedToNode = diagnostic.MetadataAttachedToNode || report.MetadataAttachedToNode
 	diagnostic.MetadataTarget = firstNonEmpty(diagnostic.MetadataTarget, strings.TrimSpace(report.MetadataTarget))
 	diagnostic.LastObservedDevicePath = firstNonEmpty(diagnostic.LastObservedDevicePath, strings.TrimSpace(report.DevicePath))
+	return diagnostic
+}
+
+func enrichLocalDiskSessionMountDiagnostic(diagnostic LocalDiskSessionDiagnostic, mountSources map[string]string) LocalDiskSessionDiagnostic {
+	stagePath := strings.TrimSpace(diagnostic.StagingTargetPath)
+	if stagePath == "" {
+		return diagnostic
+	}
+	mountSource := strings.TrimSpace(mountSources[stagePath])
+	diagnostic.CurrentStageMountSource = mountSource
+	if mountSource == "" {
+		diagnostic.CurrentStageMountState = "missing"
+		diagnostic.CurrentStageMountMessage = "stage path is not present in the current mount table"
+		return diagnostic
+	}
+	expectedSource := normalizedRecoveryDeviceName(firstNonEmpty(diagnostic.LastObservedDevicePath, diagnostic.LastObservedByIDPath))
+	observedSource := normalizedRecoveryDeviceName(mountSource)
+	if expectedSource != "" && observedSource == expectedSource {
+		diagnostic.CurrentStageMountMatchesExpected = true
+		diagnostic.CurrentStageMountState = "confirmed"
+		diagnostic.CurrentStageMountMessage = fmt.Sprintf("stage path is mounted from expected device source %s", mountSource)
+		return diagnostic
+	}
+	if diagnostic.ExpectedSerial != "" && strings.Contains(strings.ToLower(mountSource), strings.ToLower(diagnostic.ExpectedSerial)) {
+		diagnostic.CurrentStageMountMatchesExpected = true
+		diagnostic.CurrentStageMountState = "confirmed"
+		diagnostic.CurrentStageMountMessage = fmt.Sprintf("stage path source %s matches expected serial %s", mountSource, diagnostic.ExpectedSerial)
+		return diagnostic
+	}
+	diagnostic.CurrentStageMountState = "mismatch"
+	diagnostic.CurrentStageMountMessage = fmt.Sprintf("stage path source %s does not match expected device evidence", mountSource)
 	return diagnostic
 }
 
@@ -1035,7 +1088,7 @@ func typedHotplugQueueSnapshot(ctx context.Context, kubeClient kubernetes.Interf
 	return snapshot
 }
 
-func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPluginConfig, kubeClient kubernetes.Interface, pvs []corev1.PersistentVolume) (map[string]VolumeHistoryRecord, map[string]VolumeRepairState, map[string]VolumeDesiredState, map[string]LocalRWOProtectionDecision) {
+func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPluginConfig, kubeClient kubernetes.Interface, pvs []corev1.PersistentVolume) (map[string]VolumeHistoryRecord, map[string]VolumeRepairState, map[string]VolumeRecoveryControlState, map[string]VolumeDesiredState, map[string]LocalRWOProtectionDecision) {
 	runtime := &KubeRuntime{client: kubeClient, enabled: true, staleVAGrace: loadStaleVolumeAttachmentGrace(cfg)}
 	if restConfig, err := loadKubeRestConfig(); err == nil {
 		runtime.inventoryClient = newInventoryRuntimeClient(restConfig)
@@ -1048,9 +1101,11 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 	driver.stickyAttachments = NewStickyAttachmentManager(runtime, "")
 	driver.volumeHistory = NewVolumeHistoryManager(runtime, "")
 	driver.volumeRepairState = NewVolumeRepairStateManager(runtime, "")
+	driver.volumeRecoveryControl = NewVolumeRecoveryControlManager(runtime, "")
 	_ = driver.stickyAttachments.LoadFromConfigMap(ctx)
 	_ = driver.volumeHistory.LoadFromConfigMap(ctx)
 	_ = driver.volumeRepairState.LoadFromConfigMap(ctx)
+	_ = driver.volumeRecoveryControl.LoadFromConfigMap(ctx)
 	driver.maintenanceMode = NewMaintenanceModeManager(driver, "")
 	if driver.maintenanceMode != nil {
 		_ = driver.maintenanceMode.Reconcile(ctx)
@@ -1064,11 +1119,21 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 	if driver.volumeRepairState != nil {
 		repairSnapshot = driver.volumeRepairState.Snapshot()
 	}
+	recoverySnapshot := map[string]VolumeRecoveryControlState{}
+	if driver.volumeRecoveryControl != nil {
+		recoverySnapshot = driver.volumeRecoveryControl.Snapshot()
+	}
 	demandSnapshot := map[string]VolumeDesiredState{}
 	protectionSnapshot := map[string]LocalRWOProtectionDecision{}
 	for _, pv := range pvs {
 		if !eligibleForLastNodePreference(&pv) {
 			continue
+		}
+		runtimeCtx, _ := runtime.ResolveVolumeRuntimeContext(ctx, pv.Spec.CSI.VolumeHandle)
+		existingRecoveryState := recoverySnapshot[pv.Spec.CSI.VolumeHandle]
+		recoveryState := resolvedRecoveryControlState(pv.Spec.CSI.VolumeHandle, runtimeCtx, existingRecoveryState)
+		if recoveryState.Active() || recoveryState.Expired || recoveryState.Invalid || recoveryState.Adopted || strings.TrimSpace(recoveryState.Mode) != "" || strings.TrimSpace(recoveryState.Warning) != "" || strings.TrimSpace(recoveryState.Message) != "" {
+			recoverySnapshot[pv.Spec.CSI.VolumeHandle] = recoveryState
 		}
 		if desiredState, err := runtime.DesiredNodeForVolume(ctx, pv.Spec.CSI.VolumeHandle); err == nil {
 			demandSnapshot[pv.Spec.CSI.VolumeHandle] = desiredState
@@ -1085,7 +1150,91 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 			protectionSnapshot[pv.Spec.CSI.VolumeHandle] = decision
 		}
 	}
-	return historySnapshot, repairSnapshot, demandSnapshot, protectionSnapshot
+	return historySnapshot, repairSnapshot, recoverySnapshot, demandSnapshot, protectionSnapshot
+}
+
+func enrichRecoveryControlSupportSnapshot(snapshot map[string]VolumeRecoveryControlState, demand map[string]VolumeDesiredState, sessions []LocalDiskSessionDiagnostic, quarantine map[string]any, hostArtifacts map[string]any) map[string]VolumeRecoveryControlState {
+	if len(snapshot) == 0 {
+		return snapshot
+	}
+	diagnosticsByVolume := map[string]LocalDiskSessionDiagnostic{}
+	for _, diagnostic := range sessions {
+		if volumeID := strings.TrimSpace(diagnostic.VolumeID); volumeID != "" {
+			diagnosticsByVolume[volumeID] = diagnostic
+		}
+	}
+	enriched := make(map[string]VolumeRecoveryControlState, len(snapshot))
+	for volumeID, state := range snapshot {
+		state.ExpectedDeviceSerial = firstNonEmpty(state.ExpectedDeviceSerial, state.ConfirmedDeviceSerial, state.AdoptedDeviceSerial)
+		state.ExpectedVolumeName = firstNonEmpty(state.ExpectedVolumeName, state.ConfirmedVolumeName, state.AdoptedVolumeName)
+		state.ActualGuestVisibleDevice = firstNonEmpty(state.ActualGuestVisibleDevice, state.AdoptedVolumeName)
+		if session, ok := diagnosticsByVolume[volumeID]; ok {
+			state.ExpectedDeviceSerial = firstNonEmpty(state.ExpectedDeviceSerial, session.ExpectedSerial)
+			state.ExpectedVolumeName = firstNonEmpty(state.ExpectedVolumeName, session.ExpectedVolumeName, session.ExpectedTarget)
+			state.ActualGuestVisibleDevice = firstNonEmpty(state.ActualGuestVisibleDevice, session.LastObservedDevicePath, session.LastObservedByIDPath)
+			state.CurrentStageMountSource = firstNonEmpty(state.CurrentStageMountSource, session.CurrentStageMountSource)
+			state.CurrentStageMountMatchesExpected = state.CurrentStageMountMatchesExpected || session.CurrentStageMountMatchesExpected
+		}
+		if desiredState, ok := demand[volumeID]; ok && state.QueueBlockerReason == "" && state.ManualActive() {
+			state.QueueBlockerReason = state.QueueBlockReason()
+			state.QueueBlockerMessage = state.QueueBlockMessage(volumeID, firstNonEmpty(desiredState.NodeName, state.AdoptedNode), "attach")
+		}
+		if quarantineState, ok := typedVolumeQuarantineSnapshotValue(quarantine[volumeID]); ok {
+			state.VolumeQuarantineReason = firstNonEmpty(state.VolumeQuarantineReason, quarantineState.Reason)
+			state.VolumeQuarantineMessage = firstNonEmpty(state.VolumeQuarantineMessage, quarantineState.Message)
+		}
+		for _, value := range hostArtifacts {
+			hostArtifactState, ok := typedHostArtifactSnapshotValue(value)
+			if !ok || strings.TrimSpace(hostArtifactState.VolumeID) != volumeID {
+				continue
+			}
+			state.HostArtifactReason = firstNonEmpty(state.HostArtifactReason, hostArtifactState.Reason)
+			state.HostArtifactMessage = firstNonEmpty(state.HostArtifactMessage, hostArtifactState.Message)
+			break
+		}
+		switch {
+		case state.Adopted:
+			state.ManualState = "adopted"
+		case state.AdoptionRequested():
+			state.ManualState = "adopt_requested"
+		case state.ManualActive():
+			state.ManualState = "manual_mode"
+		case state.ObserveActive():
+			state.ManualState = "observe_mode"
+		}
+		enriched[volumeID] = state
+	}
+	return enriched
+}
+
+func typedVolumeQuarantineSnapshotValue(value any) (VolumeQuarantineState, bool) {
+	if value == nil {
+		return VolumeQuarantineState{}, false
+	}
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return VolumeQuarantineState{}, false
+	}
+	var state VolumeQuarantineState
+	if err := json.Unmarshal(payload, &state); err != nil {
+		return VolumeQuarantineState{}, false
+	}
+	return state, true
+}
+
+func typedHostArtifactSnapshotValue(value any) (HostArtifactQuarantineState, bool) {
+	if value == nil {
+		return HostArtifactQuarantineState{}, false
+	}
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return HostArtifactQuarantineState{}, false
+	}
+	var state HostArtifactQuarantineState
+	if err := json.Unmarshal(payload, &state); err != nil {
+		return HostArtifactQuarantineState{}, false
+	}
+	return state, true
 }
 
 func summarizeHotplugQueueReasons(events []corev1.Event) []HotplugQueueReasonSnapshot {

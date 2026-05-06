@@ -120,11 +120,13 @@ func newStickyTestDriver(t *testing.T, objects ...runtime.Object) *Driver {
 	driver.stickyAttachments = NewStickyAttachmentManager(runtime, "default")
 	driver.volumeHistory = NewVolumeHistoryManager(runtime, "default")
 	driver.volumeRepairState = NewVolumeRepairStateManager(runtime, "default")
+	driver.volumeRecoveryControl = NewVolumeRecoveryControlManager(runtime, "default")
 	driver.volumeQuarantine = NewVolumeQuarantineManager(runtime, "default")
 	driver.hostArtifactQuarantine = NewHostArtifactQuarantineManager(runtime, "default")
 	require.NoError(t, driver.stickyAttachments.LoadFromConfigMap(context.Background()))
 	require.NoError(t, driver.volumeHistory.LoadFromConfigMap(context.Background()))
 	require.NoError(t, driver.volumeRepairState.LoadFromConfigMap(context.Background()))
+	require.NoError(t, driver.volumeRecoveryControl.LoadFromConfigMap(context.Background()))
 	return driver
 }
 

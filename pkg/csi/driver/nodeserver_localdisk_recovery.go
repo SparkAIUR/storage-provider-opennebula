@@ -59,6 +59,9 @@ type localDiskSession struct {
 	AttachmentState        string                     `json:"attachmentState,omitempty"`
 	MetadataAttachedToNode bool                       `json:"metadataAttachedToNode,omitempty"`
 	MetadataTarget         string                     `json:"metadataTarget,omitempty"`
+	RecoveryMode           string                     `json:"recoveryMode,omitempty"`
+	RecoveryTicket         string                     `json:"recoveryTicket,omitempty"`
+	RecoveryAdoptedDevice  bool                       `json:"recoveryAdoptedDevice,omitempty"`
 }
 
 type localDiskMountHealth struct {
@@ -202,7 +205,10 @@ func (ns *NodeServer) recordLocalDiskStageSession(ctx context.Context, req *csi.
 		PVCNamespace:      strings.TrimSpace(publishContext[paramPVCNamespace]),
 		PVCName:           strings.TrimSpace(publishContext[paramPVCName]),
 		PVName:            strings.TrimSpace(publishContext[paramPVName]),
+		RecoveryMode:      strings.TrimSpace(publishContext[publishContextRecoveryMode]),
+		RecoveryTicket:    strings.TrimSpace(publishContext[publishContextRecoveryTicket]),
 	}
+	session.RecoveryAdoptedDevice = strings.EqualFold(strings.TrimSpace(publishContext[publishContextRecoveryAdoptedDevice]), "true")
 	if existing, exists, err := ns.loadLocalDiskSession(session.VolumeID); err == nil && exists {
 		session.PublishedTargets = existing.PublishedTargets
 	}
@@ -311,13 +317,48 @@ func (ns *NodeServer) evaluateLocalDiskPath(volumeID, path string) (localDiskMou
 			}
 			return localDiskMountHealth{}, err
 		}
-		if session, exists, loadErr := ns.loadLocalDiskSession(volumeID); loadErr == nil && exists && session.DeviceSerial != "" {
-			if !deviceMatchesSerial(ns.mounter.Exec, mountPoint.Device, session.DeviceSerial, "") {
+		if session, exists, loadErr := ns.loadLocalDiskSession(volumeID); loadErr == nil && exists {
+			if session.DeviceSerial != "" && !deviceMatchesSerial(ns.mounter.Exec, mountPoint.Device, session.DeviceSerial, "") {
 				return localDiskMountHealth{Stale: true, Reason: "serial_mismatch", MountSource: mountPoint.Device, Message: "mount source serial does not match expected volume serial"}, nil
+			}
+			if session.Identity != nil {
+				observed := ns.observeLocalDiskIdentity(mountPoint.Device, session.FSType, nil)
+				if matched, reason := localDiskIdentityMatches(session.Identity, observed); !matched {
+					return localDiskMountHealth{Stale: true, Reason: "wrong_device_reuse", MountSource: mountPoint.Device, Message: reason}, nil
+				}
+			}
+			if duplicate, duplicatePath := ns.duplicateLocalDiskMount(volumeID, mountPoint.Device); duplicate {
+				return localDiskMountHealth{Stale: true, Reason: "duplicate_device_mount", MountSource: mountPoint.Device, Message: fmt.Sprintf("mount source %s is already tracked by another local disk session at %s", mountPoint.Device, duplicatePath)}, nil
 			}
 		}
 	}
 	return health, nil
+}
+
+func (ns *NodeServer) duplicateLocalDiskMount(volumeID, devicePath string) (bool, string) {
+	if ns == nil || ns.localDiskSessions == nil || strings.TrimSpace(devicePath) == "" {
+		return false, ""
+	}
+	sessions, err := ns.localDiskSessions.List()
+	if err != nil {
+		return false, ""
+	}
+	current := normalizedRecoveryDeviceName(devicePath)
+	for _, session := range sessions {
+		if strings.TrimSpace(session.VolumeID) == strings.TrimSpace(volumeID) {
+			continue
+		}
+		other := normalizedRecoveryDeviceName(firstNonEmpty(
+			strings.TrimSpace(session.DevicePath),
+			localDiskObservedMountSourceIdentity(session.Identity),
+			localDiskObservedByIDPath(session.Identity),
+		))
+		if other == "" || other != current {
+			continue
+		}
+		return true, firstNonEmpty(strings.TrimSpace(session.StagingTargetPath), strings.TrimSpace(session.VolumeID))
+	}
+	return false, ""
 }
 
 func (ns *NodeServer) handleStaleLocalDiskPath(volumeID, volumePath string, cause error) error {

@@ -163,7 +163,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 		if pv == nil || pv.Spec.CSI == nil {
 			continue
 		}
-		if r.skipVolume(volumeHandle) {
+		if r.skipVolume(ctx, volumeHandle) {
 			continue
 		}
 		pvcKey := pvcKeyForPV(pv)
@@ -230,7 +230,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			continue
 		}
 		volumeHandle := pv.Spec.CSI.VolumeHandle
-		if r.skipVolume(volumeHandle) {
+		if r.skipVolume(ctx, volumeHandle) {
 			continue
 		}
 		if _, ok := attachmentByVolumeNode[volumeHandle+"@"+va.Spec.NodeName]; ok {
@@ -278,6 +278,13 @@ func (r *AttachmentReconciler) cleanupStaleDriverState(ctx context.Context, pvBy
 		for volumeID := range r.server.driver.volumeRepairState.Snapshot() {
 			if pvByHandle[volumeID] == nil {
 				_ = r.server.driver.volumeRepairState.Clear(ctx, volumeID)
+			}
+		}
+	}
+	if r.server.driver.volumeRecoveryControl != nil {
+		for volumeID := range r.server.driver.volumeRecoveryControl.Snapshot() {
+			if pvByHandle[volumeID] == nil {
+				_ = r.server.driver.volumeRecoveryControl.Clear(ctx, volumeID)
 			}
 		}
 	}
@@ -337,9 +344,20 @@ func nodeMissing(existingNodes map[string]struct{}, node string) bool {
 	return !ok
 }
 
-func (r *AttachmentReconciler) skipVolume(volumeHandle string) bool {
+func (r *AttachmentReconciler) skipVolume(ctx context.Context, volumeHandle string) bool {
 	if r == nil || r.server == nil || r.server.driver == nil {
 		return true
+	}
+	if r.server.driver.volumeRecoveryControl != nil {
+		var runtimeCtx *VolumeRuntimeContext
+		if r.server.driver.kubeRuntime != nil && r.server.driver.kubeRuntime.enabled {
+			if resolved, err := r.server.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeHandle); err == nil {
+				runtimeCtx = resolved
+			}
+		}
+		if control, err := r.server.recoveryControlState(ctx, volumeHandle, runtimeCtx); err == nil && control.ManualActive() {
+			return true
+		}
 	}
 	if r.server.driver.stickyAttachments != nil {
 		if _, ok := r.server.driver.stickyAttachments.Get(volumeHandle); ok {

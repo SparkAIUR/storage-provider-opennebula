@@ -71,6 +71,7 @@ type Driver struct {
 	stickyAttachments      *StickyAttachmentManager
 	volumeHistory          *VolumeHistoryManager
 	volumeRepairState      *VolumeRepairStateManager
+	volumeRecoveryControl  *VolumeRecoveryControlManager
 	volumeQuarantine       *VolumeQuarantineManager
 	hostArtifactQuarantine *HostArtifactQuarantineManager
 	hotplugQueue           *HotplugQueueManager
@@ -125,6 +126,10 @@ func (d *Driver) Run(ctx context.Context) error {
 	d.volumeRepairState = NewVolumeRepairStateManager(d.kubeRuntime, "")
 	if err := d.volumeRepairState.LoadFromConfigMap(ctx); err != nil {
 		klog.V(2).InfoS("Failed to load volume repair state", "err", err)
+	}
+	d.volumeRecoveryControl = NewVolumeRecoveryControlManager(d.kubeRuntime, "")
+	if err := d.volumeRecoveryControl.LoadFromConfigMap(ctx); err != nil {
+		klog.V(2).InfoS("Failed to load volume recovery control state", "err", err)
 	}
 	if strings.TrimSpace(d.nodeID) == "" {
 		d.stickyAttachments = NewStickyAttachmentManager(d.kubeRuntime, "")

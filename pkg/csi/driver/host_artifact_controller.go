@@ -18,6 +18,16 @@ func (s *ControllerServer) rejectIfHostArtifactQuarantineActive(ctx context.Cont
 	if s == nil || s.driver == nil || req == nil || !s.hostArtifactQuarantineEnabled() {
 		return nil
 	}
+	var runtimeCtx *VolumeRuntimeContext
+	if s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
+		if resolved, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId); err == nil {
+			runtimeCtx = resolved
+		}
+	}
+	recoveryControl, controlErr := s.recoveryControlState(ctx, req.VolumeId, runtimeCtx)
+	if controlErr == nil {
+		s.recordRecoveryModeExpiryWarning(ctx, runtimeCtx, recoveryControl)
+	}
 	if len(s.driver.hostArtifactQuarantine.Snapshot()) == 0 {
 		return nil
 	}
@@ -33,8 +43,15 @@ func (s *ControllerServer) rejectIfHostArtifactQuarantineActive(ctx context.Cont
 	if target == nil {
 		return nil
 	}
+	if err := s.driver.hostArtifactQuarantine.RefreshKey(ctx, target.Key()); err != nil {
+		klog.V(2).InfoS("Failed to refresh host artifact quarantine target", "key", target.Key(), "err", err)
+	}
 	state, active := s.driver.hostArtifactQuarantine.GetActive(target.Key(), time.Now().UTC())
 	if !active {
+		return nil
+	}
+	if recoveryControl.Active() && recoveryControl.SuppressRepairActions {
+		s.recordHostArtifactWarning(ctx, req.VolumeId, req.GetVolumeContext(), eventReasonHostArtifactQuarantined, state.Message)
 		return nil
 	}
 	message := hostArtifactQuarantineMessage(state)
@@ -47,7 +64,22 @@ func (s *ControllerServer) handleHostArtifactConflict(ctx context.Context, req *
 	if s == nil || s.driver == nil || req == nil || conflict == nil {
 		return nil
 	}
+	var runtimeCtx *VolumeRuntimeContext
+	if s.driver != nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
+		if resolved, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId); err == nil {
+			runtimeCtx = resolved
+		}
+	}
+	recoveryControl, recoveryErr := s.recoveryControlState(ctx, req.VolumeId, runtimeCtx)
+	if recoveryErr == nil {
+		s.recordRecoveryModeExpiryWarning(ctx, runtimeCtx, recoveryControl)
+	}
 	if !s.hostArtifactQuarantineEnabled() {
+		message := conflict.Error()
+		s.recordHostArtifactWarning(ctx, req.VolumeId, req.GetVolumeContext(), eventReasonHostArtifactQuarantined, message)
+		return status.Error(codes.FailedPrecondition, message)
+	}
+	if recoveryControl.Active() && recoveryControl.SuppressRepairActions {
 		message := conflict.Error()
 		s.recordHostArtifactWarning(ctx, req.VolumeId, req.GetVolumeContext(), eventReasonHostArtifactQuarantined, message)
 		return status.Error(codes.FailedPrecondition, message)

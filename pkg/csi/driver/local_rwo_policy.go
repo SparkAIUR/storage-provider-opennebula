@@ -13,6 +13,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -22,12 +23,14 @@ const (
 	repairClassificationWrongDeviceIdentity        = "wrong_device_identity"
 	repairClassificationRuntimeAttachUnconfirmed   = "same_node_runtime_attach_unconfirmed"
 
-	queueReasonDesiredStateChanged   = "desired_state_changed"
-	queueReasonVolumeParked          = "volume_parked"
-	queueReasonNodeTombstoned        = "node_tombstoned"
-	queueReasonSameNodeReuseRequired = "same_node_reuse_required"
-	queueReasonVolumeQuarantined     = "volume_quarantined"
-	queueReasonRepairRequired        = "repair_required"
+	queueReasonDesiredStateChanged    = "desired_state_changed"
+	queueReasonVolumeParked           = "volume_parked"
+	queueReasonNodeTombstoned         = "node_tombstoned"
+	queueReasonSameNodeReuseRequired  = "same_node_reuse_required"
+	queueReasonVolumeQuarantined      = "volume_quarantined"
+	queueReasonRepairRequired         = "repair_required"
+	queueReasonRecoveryControlInvalid = "recovery_control_invalid"
+	queueReasonManualRecoveryAdopted  = "manual_recovery_adopted"
 
 	protectionReasonMaintenance          = "maintenance_cross_node_blocked"
 	protectionReasonAutomaticMaintenance = "automatic_maintenance_cross_node_blocked"
@@ -779,16 +782,22 @@ func (s *ControllerServer) recordActiveRepairStateEvent(ctx context.Context, run
 	s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonVolumeRepairRequired, firstNonEmpty(state.Message, fmt.Sprintf("repair-required state %s is active", state.Classification)))
 }
 
-func (s *ControllerServer) activeVolumeQuarantine(volumeID string) (VolumeQuarantineState, bool) {
+func (s *ControllerServer) activeVolumeQuarantine(ctx context.Context, volumeID string) (VolumeQuarantineState, bool) {
 	if s == nil || s.driver == nil || s.driver.volumeQuarantine == nil {
 		return VolumeQuarantineState{}, false
+	}
+	if err := s.driver.volumeQuarantine.RefreshEntry(ctx, volumeID); err != nil {
+		klog.V(3).InfoS("Failed to refresh volume quarantine state", "volumeID", volumeID, "err", err)
 	}
 	return s.driver.volumeQuarantine.GetActive(volumeID, time.Now().UTC())
 }
 
-func (s *ControllerServer) activeHostArtifactQuarantine(volumeID string) bool {
+func (s *ControllerServer) activeHostArtifactQuarantine(ctx context.Context, volumeID string) bool {
 	if s == nil || s.driver == nil || s.driver.hostArtifactQuarantine == nil {
 		return false
+	}
+	if err := s.driver.hostArtifactQuarantine.RefreshVolume(ctx, volumeID); err != nil {
+		klog.V(3).InfoS("Failed to refresh host artifact quarantine state", "volumeID", volumeID, "err", err)
 	}
 	for _, state := range s.driver.hostArtifactQuarantine.Snapshot() {
 		if strings.TrimSpace(state.VolumeID) == strings.TrimSpace(volumeID) && (state.ExpiresAt.IsZero() || state.ExpiresAt.After(time.Now().UTC())) {

@@ -38,6 +38,7 @@ func newLocalDeviceRecoveryTestDriver(t *testing.T, objects ...runtime.Object) *
 	}
 	driver.volumeHistory = NewVolumeHistoryManager(runtime, namespaceFromServiceAccount())
 	driver.volumeRepairState = NewVolumeRepairStateManager(runtime, namespaceFromServiceAccount())
+	driver.volumeRecoveryControl = NewVolumeRecoveryControlManager(runtime, namespaceFromServiceAccount())
 	return driver
 }
 
