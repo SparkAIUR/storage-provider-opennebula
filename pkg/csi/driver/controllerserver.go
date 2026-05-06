@@ -33,6 +33,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 )
 
@@ -1941,15 +1942,20 @@ func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node
 				Message:  fmt.Sprintf("volume %s is already detached from node %s", volume, node),
 			}
 		}
-		if desiredState, desiredErr := s.driver.kubeRuntime.DesiredNodeForVolume(ctx, volume); desiredErr == nil && desiredState.Desired && !desiredState.MultipleNodes && strings.TrimSpace(desiredState.NodeName) == strings.TrimSpace(node) {
+		desiredState, desiredErr := s.driver.kubeRuntime.DesiredNodeForVolume(ctx, volume)
+		if desiredErr == nil && desiredState.Desired && !desiredState.MultipleNodes && strings.TrimSpace(desiredState.NodeName) == strings.TrimSpace(node) {
 			return HotplugQueueValidation{
 				Decision: HotplugQueueValidationPaused,
 				Reason:   queueReasonSameNodeReuseRequired,
 				Message:  fmt.Sprintf("queued detach for volume %s on node %s is paused because Kubernetes still desires the volume there (%s)", volume, node, desiredState.Reason),
 			}
 		}
+		orphanTeardown, _ := s.orphanTeardownEligible(ctx, volume, node, runtimeCtx, desiredState, desiredErr)
+		if orphanTeardown {
+			history = s.refreshVolumeHistory(ctx, volume)
+		}
 		protection, protectionErr := s.localRWOProtectionDecision(ctx, volume, node)
-		if protectionErr == nil && protection.Protected && strings.TrimSpace(protection.RequiredNode) == strings.TrimSpace(node) {
+		if protectionErr == nil && protection.Protected && strings.TrimSpace(protection.RequiredNode) == strings.TrimSpace(node) && !bypassProtectionForOrphanTeardown(protection, orphanTeardown) {
 			return HotplugQueueValidation{
 				Decision: HotplugQueueValidationPaused,
 				Reason:   protection.Reason,
@@ -2106,6 +2112,73 @@ func (s *ControllerServer) attachRequestStale(ctx context.Context, node, volume 
 		return true, queueReasonRepairRequired
 	}
 	return false, ""
+}
+
+func (s *ControllerServer) orphanTeardownEligible(ctx context.Context, volume, node string, runtimeCtx *VolumeRuntimeContext, desiredState VolumeDesiredState, desiredErr error) (bool, string) {
+	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
+		return false, ""
+	}
+	if desiredErr != nil {
+		if strings.Contains(desiredErr.Error(), "persistent volume for handle") {
+			return true, "persistent_volume_not_found"
+		}
+		return false, ""
+	}
+	if desiredState.Desired {
+		return false, ""
+	}
+	if desiredState.PVDeleting {
+		return true, "persistent_volume_deleting"
+	}
+	if desiredState.PVPhase == corev1.VolumeReleased || desiredState.PVPhase == corev1.VolumeFailed {
+		return true, "persistent_volume_" + strings.ToLower(string(desiredState.PVPhase))
+	}
+	if desiredState.PVCDeleting {
+		return true, "persistent_volume_claim_deleting"
+	}
+	switch strings.TrimSpace(desiredState.Reason) {
+	case "persistent_volume_claim_not_found", "unbound_volume", volumeDemandSourceVolumeParked:
+		return true, desiredState.Reason
+	}
+	if deleting, attachmentName := s.volumeAttachmentDeletingForNode(ctx, runtimeCtx, node); deleting {
+		return true, firstNonEmpty(attachmentName, "volume_attachment_deleting")
+	}
+	return false, ""
+}
+
+func (s *ControllerServer) volumeAttachmentDeletingForNode(ctx context.Context, runtimeCtx *VolumeRuntimeContext, node string) (bool, string) {
+	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled || runtimeCtx == nil || strings.TrimSpace(runtimeCtx.PVName) == "" {
+		return false, ""
+	}
+	attachments, err := s.driver.kubeRuntime.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, ""
+	}
+	for idx := range attachments.Items {
+		attachment := &attachments.Items[idx]
+		if !matchesVolumeAttachment(runtimeCtx.PVName, attachment) {
+			continue
+		}
+		if strings.TrimSpace(attachment.Spec.NodeName) != strings.TrimSpace(node) {
+			continue
+		}
+		if attachment.DeletionTimestamp != nil && !attachment.DeletionTimestamp.IsZero() {
+			return true, strings.TrimSpace(attachment.Name)
+		}
+	}
+	return false, ""
+}
+
+func bypassProtectionForOrphanTeardown(protection LocalRWOProtectionDecision, orphanTeardown bool) bool {
+	if !orphanTeardown {
+		return false
+	}
+	switch strings.TrimSpace(protection.Source) {
+	case protectionSourceHistoricalOwnership, protectionSourceAutomaticMaintenance:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *ControllerServer) handleHotplugTimeout(ctx context.Context, node, volume string, params map[string]string, operation, backend string, err error) {

@@ -332,6 +332,43 @@ Important interpretations:
 - annotation audit finding on `last-attached-node`
   means the historical hint is stale and should not be trusted
 
+### Orphan teardown and stale historical protection
+
+If the workload is already gone, but the final detach still appears stuck on historical local-RWO ownership:
+
+- inspect `volumeDemand` first
+- check whether the PV is `Released`, deleting, or no longer bound to a live claim
+- check whether the remaining `VolumeAttachment` is already deleting
+
+In `v0.5.x`, orphan teardown now prefers detach progress over stale historical ownership. The controller should no longer need a restart just to let a deleting local-RWO attachment finish tearing down.
+
+If it still does not move, verify that the blocker is not one of the stronger classes that still intentionally win:
+
+- active `recovery-mode=manual`
+- repair-required state
+- volume quarantine
+- host-artifact quarantine
+
+### Refresh stale history-backed protection
+
+If `lastNodeProtection` still points at an old historical node after you already proved that history is stale:
+
+1. inspect `volumeHistory` in the support bundle
+2. remove or edit the single stale key in `ConfigMap/opennebula-csi-volume-history-state`
+3. trigger a fresh controller evaluation by retrying the publish/detach path or re-running the support bundle
+
+You no longer need a controller restart just to invalidate one stale `volumeHistory` entry. The controller now refreshes that entry directly on:
+
+- degraded local-RWO protection evaluation
+- publish lookup error handling
+- orphan detach validation
+
+Confirm the refresh by checking that:
+
+- `volumeHistory` no longer contains the stale record
+- `lastNodeProtection` stops reporting `historical_ownership_active` for that volume
+- orphan detach validation no longer pauses forever on the old node
+
 ### Events
 
 Inspect workload and CSI namespace events:
@@ -576,12 +613,44 @@ Treat repeated restarts as a product gap when:
 - the support bundle keeps showing stale in-memory queue, quarantine, or host-artifact blockers after the external state is clean
 - the only path that works is direct `VolumeAttachment.status` editing
 
-### 8. What to inspect now
+### 8. Supported node-side unstage / reprobe
+
+When the stage path itself is stale or contaminated on the node, use the supported node-side reprobe action from the node plugin pod on the affected node:
+
+```bash
+opennebula-csi -mode=local-disk-reprobe -volume-id <volume-id>
+```
+
+What it does:
+
+- targets one local-RWO volume only
+- cleans that volume's stage path with the same unstage path used by the node server
+- removes the persisted node-local session for that volume
+- leaves before/after evidence in the command output so you can see what changed
+
+If the volume still has published consumer targets, the command fails closed by default.
+
+To force the unstage anyway, first put the volume into bounded manual recovery mode and then acknowledge the risk explicitly:
+
+```bash
+opennebula-csi -mode=local-disk-reprobe -volume-id <volume-id> -allow-published-reprobe
+```
+
+That forced path is accepted only when `recovery-mode=manual` is already active for the volume. It is meant for targeted incident work, not routine operations.
+
+Use this when:
+
+- `nodeLocalDiskSessions` shows a stale `globalmount`
+- the current stage mount source does not match the expected device evidence
+- you need the next `NodeStageVolume` to perform a fresh node-side reprobe instead of reusing contaminated local session state
+
+### 9. What to inspect now
 
 For a current incident, collect:
 
 - `opennebula-csi --mode=support-bundle`
 - `opennebula-csi --mode=local-disk-sessions` from the node plugin pod on the affected node
+- `opennebula-csi -mode=local-disk-reprobe -volume-id <volume-id>` when you intentionally need a single-volume node-side reset
 
 The relevant fields are now:
 

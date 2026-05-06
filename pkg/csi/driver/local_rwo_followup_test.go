@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -213,8 +214,25 @@ func TestCollectLocalDiskSessionDiagnostics(t *testing.T) {
 func TestLocalRWOProtectionDecisionUsesAutomaticMaintenanceSource(t *testing.T) {
 	node := newReadyNode("node-a", true)
 	node.Spec.Unschedulable = true
+	record := VolumeHistoryRecord{
+		Version:                   stateObjectVersion,
+		VolumeID:                  "vol-1",
+		Backend:                   "local",
+		LastSuccessfulNodeName:    "node-a",
+		LastSuccessfulPublishTime: time.Now().Add(-5 * time.Minute),
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("failed to marshal history payload: %v", err)
+	}
 	runtime := &KubeRuntime{
-		client:  fake.NewSimpleClientset(node),
+		client: fake.NewSimpleClientset(
+			node,
+			&corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: volumeHistoryStateConfigMapName, Namespace: "default"},
+				Data:       map[string]string{"vol-1": string(payload)},
+			},
+		),
 		enabled: true,
 	}
 	driver := &Driver{
@@ -222,11 +240,8 @@ func TestLocalRWOProtectionDecisionUsesAutomaticMaintenanceSource(t *testing.T) 
 		featureGates:  FeatureGates{LocalRWOAutoProtection: true},
 		volumeHistory: NewVolumeHistoryManager(runtime, ""),
 	}
-	driver.volumeHistory.entries["vol-1"] = VolumeHistoryRecord{
-		VolumeID:                  "vol-1",
-		Backend:                   "local",
-		LastSuccessfulNodeName:    "node-a",
-		LastSuccessfulPublishTime: time.Now().Add(-5 * time.Minute),
+	if err := driver.volumeHistory.LoadFromConfigMap(context.Background()); err != nil {
+		t.Fatalf("failed to load volume history configmap: %v", err)
 	}
 
 	decision, err := localRWOProtectionDecisionForDriver(context.Background(), driver, "vol-1", "node-b")

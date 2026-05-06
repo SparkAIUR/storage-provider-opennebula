@@ -101,11 +101,9 @@ func (s *ControllerServer) localRWOProtectionDecision(ctx context.Context, volum
 	}
 	decision.RuntimeContext = runtimeCtx
 
-	var history VolumeHistoryRecord
-	if s.driver.volumeHistory != nil {
-		if current, ok := s.driver.volumeHistory.Get(volumeID); ok {
-			history = current
-		}
+	history := s.currentVolumeHistory(volumeID)
+	if localRWOHistoryRuntimeContextDegraded(runtimeCtx) {
+		history = s.refreshVolumeHistory(ctx, volumeID)
 	}
 	decision.History = history
 
@@ -243,6 +241,16 @@ func (s *ControllerServer) localRWOProtectionDecision(ctx context.Context, volum
 		}
 	}
 	return decision, nil
+}
+
+func localRWOHistoryRuntimeContextDegraded(runtimeCtx *VolumeRuntimeContext) bool {
+	if runtimeCtx == nil {
+		return true
+	}
+	if strings.TrimSpace(runtimeCtx.PVName) == "" {
+		return true
+	}
+	return false
 }
 
 func (s *ControllerServer) inferredLocalRWORequiredNode(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext, history VolumeHistoryRecord) (string, string, string, string) {
@@ -680,12 +688,7 @@ func (s *ControllerServer) classifyRepairRequiredLookup(ctx context.Context, vol
 }
 
 func (s *ControllerServer) lookupVolumeForPublish(ctx context.Context, volumeID, requestedNode string) (*opennebula.VolumeLookupResult, VolumeHistoryRecord, *VolumeRuntimeContext, error) {
-	var history VolumeHistoryRecord
-	if s != nil && s.driver != nil && s.driver.volumeHistory != nil {
-		if record, ok := s.driver.volumeHistory.Get(volumeID); ok {
-			history = record
-		}
-	}
+	history := s.currentVolumeHistory(volumeID)
 	var runtimeCtx *VolumeRuntimeContext
 	if s != nil && s.driver != nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
 		if resolved, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeID); err == nil {
@@ -696,6 +699,9 @@ func (s *ControllerServer) lookupVolumeForPublish(ctx context.Context, volumeID,
 		result, err := inspector.InspectVolumeLookup(ctx, volumeID, requestedNode)
 		if err != nil {
 			return nil, history, runtimeCtx, err
+		}
+		if result.Status != opennebula.VolumeLookupPresent {
+			history = s.refreshVolumeHistory(ctx, volumeID)
 		}
 		switch result.Status {
 		case opennebula.VolumeLookupPresent:
@@ -718,6 +724,7 @@ func (s *ControllerServer) lookupVolumeForPublish(ctx context.Context, volumeID,
 
 	imageID, sizeBytes, err := s.volumeProvider.VolumeExists(ctx, volumeID)
 	if err != nil || imageID == -1 {
+		history = s.refreshVolumeHistory(ctx, volumeID)
 		if history.LastSuccessfulPublishTime.IsZero() {
 			return nil, history, runtimeCtx, status.Error(codes.NotFound, "volume not found")
 		}
@@ -735,6 +742,29 @@ func (s *ControllerServer) lookupVolumeForPublish(ctx context.Context, volumeID,
 		ImageID:       imageID,
 		SizeBytes:     int64(sizeBytes),
 	}, history, runtimeCtx, nil
+}
+
+func (s *ControllerServer) currentVolumeHistory(volumeID string) VolumeHistoryRecord {
+	if s == nil || s.driver == nil || s.driver.volumeHistory == nil {
+		return VolumeHistoryRecord{}
+	}
+	if record, ok := s.driver.volumeHistory.Get(volumeID); ok {
+		return record
+	}
+	return VolumeHistoryRecord{}
+}
+
+func (s *ControllerServer) refreshVolumeHistory(ctx context.Context, volumeID string) VolumeHistoryRecord {
+	if s == nil || s.driver == nil || s.driver.volumeHistory == nil || strings.TrimSpace(volumeID) == "" {
+		return VolumeHistoryRecord{}
+	}
+	if err := s.driver.volumeHistory.RefreshEntry(ctx, volumeID); err != nil {
+		klog.V(3).InfoS("Failed to refresh volume history state", "volumeID", volumeID, "err", err)
+	}
+	if record, ok := s.driver.volumeHistory.Get(volumeID); ok {
+		return record
+	}
+	return VolumeHistoryRecord{}
 }
 
 func parseIntOrZero(value string) int {

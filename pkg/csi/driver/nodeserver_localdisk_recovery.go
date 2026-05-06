@@ -187,6 +187,31 @@ func (ns *NodeServer) deleteLocalDiskSession(volumeID string) {
 	}
 }
 
+func cleanupLocalDiskStagePath(volumeID, stagingTargetPath string, mounter mount.Interface, sessions *localDiskSessionStore) error {
+	if strings.TrimSpace(stagingTargetPath) == "" {
+		return fmt.Errorf("staging target path is required")
+	}
+	if mounter == nil {
+		mounter = mount.New("")
+	}
+	if sessions != nil && strings.TrimSpace(volumeID) != "" {
+		if err := sessions.Delete(volumeID); err != nil {
+			return err
+		}
+	}
+	notMountPoint, err := mounter.IsLikelyNotMountPoint(stagingTargetPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if notMountPoint {
+		return os.RemoveAll(stagingTargetPath)
+	}
+	return mount.CleanupMountPoint(stagingTargetPath, mounter, true)
+}
+
 func (ns *NodeServer) recordLocalDiskStageSession(ctx context.Context, req *csi.NodeStageVolumeRequest, devicePath, fsType string, mountOptions []string, identity *LocalDiskIdentity, report *LocalDeviceMissingReport) {
 	if req == nil {
 		return

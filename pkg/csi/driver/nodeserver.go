@@ -331,9 +331,7 @@ func (ns *NodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageV
 	if ns.deviceResolver != nil {
 		ns.deviceResolver.Invalidate(volumeID)
 	}
-	ns.deleteLocalDiskSession(volumeID)
-
-	err := mount.CleanupMountPoint(stagingTargetPath, ns.mounter.Interface, true)
+	err := cleanupLocalDiskStagePath(volumeID, stagingTargetPath, ns.mounter.Interface, ns.localDiskSessions)
 	if err != nil {
 		klog.V(0).ErrorS(err, "Failed to clean mount point of staging target path",
 			"method", "NodeUnstageVolume", "volumeID", volumeID, "stagingTargetPath", stagingTargetPath)

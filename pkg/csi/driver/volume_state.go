@@ -198,6 +198,43 @@ func (m *VolumeHistoryManager) Clear(ctx context.Context, volumeID string) error
 	return m.runtime.DeleteConfigMapKey(ctx, m.namespace, volumeHistoryStateConfigMapName, volumeID)
 }
 
+func (m *VolumeHistoryManager) RefreshEntry(ctx context.Context, volumeID string) error {
+	if m == nil || m.runtime == nil || !m.runtime.enabled || strings.TrimSpace(volumeID) == "" {
+		return nil
+	}
+	volumeID = strings.TrimSpace(volumeID)
+	cm, err := m.runtime.GetConfigMap(ctx, m.namespace, volumeHistoryStateConfigMapName)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			m.mu.Lock()
+			delete(m.entries, volumeID)
+			m.mu.Unlock()
+			return nil
+		}
+		return err
+	}
+	raw := strings.TrimSpace(cm.Data[volumeID])
+	if raw == "" {
+		m.mu.Lock()
+		delete(m.entries, volumeID)
+		m.mu.Unlock()
+		return nil
+	}
+	var state VolumeHistoryRecord
+	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		return err
+	}
+	if strings.TrimSpace(state.VolumeID) == "" {
+		state.VolumeID = volumeID
+	}
+	state.Version = stateObjectVersion
+	normalizeLocalDiskIdentity(state.LastHealthyIdentity)
+	m.mu.Lock()
+	m.entries[volumeID] = state
+	m.mu.Unlock()
+	return nil
+}
+
 func (m *VolumeHistoryManager) Snapshot() map[string]VolumeHistoryRecord {
 	if m == nil {
 		return nil

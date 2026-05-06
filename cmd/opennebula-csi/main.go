@@ -35,26 +35,27 @@ import (
 )
 
 var (
-	driverName                   = flag.String("drivername", driver.DefaultDriverName, "CSI driver name")
-	pluginEndpoint               = flag.String("endpoint", driver.DefaultGRPCServerEndpoint, "CSI plugin endpoint")
-	nodeID                       = flag.String("nodeid", "", "Node ID")
-	maxVolumesPerNode            = flag.Uint64("maxVolumesPerNode", 255, "Maximum number of volumes that can be attached to a node")
-	mode                         = flag.String("mode", "driver", "Execution mode: driver, preflight, inventory-controller, inventory-validate, support-bundle, volume-health, local-disk-sessions, or hotplug-diagnose")
-	output                       = flag.String("output", "text", "Output format for preflight mode: text or json")
-	preflightDatastores          = flag.String("preflight-datastores", "", "Comma-separated datastore identifiers to validate during preflight")
-	preflightNodeStageSecrets    = flag.String("preflight-node-stage-secrets", "", "Comma-separated namespace/name secret references for CephFS node-stage validation")
-	preflightProvisionerSecrets  = flag.String("preflight-provisioner-secrets", "", "Comma-separated namespace/name secret references for CephFS provisioner validation")
-	requireSnapshotCRDs          = flag.Bool("require-snapshot-crds", false, "Require snapshot.storage.k8s.io CRDs during preflight")
-	requireServiceMonitorCRDs    = flag.Bool("require-servicemonitor-crds", false, "Require monitoring.coreos.com ServiceMonitor CRD during preflight")
-	inventoryValidateDatastore   = flag.Int("datastore-id", 0, "OpenNebula datastore ID for inventory-validate mode")
-	inventoryValidateSC          = flag.String("storage-class", "", "StorageClass to use for inventory-validate mode")
-	inventoryValidateSize        = flag.String("size", "", "Validation PVC size for inventory-validate mode")
-	inventoryValidateAccessModes = flag.String("access-modes", "", "Comma-separated PVC access modes for inventory-validate mode")
-	inventoryValidateFioArgs     = flag.String("fio-args", "", "Comma-separated fio args for inventory-validate mode")
-	volumeHealthVolumeID         = flag.String("volume-id", "", "CSI volume ID for volume-health mode")
-	volumeHealthPV               = flag.String("pv", "", "PersistentVolume name for volume-health mode")
-	volumeHealthPVC              = flag.String("pvc", "", "namespace/name PersistentVolumeClaim for volume-health mode")
-	hotplugDiagnoseNode          = flag.String("hotplug-node", "", "Optional Kubernetes node name for hotplug-diagnose mode")
+	driverName                     = flag.String("drivername", driver.DefaultDriverName, "CSI driver name")
+	pluginEndpoint                 = flag.String("endpoint", driver.DefaultGRPCServerEndpoint, "CSI plugin endpoint")
+	nodeID                         = flag.String("nodeid", "", "Node ID")
+	maxVolumesPerNode              = flag.Uint64("maxVolumesPerNode", 255, "Maximum number of volumes that can be attached to a node")
+	mode                           = flag.String("mode", "driver", "Execution mode: driver, preflight, inventory-controller, inventory-validate, support-bundle, volume-health, local-disk-sessions, local-disk-reprobe, or hotplug-diagnose")
+	output                         = flag.String("output", "text", "Output format for preflight mode: text or json")
+	preflightDatastores            = flag.String("preflight-datastores", "", "Comma-separated datastore identifiers to validate during preflight")
+	preflightNodeStageSecrets      = flag.String("preflight-node-stage-secrets", "", "Comma-separated namespace/name secret references for CephFS node-stage validation")
+	preflightProvisionerSecrets    = flag.String("preflight-provisioner-secrets", "", "Comma-separated namespace/name secret references for CephFS provisioner validation")
+	requireSnapshotCRDs            = flag.Bool("require-snapshot-crds", false, "Require snapshot.storage.k8s.io CRDs during preflight")
+	requireServiceMonitorCRDs      = flag.Bool("require-servicemonitor-crds", false, "Require monitoring.coreos.com ServiceMonitor CRD during preflight")
+	inventoryValidateDatastore     = flag.Int("datastore-id", 0, "OpenNebula datastore ID for inventory-validate mode")
+	inventoryValidateSC            = flag.String("storage-class", "", "StorageClass to use for inventory-validate mode")
+	inventoryValidateSize          = flag.String("size", "", "Validation PVC size for inventory-validate mode")
+	inventoryValidateAccessModes   = flag.String("access-modes", "", "Comma-separated PVC access modes for inventory-validate mode")
+	inventoryValidateFioArgs       = flag.String("fio-args", "", "Comma-separated fio args for inventory-validate mode")
+	volumeHealthVolumeID           = flag.String("volume-id", "", "CSI volume ID for volume-health or local-disk-reprobe mode")
+	volumeHealthPV                 = flag.String("pv", "", "PersistentVolume name for volume-health mode")
+	volumeHealthPVC                = flag.String("pvc", "", "namespace/name PersistentVolumeClaim for volume-health mode")
+	localDiskReprobeAllowPublished = flag.Bool("allow-published-reprobe", false, "Allow local-disk-reprobe to unstage a volume that still has published targets; requires recovery-mode=manual")
+	hotplugDiagnoseNode            = flag.String("hotplug-node", "", "Optional Kubernetes node name for hotplug-diagnose mode")
 )
 
 func main() {
@@ -167,6 +168,15 @@ func handle(cfg config.CSIPluginConfig) int {
 	case "local-disk-sessions":
 		if err := driver.RunLocalDiskSessionsCommand(ctx, os.Stdout); err != nil {
 			klog.Errorf("Local disk session export failed: %v", err)
+			return 1
+		}
+		return 0
+	case "local-disk-reprobe":
+		if err := driver.RunLocalDiskReprobeCommand(ctx, driver.LocalDiskReprobeOptions{
+			VolumeID:       *volumeHealthVolumeID,
+			AllowPublished: *localDiskReprobeAllowPublished,
+		}, os.Stdout); err != nil {
+			klog.Errorf("Local disk reprobe failed: %v", err)
 			return 1
 		}
 		return 0

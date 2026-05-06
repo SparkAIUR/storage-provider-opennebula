@@ -48,9 +48,25 @@ type HotplugDiagnoseOptions struct {
 	Node string
 }
 
+type LocalDiskReprobeOptions struct {
+	VolumeID       string
+	AllowPublished bool
+}
+
 type LocalDiskSessionsReport struct {
 	Timestamp time.Time                    `json:"timestamp"`
 	Sessions  []LocalDiskSessionDiagnostic `json:"sessions"`
+}
+
+type LocalDiskReprobeReport struct {
+	Timestamp              time.Time                   `json:"timestamp"`
+	VolumeID               string                      `json:"volumeID"`
+	StagingTargetPath      string                      `json:"stagingTargetPath,omitempty"`
+	PublishedGuardBypassed bool                        `json:"publishedGuardBypassed,omitempty"`
+	CleanupPerformed       bool                        `json:"cleanupPerformed,omitempty"`
+	Message                string                      `json:"message,omitempty"`
+	Before                 *LocalDiskSessionDiagnostic `json:"before,omitempty"`
+	After                  *LocalDiskSessionDiagnostic `json:"after,omitempty"`
 }
 
 type LocalDiskSessionDiagnostic struct {
@@ -340,6 +356,20 @@ func RunLocalDiskSessionsCommand(ctx context.Context, w io.Writer) error {
 	report := LocalDiskSessionsReport{
 		Timestamp: time.Now().UTC(),
 		Sessions:  sessions,
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(report)
+}
+
+func RunLocalDiskReprobeCommand(ctx context.Context, opts LocalDiskReprobeOptions, w io.Writer) error {
+	kubeClient, _, err := preflightKubeClients()
+	if err != nil {
+		kubeClient = nil
+	}
+	report, err := runLocalDiskReprobeCommand(ctx, kubeClient, opts)
+	if err != nil {
+		return err
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
@@ -656,8 +686,81 @@ func sharedSessionForVolume(sessions []sharedFilesystemSession, volumeID string)
 	return sharedFilesystemSession{}, false
 }
 
+func localDiskDiagnosticForVolume(diagnostics []LocalDiskSessionDiagnostic, volumeID string) (LocalDiskSessionDiagnostic, bool) {
+	volumeID = strings.TrimSpace(volumeID)
+	for _, diagnostic := range diagnostics {
+		if strings.TrimSpace(diagnostic.VolumeID) == volumeID {
+			return diagnostic, true
+		}
+	}
+	return LocalDiskSessionDiagnostic{}, false
+}
+
 func collectLocalDiskSessionDiagnostics() ([]LocalDiskSessionDiagnostic, error) {
 	return collectLocalDiskSessionDiagnosticsWithKube(context.Background(), nil)
+}
+
+func runLocalDiskReprobeCommand(ctx context.Context, kubeClient kubernetes.Interface, opts LocalDiskReprobeOptions) (LocalDiskReprobeReport, error) {
+	return runLocalDiskReprobeCommandWithMounter(ctx, kubeClient, opts, mount.New(""))
+}
+
+func runLocalDiskReprobeCommandWithMounter(ctx context.Context, kubeClient kubernetes.Interface, opts LocalDiskReprobeOptions, mounter mount.Interface) (LocalDiskReprobeReport, error) {
+	volumeID := strings.TrimSpace(opts.VolumeID)
+	if volumeID == "" {
+		return LocalDiskReprobeReport{}, fmt.Errorf("volume ID must be provided")
+	}
+	if opennebula.IsSharedFilesystemVolumeID(volumeID) {
+		return LocalDiskReprobeReport{}, fmt.Errorf("local-disk-reprobe only supports local disk volumes")
+	}
+
+	diagnostics, err := collectLocalDiskSessionDiagnosticsWithKube(ctx, kubeClient)
+	if err != nil {
+		return LocalDiskReprobeReport{}, err
+	}
+	before, ok := localDiskDiagnosticForVolume(diagnostics, volumeID)
+	if !ok {
+		return LocalDiskReprobeReport{}, fmt.Errorf("no node-local session or local device report was found for volume %s", volumeID)
+	}
+	report := LocalDiskReprobeReport{
+		Timestamp:         time.Now().UTC(),
+		VolumeID:          volumeID,
+		StagingTargetPath: strings.TrimSpace(before.StagingTargetPath),
+		Before:            &before,
+	}
+	if report.StagingTargetPath == "" {
+		return report, fmt.Errorf("volume %s has no staging target path in node-local diagnostics", volumeID)
+	}
+	if len(before.PublishedTargets) > 0 {
+		if !opts.AllowPublished {
+			return report, fmt.Errorf("volume %s still has published targets; rerun with -allow-published-reprobe and recovery-mode=manual if you intend to unstage it anyway", volumeID)
+		}
+		if !strings.EqualFold(strings.TrimSpace(before.RecoveryMode), recoveryModeManual) {
+			return report, fmt.Errorf("volume %s still has published targets and local-disk-reprobe requires recovery-mode=manual before forcing an unstage", volumeID)
+		}
+		report.PublishedGuardBypassed = true
+	}
+
+	if err := cleanupLocalDiskStagePath(volumeID, report.StagingTargetPath, mounter, newLocalDiskSessionStore(localDiskSessionRootPath)); err != nil {
+		return report, err
+	}
+	report.CleanupPerformed = true
+	report.Message = fmt.Sprintf("cleaned staging target path %s for volume %s and removed any persisted local-disk session so the next publish must reprobe node-local device state", report.StagingTargetPath, volumeID)
+
+	afterDiagnostics, afterErr := collectLocalDiskSessionDiagnosticsWithKube(ctx, kubeClient)
+	if afterErr == nil {
+		if after, ok := localDiskDiagnosticForVolume(afterDiagnostics, volumeID); ok {
+			report.After = &after
+		}
+	}
+	if report.After == nil {
+		report.After = &LocalDiskSessionDiagnostic{
+			VolumeID:                 volumeID,
+			StagingTargetPath:        report.StagingTargetPath,
+			CurrentStageMountState:   "missing",
+			CurrentStageMountMessage: "stage path cleanup completed and no node-local session remained for this volume",
+		}
+	}
+	return report, nil
 }
 
 func controllerPodDiagnostics(pods []corev1.Pod) []ControllerPodDiagnostic {
