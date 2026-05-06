@@ -458,6 +458,148 @@ Guidance:
 - recover the original shard from OpenNebula/LV artifacts if possible
 - restore it into the exact original slot before resuming heal
 
+### 4. The controller is fighting recovery
+
+Symptoms:
+
+- you delete a stale host-artifact or quarantine key and the same conflict appears to keep winning immediately
+- `VolumeAttachment` API state looks cleaner than the controller behavior
+- an external-attacher timeout or stale same-node detach keeps blocking fresh attach progress
+- the correct disk is already present on-node, but the CSI control plane still refuses to let kubelet proceed
+
+Interpretation:
+
+- this is a recovery-control problem, not just a storage problem
+- deleting ConfigMap keys alone may not be enough if the controller is still holding equivalent in-memory state
+
+Guidance:
+
+1. Confirm current API truth first:
+   - `VolumeAttachment`
+   - host-artifact state
+   - quarantine state
+   - desired workload placement
+2. Confirm the data-plane truth separately:
+   - OpenNebula VM template/runtime state
+   - actual guest-visible device by serial or `/dev/disk/by-id`
+   - current kubelet stage path and mount source
+3. If the API is clean but the controller is clearly still acting on dead state, a bounded restart of `opennebula-csi-controller-0` is an acceptable incident workaround.
+4. Do not treat direct `VolumeAttachment.status` patching as the desired steady-state operator interface. It is a bounded recovery bypass for cases where:
+   - the correct device is already attached on the intended node
+   - you have proven the serial and guest-visible device identity
+   - the normal attach path is blocked by a known controller or OpenNebula bug
+5. Keep proof or anchor pods in place until the consuming workload is actually `Running`, so kubelet does not immediately re-enter the same bad attach path.
+
+If you repeatedly need controller restarts or direct `VolumeAttachment.status` surgery, treat that as a product gap and capture it for CSI follow-up rather than normalizing it as standard workflow.
+
+### 5. Use recovery-mode before you restart the controller
+
+The supported control-plane interface for one affected local RWO volume is now:
+
+- `storage-provider.opennebula.sparkaiur.io/recovery-mode`
+- `storage-provider.opennebula.sparkaiur.io/recovery-mode-until`
+- `storage-provider.opennebula.sparkaiur.io/recovery-ticket`
+- `storage-provider.opennebula.sparkaiur.io/adopt-attached-device`
+- `storage-provider.opennebula.sparkaiur.io/confirmed-device-serial`
+- `storage-provider.opennebula.sparkaiur.io/confirmed-volume-name`
+
+Use them on the PV or PVC. PV wins if both are set.
+
+Recommended first move when the controller is fighting recovery:
+
+```bash
+kubectl annotate pv <pv> \
+  storage-provider.opennebula.sparkaiur.io/recovery-mode=manual \
+  storage-provider.opennebula.sparkaiur.io/recovery-mode-until=2026-05-06T04:00:00Z \
+  storage-provider.opennebula.sparkaiur.io/recovery-ticket='incident-1234'
+```
+
+Effect:
+
+- attach and detach churn is suppressed for that volume only
+- stale host-artifact or metadata-drift memory no longer requires a controller restart just to stop the fight
+- diagnostics continue updating
+
+Use `recovery-mode=observe` when you want the driver to keep reporting fresh evidence while suppressing new repair-driving actions, but you are not ready to force a manual workflow yet.
+
+Use `recovery-mode=disabled` to drop the suppression and return the volume to normal control-plane behavior.
+
+### 6. Supported adopt-attached-device workflow
+
+This replaces direct `VolumeAttachment.status` patching as the preferred steady-state recovery interface.
+
+Use it only after you have independent node evidence for:
+
+- the exact guest-visible device name
+- the exact `onecsi-<imageID>` serial
+- the target node that still genuinely desires the workload
+
+Example:
+
+```bash
+kubectl annotate pv <pv> \
+  storage-provider.opennebula.sparkaiur.io/recovery-mode=manual \
+  storage-provider.opennebula.sparkaiur.io/recovery-mode-until=2026-05-06T04:00:00Z \
+  storage-provider.opennebula.sparkaiur.io/recovery-ticket='incident-1234' \
+  storage-provider.opennebula.sparkaiur.io/adopt-attached-device=true \
+  storage-provider.opennebula.sparkaiur.io/confirmed-device-serial=onecsi-394 \
+  storage-provider.opennebula.sparkaiur.io/confirmed-volume-name=sdf
+```
+
+What the controller now does:
+
+- confirms the volume is still desired on that node
+- confirms the serial matches the expected volume identity
+- refuses the adoption if OpenNebula still shows a conflicting owner
+- returns publish context using the operator-confirmed guest-visible device instead of forcing unsupported `VolumeAttachment.status` surgery
+
+This fails closed if:
+
+- the desired node moved
+- the confirmed serial is wrong
+- the guest-visible device name is guessed
+- OpenNebula still shows another owner
+
+### 7. When a controller restart is still acceptable
+
+A targeted restart of `opennebula-csi-controller-0` is still an incident workaround when:
+
+- you have already cleared or invalidated the per-volume recovery annotations
+- the API truth is clean
+- support-bundle recovery state still shows no active suppression, but behavior is obviously stale
+
+It is a workaround, not the primary interface.
+
+Treat repeated restarts as a product gap when:
+
+- the same volume repeatedly needs a restart after bounded recovery annotations were used correctly
+- the support bundle keeps showing stale in-memory queue, quarantine, or host-artifact blockers after the external state is clean
+- the only path that works is direct `VolumeAttachment.status` editing
+
+### 8. What to inspect now
+
+For a current incident, collect:
+
+- `opennebula-csi --mode=support-bundle`
+- `opennebula-csi --mode=local-disk-sessions` from the node plugin pod on the affected node
+
+The relevant fields are now:
+
+- `volumeRecoveryControl`
+- `localDeviceReports`
+- `nodeLocalDiskSessions`
+- `volumeQuarantine`
+- `hostArtifactQuarantine`
+- `hotplugQueue`
+
+Focus on:
+
+- recovery-mode status and expiry
+- recovery ticket
+- whether the volume is in adopted/manual state
+- expected serial versus actual guest-visible device
+- current stage-path mount source and whether it matches the expected device evidence
+
 ### Validate MinIO shard identity, not just mount success
 
 For local RWO MinIO, a successful mount is necessary but not sufficient.
@@ -508,6 +650,10 @@ After the tenant is healthy:
 - remove temporary `preferred-node` hints if they were only for incident handling
 - uncordon temporary node blocks only after repeated restarts prove the attach path is stable
 - capture support-bundle and volume-health output while the system is healthy, so future incidents have a known-good baseline
+- if you used proof pods, manual runtime hotplug, or a bounded `VolumeAttachment` recovery bypass, remove those only after:
+  - heal has progressed sufficiently
+  - bucket-level reads look correct
+  - at least one controlled restart test passes without reintroducing stale-stage or wrong-device behavior
 
 ### What not to do
 
