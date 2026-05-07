@@ -43,6 +43,54 @@ func TestStorageClassReconcileRecreatesUnmodifiedChartManagedClass(t *testing.T)
 	require.Equal(t, storageClassDesiredSpecHash(newDesired), updated.Annotations[storageClassAnnotationAppliedSpecHash])
 }
 
+func TestStorageClassReconcileTreatsMissingAllowedTopologiesAsEmpty(t *testing.T) {
+	oldDesired := testDesiredStorageClass("opennebula-local", false)
+	helmAppliedHash := storageClassSpecHash(storageClassSpecFingerprint{
+		Provisioner:       DefaultDriverName,
+		ReclaimPolicy:     string(corev1.PersistentVolumeReclaimDelete),
+		AllowExpansion:    oldDesired.AllowExpansion,
+		AllowedTopologies: []corev1.TopologySelectorTerm{},
+		MountOptions:      []string{},
+		VolumeBindingMode: string(storagev1.VolumeBindingWaitForFirstConsumer),
+		Parameters:        map[string]string{"datastoreIDs": "101"},
+	})
+	live := desiredStorageClassObject(oldDesired, helmAppliedHash)
+	require.Empty(t, live.AllowedTopologies)
+	require.Equal(t, helmAppliedHash, storageClassLiveSpecHash(live))
+
+	newDesired := oldDesired
+	newDesired.AllowedTopologies = []corev1.TopologySelectorTerm{
+		{
+			MatchLabelExpressions: []corev1.TopologySelectorLabelRequirement{
+				{
+					Key:    "topology.opennebula.sparkaiur.io/system-ds",
+					Values: []string{"100", "104"},
+				},
+			},
+		},
+	}
+	payload := storageClassReconcilePayload(t, []StorageClassReconcileDesired{newDesired})
+	client := fake.NewSimpleClientset(
+		live,
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "sc-reconcile", Namespace: "default"},
+			Data:       map[string]string{storageClassReconcileDataKey: payload},
+		},
+	)
+
+	var out bytes.Buffer
+	err := RunStorageClassReconcile(context.Background(), client, StorageClassReconcileOptions{
+		Namespace:     "default",
+		ConfigMapName: "sc-reconcile",
+	}, &out)
+	require.NoError(t, err)
+	require.Contains(t, out.String(), "recreated")
+	updated, err := client.StorageV1().StorageClasses().Get(context.Background(), "opennebula-local", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, newDesired.AllowedTopologies, updated.AllowedTopologies)
+	require.Equal(t, storageClassDesiredSpecHash(newDesired), updated.Annotations[storageClassAnnotationAppliedSpecHash])
+}
+
 func TestStorageClassReconcileRejectsManualMutationByDefault(t *testing.T) {
 	desired := testDesiredStorageClass("opennebula-local", false)
 	appliedHash := storageClassDesiredSpecHash(desired)

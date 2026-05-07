@@ -219,7 +219,7 @@ func desiredStorageClassObject(desired StorageClassReconcileDesired, desiredHash
 		MountOptions: normalizeStorageClassMountOptions(desired.MountOptions),
 	}
 	if len(desired.AllowedTopologies) > 0 {
-		sc.AllowedTopologies = append([]corev1.TopologySelectorTerm(nil), desired.AllowedTopologies...)
+		sc.AllowedTopologies = normalizeStorageClassAllowedTopologies(desired.AllowedTopologies)
 	}
 	if reclaim := strings.TrimSpace(desired.ReclaimPolicy); reclaim != "" {
 		value := corev1.PersistentVolumeReclaimPolicy(reclaim)
@@ -260,7 +260,7 @@ func storageClassDesiredSpecHash(desired StorageClassReconcileDesired) string {
 		Provisioner:       firstNonEmpty(strings.TrimSpace(desired.Provisioner), DefaultDriverName),
 		ReclaimPolicy:     strings.TrimSpace(desired.ReclaimPolicy),
 		AllowExpansion:    desired.AllowExpansion,
-		AllowedTopologies: append([]corev1.TopologySelectorTerm(nil), desired.AllowedTopologies...),
+		AllowedTopologies: normalizeStorageClassAllowedTopologies(desired.AllowedTopologies),
 		MountOptions:      normalizeStorageClassMountOptions(desired.MountOptions),
 		VolumeBindingMode: strings.TrimSpace(desired.VolumeBindingMode),
 		Parameters:        cloneStringMap(desired.Parameters),
@@ -287,7 +287,7 @@ func storageClassLiveSpecHash(sc *storagev1.StorageClass) string {
 		Provisioner:       strings.TrimSpace(sc.Provisioner),
 		ReclaimPolicy:     reclaim,
 		AllowExpansion:    allow,
-		AllowedTopologies: append([]corev1.TopologySelectorTerm(nil), sc.AllowedTopologies...),
+		AllowedTopologies: normalizeStorageClassAllowedTopologies(sc.AllowedTopologies),
 		MountOptions:      normalizeStorageClassMountOptions(sc.MountOptions),
 		VolumeBindingMode: mode,
 		Parameters:        cloneStringMap(sc.Parameters),
@@ -298,6 +298,7 @@ func storageClassSpecHash(spec storageClassSpecFingerprint) string {
 	if spec.Parameters == nil {
 		spec.Parameters = map[string]string{}
 	}
+	spec.AllowedTopologies = normalizeStorageClassAllowedTopologies(spec.AllowedTopologies)
 	spec.MountOptions = normalizeStorageClassMountOptions(spec.MountOptions)
 	payload, err := json.Marshal(map[string]interface{}{
 		"allowVolumeExpansion": spec.AllowExpansion,
@@ -313,6 +314,13 @@ func storageClassSpecHash(spec storageClassSpecFingerprint) string {
 	}
 	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:])
+}
+
+func normalizeStorageClassAllowedTopologies(values []corev1.TopologySelectorTerm) []corev1.TopologySelectorTerm {
+	if len(values) == 0 {
+		return []corev1.TopologySelectorTerm{}
+	}
+	return append([]corev1.TopologySelectorTerm(nil), values...)
 }
 
 func normalizeStorageClassMountOptions(values []string) []string {
