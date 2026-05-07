@@ -576,6 +576,13 @@ func (s *ControllerServer) executeLocalDeviceRecovery(ctx context.Context, repor
 			klog.V(3).InfoS("Confirmed local device recovery desired state", "volumeID", volumeID, "node", node, "reason", reason)
 		}
 
+		if hostArtifactErr := s.rejectIfHostArtifactQuarantineActiveForVolumeNode(queueCtx, volumeID, node, params); hostArtifactErr != nil {
+			return hostArtifactErr
+		}
+		if s.activeHostArtifactQuarantine(queueCtx, volumeID) {
+			return fmt.Errorf("host artifact quarantine is active for volume %s", volumeID)
+		}
+
 		target, attachedErr := s.volumeProvider.GetVolumeInNode(queueCtx, volumeNumericID, nodeNumericID)
 		sizeBytes, sizeErr := s.volumeProvider.ResolveVolumeSizeBytes(queueCtx, volumeID)
 		if attachedErr == nil {
@@ -605,6 +612,9 @@ func (s *ControllerServer) executeLocalDeviceRecovery(ctx context.Context, repor
 
 		attachStarted := time.Now()
 		if err := s.volumeProvider.AttachVolume(queueCtx, volumeID, node, false, params); err != nil {
+			if conflict, ok := opennebula.AsHostArtifactConflictError(err); ok {
+				return s.handleHostArtifactConflictForVolumeNode(queueCtx, volumeID, node, params, conflict)
+			}
 			s.handleHotplugTimeout(queueCtx, node, volumeID, params, "attach", "disk", err)
 			return fmt.Errorf("failed to attach volume back to same node: %w", err)
 		}

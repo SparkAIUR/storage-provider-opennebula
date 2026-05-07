@@ -180,19 +180,21 @@ type OpenNebulaDatastoreBenchmarkRunSpec struct {
 }
 
 type OpenNebulaDatastoreBenchmarkRunStatus struct {
-	ObservedGeneration int64            `json:"observedGeneration,omitempty"`
-	Phase              string           `json:"phase,omitempty"`
-	DatastoreID        int              `json:"datastoreID,omitempty"`
-	DatastoreName      string           `json:"datastoreName,omitempty"`
-	Backend            string           `json:"backend,omitempty"`
-	JobName            string           `json:"jobName,omitempty"`
-	PVCName            string           `json:"pvcName,omitempty"`
-	StartedAt          *metav1.Time     `json:"startedAt,omitempty"`
-	CompletedAt        *metav1.Time     `json:"completedAt,omitempty"`
-	Summary            string           `json:"summary,omitempty"`
-	Message            string           `json:"message,omitempty"`
-	FailureLog         string           `json:"failureLog,omitempty"`
-	Result             ValidationResult `json:"result,omitempty"`
+	ObservedGeneration    int64            `json:"observedGeneration,omitempty"`
+	Phase                 string           `json:"phase,omitempty"`
+	DatastoreID           int              `json:"datastoreID,omitempty"`
+	DatastoreName         string           `json:"datastoreName,omitempty"`
+	SelectedDatastoreID   int              `json:"selectedDatastoreID,omitempty"`
+	SelectedDatastoreName string           `json:"selectedDatastoreName,omitempty"`
+	Backend               string           `json:"backend,omitempty"`
+	JobName               string           `json:"jobName,omitempty"`
+	PVCName               string           `json:"pvcName,omitempty"`
+	StartedAt             *metav1.Time     `json:"startedAt,omitempty"`
+	CompletedAt           *metav1.Time     `json:"completedAt,omitempty"`
+	Summary               string           `json:"summary,omitempty"`
+	Message               string           `json:"message,omitempty"`
+	FailureLog            string           `json:"failureLog,omitempty"`
+	Result                ValidationResult `json:"result,omitempty"`
 }
 
 // +kubebuilder:object:root=true

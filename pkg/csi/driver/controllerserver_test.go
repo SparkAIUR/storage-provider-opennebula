@@ -1822,13 +1822,13 @@ func TestControllerPublishVolumeBlocksCrossNodeDuringMaintenance(t *testing.T) {
 	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
 	mockProvider.On("VolumeExists", mock.Anything, "vol-maint-block").Return(1, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-new").Return(42, nil)
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 42).Return("", fmt.Errorf("not attached")).Once()
 
 	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
 	resp, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-maint-block", "node-new"))
 	require.Error(t, err)
 	assert.Nil(t, resp)
 	assert.Equal(t, codes.Unavailable, status.Code(err))
+	mockProvider.AssertNotCalled(t, "GetVolumeInNode", mock.Anything, 1, 42)
 	mockProvider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	mockProvider.AssertExpectations(t)
 }
@@ -1952,13 +1952,13 @@ func TestControllerPublishVolumeBlocksActiveHostArtifactQuarantine(t *testing.T)
 	provider := new(MockOpenNebulaVolumeProviderTestify)
 	provider.On("VolumeExists", mock.Anything, "vol-host-artifact-active").Return(233, volumeSize, nil)
 	provider.On("NodeExists", mock.Anything, "node-161").Return(161, nil)
-	provider.On("GetVolumeInNode", mock.Anything, 233, 161).Return("", errors.New("not attached")).Once()
 
 	cs := NewControllerServer(driver, provider, &MockSharedFilesystemProviderTestify{})
 	_, err = cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-host-artifact-active", "node-161"))
 	require.Error(t, err)
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 	assert.Contains(t, err.Error(), "host artifact quarantine is active")
+	provider.AssertNotCalled(t, "GetVolumeInNode", mock.Anything, mock.Anything, mock.Anything)
 	provider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	provider.AssertExpectations(t)
 }
@@ -2003,6 +2003,44 @@ func TestControllerUnpublishVolumeClassifiesDetachMetadataDrift(t *testing.T) {
 	cm, err := driver.kubeRuntime.client.CoreV1().ConfigMaps("default").Get(context.Background(), volumeQuarantineStateConfigMapName, metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.Contains(t, cm.Data, "vol-detach-drift")
+	provider.AssertExpectations(t)
+}
+
+func TestControllerPublishVolumeRejectsAlreadyAttachedWhenLocalDeviceUnconfirmed(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-runtime-missing", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pvc.Spec.VolumeName = pv.Name
+	report := LocalDeviceMissingReport{
+		Node:              "node-161",
+		VolumeID:          "vol-runtime-missing",
+		VolumeName:        "sdb",
+		FailureClass:      localDeviceFailureClassRuntimeAttachmentMissing,
+		ExpectedTarget:    "sdb",
+		DeviceSerial:      "onecsi-244",
+		OpenNebulaImageID: "244",
+		LastObservedAt:    time.Now().UTC(),
+		Attempts:          3,
+		AttachmentState:   localDeviceAttachmentStateRuntimeUnconfirmed,
+	}
+	payload, err := json.Marshal(report)
+	require.NoError(t, err)
+	driver := newStickyTestDriver(t, pv, pvc, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: localDeviceStateConfigMapName, Namespace: "default"},
+		Data: map[string]string{
+			localDeviceReportKey("node-161", "vol-runtime-missing"): string(payload),
+		},
+	})
+
+	provider := new(MockOpenNebulaVolumeProviderTestify)
+	provider.On("VolumeExists", mock.Anything, "vol-runtime-missing").Return(244, volumeSize, nil)
+	provider.On("NodeExists", mock.Anything, "node-161").Return(161, nil)
+	provider.On("GetVolumeInNode", mock.Anything, 244, 161).Return("sdb", nil).Once()
+
+	cs := NewControllerServer(driver, provider, &MockSharedFilesystemProviderTestify{})
+	_, err = cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-runtime-missing", "node-161"))
+	require.Error(t, err)
+	assert.Equal(t, codes.Unavailable, status.Code(err))
+	assert.Contains(t, err.Error(), "runtime attachment")
+	provider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	provider.AssertExpectations(t)
 }
 
@@ -2061,7 +2099,6 @@ func TestControllerPublishVolumeBlocksStickyAttachmentOnDifferentNode(t *testing
 	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
 	mockProvider.On("VolumeExists", mock.Anything, "vol-move").Return(1, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-new").Return(42, nil)
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 42).Return("", fmt.Errorf("not attached")).Once()
 
 	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
 	resp, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-move", "node-new"))
@@ -2070,6 +2107,7 @@ func TestControllerPublishVolumeBlocksStickyAttachmentOnDifferentNode(t *testing
 	assert.Equal(t, codes.Unavailable, status.Code(err))
 	_, ok := driver.stickyAttachments.Get("vol-move")
 	assert.True(t, ok)
+	mockProvider.AssertNotCalled(t, "GetVolumeInNode", mock.Anything, 1, 42)
 	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
 	mockProvider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	mockProvider.AssertNotCalled(t, "NodeExists", mock.Anything, "node-old")
@@ -2183,13 +2221,13 @@ func TestControllerPublishVolumeBlocksCrossNodeWhenOldNodeHotplugStuck(t *testin
 	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
 	mockProvider.On("VolumeExists", mock.Anything, "vol-stuck").Return(1, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-new").Return(42, nil)
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 42).Return("", fmt.Errorf("not attached")).Once()
 
 	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
 	resp, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-stuck", "node-new"))
 	require.Error(t, err)
 	assert.Nil(t, resp)
 	assert.Equal(t, codes.Unavailable, status.Code(err))
+	mockProvider.AssertNotCalled(t, "GetVolumeInNode", mock.Anything, 1, 42)
 	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
 	mockProvider.AssertExpectations(t)
 }

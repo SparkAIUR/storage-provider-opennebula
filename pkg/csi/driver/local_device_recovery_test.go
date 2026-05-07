@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -39,6 +40,7 @@ func newLocalDeviceRecoveryTestDriver(t *testing.T, objects ...runtime.Object) *
 	driver.volumeHistory = NewVolumeHistoryManager(runtime, namespaceFromServiceAccount())
 	driver.volumeRepairState = NewVolumeRepairStateManager(runtime, namespaceFromServiceAccount())
 	driver.volumeRecoveryControl = NewVolumeRecoveryControlManager(runtime, namespaceFromServiceAccount())
+	driver.hostArtifactQuarantine = NewHostArtifactQuarantineManager(runtime, namespaceFromServiceAccount())
 	return driver
 }
 
@@ -185,6 +187,71 @@ func TestLocalDeviceRecoveryReattachesSameNodeAndMarksPendingRuntimeConfirmation
 	assert.Equal(t, "sdd", report.MetadataTarget)
 	assert.Equal(t, 1, report.RecoveryAttempts)
 	require.NotNil(t, report.ConfirmationDeadline)
+	mockProvider.AssertExpectations(t)
+}
+
+func TestLocalDeviceRecoveryPersistsHostArtifactQuarantineOnReattachConflict(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-device-artifact", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pvc.Spec.VolumeName = pv.Name
+	pvName := pv.Name
+	report := LocalDeviceMissingReport{
+		Node:              "node-a",
+		VolumeID:          "vol-device-artifact",
+		VolumeName:        "sdb",
+		ExpectedTarget:    "sdb",
+		PVCNamespace:      "default",
+		PVCName:           pvc.Name,
+		PVName:            pv.Name,
+		FirstObservedAt:   time.Now().Add(-2 * time.Minute),
+		LastObservedAt:    time.Now().Add(-time.Minute),
+		Attempts:          3,
+		DeviceSerial:      "onecsi-575",
+		OpenNebulaImageID: "575",
+	}
+	key := localDeviceReportKey(report.Node, report.VolumeID)
+	payload, err := json.Marshal(report)
+	require.NoError(t, err)
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: localDeviceStateConfigMapName, Namespace: namespaceFromServiceAccount()},
+		Data:       map[string]string{key: string(payload)},
+	}
+	va := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "va-device-artifact",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-30 * time.Second)),
+		},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: DefaultDriverName,
+			NodeName: "node-a",
+			Source:   storagev1.VolumeAttachmentSource{PersistentVolumeName: &pvName},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: true},
+	}
+	driver := newLocalDeviceRecoveryTestDriver(t, pv, pvc, newReadyNode("node-a", true), va, cm)
+	conflict, ok := opennebula.HostArtifactConflictFromMessage(
+		`ATTACHDISK: transfer manager failed; see more details in VM log`,
+		opennebula.HostArtifactAttachmentTarget{VolumeHandle: report.VolumeID, ImageID: 575, NodeName: "node-a", VMID: 160, DiskID: 2, Target: "sdb"},
+		errors.New("attach failed"),
+	)
+	require.True(t, ok)
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	mockProvider.On("NodeReady", mock.Anything, "node-a").Return(true, nil).Once()
+	mockProvider.On("VolumeExists", mock.Anything, "vol-device-artifact").Return(575, 1, nil).Once()
+	mockProvider.On("NodeExists", mock.Anything, "node-a").Return(160, nil).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 575, 160).Return("", errors.New("not attached")).Once()
+	mockProvider.On("AttachVolume", mock.Anything, "vol-device-artifact", "node-a", false, mock.Anything).Return(conflict).Once()
+	server := NewControllerServer(driver, mockProvider, nil)
+
+	require.NoError(t, server.recoverLocalDeviceReport(context.Background(), key, report))
+	artifactCM, err := driver.kubeRuntime.client.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(context.Background(), hostArtifactStateConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Contains(t, artifactCM.Data, "vm-160")
+	assert.NotContains(t, artifactCM.Data, "vm-160.disk-2")
+	updated, err := driver.kubeRuntime.client.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(context.Background(), localDeviceStateConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal([]byte(updated.Data[key]), &report))
+	assert.Equal(t, "failed", report.LastRecoveryOutcome)
+	assert.Contains(t, report.LastRecoveryError, "host artifact")
 	mockProvider.AssertExpectations(t)
 }
 

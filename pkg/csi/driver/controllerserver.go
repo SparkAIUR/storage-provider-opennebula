@@ -862,7 +862,6 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.FailedPrecondition, recoveryControl.Message)
 	}
 
-	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if recoveryControl.AdoptionRequested() {
 		manualTarget, adoptErr := s.manualRecoveryAdoptionTarget(ctx, req.VolumeId, req.NodeId, protection.History, runtimeCtx, lookup, recoveryControl)
 		if adoptErr != nil {
@@ -890,24 +889,6 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			}, nil
 		}
 	}
-	if err == nil {
-		if s.driver.volumeQuarantine != nil {
-			_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
-		}
-		s.clearRepairStateOnSuccess(ctx, req.VolumeId)
-		s.clearHostArtifactQuarantineForVolume(ctx, req.VolumeId)
-		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
-		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
-		s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), &protection, lookup.AttachmentMetadata)
-		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext())
-		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
-		s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
-		klog.V(1).InfoS("Volume already attached to node",
-			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
-		return &csi.ControllerPublishVolumeResponse{
-			PublishContext: publishContext,
-		}, nil
-	}
 	if recoveryControl.ManualActive() {
 		message := recoveryControl.QueueBlockMessage(req.VolumeId, req.NodeId, "attach")
 		s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonRecoveryModeActive, message)
@@ -927,6 +908,11 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "failed_precondition", time.Since(started))
 		s.driver.metrics.RecordControllerPublishDuration("disk", "failed_precondition", time.Since(started))
 		return nil, status.Error(codes.FailedPrecondition, message)
+	}
+	if hostArtifactErr := s.rejectIfHostArtifactQuarantineActive(ctx, req); hostArtifactErr != nil {
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "failed_precondition", time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", "failed_precondition", time.Since(started))
+		return nil, hostArtifactErr
 	}
 	if s.activeHostArtifactQuarantine(ctx, req.VolumeId) {
 		message := fmt.Sprintf("host artifact quarantine is active for volume %s", req.VolumeId)
@@ -957,6 +943,30 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		message := s.formatHotplugGuardMessage(cooldown)
 		s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonHotplugCooldown, message)
 		return nil, status.Error(codes.Unavailable, message)
+	}
+
+	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
+	if err == nil {
+		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), runtimeCtx); localErr != nil {
+			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "unavailable", time.Since(started))
+			s.driver.metrics.RecordControllerPublishDuration("disk", "unavailable", time.Since(started))
+			return nil, localErr
+		}
+		if s.driver.volumeQuarantine != nil {
+			_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
+		}
+		s.clearRepairStateOnSuccess(ctx, req.VolumeId)
+		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
+		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
+		s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), &protection, lookup.AttachmentMetadata)
+		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext())
+		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
+		s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
+		klog.V(1).InfoS("Volume already attached to node",
+			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
+		return &csi.ControllerPublishVolumeResponse{
+			PublishContext: publishContext,
+		}, nil
 	}
 	priority := hotplugQueuePriorityNormal
 	if _, ok := s.driver.stickyAttachments.Get(req.VolumeId); ok {
@@ -1027,7 +1037,6 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			_ = s.driver.volumeQuarantine.Clear(queueCtx, req.VolumeId)
 		}
 		s.clearRepairStateOnSuccess(queueCtx, req.VolumeId)
-		s.clearHostArtifactQuarantineForVolume(queueCtx, req.VolumeId)
 
 		klog.V(3).InfoS("Checking if volume is attached",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID)
@@ -1035,6 +1044,10 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		if err != nil {
 			return status.Error(codes.Internal, "failed to get volume in node")
 		}
+		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(queueCtx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), runtimeCtx); localErr != nil {
+			return localErr
+		}
+		s.clearHostArtifactQuarantineForVolume(queueCtx, req.VolumeId)
 		s.driver.observeAdaptiveTimeout(queueCtx, "attach", "disk", sizeBytes, time.Since(attachStarted))
 
 		s.driver.metrics.RecordAttachValidation("disk", "attach", "success")
@@ -1843,6 +1856,9 @@ func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.
 		if protection == nil {
 			protection = &LocalRWOProtectionDecision{}
 		}
+		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), protection.RuntimeContext); localErr != nil {
+			return true, nil, localErr
+		}
 		if validation.Reason != queueReasonManualRecoveryAdopted {
 			if s.driver.volumeQuarantine != nil {
 				_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
@@ -2452,6 +2468,9 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 		if err != nil {
 			_ = s.driver.stickyAttachments.Clear(req.VolumeId)
 			return false, nil, nil
+		}
+		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), nil); localErr != nil {
+			return true, nil, localErr
 		}
 		if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
 			return true, nil, status.Errorf(codes.Internal, "failed to clear sticky attachment state: %v", err)

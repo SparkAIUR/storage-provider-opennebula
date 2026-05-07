@@ -239,6 +239,29 @@ func TestHostArtifactConflictFromMessageParsesLocalLVName(t *testing.T) {
 	assert.Contains(t, conflict.Error(), "lv=lv-one-161-2")
 }
 
+func TestHostArtifactConflictFromMessageDoesNotInventPredictedLVName(t *testing.T) {
+	conflict, ok := HostArtifactConflictFromMessage(
+		`ATTACHDISK: transfer manager failed; see more details in VM log`,
+		HostArtifactAttachmentTarget{
+			NodeName: "hplbravow01",
+			VMID:     160,
+			DiskID:   2,
+			Target:   "sdb",
+			LVName:   "lv-one-160-2",
+		},
+		fmt.Errorf("attach failed"),
+	)
+
+	require.True(t, ok)
+	require.NotNil(t, conflict)
+	assert.Equal(t, 160, conflict.Target.VMID)
+	assert.Zero(t, conflict.Target.DiskID)
+	assert.Empty(t, conflict.Target.Target)
+	assert.Empty(t, conflict.Target.LVName)
+	assert.Equal(t, "vm-160", conflict.Target.Key())
+	assert.NotContains(t, conflict.Error(), "lv-one-160-2")
+}
+
 func TestNextAvailableDiskIDIncludesContextDisk(t *testing.T) {
 	tpl := vm.NewTemplate()
 	root := shared.NewDisk()

@@ -669,6 +669,59 @@ func TestNodeDisplayState(t *testing.T) {
 	}
 }
 
+func TestSelectedDatastoreFromPVReadsProvisionedAnnotations(t *testing.T) {
+	pv := corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				annotationDatastoreID:   "130",
+				annotationDatastoreName: "PRODKUBE1",
+			},
+		},
+	}
+	id, name, ok := selectedDatastoreFromPV(pv)
+	if !ok || id != 130 || name != "PRODKUBE1" {
+		t.Fatalf("expected selected datastore 130/PRODKUBE1, got id=%d name=%q ok=%v", id, name, ok)
+	}
+}
+
+func TestBenchmarkOpenNebulaNodeBlockedForHotplugRisk(t *testing.T) {
+	node := inventoryv1alpha1.OpenNebulaNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "hplbravow01"},
+		Status: inventoryv1alpha1.OpenNebulaNodeStatus{
+			Phase:        inventoryv1alpha1.NodePhaseReady,
+			DisplayState: "HotplugStuck",
+			Hotplug: inventoryv1alpha1.OpenNebulaNodeHotplugStatus{
+				Ready: true,
+				Diagnosis: inventoryv1alpha1.OpenNebulaNodeHotplugDiagnosisStatus{
+					Classification: opennebula.HotplugClassificationStuck,
+					Message:        "VM remained in HOTPLUG",
+				},
+			},
+		},
+	}
+	blocked, message := benchmarkOpenNebulaNodeBlocked(node)
+	if !blocked || !strings.Contains(message, "HotplugStuck") {
+		t.Fatalf("expected hotplug-stuck node to block benchmark, blocked=%v message=%q", blocked, message)
+	}
+}
+
+func TestBenchmarkNodeDeviceReportBlocksRuntimeMissing(t *testing.T) {
+	report := benchmarkNodeDeviceReport{
+		Node:            "hplbravow01",
+		VolumeID:        "pvc-test",
+		FailureClass:    "runtime_attachment_missing",
+		AttachmentState: "runtime_unconfirmed",
+		Attempts:        2,
+	}
+	if !benchmarkNodeDeviceReportBlocks(report) {
+		t.Fatal("expected unresolved runtime-missing device report to block pinned benchmark")
+	}
+	report.ConfirmationState = "confirmed_by_node"
+	if benchmarkNodeDeviceReportBlocks(report) {
+		t.Fatal("expected confirmed device report not to block pinned benchmark")
+	}
+}
+
 func TestSyncNodeTopologyLabelPatchesSystemDatastore(t *testing.T) {
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{corev1.LabelHostname: "node-a"}}}
 	s := &Syncer{kube: fake.NewSimpleClientset(node)}

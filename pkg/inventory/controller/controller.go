@@ -58,8 +58,10 @@ const (
 	eventReasonInventoryVMNotFound                           = "VMNotFound"
 	eventReasonInventoryNodeNotFound                         = "NodeNotFound"
 	annotationDatastoreID                                    = "storage-provider.opennebula.sparkaiur.io/datastore-id"
+	annotationDatastoreName                                  = "storage-provider.opennebula.sparkaiur.io/datastore-name"
 	topologySystemDSLabel                                    = "topology.opennebula.sparkaiur.io/system-ds"
 	hotplugStateConfigMapName                                = "opennebula-csi-hotplug-state"
+	nodeDeviceStateConfigMapName                             = "opennebula-csi-node-device-state"
 	hotplugDiagnosticsConfigMapName                          = "opennebula-csi-hotplug-diagnostics"
 	sharedBackendAttr                                        = "SPARKAI_CSI_SHARE_BACKEND"
 	defaultValidationImagePullPolicy       corev1.PullPolicy = corev1.PullIfNotPresent
@@ -821,6 +823,28 @@ func (s *Syncer) reconcileBenchmarkRuns(ctx context.Context, discovered map[int]
 			}
 			_ = s.cleanupValidationResources(ctx, current.Status.JobName, current.Status.PVCName)
 		}
+		if blocked, message, healthErr := s.benchmarkPinnedNodeBlocked(ctx, &resolved); healthErr != nil {
+			return healthErr
+		} else if blocked {
+			now := metav1.Now()
+			current.Status = inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunStatus{
+				ObservedGeneration: resolved.Generation,
+				Phase:              inventoryv1alpha1.ValidationPhaseFailed,
+				DatastoreID:        resolved.Spec.DatastoreID,
+				DatastoreName:      ds.Name,
+				Backend:            normalizeDatastoreBackend(ds),
+				JobName:            jobName,
+				PVCName:            pvcName,
+				CompletedAt:        &now,
+				Summary:            "-",
+				Message:            message,
+			}
+			if err := s.client.Status().Patch(ctx, current, ctrlclient.MergeFrom(item.DeepCopy())); err != nil {
+				return err
+			}
+			_ = s.cleanupValidationResources(ctx, jobName, pvcName)
+			continue
+		}
 
 		pvc := &corev1.PersistentVolumeClaim{}
 		err := s.client.Get(ctx, types.NamespacedName{Namespace: s.namespace, Name: pvcName}, pvc)
@@ -847,9 +871,11 @@ func (s *Syncer) reconcileBenchmarkRuns(ctx context.Context, discovered map[int]
 			if err := s.client.Create(ctx, pvcObj); err != nil {
 				return err
 			}
+			pvc = pvcObj
 		} else if err != nil {
 			return err
 		}
+		selectedDatastoreID, selectedDatastoreName := s.benchmarkSelectedDatastoreForPVC(ctx, pvc)
 
 		job := &batchv1.Job{}
 		err = s.client.Get(ctx, types.NamespacedName{Namespace: s.namespace, Name: jobName}, job)
@@ -859,15 +885,17 @@ func (s *Syncer) reconcileBenchmarkRuns(ctx context.Context, discovered map[int]
 			}
 			now := metav1.Now()
 			current.Status = inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRunStatus{
-				ObservedGeneration: resolved.Generation,
-				Phase:              inventoryv1alpha1.ValidationPhaseRunning,
-				DatastoreID:        resolved.Spec.DatastoreID,
-				DatastoreName:      ds.Name,
-				Backend:            normalizeDatastoreBackend(ds),
-				JobName:            jobName,
-				PVCName:            pvcName,
-				StartedAt:          &now,
-				Message:            "benchmark job created",
+				ObservedGeneration:    resolved.Generation,
+				Phase:                 inventoryv1alpha1.ValidationPhaseRunning,
+				DatastoreID:           resolved.Spec.DatastoreID,
+				DatastoreName:         ds.Name,
+				SelectedDatastoreID:   selectedDatastoreID,
+				SelectedDatastoreName: selectedDatastoreName,
+				Backend:               normalizeDatastoreBackend(ds),
+				JobName:               jobName,
+				PVCName:               pvcName,
+				StartedAt:             &now,
+				Message:               "benchmark job created",
 			}
 			if err := s.client.Status().Patch(ctx, current, ctrlclient.MergeFrom(item.DeepCopy())); err != nil {
 				return err
@@ -881,6 +909,8 @@ func (s *Syncer) reconcileBenchmarkRuns(ctx context.Context, discovered map[int]
 		nextStatus.ObservedGeneration = resolved.Generation
 		nextStatus.DatastoreID = resolved.Spec.DatastoreID
 		nextStatus.DatastoreName = ds.Name
+		nextStatus.SelectedDatastoreID = selectedDatastoreID
+		nextStatus.SelectedDatastoreName = selectedDatastoreName
 		nextStatus.Backend = normalizeDatastoreBackend(ds)
 		nextStatus.JobName = jobName
 		nextStatus.PVCName = pvcName
@@ -1950,6 +1980,161 @@ func storageClassUsesDatastore(sc storagev1.StorageClass, datastoreID int) bool 
 		}
 	}
 	return false
+}
+
+func (s *Syncer) benchmarkSelectedDatastoreForPVC(ctx context.Context, pvc *corev1.PersistentVolumeClaim) (int, string) {
+	if pvc == nil || strings.TrimSpace(pvc.Spec.VolumeName) == "" {
+		return 0, ""
+	}
+	var reader ctrlclient.Reader = s.apiReader
+	if reader == nil {
+		reader = s.client
+	}
+	if reader == nil {
+		return 0, ""
+	}
+	var pv corev1.PersistentVolume
+	if err := reader.Get(ctx, types.NamespacedName{Name: pvc.Spec.VolumeName}, &pv); err != nil {
+		return 0, ""
+	}
+	id, name, ok := selectedDatastoreFromPV(pv)
+	if !ok {
+		return 0, ""
+	}
+	return id, name
+}
+
+func selectedDatastoreFromPV(pv corev1.PersistentVolume) (int, string, bool) {
+	if pv.Annotations == nil {
+		return 0, "", false
+	}
+	rawID := strings.TrimSpace(pv.Annotations[annotationDatastoreID])
+	if rawID == "" {
+		return 0, "", false
+	}
+	id, err := strconv.Atoi(rawID)
+	if err != nil || id <= 0 {
+		return 0, "", false
+	}
+	return id, strings.TrimSpace(pv.Annotations[annotationDatastoreName]), true
+}
+
+func (s *Syncer) benchmarkPinnedNodeBlocked(ctx context.Context, run *inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun) (bool, string, error) {
+	if run == nil {
+		return false, "", nil
+	}
+	nodeName := strings.TrimSpace(run.Spec.NodeSelector[corev1.LabelHostname])
+	if nodeName == "" {
+		nodeName = strings.TrimSpace(run.Spec.NodeSelector["kubernetes.io/hostname"])
+	}
+	if nodeName == "" {
+		return false, "", nil
+	}
+	var reader ctrlclient.Reader = s.apiReader
+	if reader == nil {
+		reader = s.client
+	}
+	if reader == nil {
+		return false, "", nil
+	}
+	var node inventoryv1alpha1.OpenNebulaNode
+	if err := reader.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, fmt.Sprintf("benchmark pinned to node %s but no OpenNebulaNode inventory object exists", nodeName), nil
+		}
+		return false, "", err
+	}
+	if blocked, message := benchmarkOpenNebulaNodeBlocked(node); blocked {
+		return true, message, nil
+	}
+	if blocked, message, err := s.benchmarkPinnedNodeDeviceStateBlocked(ctx, nodeName); blocked || err != nil {
+		return blocked, message, err
+	}
+	return false, "", nil
+}
+
+func benchmarkOpenNebulaNodeBlocked(node inventoryv1alpha1.OpenNebulaNode) (bool, string) {
+	name := strings.TrimSpace(node.Name)
+	if name == "" {
+		name = strings.TrimSpace(node.Status.Kubernetes.Name)
+	}
+	if strings.TrimSpace(node.Status.Phase) != inventoryv1alpha1.NodePhaseReady {
+		return true, fmt.Sprintf("benchmark pinned to node %s but OpenNebulaNode phase is %q", name, node.Status.Phase)
+	}
+	if display := strings.TrimSpace(node.Status.DisplayState); display != "" && display != "Ready" {
+		return true, fmt.Sprintf("benchmark pinned to node %s but OpenNebulaNode displayState is %q", name, display)
+	}
+	if !node.Status.Hotplug.Ready {
+		return true, fmt.Sprintf("benchmark pinned to node %s but OpenNebula hotplug readiness is false", name)
+	}
+	if node.Status.Hotplug.InCooldown {
+		return true, fmt.Sprintf("benchmark pinned to node %s but hotplug cooldown is active: %s", name, node.Status.Hotplug.Reason)
+	}
+	switch strings.TrimSpace(node.Status.Hotplug.Diagnosis.Classification) {
+	case string(opennebula.HotplugClassificationStuck), string(opennebula.HotplugClassificationProgressing):
+		return true, fmt.Sprintf("benchmark pinned to node %s but hotplug diagnosis is %q: %s", name, node.Status.Hotplug.Diagnosis.Classification, node.Status.Hotplug.Diagnosis.Message)
+	}
+	if node.Status.ActiveHotplugPressure >= 8 {
+		return true, fmt.Sprintf("benchmark pinned to node %s but active hotplug pressure is high (%d)", name, node.Status.ActiveHotplugPressure)
+	}
+	return false, ""
+}
+
+type benchmarkNodeDeviceReport struct {
+	Node              string `json:"node"`
+	VolumeID          string `json:"volumeID"`
+	FailureClass      string `json:"failureClass,omitempty"`
+	AttachmentState   string `json:"attachmentState,omitempty"`
+	ConfirmationState string `json:"confirmationState,omitempty"`
+	Attempts          int    `json:"attempts,omitempty"`
+}
+
+func (s *Syncer) benchmarkPinnedNodeDeviceStateBlocked(ctx context.Context, nodeName string) (bool, string, error) {
+	if s == nil || s.kube == nil || strings.TrimSpace(nodeName) == "" {
+		return false, "", nil
+	}
+	cm, err := s.kube.CoreV1().ConfigMaps(s.namespace).Get(ctx, nodeDeviceStateConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, "", nil
+		}
+		return false, "", err
+	}
+	for _, raw := range cm.Data {
+		var report benchmarkNodeDeviceReport
+		if err := json.Unmarshal([]byte(raw), &report); err != nil {
+			continue
+		}
+		if strings.TrimSpace(report.Node) != strings.TrimSpace(nodeName) {
+			continue
+		}
+		if !benchmarkNodeDeviceReportBlocks(report) {
+			continue
+		}
+		return true, fmt.Sprintf("benchmark pinned to node %s but local device report for volume %s is unresolved (failureClass=%s attachmentState=%s confirmationState=%s)", nodeName, report.VolumeID, report.FailureClass, report.AttachmentState, report.ConfirmationState), nil
+	}
+	return false, "", nil
+}
+
+func benchmarkNodeDeviceReportBlocks(report benchmarkNodeDeviceReport) bool {
+	switch strings.TrimSpace(report.ConfirmationState) {
+	case "confirmed_by_node":
+		return false
+	case "pending_runtime_confirmation", "timed_out_waiting_for_node_confirmation", "repair_required_runtime_attach_unconfirmed":
+		return true
+	}
+	if strings.TrimSpace(report.AttachmentState) == "runtime_confirmed_by_node" {
+		return false
+	}
+	if strings.TrimSpace(report.AttachmentState) == "runtime_unconfirmed" {
+		return true
+	}
+	switch strings.TrimSpace(report.FailureClass) {
+	case "runtime_attachment_missing", "device_missing", "wrong_device_identity":
+		return report.Attempts > 0
+	default:
+		return false
+	}
 }
 
 func datastoreConditions(item inventoryv1alpha1.OpenNebulaDatastore, normalized opennebula.Datastore, status inventoryv1alpha1.OpenNebulaDatastoreStatus, benchmark *latestBenchmarkResult) []metav1.Condition {

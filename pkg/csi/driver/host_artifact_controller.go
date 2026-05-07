@@ -43,10 +43,7 @@ func (s *ControllerServer) rejectIfHostArtifactQuarantineActive(ctx context.Cont
 	if target == nil {
 		return nil
 	}
-	if err := s.driver.hostArtifactQuarantine.RefreshKey(ctx, target.Key()); err != nil {
-		klog.V(2).InfoS("Failed to refresh host artifact quarantine target", "key", target.Key(), "err", err)
-	}
-	state, active := s.driver.hostArtifactQuarantine.GetActive(target.Key(), time.Now().UTC())
+	state, active := s.activeHostArtifactQuarantineForTarget(ctx, *target)
 	if !active {
 		return nil
 	}
@@ -58,6 +55,54 @@ func (s *ControllerServer) rejectIfHostArtifactQuarantineActive(ctx context.Cont
 	s.driver.metrics.RecordHostArtifactQuarantine(state.Classification, "active")
 	s.recordHostArtifactWarning(ctx, req.VolumeId, req.GetVolumeContext(), eventReasonHostArtifactQuarantined, message)
 	return status.Error(codes.FailedPrecondition, message)
+}
+
+func (s *ControllerServer) rejectIfHostArtifactQuarantineActiveForVolumeNode(ctx context.Context, volumeID, node string, params map[string]string) error {
+	return s.rejectIfHostArtifactQuarantineActive(ctx, &csi.ControllerPublishVolumeRequest{
+		VolumeId:      strings.TrimSpace(volumeID),
+		NodeId:        strings.TrimSpace(node),
+		VolumeContext: params,
+	})
+}
+
+func (s *ControllerServer) activeHostArtifactQuarantineForTarget(ctx context.Context, target opennebula.HostArtifactAttachmentTarget) (HostArtifactQuarantineState, bool) {
+	if s == nil || s.driver == nil || s.driver.hostArtifactQuarantine == nil {
+		return HostArtifactQuarantineState{}, false
+	}
+	now := time.Now().UTC()
+	for _, key := range hostArtifactTargetQuarantineKeys(target) {
+		if err := s.driver.hostArtifactQuarantine.RefreshKey(ctx, key); err != nil {
+			klog.V(2).InfoS("Failed to refresh host artifact quarantine target", "key", key, "err", err)
+		}
+		if state, active := s.driver.hostArtifactQuarantine.GetActive(key, now); active {
+			return state, true
+		}
+	}
+	return HostArtifactQuarantineState{}, false
+}
+
+func hostArtifactTargetQuarantineKeys(target opennebula.HostArtifactAttachmentTarget) []string {
+	candidates := []string{target.Key()}
+	if target.VMID > 0 && target.DiskID > 0 {
+		candidates = append(candidates, fmt.Sprintf("vm-%d", target.VMID))
+	}
+	if node := strings.TrimSpace(target.NodeName); node != "" && target.DiskID > 0 {
+		candidates = append(candidates, fmt.Sprintf("node-%s", node))
+	}
+	seen := map[string]struct{}{}
+	keys := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		keys = append(keys, candidate)
+	}
+	return keys
 }
 
 func (s *ControllerServer) handleHostArtifactConflict(ctx context.Context, req *csi.ControllerPublishVolumeRequest, conflict *opennebula.HostArtifactConflictError) error {
@@ -103,6 +148,14 @@ func (s *ControllerServer) handleHostArtifactConflict(ctx context.Context, req *
 	s.driver.metrics.RecordHostArtifactQuarantine(state.Classification, outcome)
 	s.recordHostArtifactWarning(ctx, req.VolumeId, req.GetVolumeContext(), eventReasonHostArtifactQuarantined, message)
 	return status.Error(codes.FailedPrecondition, message)
+}
+
+func (s *ControllerServer) handleHostArtifactConflictForVolumeNode(ctx context.Context, volumeID, node string, params map[string]string, conflict *opennebula.HostArtifactConflictError) error {
+	return s.handleHostArtifactConflict(ctx, &csi.ControllerPublishVolumeRequest{
+		VolumeId:      strings.TrimSpace(volumeID),
+		NodeId:        strings.TrimSpace(node),
+		VolumeContext: params,
+	}, conflict)
 }
 
 func hostArtifactStateFromConflict(volumeID string, conflict *opennebula.HostArtifactConflictError) HostArtifactQuarantineState {

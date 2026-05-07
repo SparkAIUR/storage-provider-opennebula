@@ -109,6 +109,10 @@ spec:
                   type: integer
                 datastoreName:
                   type: string
+                selectedDatastoreID:
+                  type: integer
+                selectedDatastoreName:
+                  type: string
                 backend:
                   type: string
                 jobName:

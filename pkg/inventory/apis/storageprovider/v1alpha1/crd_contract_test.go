@@ -64,6 +64,8 @@ func TestBenchmarkRunCRDExists(t *testing.T) {
 		"- name: Datastore",
 		"- name: Phase",
 		"datastoreID:",
+		"selectedDatastoreID:",
+		"selectedDatastoreName:",
 		"accessModes:",
 		"fioArgs:",
 		"activeDeadlineSeconds:",

@@ -138,12 +138,16 @@ func HostArtifactConflictFromMessage(raw string, target HostArtifactAttachmentTa
 	if !hostAttachFailure {
 		return nil, false
 	}
-	if target.VMID <= 0 || target.DiskID <= 0 {
+	if target.VMID <= 0 && strings.TrimSpace(target.NodeName) == "" {
 		return nil, false
 	}
-	if strings.TrimSpace(target.LVName) == "" {
-		target.LVName = fmt.Sprintf("lv-one-%d-%d", target.VMID, target.DiskID)
-	}
+	// Do not synthesize a precise disk/LV from a predicted attachment target.
+	// OpenNebula often truncates VM ERROR text; if the actual lv-one-<vm>-<disk>
+	// name is absent, quarantine the whole VM/node instead of reporting a
+	// misleading disk id such as the next free slot computed before attach.
+	target.DiskID = 0
+	target.Target = ""
+	target.LVName = ""
 	return &HostArtifactConflictError{
 		Classification: HostArtifactConflictClassification,
 		Target:         target,
