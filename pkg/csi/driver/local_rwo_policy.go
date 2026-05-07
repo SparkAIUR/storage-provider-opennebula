@@ -457,6 +457,19 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 		state.PVCNamespace = firstNonEmpty(state.PVCNamespace, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVCNamespace }), strings.TrimSpace(sourceContext[paramPVCNamespace]))
 		state.PVCName = firstNonEmpty(state.PVCName, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVCName }), strings.TrimSpace(sourceContext[paramPVCName]))
 		state.Backend = firstNonEmpty(runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.Backend }), state.Backend, "local")
+		if runtimeCtx != nil {
+			if runtimeCtx.DatastoreID > 0 {
+				state.DatastoreID = runtimeCtx.DatastoreID
+			} else if parsed := parseIntOrZero(volumeRuntimeAnnotation(runtimeCtx, annotationDatastoreID)); parsed > 0 && state.DatastoreID == 0 {
+				state.DatastoreID = parsed
+			}
+			state.DatastoreName = firstNonEmpty(volumeRuntimeAnnotation(runtimeCtx, annotationDatastoreName), state.DatastoreName)
+			state.RestartOptimization = firstNonEmpty(strings.TrimSpace(runtimeCtx.RestartMode), volumeRuntimeAnnotation(runtimeCtx, annotationRestartOpt), state.RestartOptimization)
+		}
+		state.EvidenceSource = volumeHistoryEvidenceSourceObserved
+		state.Bootstrapped = false
+		state.BootstrappedAt = time.Time{}
+		state.BootstrappedFields = nil
 		state.LastSuccessfulNodeName = strings.TrimSpace(requestedNode)
 		state.LastSuccessfulNodeUID = nodeUID
 		state.LastSuccessfulPublishTime = now
@@ -509,6 +522,20 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 		state.PVCNamespace = firstNonEmpty(state.PVCNamespace, strings.TrimSpace(publishContext[paramPVCNamespace]))
 		state.PVCName = firstNonEmpty(state.PVCName, strings.TrimSpace(publishContext[paramPVCName]))
 		state.Backend = firstNonEmpty(state.Backend, strings.TrimSpace(publishContext[annotationBackend]), "local")
+		state.EvidenceSource = volumeHistoryEvidenceSourceObserved
+		state.Bootstrapped = false
+		state.BootstrappedAt = time.Time{}
+		state.BootstrappedFields = nil
+		if ns.Driver != nil {
+			if nodeName := strings.TrimSpace(ns.Driver.nodeID); nodeName != "" {
+				state.LastSuccessfulNodeName = nodeName
+				if ns.Driver.kubeRuntime != nil && ns.Driver.kubeRuntime.enabled {
+					if identity, err := ns.Driver.kubeRuntime.NodeIdentity(ctx, nodeName); err == nil && identity.Exists {
+						state.LastSuccessfulNodeUID = strings.TrimSpace(identity.UID)
+					}
+				}
+			}
+		}
 		state.LastSuccessfulStageTime = time.Now().UTC()
 		if identity != nil {
 			state.LastHealthyIdentity = identity
@@ -640,22 +667,29 @@ func (s *ControllerServer) classifyRepairRequiredLookup(ctx context.Context, vol
 	if history.Backend == "" && runtimeCtx != nil {
 		history.Backend = runtimeCtx.Backend
 	}
+	if !volumeHistoryHasLocalHistoricalEvidence(history, runtimeCtx) {
+		return nil
+	}
+	historySource := volumeHistoryEvidenceSource(history)
+	if historySource != "" {
+		evidenceSource = "provider_lookup+" + historySource
+	}
 
 	if lastKnownNode != "" && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
 		if identity, err := s.driver.kubeRuntime.NodeIdentity(ctx, lastKnownNode); err == nil && (!identity.Exists || (lastKnownNodeUID != "" && identity.UID != "" && identity.UID != lastKnownNodeUID)) {
 			classification = repairClassificationHistoricalNodeTombstone
-			evidenceSource = "volume_history_node_identity"
-			message = fmt.Sprintf("historical node tombstone for local RWO volume %s: last known node=%s uid=%s currentUID=%s lastKnownVMID=%d imageID=%d diskID=%d target=%s", volumeID, lastKnownNode, lastKnownNodeUID, identity.UID, lastKnownVMID, lastKnownImageID, lastKnownDiskID, lastKnownTarget)
+			evidenceSource = firstNonEmpty(historySource, "volume_history") + "_node_identity"
+			message = fmt.Sprintf("historical node tombstone for local RWO volume %s: last known node=%s uid=%s currentUID=%s lastKnownVMID=%d imageID=%d diskID=%d target=%s evidenceSource=%s bootstrapped=%t", volumeID, lastKnownNode, lastKnownNodeUID, identity.UID, lastKnownVMID, lastKnownImageID, lastKnownDiskID, lastKnownTarget, firstNonEmpty(historySource, "volume_history"), history.Bootstrapped)
 		}
 	}
 	if classification == "" {
 		switch result.Status {
-		case opennebula.VolumeLookupImageRecordMissing:
+		case opennebula.VolumeLookupNotFound, opennebula.VolumeLookupImageRecordMissing:
 			classification = repairClassificationMissingImageRecord
-			message = fmt.Sprintf("missing image record for local RWO volume %s: lastKnownImageID=%d lastKnownNode=%s lastKnownNodeUID=%s lastKnownVMID=%d lastKnownDiskID=%d lastKnownTarget=%s requestedNode=%s", volumeID, lastKnownImageID, lastKnownNode, lastKnownNodeUID, lastKnownVMID, lastKnownDiskID, lastKnownTarget, requestedNode)
+			message = fmt.Sprintf("missing image record for local RWO volume %s: lastKnownImageID=%d lastKnownNode=%s lastKnownNodeUID=%s lastKnownVMID=%d lastKnownDiskID=%d lastKnownTarget=%s requestedNode=%s evidenceSource=%s bootstrapped=%t", volumeID, lastKnownImageID, lastKnownNode, lastKnownNodeUID, lastKnownVMID, lastKnownDiskID, lastKnownTarget, requestedNode, firstNonEmpty(historySource, "volume_history"), history.Bootstrapped)
 		case opennebula.VolumeLookupProviderInconsistent:
 			classification = repairClassificationProviderLookupInconsistent
-			message = fmt.Sprintf("provider lookup inconsistent for local RWO volume %s: %s", volumeID, firstNonEmpty(result.Message, "OpenNebula lookup resolved an inconsistent image state"))
+			message = fmt.Sprintf("provider lookup inconsistent for local RWO volume %s: %s evidenceSource=%s bootstrapped=%t", volumeID, firstNonEmpty(result.Message, "OpenNebula lookup resolved an inconsistent image state"), firstNonEmpty(historySource, "volume_history"), history.Bootstrapped)
 		default:
 			return nil
 		}
@@ -702,21 +736,26 @@ func (s *ControllerServer) lookupVolumeForPublish(ctx context.Context, volumeID,
 		}
 		if result.Status != opennebula.VolumeLookupPresent {
 			history = s.refreshVolumeHistory(ctx, volumeID)
+			history = s.bootstrapVolumeHistoryEvidence(ctx, volumeID, runtimeCtx, history)
 		}
 		switch result.Status {
 		case opennebula.VolumeLookupPresent:
 			return result, history, runtimeCtx, nil
 		case opennebula.VolumeLookupNotFound:
-			if history.LastSuccessfulPublishTime.IsZero() {
+			if !volumeHistoryHasLocalHistoricalEvidence(history, runtimeCtx) {
 				return result, history, runtimeCtx, status.Error(codes.NotFound, "volume not found")
 			}
+			repairResult := *result
+			repairResult.Status = opennebula.VolumeLookupImageRecordMissing
+			repairResult.Message = firstNonEmpty(repairResult.Message, "provider lookup returned not found for a historically local RWO volume")
+			return &repairResult, history, runtimeCtx, s.classifyRepairRequiredLookup(ctx, volumeID, requestedNode, runtimeCtx, history, &repairResult)
 		case opennebula.VolumeLookupImageRecordMissing, opennebula.VolumeLookupProviderInconsistent:
-			if !history.LastSuccessfulPublishTime.IsZero() {
+			if volumeHistoryHasLocalHistoricalEvidence(history, runtimeCtx) {
 				return result, history, runtimeCtx, s.classifyRepairRequiredLookup(ctx, volumeID, requestedNode, runtimeCtx, history, result)
 			}
 			return result, history, runtimeCtx, status.Error(codes.NotFound, "volume not found")
 		}
-		if history.LastSuccessfulPublishTime.IsZero() {
+		if !volumeHistoryHasLocalHistoricalEvidence(history, runtimeCtx) {
 			return result, history, runtimeCtx, status.Error(codes.NotFound, "volume not found")
 		}
 		return result, history, runtimeCtx, s.classifyRepairRequiredLookup(ctx, volumeID, requestedNode, runtimeCtx, history, result)
@@ -725,7 +764,8 @@ func (s *ControllerServer) lookupVolumeForPublish(ctx context.Context, volumeID,
 	imageID, sizeBytes, err := s.volumeProvider.VolumeExists(ctx, volumeID)
 	if err != nil || imageID == -1 {
 		history = s.refreshVolumeHistory(ctx, volumeID)
-		if history.LastSuccessfulPublishTime.IsZero() {
+		history = s.bootstrapVolumeHistoryEvidence(ctx, volumeID, runtimeCtx, history)
+		if !volumeHistoryHasLocalHistoricalEvidence(history, runtimeCtx) {
 			return nil, history, runtimeCtx, status.Error(codes.NotFound, "volume not found")
 		}
 		result := &opennebula.VolumeLookupResult{
@@ -742,6 +782,25 @@ func (s *ControllerServer) lookupVolumeForPublish(ctx context.Context, volumeID,
 		ImageID:       imageID,
 		SizeBytes:     int64(sizeBytes),
 	}, history, runtimeCtx, nil
+}
+
+func (s *ControllerServer) bootstrapVolumeHistoryEvidence(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext, history VolumeHistoryRecord) VolumeHistoryRecord {
+	if s == nil || s.driver == nil || s.driver.volumeHistory == nil || volumeHistoryHasObservedSuccess(history) {
+		return history
+	}
+	record, seeded, err := s.driver.volumeHistory.SeedFromRuntimeContext(ctx, volumeID, runtimeCtx)
+	if err != nil {
+		klog.V(3).InfoS("Failed to bootstrap volume history evidence", "volumeID", volumeID, "err", err)
+		return history
+	}
+	if seeded {
+		s.driver.metrics.RecordVolumeHistory("bootstrap", "persisted")
+		return record
+	}
+	if strings.TrimSpace(record.VolumeID) != "" {
+		return record
+	}
+	return history
 }
 
 func (s *ControllerServer) currentVolumeHistory(volumeID string) VolumeHistoryRecord {

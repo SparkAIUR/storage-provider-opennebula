@@ -90,6 +90,31 @@ func TestSupportBundleConfigIncludesInventorySettings(t *testing.T) {
 	}
 }
 
+func TestSupportBundleLocalRWOSnapshotMarksBootstrappedHistory(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-support-bootstrap", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv.Annotations[annotationLastAttachedNode] = "node-old"
+	client := fake.NewSimpleClientset(pv, pvc, newReadyNode("node-old", true))
+	cfg := config.LoadConfiguration()
+
+	history, _, _, _, _ := collectSupportBundleLocalRWOSnapshot(context.Background(), cfg, client, []corev1.PersistentVolume{*pv})
+	record, ok := history["vol-support-bootstrap"]
+	if !ok {
+		t.Fatalf("expected bootstrapped support history for volume")
+	}
+	if !record.Bootstrapped {
+		t.Fatalf("expected support history to be marked bootstrapped: %#v", record)
+	}
+	if record.EvidenceSource != volumeHistoryEvidenceSourceBootstrap {
+		t.Fatalf("expected bootstrap evidence source, got %q", record.EvidenceSource)
+	}
+	if record.LastSuccessfulNodeName != "node-old" {
+		t.Fatalf("expected last attached node to be preserved, got %q", record.LastSuccessfulNodeName)
+	}
+	if !record.LastSuccessfulPublishTime.IsZero() || !record.LastSuccessfulStageTime.IsZero() {
+		t.Fatalf("support bootstrap must not fabricate successful publish/stage timestamps: %#v", record)
+	}
+}
+
 func TestCollectVolumeHealthReportsFlagsLegacyLastAttachedNodeAnnotation(t *testing.T) {
 	pv := &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{

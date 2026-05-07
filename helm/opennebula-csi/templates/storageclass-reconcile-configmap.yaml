@@ -1,0 +1,46 @@
+{{- $storageClassReconcile := (get .Values "storageClassReconcile") | default dict -}}
+{{- $storageClassReconcileEnabled := (get $storageClassReconcile "enabled") | default true -}}
+{{- if and $storageClassReconcileEnabled .Values.storageClasses }}
+{{- $desired := list -}}
+{{- range .Values.storageClasses }}
+{{- $params := dict -}}
+{{- range $key, $value := (default dict .parameters) -}}
+{{- $_ := set $params $key (printf "%v" $value) -}}
+{{- end -}}
+{{- $annotations := dict -}}
+{{- range $key, $value := (default dict .annotations) -}}
+{{- $_ := set $annotations $key (printf "%v" $value) -}}
+{{- end -}}
+{{- $labels := dict "app.kubernetes.io/name" (include "opennebula-csi.name" $) "app.kubernetes.io/instance" $.Release.Name "app.kubernetes.io/managed-by" $.Release.Service -}}
+{{- range $key, $value := (default dict .labels) -}}
+{{- $_ := set $labels $key (printf "%v" $value) -}}
+{{- end -}}
+{{- $specHash := include "opennebula-csi.storageClassSpecHash" . -}}
+{{- $_ := set $annotations "storage-provider.opennebula.sparkaiur.io/chart-managed" "true" -}}
+{{- $_ := set $annotations "storage-provider.opennebula.sparkaiur.io/release-name" $.Release.Name -}}
+{{- $_ := set $annotations "storage-provider.opennebula.sparkaiur.io/release-namespace" (include "opennebula-csi.namespace" $) -}}
+{{- $_ := set $annotations "storage-provider.opennebula.sparkaiur.io/spec-hash" $specHash -}}
+{{- $_ := set $annotations "storage-provider.opennebula.sparkaiur.io/applied-spec-hash" $specHash -}}
+{{- $item := dict "name" .name "releaseName" $.Release.Name "releaseNamespace" (include "opennebula-csi.namespace" $) "specHash" $specHash "annotations" $annotations "labels" $labels "provisioner" "csi.opennebula.io" "reclaimPolicy" (default "Delete" .reclaimPolicy) "allowVolumeExpansion" (default false .allowVolumeExpansion) "mountOptions" (default (list) .mountOptions) "volumeBindingMode" (default "Immediate" .volumeBindingMode) "parameters" $params -}}
+{{- $desired = append $desired $item -}}
+{{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "%s-storageclass-reconcile" (include "opennebula-csi.fullname" .) | trunc 63 | trimSuffix "-" }}
+  namespace: {{ include "opennebula-csi.namespace" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "opennebula-csi.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: storageclass-reconcile
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-20"
+    "helm.sh/hook-delete-policy": before-hook-creation
+    storage-provider.opennebula.sparkaiur.io/release-name: {{ .Release.Name | quote }}
+    storage-provider.opennebula.sparkaiur.io/release-namespace: {{ (include "opennebula-csi.namespace" .) | quote }}
+data:
+  storageclasses.json: |
+{{ $desired | toPrettyJson | nindent 4 }}
+{{- end }}

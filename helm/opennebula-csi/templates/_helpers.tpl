@@ -73,6 +73,23 @@ Create chart name and version as used by the chart label.
 {{- default .Values.image.tag .Values.preflight.image.tag -}}
 {{- end }}
 
+{{- define "opennebula-csi.storageClassReconcileImageRepository" -}}
+{{- default .Values.image.repository .Values.storageClassReconcile.image.repository -}}
+{{- end }}
+
+{{- define "opennebula-csi.storageClassReconcileImageTag" -}}
+{{- default .Values.image.tag .Values.storageClassReconcile.image.tag -}}
+{{- end }}
+
+{{- define "opennebula-csi.storageClassSpecHash" -}}
+{{- $params := dict -}}
+{{- range $key, $value := (default dict .parameters) -}}
+{{- $_ := set $params $key (printf "%v" $value) -}}
+{{- end -}}
+{{- $spec := dict "allowVolumeExpansion" (default false .allowVolumeExpansion) "mountOptions" (default (list) .mountOptions) "parameters" $params "provisioner" "csi.opennebula.io" "reclaimPolicy" (default "Delete" .reclaimPolicy) "volumeBindingMode" (default "Immediate" .volumeBindingMode) -}}
+{{- toJson $spec | sha256sum -}}
+{{- end }}
+
 {{- define "opennebula-csi.driverCommonEnv" -}}
 {{- $root := . -}}
 {{- $inventoryEnabledOverrideSet := false -}}

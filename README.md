@@ -707,6 +707,7 @@ The chart no longer renders a fixed set of StorageClasses. Instead it accepts a 
 - `metrics.driver`
 - `preflight`
 - `snapshotter`
+- `storageClassReconcile`
 
 ### StorageClass schema
 
@@ -720,6 +721,8 @@ Each item under `storageClasses` supports:
 - `mountOptions`
 - `volumeBindingMode`
 - `parameters`
+
+The Helm chart fingerprints rendered StorageClasses with `storage-provider.opennebula.sparkaiur.io/*` annotations. During upgrades, `storageClassReconcile.enabled=true` creates a pre-upgrade hook that recreates only chart-owned, unmodified StorageClasses whose desired immutable spec changed. User-created or manually changed classes fail the hook by default (`manualMutationPolicy: fail`) unless explicitly set to `skip`.
 
 ## Example values files
 

@@ -11,6 +11,8 @@ import (
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -78,6 +80,130 @@ func TestLocalRWOProtectionDecisionRefreshesDeletedHistoryEntry(t *testing.T) {
 	require.False(t, decision.Protected)
 	require.Empty(t, decision.RequiredNode)
 	require.True(t, decision.History.LastSuccessfulPublishTime.IsZero())
+}
+
+func TestLookupVolumeForPublishBootstrapsLegacyLocalHistoryForTombstone(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-legacy-tombstone", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv.Annotations[annotationLastAttachedNode] = "node-gone"
+	driver := newStickyTestDriver(t, pv, pvc)
+
+	provider := new(MockOpenNebulaVolumeProviderTestify)
+	provider.On("InspectVolumeLookup", mock.Anything, "vol-legacy-tombstone", "node-new").Return(&opennebula.VolumeLookupResult{
+		Status:        opennebula.VolumeLookupNotFound,
+		VolumeHandle:  "vol-legacy-tombstone",
+		RequestedNode: "node-new",
+	}, nil).Once()
+
+	server := NewControllerServer(driver, provider, nil)
+	result, history, _, err := server.lookupVolumeForPublish(context.Background(), "vol-legacy-tombstone", "node-new")
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.NotNil(t, result)
+	require.Equal(t, opennebula.VolumeLookupImageRecordMissing, result.Status)
+	require.True(t, history.Bootstrapped)
+	require.Equal(t, volumeHistoryEvidenceSourceBootstrap, history.EvidenceSource)
+	require.Equal(t, "node-gone", history.LastSuccessfulNodeName)
+	require.True(t, history.LastSuccessfulPublishTime.IsZero())
+	require.True(t, history.LastSuccessfulStageTime.IsZero())
+
+	state, ok := driver.volumeRepairState.Get("vol-legacy-tombstone")
+	require.True(t, ok)
+	require.Equal(t, repairClassificationHistoricalNodeTombstone, state.Classification)
+	require.Contains(t, state.EvidenceSource, "bootstrap")
+	provider.AssertExpectations(t)
+}
+
+func TestLookupVolumeForPublishBootstrapsLegacyLocalHistoryForMissingImageRecord(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-legacy-missing", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv.Annotations[annotationLastAttachedNode] = "node-old"
+	driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
+
+	provider := new(MockOpenNebulaVolumeProviderTestify)
+	provider.On("InspectVolumeLookup", mock.Anything, "vol-legacy-missing", "node-new").Return(&opennebula.VolumeLookupResult{
+		Status:        opennebula.VolumeLookupImageRecordMissing,
+		VolumeHandle:  "vol-legacy-missing",
+		RequestedNode: "node-new",
+	}, nil).Once()
+
+	server := NewControllerServer(driver, provider, nil)
+	_, history, _, err := server.lookupVolumeForPublish(context.Background(), "vol-legacy-missing", "node-new")
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.True(t, history.Bootstrapped)
+	require.Equal(t, "node-old", history.LastSuccessfulNodeName)
+	require.True(t, history.LastSuccessfulPublishTime.IsZero())
+	require.True(t, history.LastSuccessfulStageTime.IsZero())
+
+	state, ok := driver.volumeRepairState.Get("vol-legacy-missing")
+	require.True(t, ok)
+	require.Equal(t, repairClassificationMissingImageRecord, state.Classification)
+	require.Contains(t, state.EvidenceSource, "bootstrap")
+	provider.AssertExpectations(t)
+}
+
+func TestLookupVolumeForPublishObservedHistoryWinsOverBootstrap(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-observed-wins", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv.Annotations[annotationLastAttachedNode] = "node-from-annotation"
+	driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-observed", true), newReadyNode("node-from-annotation", true))
+	_, err := driver.volumeHistory.Upsert(context.Background(), "vol-observed-wins", func(state *VolumeHistoryRecord) {
+		state.Backend = "local"
+		state.LastSuccessfulNodeName = "node-observed"
+		state.LastSuccessfulPublishTime = time.Now().UTC()
+	})
+	require.NoError(t, err)
+
+	provider := new(MockOpenNebulaVolumeProviderTestify)
+	provider.On("InspectVolumeLookup", mock.Anything, "vol-observed-wins", "node-new").Return(&opennebula.VolumeLookupResult{
+		Status:        opennebula.VolumeLookupImageRecordMissing,
+		VolumeHandle:  "vol-observed-wins",
+		RequestedNode: "node-new",
+	}, nil).Once()
+
+	server := NewControllerServer(driver, provider, nil)
+	_, history, _, err := server.lookupVolumeForPublish(context.Background(), "vol-observed-wins", "node-new")
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.False(t, history.Bootstrapped)
+	require.Equal(t, volumeHistoryEvidenceSourceObserved, history.EvidenceSource)
+	require.Equal(t, "node-observed", history.LastSuccessfulNodeName)
+	require.False(t, history.LastSuccessfulPublishTime.IsZero())
+	provider.AssertExpectations(t)
+}
+
+func TestLookupVolumeForPublishUnknownVolumeRemainsNotFound(t *testing.T) {
+	driver := newStickyTestDriver(t)
+	provider := new(MockOpenNebulaVolumeProviderTestify)
+	provider.On("InspectVolumeLookup", mock.Anything, "vol-unknown", "node-new").Return(&opennebula.VolumeLookupResult{
+		Status:        opennebula.VolumeLookupNotFound,
+		VolumeHandle:  "vol-unknown",
+		RequestedNode: "node-new",
+	}, nil).Once()
+
+	server := NewControllerServer(driver, provider, nil)
+	_, history, _, err := server.lookupVolumeForPublish(context.Background(), "vol-unknown", "node-new")
+	require.Error(t, err)
+	require.Equal(t, codes.NotFound, status.Code(err))
+	require.False(t, history.Bootstrapped)
+	_, ok := driver.volumeRepairState.Get("vol-unknown")
+	require.False(t, ok)
+	provider.AssertExpectations(t)
+}
+
+func TestVolumeHistoryBootstrapUsesPlacementSummaryFallback(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-summary", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv.Annotations[annotationPlacementSummary] = `{"backend":"local","lastAttachedNode":"node-summary"}`
+	driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-summary", true))
+	runtimeCtx, err := driver.kubeRuntime.ResolveVolumeRuntimeContext(context.Background(), "vol-summary")
+	require.NoError(t, err)
+
+	record, seeded, err := driver.volumeHistory.SeedFromRuntimeContext(context.Background(), "vol-summary", runtimeCtx)
+	require.NoError(t, err)
+	require.True(t, seeded)
+	require.True(t, record.Bootstrapped)
+	require.Equal(t, "node-summary", record.LastSuccessfulNodeName)
+	require.Contains(t, record.BootstrappedFields, "pv.placementSummary.lastAttachedNode")
+	require.True(t, record.LastSuccessfulPublishTime.IsZero())
+	require.True(t, record.LastSuccessfulStageTime.IsZero())
 }
 
 func TestValidateHotplugQueueRequestAllowsOrphanDetachAfterHistoryRefresh(t *testing.T) {

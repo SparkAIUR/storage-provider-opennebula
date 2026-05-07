@@ -332,6 +332,34 @@ Important interpretations:
 - annotation audit finding on `last-attached-node`
   means the historical hint is stale and should not be trusted
 
+### Legacy local-RWO history bootstrap
+
+Older local RWO volumes may predate durable `volumeHistory`.
+If a local PV/PVC still has Kubernetes-side ownership evidence, the controller now
+bootstraps a clearly marked history record from runtime metadata before reducing
+an attach failure to `NotFound`.
+
+Bootstrapped evidence can come from:
+
+- PV/PVC `storage-provider.opennebula.sparkaiur.io/last-attached-node`
+- PV/PVC `placement-summary.lastAttachedNode`
+- local backend, datastore, PVC/PV identity, and restart-optimization annotations
+
+Important interpretations:
+
+- `volumeHistory[*].evidenceSource=bootstrap_runtime_annotations` means the record
+  came from Kubernetes runtime metadata, not a successful publish/stage observation.
+- `volumeHistory[*].bootstrapped=true` must have zero
+  `lastSuccessfulPublishTime` and zero `lastSuccessfulStageTime`.
+- `volumeRepairState[*].classification=historical_node_tombstone` means the
+  last historical node no longer exists or has a mismatched UID.
+- `volumeRepairState[*].classification=missing_image_record` means the local
+  volume has historical local ownership evidence, but the provider-side image
+  record/source is missing.
+
+Truly unknown volumes, non-local volumes, or local volumes without historical
+ownership evidence should still return ordinary `volume not found`.
+
 ### Orphan teardown and stale historical protection
 
 If the workload is already gone, but the final detach still appears stuck on historical local-RWO ownership:

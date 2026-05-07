@@ -259,6 +259,14 @@ preflight:
   nodeStageSecretRefs: []
   provisionerSecretRefs: []
 
+storageClassReconcile:
+  enabled: true
+  manualMutationPolicy: "fail"
+  adoptUnannotated: true
+  image:
+    repository: ""
+    tag: ""
+
 snapshotter:
   enabled: true
   image: registry.k8s.io/sig-storage/csi-snapshotter:v8.2.1

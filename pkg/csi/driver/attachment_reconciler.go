@@ -378,6 +378,15 @@ func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, att
 		volumeRelease := r.server.driver.operationLocks.Acquire(controllerVolumeLockKey(attachment.VolumeHandle))
 		defer volumeRelease()
 
+		allowed, reason := r.server.backgroundDetachAllowedByDecision(queueCtx, attachment.VolumeHandle, attachment.NodeName)
+		if !allowed {
+			klog.V(3).InfoS("Attachment reconciler skipped detach after central reconcile decision",
+				"volume", attachment.VolumeHandle,
+				"node", attachment.NodeName,
+				"reason", reason)
+			return nil
+		}
+
 		if r.server.driver.stickyAttachments != nil {
 			if _, ok := r.server.driver.stickyAttachments.Get(attachment.VolumeHandle); ok {
 				return nil

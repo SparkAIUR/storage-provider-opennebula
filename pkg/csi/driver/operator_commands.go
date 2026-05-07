@@ -1233,6 +1233,16 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 			continue
 		}
 		runtimeCtx, _ := runtime.ResolveVolumeRuntimeContext(ctx, pv.Spec.CSI.VolumeHandle)
+		if runtimeCtx != nil {
+			existingHistory := historySnapshot[pv.Spec.CSI.VolumeHandle]
+			if !volumeHistoryHasObservedSuccess(existingHistory) {
+				if seed, ok := buildVolumeHistoryBootstrapEvidence(ctx, runtime, pv.Spec.CSI.VolumeHandle, runtimeCtx); ok {
+					mergeVolumeHistoryBootstrap(&existingHistory, seed)
+					normalizeVolumeHistoryRecord(&existingHistory)
+					historySnapshot[pv.Spec.CSI.VolumeHandle] = existingHistory
+				}
+			}
+		}
 		existingRecoveryState := recoverySnapshot[pv.Spec.CSI.VolumeHandle]
 		recoveryState := resolvedRecoveryControlState(pv.Spec.CSI.VolumeHandle, runtimeCtx, existingRecoveryState)
 		if recoveryState.Active() || recoveryState.Expired || recoveryState.Invalid || recoveryState.Adopted || strings.TrimSpace(recoveryState.Mode) != "" || strings.TrimSpace(recoveryState.Warning) != "" || strings.TrimSpace(recoveryState.Message) != "" {

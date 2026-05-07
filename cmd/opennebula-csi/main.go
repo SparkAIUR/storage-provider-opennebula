@@ -39,7 +39,7 @@ var (
 	pluginEndpoint                 = flag.String("endpoint", driver.DefaultGRPCServerEndpoint, "CSI plugin endpoint")
 	nodeID                         = flag.String("nodeid", "", "Node ID")
 	maxVolumesPerNode              = flag.Uint64("maxVolumesPerNode", 255, "Maximum number of volumes that can be attached to a node")
-	mode                           = flag.String("mode", "driver", "Execution mode: driver, preflight, inventory-controller, inventory-validate, support-bundle, volume-health, local-disk-sessions, local-disk-reprobe, or hotplug-diagnose")
+	mode                           = flag.String("mode", "driver", "Execution mode: driver, preflight, inventory-controller, inventory-validate, support-bundle, volume-health, local-disk-sessions, local-disk-reprobe, hotplug-diagnose, or storageclass-reconcile")
 	output                         = flag.String("output", "text", "Output format for preflight mode: text or json")
 	preflightDatastores            = flag.String("preflight-datastores", "", "Comma-separated datastore identifiers to validate during preflight")
 	preflightNodeStageSecrets      = flag.String("preflight-node-stage-secrets", "", "Comma-separated namespace/name secret references for CephFS node-stage validation")
@@ -56,6 +56,10 @@ var (
 	volumeHealthPVC                = flag.String("pvc", "", "namespace/name PersistentVolumeClaim for volume-health mode")
 	localDiskReprobeAllowPublished = flag.Bool("allow-published-reprobe", false, "Allow local-disk-reprobe to unstage a volume that still has published targets; requires recovery-mode=manual")
 	hotplugDiagnoseNode            = flag.String("hotplug-node", "", "Optional Kubernetes node name for hotplug-diagnose mode")
+	storageClassReconcileNamespace = flag.String("storageclass-reconcile-namespace", "", "Namespace containing the storageclass-reconcile ConfigMap")
+	storageClassReconcileConfigMap = flag.String("storageclass-reconcile-configmap", "", "ConfigMap containing desired chart-managed StorageClass fingerprints")
+	storageClassReconcilePolicy    = flag.String("storageclass-reconcile-manual-policy", "fail", "Manual StorageClass mutation policy for storageclass-reconcile mode: fail or skip")
+	storageClassReconcileAdopt     = flag.Bool("storageclass-reconcile-adopt-unannotated", true, "Adopt unannotated StorageClasses only when their live spec already matches the desired chart spec")
 )
 
 func main() {
@@ -185,6 +189,17 @@ func handle(cfg config.CSIPluginConfig) int {
 			Node: *hotplugDiagnoseNode,
 		}, os.Stdout); err != nil {
 			klog.Errorf("Hotplug diagnosis failed: %v", err)
+			return 1
+		}
+		return 0
+	case "storageclass-reconcile":
+		if err := driver.RunStorageClassReconcileCommand(ctx, driver.StorageClassReconcileOptions{
+			Namespace:            *storageClassReconcileNamespace,
+			ConfigMapName:        *storageClassReconcileConfigMap,
+			ManualMutationPolicy: *storageClassReconcilePolicy,
+			AdoptUnannotated:     *storageClassReconcileAdopt,
+		}, os.Stdout); err != nil {
+			klog.Errorf("StorageClass reconcile failed: %v", err)
 			return 1
 		}
 		return 0

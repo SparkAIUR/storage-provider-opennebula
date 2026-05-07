@@ -47,7 +47,8 @@ func TestAttachmentReconcilerDetachesOrphanAttachment(t *testing.T) {
 		NodeID:       101,
 		Backend:      "local",
 	}}, nil).Once()
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 101).Return("vdb", nil).Once()
+	mockProvider.On("NodeExists", mock.Anything, "node-a").Return(101, nil).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 101).Return("vdb", nil).Twice()
 	mockProvider.On("DetachVolume", mock.Anything, "vol-1", "node-a").Return(nil).Once()
 	mockProvider.On("ResolveVolumeSizeBytes", mock.Anything, "vol-1").Return(int64(1024), nil).Once()
 

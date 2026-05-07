@@ -17,6 +17,9 @@ const (
 	volumeHistoryStateConfigMapName = "opennebula-csi-volume-history-state"
 	volumeRepairStateConfigMapName  = "opennebula-csi-volume-repair-state"
 	stateObjectVersion              = 1
+
+	volumeHistoryEvidenceSourceObserved  = "observed"
+	volumeHistoryEvidenceSourceBootstrap = "bootstrap_runtime_annotations"
 )
 
 type LocalDiskIdentity struct {
@@ -66,6 +69,13 @@ type VolumeHistoryRecord struct {
 	PVCNamespace                 string             `json:"pvcNamespace,omitempty"`
 	PVCName                      string             `json:"pvcName,omitempty"`
 	Backend                      string             `json:"backend,omitempty"`
+	DatastoreID                  int                `json:"datastoreID,omitempty"`
+	DatastoreName                string             `json:"datastoreName,omitempty"`
+	RestartOptimization          string             `json:"restartOptimization,omitempty"`
+	EvidenceSource               string             `json:"evidenceSource,omitempty"`
+	Bootstrapped                 bool               `json:"bootstrapped,omitempty"`
+	BootstrappedAt               time.Time          `json:"bootstrappedAt,omitempty"`
+	BootstrappedFields           []string           `json:"bootstrappedFields,omitempty"`
 	LastSuccessfulNodeName       string             `json:"lastSuccessfulNodeName,omitempty"`
 	LastSuccessfulNodeUID        string             `json:"lastSuccessfulNodeUID,omitempty"`
 	LastSuccessfulOpenNebulaVMID int                `json:"lastSuccessfulOpenNebulaVMID,omitempty"`
@@ -141,8 +151,7 @@ func (m *VolumeHistoryManager) LoadFromConfigMap(ctx context.Context) error {
 		if strings.TrimSpace(state.VolumeID) == "" {
 			state.VolumeID = key
 		}
-		state.Version = stateObjectVersion
-		normalizeLocalDiskIdentity(state.LastHealthyIdentity)
+		normalizeVolumeHistoryRecord(&state)
 		loaded[state.VolumeID] = state
 	}
 	m.mu.Lock()
@@ -174,8 +183,7 @@ func (m *VolumeHistoryManager) Upsert(ctx context.Context, volumeID string, muta
 	state.Version = stateObjectVersion
 	mutate(&state)
 	state.VolumeID = volumeID
-	state.Version = stateObjectVersion
-	normalizeLocalDiskIdentity(state.LastHealthyIdentity)
+	normalizeVolumeHistoryRecord(&state)
 	m.entries[volumeID] = state
 	m.mu.Unlock()
 	if err := m.persistEntry(ctx, state); err != nil {
@@ -227,12 +235,36 @@ func (m *VolumeHistoryManager) RefreshEntry(ctx context.Context, volumeID string
 	if strings.TrimSpace(state.VolumeID) == "" {
 		state.VolumeID = volumeID
 	}
-	state.Version = stateObjectVersion
-	normalizeLocalDiskIdentity(state.LastHealthyIdentity)
+	normalizeVolumeHistoryRecord(&state)
 	m.mu.Lock()
 	m.entries[volumeID] = state
 	m.mu.Unlock()
 	return nil
+}
+
+func (m *VolumeHistoryManager) SeedFromRuntimeContext(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext) (VolumeHistoryRecord, bool, error) {
+	if m == nil || strings.TrimSpace(volumeID) == "" {
+		return VolumeHistoryRecord{}, false, nil
+	}
+	volumeID = strings.TrimSpace(volumeID)
+	existing, _ := m.Get(volumeID)
+	if volumeHistoryHasObservedSuccess(existing) {
+		return existing, false, nil
+	}
+	seed, ok := buildVolumeHistoryBootstrapEvidence(ctx, m.runtime, volumeID, runtimeCtx)
+	if !ok {
+		return existing, false, nil
+	}
+	merged, err := m.Upsert(ctx, volumeID, func(state *VolumeHistoryRecord) {
+		if volumeHistoryHasObservedSuccess(*state) {
+			return
+		}
+		mergeVolumeHistoryBootstrap(state, seed)
+	})
+	if err != nil {
+		return merged, false, err
+	}
+	return merged, true, nil
 }
 
 func (m *VolumeHistoryManager) Snapshot() map[string]VolumeHistoryRecord {
@@ -469,6 +501,223 @@ func normalizeLocalDiskIdentity(identity *LocalDiskIdentity) {
 	identity.LegacyOpenNebulaImageID = ""
 	identity.LegacyDiskTarget = ""
 	identity.LegacyMountSourceIdentity = ""
+}
+
+func normalizeVolumeHistoryRecord(state *VolumeHistoryRecord) {
+	if state == nil {
+		return
+	}
+	state.Version = stateObjectVersion
+	state.VolumeID = strings.TrimSpace(state.VolumeID)
+	state.PVName = strings.TrimSpace(state.PVName)
+	state.PVCNamespace = strings.TrimSpace(state.PVCNamespace)
+	state.PVCName = strings.TrimSpace(state.PVCName)
+	state.Backend = strings.TrimSpace(state.Backend)
+	state.DatastoreName = strings.TrimSpace(state.DatastoreName)
+	state.RestartOptimization = strings.TrimSpace(state.RestartOptimization)
+	state.EvidenceSource = strings.TrimSpace(state.EvidenceSource)
+	state.LastSuccessfulNodeName = strings.TrimSpace(state.LastSuccessfulNodeName)
+	state.LastSuccessfulNodeUID = strings.TrimSpace(state.LastSuccessfulNodeUID)
+	state.LastSuccessfulTarget = strings.TrimSpace(state.LastSuccessfulTarget)
+	state.LastSuccessfulDeviceSerial = strings.TrimSpace(state.LastSuccessfulDeviceSerial)
+	state.LastSafeDetachNodeName = strings.TrimSpace(state.LastSafeDetachNodeName)
+	state.BootstrappedFields = compactSortedStrings(state.BootstrappedFields)
+	if volumeHistoryHasObservedSuccess(*state) {
+		state.EvidenceSource = volumeHistoryEvidenceSourceObserved
+		state.Bootstrapped = false
+		state.BootstrappedAt = time.Time{}
+		state.BootstrappedFields = nil
+	} else if state.Bootstrapped && state.EvidenceSource == "" {
+		state.EvidenceSource = volumeHistoryEvidenceSourceBootstrap
+	}
+	normalizeLocalDiskIdentity(state.LastHealthyIdentity)
+}
+
+func compactSortedStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	compacted := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		compacted = append(compacted, value)
+	}
+	sort.Strings(compacted)
+	return compacted
+}
+
+func volumeHistoryHasObservedSuccess(state VolumeHistoryRecord) bool {
+	return !state.LastSuccessfulPublishTime.IsZero() || !state.LastSuccessfulStageTime.IsZero()
+}
+
+func volumeHistoryEvidenceSource(state VolumeHistoryRecord) string {
+	if volumeHistoryHasObservedSuccess(state) {
+		return volumeHistoryEvidenceSourceObserved
+	}
+	return strings.TrimSpace(state.EvidenceSource)
+}
+
+func volumeHistoryHasLocalHistoricalEvidence(state VolumeHistoryRecord, runtimeCtx *VolumeRuntimeContext) bool {
+	backend := firstNonEmpty(strings.TrimSpace(state.Backend), volumeRuntimeAnnotation(runtimeCtx, annotationBackend))
+	if !strings.EqualFold(backend, "local") {
+		return false
+	}
+	if volumeHistoryHasObservedSuccess(state) {
+		return true
+	}
+	return state.Bootstrapped && strings.TrimSpace(state.LastSuccessfulNodeName) != ""
+}
+
+func buildVolumeHistoryBootstrapEvidence(ctx context.Context, runtime *KubeRuntime, volumeID string, runtimeCtx *VolumeRuntimeContext) (VolumeHistoryRecord, bool) {
+	volumeID = strings.TrimSpace(volumeID)
+	if volumeID == "" || runtimeCtx == nil {
+		return VolumeHistoryRecord{}, false
+	}
+	backend := firstNonEmpty(strings.TrimSpace(runtimeCtx.Backend), volumeRuntimeAnnotation(runtimeCtx, annotationBackend))
+	if !strings.EqualFold(backend, "local") {
+		return VolumeHistoryRecord{}, false
+	}
+	if len(runtimeCtx.AccessModes) > 0 && !hasSingleWriterAccessMode(runtimeCtx.AccessModes) {
+		return VolumeHistoryRecord{}, false
+	}
+
+	lastNode, lastNodeField := bootstrappedLastAttachedNode(runtimeCtx)
+	if lastNode == "" {
+		return VolumeHistoryRecord{}, false
+	}
+
+	fields := []string{}
+	addField := func(field string) {
+		fields = append(fields, field)
+	}
+	record := VolumeHistoryRecord{
+		Version:                      stateObjectVersion,
+		VolumeID:                     volumeID,
+		PVName:                       strings.TrimSpace(runtimeCtx.PVName),
+		PVCNamespace:                 strings.TrimSpace(runtimeCtx.PVCNamespace),
+		PVCName:                      strings.TrimSpace(runtimeCtx.PVCName),
+		Backend:                      backend,
+		RestartOptimization:          firstNonEmpty(strings.TrimSpace(runtimeCtx.RestartMode), volumeRuntimeAnnotation(runtimeCtx, annotationRestartOpt)),
+		EvidenceSource:               volumeHistoryEvidenceSourceBootstrap,
+		Bootstrapped:                 true,
+		BootstrappedAt:               time.Now().UTC(),
+		LastSuccessfulNodeName:       lastNode,
+		LastSuccessfulNodeUID:        "",
+		LastSuccessfulPublishTime:    time.Time{},
+		LastSuccessfulStageTime:      time.Time{},
+		LastSuccessfulOpenNebulaVMID: 0,
+	}
+	if record.PVName != "" {
+		addField("pvName")
+	}
+	if record.PVCNamespace != "" {
+		addField("pvcNamespace")
+	}
+	if record.PVCName != "" {
+		addField("pvcName")
+	}
+	addField("backend")
+	if record.RestartOptimization != "" {
+		addField("restartOptimization")
+	}
+	if lastNodeField != "" {
+		addField(lastNodeField)
+	}
+	if runtimeCtx.DatastoreID > 0 {
+		record.DatastoreID = runtimeCtx.DatastoreID
+		addField("datastoreID")
+	} else if parsed := parseIntOrZero(volumeRuntimeAnnotation(runtimeCtx, annotationDatastoreID)); parsed > 0 {
+		record.DatastoreID = parsed
+		addField("datastoreID")
+	}
+	if datastoreName := volumeRuntimeAnnotation(runtimeCtx, annotationDatastoreName); datastoreName != "" {
+		record.DatastoreName = datastoreName
+		addField("datastoreName")
+	}
+	if runtime != nil && runtime.enabled {
+		if identity, err := runtime.NodeIdentity(ctx, lastNode); err == nil && identity.Exists {
+			record.LastSuccessfulNodeUID = strings.TrimSpace(identity.UID)
+			if record.LastSuccessfulNodeUID != "" {
+				addField("lastAttachedNodeUID")
+			}
+		}
+	}
+	record.BootstrappedFields = compactSortedStrings(fields)
+	normalizeVolumeHistoryRecord(&record)
+	return record, true
+}
+
+func mergeVolumeHistoryBootstrap(state *VolumeHistoryRecord, seed VolumeHistoryRecord) {
+	if state == nil || strings.TrimSpace(seed.VolumeID) == "" || volumeHistoryHasObservedSuccess(*state) {
+		return
+	}
+	state.VolumeID = firstNonEmpty(state.VolumeID, seed.VolumeID)
+	state.PVName = firstNonEmpty(state.PVName, seed.PVName)
+	state.PVCNamespace = firstNonEmpty(state.PVCNamespace, seed.PVCNamespace)
+	state.PVCName = firstNonEmpty(state.PVCName, seed.PVCName)
+	state.Backend = firstNonEmpty(state.Backend, seed.Backend)
+	if state.DatastoreID == 0 {
+		state.DatastoreID = seed.DatastoreID
+	}
+	state.DatastoreName = firstNonEmpty(state.DatastoreName, seed.DatastoreName)
+	state.RestartOptimization = firstNonEmpty(state.RestartOptimization, seed.RestartOptimization)
+	state.LastSuccessfulNodeName = firstNonEmpty(state.LastSuccessfulNodeName, seed.LastSuccessfulNodeName)
+	state.LastSuccessfulNodeUID = firstNonEmpty(state.LastSuccessfulNodeUID, seed.LastSuccessfulNodeUID)
+	state.EvidenceSource = volumeHistoryEvidenceSourceBootstrap
+	state.Bootstrapped = true
+	if state.BootstrappedAt.IsZero() {
+		state.BootstrappedAt = seed.BootstrappedAt
+	}
+	state.BootstrappedFields = compactSortedStrings(append(state.BootstrappedFields, seed.BootstrappedFields...))
+}
+
+func volumeRuntimeAnnotation(runtimeCtx *VolumeRuntimeContext, key string) string {
+	if runtimeCtx == nil || strings.TrimSpace(key) == "" {
+		return ""
+	}
+	if value := strings.TrimSpace(runtimeCtx.PVAnnotations[key]); value != "" {
+		return value
+	}
+	return strings.TrimSpace(runtimeCtx.PVCAnnotations[key])
+}
+
+func bootstrappedLastAttachedNode(runtimeCtx *VolumeRuntimeContext) (string, string) {
+	if runtimeCtx == nil {
+		return "", ""
+	}
+	if value := strings.TrimSpace(runtimeCtx.PVAnnotations[annotationLastAttachedNode]); value != "" {
+		return value, "pv.lastAttachedNode"
+	}
+	if value := strings.TrimSpace(runtimeCtx.PVCAnnotations[annotationLastAttachedNode]); value != "" {
+		return value, "pvc.lastAttachedNode"
+	}
+	if value := placementSummaryLastAttachedNode(runtimeCtx.PVAnnotations); value != "" {
+		return value, "pv.placementSummary.lastAttachedNode"
+	}
+	if value := placementSummaryLastAttachedNode(runtimeCtx.PVCAnnotations); value != "" {
+		return value, "pvc.placementSummary.lastAttachedNode"
+	}
+	return "", ""
+}
+
+func placementSummaryLastAttachedNode(annotations map[string]string) string {
+	raw := strings.TrimSpace(annotations[annotationPlacementSummary])
+	if raw == "" {
+		return ""
+	}
+	var report PlacementReport
+	if err := json.Unmarshal([]byte(raw), &report); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(report.LastAttachedNode)
 }
 
 func localDiskAssertedDeviceSerial(identity *LocalDiskIdentity) string {
