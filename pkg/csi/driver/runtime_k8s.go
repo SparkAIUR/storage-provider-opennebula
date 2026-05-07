@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	inventoryv1alpha1 "github.com/SparkAIUR/storage-provider-opennebula/pkg/inventory/apis/storageprovider/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -62,6 +63,7 @@ const (
 	annotationLastNodeInjected      = "storage-provider.opennebula.sparkaiur.io/last-node-preference-injected"
 	annotationSystemDSAffinity      = "storage-provider.opennebula.sparkaiur.io/system-ds-affinity"
 	annotationSystemDSInjected      = "storage-provider.opennebula.sparkaiur.io/system-ds-affinity-injected"
+	annotationSelectedNode          = "volume.kubernetes.io/selected-node"
 
 	annotationLegacyLastAttachedNode = "csi.opennebula.io/last-attached-node"
 
@@ -119,12 +121,13 @@ type KubernetesNodeHealth struct {
 	Unschedulable bool
 }
 
-func NewKubeRuntime(component string) *KubeRuntime {
+func NewKubeRuntime(component string, pluginConfig config.CSIPluginConfig) *KubeRuntime {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		klog.V(2).InfoS("Kubernetes runtime disabled", "reason", "not running in cluster", "err", err)
 		return &KubeRuntime{}
 	}
+	config.ApplyKubeAPIClientRateLimit(cfg, pluginConfig)
 
 	client, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
@@ -267,30 +270,25 @@ func (r *KubeRuntime) UpsertConfigMapData(ctx context.Context, namespace, name s
 		namespace = namespaceFromServiceAccount()
 	}
 	cmClient := r.client.CoreV1().ConfigMaps(namespace)
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		current, err := cmClient.Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			if !errors.IsNotFound(err) {
-				return err
-			}
-			_, err = cmClient.Create(ctx, &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
-				Data:       data,
-			}, metav1.CreateOptions{})
-			if errors.IsAlreadyExists(err) {
-				return errors.NewConflict(corev1.Resource("configmaps"), name, err)
-			}
-			return err
-		}
-		if current.Data == nil {
-			current.Data = map[string]string{}
-		}
-		for key, value := range data {
-			current.Data[key] = value
-		}
-		_, err = cmClient.Update(ctx, current, metav1.UpdateOptions{})
+	payload, err := json.Marshal(map[string]any{"data": data})
+	if err != nil {
 		return err
-	})
+	}
+	_, err = cmClient.Patch(ctx, name, types.MergePatchType, payload, metav1.PatchOptions{})
+	if err == nil {
+		return nil
+	}
+	if !errors.IsNotFound(err) {
+		return err
+	}
+	_, err = cmClient.Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Data:       data,
+	}, metav1.CreateOptions{})
+	if errors.IsAlreadyExists(err) {
+		_, err = cmClient.Patch(ctx, name, types.MergePatchType, payload, metav1.PatchOptions{})
+	}
+	return err
 }
 
 func (r *KubeRuntime) DeleteConfigMapKey(ctx context.Context, namespace, name, key string) error {
@@ -301,24 +299,17 @@ func (r *KubeRuntime) DeleteConfigMapKey(ctx context.Context, namespace, name, k
 		namespace = namespaceFromServiceAccount()
 	}
 	cmClient := r.client.CoreV1().ConfigMaps(namespace)
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		current, err := cmClient.Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			if errors.IsNotFound(err) {
-				return nil
-			}
-			return err
-		}
-		if current.Data == nil {
-			return nil
-		}
-		if _, ok := current.Data[key]; !ok {
-			return nil
-		}
-		delete(current.Data, key)
-		_, err = cmClient.Update(ctx, current, metav1.UpdateOptions{})
-		return err
+	payload, err := json.Marshal(map[string]any{
+		"data": map[string]any{key: nil},
 	})
+	if err != nil {
+		return err
+	}
+	_, err = cmClient.Patch(ctx, name, types.MergePatchType, payload, metav1.PatchOptions{})
+	if errors.IsNotFound(err) {
+		return nil
+	}
+	return err
 }
 
 func (r *KubeRuntime) DeletePVAnnotation(ctx context.Context, pvName, key string) error {

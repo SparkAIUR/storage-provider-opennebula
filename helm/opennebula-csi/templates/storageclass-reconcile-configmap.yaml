@@ -21,7 +21,7 @@
 {{- $_ := set $annotations "storage-provider.opennebula.sparkaiur.io/release-namespace" (include "opennebula-csi.namespace" $) -}}
 {{- $_ := set $annotations "storage-provider.opennebula.sparkaiur.io/spec-hash" $specHash -}}
 {{- $_ := set $annotations "storage-provider.opennebula.sparkaiur.io/applied-spec-hash" $specHash -}}
-{{- $item := dict "name" .name "releaseName" $.Release.Name "releaseNamespace" (include "opennebula-csi.namespace" $) "specHash" $specHash "annotations" $annotations "labels" $labels "provisioner" "csi.opennebula.io" "reclaimPolicy" (default "Delete" .reclaimPolicy) "allowVolumeExpansion" (default false .allowVolumeExpansion) "mountOptions" (default (list) .mountOptions) "volumeBindingMode" (default "Immediate" .volumeBindingMode) "parameters" $params -}}
+{{- $item := dict "name" .name "releaseName" $.Release.Name "releaseNamespace" (include "opennebula-csi.namespace" $) "specHash" $specHash "annotations" $annotations "labels" $labels "provisioner" "csi.opennebula.io" "reclaimPolicy" (default "Delete" .reclaimPolicy) "allowVolumeExpansion" (default false .allowVolumeExpansion) "allowedTopologies" (default (list) .allowedTopologies) "mountOptions" (default (list) .mountOptions) "volumeBindingMode" (default "Immediate" .volumeBindingMode) "parameters" $params -}}
 {{- $desired = append $desired $item -}}
 {{- end }}
 ---

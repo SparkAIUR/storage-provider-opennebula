@@ -174,6 +174,7 @@ type HotplugQueueManager struct {
 	snapshotDebounce time.Duration
 	pendingSnapshots map[string]HotplugQueueNodeSnapshot
 	snapshotTimers   map[string]*time.Timer
+	lastSnapshots    map[string]string
 }
 
 func NewHotplugQueueManager(runtime *KubeRuntime, namespace string, metrics *DriverMetrics, maxWait, ageBoost time.Duration) *HotplugQueueManager {
@@ -655,13 +656,21 @@ func (m *HotplugQueueManager) persistSnapshotNow(snapshot HotplugQueueNodeSnapsh
 		return
 	}
 	m.snapshotMu.Lock()
+	if m.lastSnapshots == nil {
+		m.lastSnapshots = map[string]string{}
+	}
 	if timer := m.snapshotTimers[snapshot.Node]; timer != nil {
 		timer.Stop()
 		delete(m.snapshotTimers, snapshot.Node)
 	}
 	delete(m.pendingSnapshots, snapshot.Node)
-	m.snapshotMu.Unlock()
 	if snapshot.Active == nil && snapshot.QueuedCount == 0 {
+		if last, ok := m.lastSnapshots[snapshot.Node]; ok && last == "" {
+			m.snapshotMu.Unlock()
+			return
+		}
+		m.lastSnapshots[snapshot.Node] = ""
+		m.snapshotMu.Unlock()
 		if err := m.runtime.DeleteConfigMapKey(context.Background(), m.namespace, hotplugQueueStateConfigMapName, snapshot.Node); err != nil {
 			klog.V(4).InfoS("Failed to clear hotplug queue snapshot", "node", snapshot.Node, "err", err)
 		}
@@ -669,11 +678,19 @@ func (m *HotplugQueueManager) persistSnapshotNow(snapshot HotplugQueueNodeSnapsh
 	}
 	payload, err := json.Marshal(snapshot)
 	if err != nil {
+		m.snapshotMu.Unlock()
 		klog.V(4).InfoS("Failed to marshal hotplug queue snapshot", "node", snapshot.Node, "err", err)
 		return
 	}
+	payloadString := string(payload)
+	if last, ok := m.lastSnapshots[snapshot.Node]; ok && last == payloadString {
+		m.snapshotMu.Unlock()
+		return
+	}
+	m.lastSnapshots[snapshot.Node] = payloadString
+	m.snapshotMu.Unlock()
 	if err := m.runtime.UpsertConfigMapData(context.Background(), m.namespace, hotplugQueueStateConfigMapName, map[string]string{
-		snapshot.Node: string(payload),
+		snapshot.Node: payloadString,
 	}); err != nil {
 		klog.V(4).InfoS("Failed to persist hotplug queue snapshot", "node", snapshot.Node, "err", err)
 	}

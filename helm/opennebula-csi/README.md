@@ -491,6 +491,8 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.adaptiveTimeout.sampleWindow` | Rolling observation window size per operation/backend/size bucket. | `20` | No |
 | `driver.adaptiveTimeout.p95MultiplierPercent` | Multiplier applied to observed p95 latency to form the recommendation. | `400` | No |
 | `driver.adaptiveTimeout.maxSeconds` | Maximum adaptive timeout recommendation. | `1800` | No |
+| `driver.kubeAPI.qps` | Default Kubernetes client QPS for driver-managed API clients. Component-specific `kubeAPI` values override this. | `20` | No |
+| `driver.kubeAPI.burst` | Default Kubernetes client burst for driver-managed API clients. Component-specific `kubeAPI` values override this. | `40` | No |
 | `driver.allowedDatastoreTypes` | Allowed backend types for provisioning. | `["local","ceph","cephfs"]` | No |
 | `driver.extraArgs` | Extra CLI args appended to both controller and node driver containers. | `[]` | No |
 | `driver.env` | Additional environment variables appended to both controller and node driver containers. Useful for advanced overrides such as `ONE_CSI_NODE_TOPOLOGY_SYSTEM_DS`. | `[]` | No |
@@ -511,7 +513,7 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | `featureGates.cephfsKernelMounts` | Allow CephFS StorageClasses to request `cephfsMounter=kernel`. Host kernel CephFS client support is still required. | `false` | No |
 | `featureGates.localRWOStaleMountRecovery` | Enable local RWO stale mount detection and recovery from persisted node-side disk sessions. Active-pod recovery also requires `driver.localRWOStaleMountRecovery.activePodRecovery=true`. | `false` | No |
 | `featureGates.localRWOAutoProtection` | Enable protect-only inferred maintenance for local RWO volumes. When the last-good node is `NotReady`, `unschedulable`, or actively draining, cross-node publish is blocked and the webhook forces required affinity. This does not publish maintenance-ready keys or create/release maintenance holds. | `false` | No |
-| `featureGates.topologyAccessibility` | Enable topology capability advertisement and `accessible_topology` handling. | `false` | No |
+| `featureGates.topologyAccessibility` | Enable topology capability advertisement and `accessible_topology` handling. | `true` | No |
 
 ### Controller
 
@@ -531,6 +533,8 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | `controller.affinity` | Affinity rules for the controller StatefulSet. | `{}` | No |
 | `controller.extraArgs` | Extra CLI args appended only to the controller driver container. | `[]` | No |
 | `controller.extraEnv` | Extra environment variables appended only to the controller driver container. | `[]` | No |
+| `controller.kubeAPI.qps` | Kubernetes client QPS for the controller driver container. | `50` | No |
+| `controller.kubeAPI.burst` | Kubernetes client burst for the controller driver container. | `100` | No |
 
 ### Node
 
@@ -543,6 +547,8 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | `node.affinity` | Affinity rules for the node DaemonSet. | `{}` | No |
 | `node.extraArgs` | Extra CLI args appended only to the node driver container. | `[]` | No |
 | `node.extraEnv` | Extra environment variables appended only to the node driver container. | `[]` | No |
+| `node.kubeAPI.qps` | Kubernetes client QPS for the node driver container. | `20` | No |
+| `node.kubeAPI.burst` | Kubernetes client burst for the node driver container. | `40` | No |
 
 ### Metrics
 
@@ -696,6 +702,7 @@ For local-backed classes, preflight now checks `volumeBindingMode` and warns by 
 | `storageClasses[].allowVolumeExpansion` | Whether PVC resize is allowed for that StorageClass. | none | No |
 | `storageClasses[].mountOptions` | StorageClass mount options. | none | No |
 | `storageClasses[].volumeBindingMode` | StorageClass binding mode. | none | No |
+| `storageClasses[].allowedTopologies` | Optional Kubernetes StorageClass topology selector. Use this to pre-filter local/LVM classes to compatible `topology.opennebula.sparkaiur.io/system-ds` values. | none | No |
 | `storageClasses[].parameters` | Driver parameters injected into the StorageClass. | none | No |
 
 Rendered StorageClasses are fingerprinted with `storage-provider.opennebula.sparkaiur.io/*` annotations. On Helm upgrade, operators may explicitly enable the optional `storageClassReconcile` pre-upgrade hook to recreate chart-owned classes only when the live spec still matches the previously applied chart hash; manual/user mutations are blocked by default.

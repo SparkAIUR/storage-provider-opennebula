@@ -136,6 +136,7 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		klog.V(0).ErrorS(err, "Invalid datastore configuration", "method", "CreateVolume", "params", rawParams)
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	selection = s.applyCreateVolumeTopology(ctx, selection, rawParams, req.GetAccessibilityRequirements())
 
 	if err := validateAccessMode(volumeCapabilities, selection.AllowedTypes); err != nil {
 		s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
@@ -144,6 +145,12 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 
 	candidates, err := s.volumeProvider.ResolveProvisioningDatastores(ctx, selection)
 	if err != nil {
+		if opennebula.IsDatastoreTopologyError(err) {
+			s.driver.metrics.RecordOperation("create_volume", backend, "resource_exhausted", time.Since(started))
+			s.recordPVCWarningFromParams(ctx, rawParams, eventReasonDatastoreRejected, err.Error())
+			klog.V(0).ErrorS(err, "No datastore candidates match selected topology", "method", "CreateVolume", "params", rawParams)
+			return nil, status.Error(codes.ResourceExhausted, err.Error())
+		}
 		s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
 		s.recordPVCWarningFromParams(ctx, rawParams, eventReasonDatastoreRejected, err.Error())
 		klog.V(0).ErrorS(err, "Invalid datastore candidates", "method", "CreateVolume", "params", rawParams)
@@ -231,6 +238,9 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 
 			if cloneErr != nil {
 				switch {
+				case opennebula.IsDatastoreTopologyError(cloneErr):
+					s.driver.metrics.RecordOperation("create_volume", backend, "resource_exhausted", time.Since(started))
+					return nil, status.Error(codes.ResourceExhausted, cloneErr.Error())
 				case opennebula.IsDatastoreConfigError(cloneErr):
 					s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
 					return nil, status.Error(codes.InvalidArgument, cloneErr.Error())
@@ -277,6 +287,10 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		})
 		if sharedErr != nil {
 			switch {
+			case opennebula.IsDatastoreTopologyError(sharedErr):
+				s.driver.metrics.RecordOperation("create_volume", backend, "resource_exhausted", time.Since(started))
+				s.recordPVCWarningFromParams(ctx, rawParams, eventReasonDatastoreRejected, sharedErr.Error())
+				return nil, status.Error(codes.ResourceExhausted, sharedErr.Error())
 			case opennebula.IsDatastoreConfigError(sharedErr):
 				s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
 				s.recordPVCWarningFromParams(ctx, rawParams, eventReasonDatastoreRejected, sharedErr.Error())
@@ -330,6 +344,9 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 			result, err := s.volumeProvider.CloneVolume(ctx, name, source.Volume.GetVolumeId(), selection)
 			if err != nil {
 				switch {
+				case opennebula.IsDatastoreTopologyError(err):
+					s.driver.metrics.RecordOperation("create_volume", backend, "resource_exhausted", time.Since(started))
+					return nil, status.Error(codes.ResourceExhausted, err.Error())
 				case opennebula.IsDatastoreConfigError(err):
 					s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
 					return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -416,6 +433,10 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	result, err := s.volumeProvider.CreateVolume(ctx, name, requiredBytes, DefaultDriverName, immutableVolume, fsType, params, selection)
 	if err != nil {
 		switch {
+		case opennebula.IsDatastoreTopologyError(err):
+			s.driver.metrics.RecordOperation("create_volume", backend, "resource_exhausted", time.Since(started))
+			s.recordPVCWarningFromParams(ctx, rawParams, eventReasonDatastoreRejected, err.Error())
+			return nil, status.Error(codes.ResourceExhausted, err.Error())
 		case opennebula.IsDatastoreConfigError(err):
 			s.driver.metrics.RecordOperation("create_volume", backend, "invalid_argument", time.Since(started))
 			s.recordPVCWarningFromParams(ctx, rawParams, eventReasonDatastoreRejected, err.Error())

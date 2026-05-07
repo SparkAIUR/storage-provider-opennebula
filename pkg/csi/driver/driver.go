@@ -117,7 +117,7 @@ func (d *Driver) Run(ctx context.Context) error {
 		"featureGates", d.featureGates)
 
 	d.metrics = NewDriverMetrics(d.version, d.commit)
-	d.kubeRuntime = NewKubeRuntime(d.name)
+	d.kubeRuntime = NewKubeRuntime(d.name, d.PluginConfig)
 	d.kubeRuntime.staleVAGrace = loadStaleVolumeAttachmentGrace(d.PluginConfig)
 	d.volumeHistory = NewVolumeHistoryManager(d.kubeRuntime, "")
 	if err := d.volumeHistory.LoadFromConfigMap(ctx); err != nil {
@@ -163,6 +163,7 @@ func (d *Driver) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to initialize Kubernetes config for inventory eligibility cache: %w", err)
 		}
+		config.ApplyKubeAPIClientRateLimit(restConfig, d.PluginConfig)
 		authorityMode, _ := d.PluginConfig.GetString(config.InventoryDatastoreAuthorityModeVar)
 		resyncSeconds, ok := d.PluginConfig.GetInt(config.InventoryControllerResyncDatastoresVar)
 		if !ok || resyncSeconds <= 0 {

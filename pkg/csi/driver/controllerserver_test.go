@@ -750,6 +750,77 @@ func TestCreateVolumeIncludesAccessibleTopologyWhenEnabled(t *testing.T) {
 	mockProvider.AssertExpectations(t)
 }
 
+func TestCreateVolumePassesSelectedTopologyToDatastoreSelection(t *testing.T) {
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	sharedProvider := &MockSharedFilesystemProviderTestify{}
+	pluginConfig := config.LoadConfiguration()
+	pluginConfig.OverrideVal(config.DefaultDatastoresVar, "131")
+	pluginConfig.OverrideVal(config.AllowedDatastoreTypesVar, "local")
+
+	driver := &Driver{
+		name:               DefaultDriverName,
+		version:            driverVersion,
+		grpcServerEndpoint: DefaultGRPCServerEndpoint,
+		nodeID:             "test-controller-id",
+		PluginConfig:       pluginConfig,
+		metrics:            NewDriverMetrics(driverVersion, "test"),
+		featureGates: FeatureGates{
+			TopologyAccessibility: true,
+		},
+	}
+
+	expectedSelection := opennebula.DatastoreSelectionConfig{
+		Identifiers:              []string{"131"},
+		Policy:                   opennebula.DatastoreSelectionPolicyLeastUsed,
+		AllowedTypes:             []string{"local"},
+		RequiredSystemDatastores: []int{123},
+	}
+	mockProvider.On("VolumeExists", mock.Anything, "topology-filtered-volume").Return(-1, -1, nil)
+	mockProvider.On(
+		"CreateVolume",
+		mock.Anything,
+		"topology-filtered-volume",
+		int64(1024*1024*1024),
+		mock.Anything,
+		false,
+		"",
+		map[string]string{},
+		expectedSelection,
+	).Return(&opennebula.VolumeCreateResult{
+		Datastore:     opennebula.Datastore{ID: 131, Name: "PRODKUBE2", Backend: "local"},
+		CapacityBytes: int64(1024 * 1024 * 1024),
+	}, nil)
+
+	cs := getTestControllerServerWithDriver(mockProvider, sharedProvider, driver)
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name: "topology-filtered-volume",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: int64(1024 * 1024 * 1024),
+		},
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessType: &csi.VolumeCapability_Mount{
+					Mount: &csi.VolumeCapability_MountVolume{},
+				},
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+		},
+		Parameters: map[string]string{
+			storageClassParamDatastoreIDs: "131",
+		},
+		AccessibilityRequirements: &csi.TopologyRequirement{
+			Preferred: []*csi.Topology{
+				topologyForSystemDatastore("123"),
+			},
+		},
+	})
+
+	assert.NoError(t, err)
+	mockProvider.AssertExpectations(t)
+}
+
 func TestCreateVolumeRejectsReadWriteManyBlockVolume(t *testing.T) {
 	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
 	sharedProvider := &MockSharedFilesystemProviderTestify{}

@@ -235,6 +235,22 @@ func (r *KubeRuntime) GetNode(ctx context.Context, nodeName string) (*corev1.Nod
 	return r.client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 }
 
+func (r *KubeRuntime) SelectedNodeForPVC(ctx context.Context, namespace, name string) (string, error) {
+	if r == nil || !r.enabled {
+		return "", fmt.Errorf("kubernetes runtime is not enabled")
+	}
+	namespace = strings.TrimSpace(namespace)
+	name = strings.TrimSpace(name)
+	if namespace == "" || name == "" {
+		return "", nil
+	}
+	pvc, err := r.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(pvc.Annotations[annotationSelectedNode]), nil
+}
+
 func (r *KubeRuntime) CompatibleSystemDatastoresForRuntimeContext(ctx context.Context, runtimeCtx *VolumeRuntimeContext) ([]string, string, error) {
 	if runtimeCtx == nil {
 		return nil, "", nil

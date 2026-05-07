@@ -52,6 +52,7 @@ func NewControllerLeadership(ctx context.Context, cfg config.CSIPluginConfig) (*
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize in-cluster config for controller leader election: %w", err)
 	}
+	config.ApplyKubeAPIClientRateLimit(restConfig, cfg)
 
 	client, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {

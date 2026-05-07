@@ -193,7 +193,7 @@ func handle(cfg config.CSIPluginConfig) int {
 		}
 		return 0
 	case "storageclass-reconcile":
-		if err := driver.RunStorageClassReconcileCommand(ctx, driver.StorageClassReconcileOptions{
+		if err := driver.RunStorageClassReconcileCommand(ctx, cfg, driver.StorageClassReconcileOptions{
 			Namespace:            *storageClassReconcileNamespace,
 			ConfigMapName:        *storageClassReconcileConfigMap,
 			ManualMutationPolicy: *storageClassReconcilePolicy,

@@ -111,6 +111,7 @@ func Run(ctx context.Context, cfg config.CSIPluginConfig, options Options) error
 	if err != nil {
 		return fmt.Errorf("failed to initialize in-cluster config for inventory controller: %w", err)
 	}
+	config.ApplyKubeAPIClientRateLimit(restConfig, cfg)
 
 	metricsAddr := "0"
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
@@ -311,7 +312,7 @@ func (s *Syncer) syncDatastores(ctx context.Context) error {
 			)
 			continue
 		}
-		nextStatus := s.buildDatastoreStatus(item, ds, pvs.Items, pvcByNSName, scs.Items, vas.Items, latestBenchmarks[ds.ID])
+		nextStatus := s.buildDatastoreStatusWithPool(item, ds, dsPool.Datastores, pvs.Items, pvcByNSName, scs.Items, vas.Items, latestBenchmarks[ds.ID])
 		status.Status = nextStatus
 		log.Info("patching datastore status",
 			"datastoreObject", item.Name,
@@ -479,7 +480,11 @@ func (s *Syncer) ensureNodeObject(ctx context.Context, node corev1.Node) error {
 }
 
 func (s *Syncer) buildDatastoreStatus(item inventoryv1alpha1.OpenNebulaDatastore, ds datastoreSchema.Datastore, pvs []corev1.PersistentVolume, pvcByNSName map[string]corev1.PersistentVolumeClaim, scs []storagev1.StorageClass, vas []storagev1.VolumeAttachment, benchmark *latestBenchmarkResult) inventoryv1alpha1.OpenNebulaDatastoreStatus {
-	normalized := normalizeDatastore(ds)
+	return s.buildDatastoreStatusWithPool(item, ds, []datastoreSchema.Datastore{ds}, pvs, pvcByNSName, scs, vas, benchmark)
+}
+
+func (s *Syncer) buildDatastoreStatusWithPool(item inventoryv1alpha1.OpenNebulaDatastore, ds datastoreSchema.Datastore, datastorePool []datastoreSchema.Datastore, pvs []corev1.PersistentVolume, pvcByNSName map[string]corev1.PersistentVolumeClaim, scs []storagev1.StorageClass, vas []storagev1.VolumeAttachment, benchmark *latestBenchmarkResult) inventoryv1alpha1.OpenNebulaDatastoreStatus {
+	normalized := normalizeDatastore(ds, datastorePool)
 	status := inventoryv1alpha1.OpenNebulaDatastoreStatus{
 		ObservedGeneration: item.Generation,
 		ID:                 normalized.ID,
@@ -1636,7 +1641,7 @@ func validationResourceName(prefix, name, nonce string) string {
 	return prefix + trimmed + "-" + suffix
 }
 
-func normalizeDatastore(ds datastoreSchema.Datastore) opennebula.Datastore {
+func normalizeDatastore(ds datastoreSchema.Datastore, pool []datastoreSchema.Datastore) opennebula.Datastore {
 	return opennebula.Datastore{
 		ID:                         ds.ID,
 		Name:                       ds.Name,
@@ -1646,7 +1651,7 @@ func normalizeDatastore(ds datastoreSchema.Datastore) opennebula.Datastore {
 		TMMad:                      strings.ToLower(strings.TrimSpace(ds.TMMad)),
 		FreeBytes:                  int64(ds.FreeMB) * 1024 * 1024,
 		TotalBytes:                 int64(ds.TotalMB) * 1024 * 1024,
-		CompatibleSystemDatastores: compatibleSystemDatastoresForInventory(ds),
+		CompatibleSystemDatastores: opennebula.EffectiveCompatibleSystemDatastores(ds, pool),
 	}
 }
 
@@ -2006,13 +2011,16 @@ func datastoreConditions(item inventoryv1alpha1.OpenNebulaDatastore, normalized 
 	attachFeasible := true
 	attachReason := "AttachFeasible"
 	attachMessage := "Attach feasibility checks passed"
-	if normalized.Backend == "ceph-rbd" || normalized.Backend == "ceph" {
+	requiresSystemDatastoreCompatibility := normalized.Backend == "ceph-rbd" ||
+		normalized.Backend == "ceph" ||
+		(normalized.Backend == "local" && strings.Contains(strings.ToLower(strings.TrimSpace(normalized.TMMad)), "fs_lvm"))
+	if requiresSystemDatastoreCompatibility {
 		if len(normalized.CompatibleSystemDatastores) == 0 {
 			attachFeasible = false
 			attachReason = "NoCompatibleSystemDatastores"
-			attachMessage = "Ceph RBD datastore does not report compatible system datastores"
+			attachMessage = fmt.Sprintf("%s datastore does not report effective compatible system datastores", normalized.Backend)
 		} else {
-			attachMessage = fmt.Sprintf("Ceph RBD datastore reports compatible system datastores %v", normalized.CompatibleSystemDatastores)
+			attachMessage = fmt.Sprintf("%s datastore reports effective compatible system datastores %v", normalized.Backend, normalized.CompatibleSystemDatastores)
 		}
 	}
 

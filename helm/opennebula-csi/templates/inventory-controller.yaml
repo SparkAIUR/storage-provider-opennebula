@@ -64,7 +64,7 @@ spec:
 {{ toYaml . | nindent 12 }}
             {{- end }}
           env:
-{{ include "opennebula-csi.driverCommonEnv" . | nindent 12 }}
+{{ include "opennebula-csi.driverCommonEnv" (dict "context" . "component" "inventoryController") | nindent 12 }}
             {{- with $inventoryExtraEnv }}
 {{ toYaml . | nindent 12 }}
             {{- end }}

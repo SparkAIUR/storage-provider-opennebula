@@ -10,6 +10,77 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 )
 
+func (s *ControllerServer) applyCreateVolumeTopology(ctx context.Context, selection opennebula.DatastoreSelectionConfig, params map[string]string, requirements *csi.TopologyRequirement) opennebula.DatastoreSelectionConfig {
+	if s == nil || s.driver == nil {
+		return selection
+	}
+	if systemDS := s.selectedNodeSystemDatastore(ctx, params); systemDS > 0 {
+		selection.RequiredSystemDatastores = []int{systemDS}
+		return selection
+	}
+	required := systemDatastoresFromTopologyRequirement(requirements)
+	if len(required) > 0 {
+		selection.RequiredSystemDatastores = required
+	}
+	return selection
+}
+
+func (s *ControllerServer) selectedNodeSystemDatastore(ctx context.Context, params map[string]string) int {
+	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil {
+		return 0
+	}
+	selectedNode, err := s.driver.kubeRuntime.SelectedNodeForPVC(ctx, params[paramPVCNamespace], params[paramPVCName])
+	if err != nil || strings.TrimSpace(selectedNode) == "" {
+		return 0
+	}
+	systemDS, err := s.driver.kubeRuntime.NodeSystemDatastore(ctx, selectedNode)
+	if err != nil {
+		return 0
+	}
+	id, err := strconv.Atoi(strings.TrimSpace(systemDS))
+	if err != nil || id <= 0 {
+		return 0
+	}
+	return id
+}
+
+func systemDatastoresFromTopologyRequirement(requirements *csi.TopologyRequirement) []int {
+	if requirements == nil {
+		return nil
+	}
+	if preferred := systemDatastoresFromTopologies(requirements.GetPreferred()); len(preferred) > 0 {
+		return preferred
+	}
+	return systemDatastoresFromTopologies(requirements.GetRequisite())
+}
+
+func systemDatastoresFromTopologies(topologies []*csi.Topology) []int {
+	if len(topologies) == 0 {
+		return nil
+	}
+	seen := map[int]struct{}{}
+	values := make([]int, 0, len(topologies))
+	for _, topology := range topologies {
+		if topology == nil {
+			continue
+		}
+		raw := strings.TrimSpace(topology.GetSegments()[topologySystemDSLabel])
+		if raw == "" {
+			continue
+		}
+		id, err := strconv.Atoi(raw)
+		if err != nil || id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		values = append(values, id)
+	}
+	return values
+}
+
 func (d *Driver) nodeAccessibleTopology(ctx context.Context) []*csi.Topology {
 	if d == nil || !d.featureGates.TopologyAccessibility {
 		return nil

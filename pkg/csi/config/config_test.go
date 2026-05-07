@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/client-go/rest"
 )
 
 func TestGetStringSliceParsesCSVValues(t *testing.T) {
@@ -67,8 +68,20 @@ func TestFeatureGateDefaultsAlignWithDriverDefaults(t *testing.T) {
 		"cephfsPersistentRecovery=true",
 		"cephfsKernelMounts=false",
 		"localRWOStaleMountRecovery=false",
-		"topologyAccessibility=false",
+		"topologyAccessibility=true",
 	} {
 		assert.Truef(t, strings.Contains(raw, expected), "expected feature gate default %q in %q", expected, raw)
 	}
+}
+
+func TestApplyKubeAPIClientRateLimit(t *testing.T) {
+	cfg := LoadConfiguration()
+	cfg.OverrideVal(KubeAPIQPSVar, 50)
+	cfg.OverrideVal(KubeAPIBurstVar, 100)
+	restConfig := &rest.Config{}
+
+	ApplyKubeAPIClientRateLimit(restConfig, cfg)
+
+	assert.Equal(t, float32(50), restConfig.QPS)
+	assert.Equal(t, 100, restConfig.Burst)
 }

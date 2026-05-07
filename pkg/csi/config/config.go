@@ -20,6 +20,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/viper"
+	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 )
 
@@ -32,6 +33,8 @@ const (
 	AllowedDatastoreTypesVar                   = "ONE_CSI_ALLOWED_DATASTORE_TYPES"
 	FeatureGatesVar                            = "ONE_CSI_FEATURE_GATES"
 	MetricsEndpointVar                         = "ONE_CSI_METRICS_ENDPOINT"
+	KubeAPIQPSVar                              = "ONE_CSI_KUBE_API_QPS"
+	KubeAPIBurstVar                            = "ONE_CSI_KUBE_API_BURST"
 	NodeTopologySystemDSVar                    = "ONE_CSI_NODE_TOPOLOGY_SYSTEM_DS"
 	VMHotplugTimeoutVar                        = "ONE_CSI_VM_HOTPLUG_TIMEOUT_SECONDS"
 	VMHotplugTimeoutBaseVar                    = "ONE_CSI_VM_HOTPLUG_TIMEOUT_BASE_SECONDS"
@@ -117,8 +120,10 @@ const (
 	defaultOpenNebulaRPCEndpoint                   = "http://localhost:2633/RPC2"
 	defaultDatastorePolicy                         = "least-used"
 	defaultAllowedDatastoreTypes                   = "local,ceph,cephfs"
-	defaultFeatureGates                            = "compatibilityAwareSelection=true,detachedDiskExpansion=true,cephfsExpansion=true,cephfsSnapshots=false,cephfsClones=false,cephfsSelfHealing=false,cephfsPersistentRecovery=true,cephfsKernelMounts=false,localRWOStaleMountRecovery=false,localRWOAutoProtection=false,topologyAccessibility=false"
+	defaultFeatureGates                            = "compatibilityAwareSelection=true,detachedDiskExpansion=true,cephfsExpansion=true,cephfsSnapshots=false,cephfsClones=false,cephfsSelfHealing=false,cephfsPersistentRecovery=true,cephfsKernelMounts=false,localRWOStaleMountRecovery=false,localRWOAutoProtection=false,topologyAccessibility=true"
 	defaultMetricsEndpoint                         = ":9810"
+	defaultKubeAPIQPS                              = 20
+	defaultKubeAPIBurst                            = 40
 	defaultVMHotplugTimeout                        = 60
 	defaultVMHotplugTimeoutBase                    = 120
 	defaultVMHotplugTimeoutStep                    = 60
@@ -233,6 +238,8 @@ func initViper() *viper.Viper {
 	viper.SetDefault(AllowedDatastoreTypesVar, defaultAllowedDatastoreTypes)
 	viper.SetDefault(FeatureGatesVar, defaultFeatureGates)
 	viper.SetDefault(MetricsEndpointVar, defaultMetricsEndpoint)
+	viper.SetDefault(KubeAPIQPSVar, defaultKubeAPIQPS)
+	viper.SetDefault(KubeAPIBurstVar, defaultKubeAPIBurst)
 	viper.SetDefault(VMHotplugTimeoutVar, defaultVMHotplugTimeout)
 	viper.SetDefault(VMHotplugTimeoutBaseVar, defaultVMHotplugTimeoutBase)
 	viper.SetDefault(VMHotplugTimeoutPer100GiVar, defaultVMHotplugTimeoutStep)
@@ -354,6 +361,18 @@ func (c *CSIPluginConfig) GetStringSlice(key string) ([]string, bool) {
 
 func (c *CSIPluginConfig) OverrideVal(key string, value any) {
 	c.viper.Set(key, value)
+}
+
+func ApplyKubeAPIClientRateLimit(restConfig *rest.Config, cfg CSIPluginConfig) {
+	if restConfig == nil {
+		return
+	}
+	if qps, ok := cfg.GetInt(KubeAPIQPSVar); ok && qps > 0 {
+		restConfig.QPS = float32(qps)
+	}
+	if burst, ok := cfg.GetInt(KubeAPIBurstVar); ok && burst > 0 {
+		restConfig.Burst = burst
+	}
 }
 
 func normalizeCSVValues(values []string) []string {

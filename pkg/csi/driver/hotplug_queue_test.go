@@ -260,3 +260,32 @@ func TestHotplugQueueSnapshotDebounce(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, cm.Data, "node-a")
 }
+
+func TestHotplugQueueSkipsUnchangedSnapshotPersistence(t *testing.T) {
+	client := fake.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: hotplugQueueStateConfigMapName, Namespace: "default"},
+		Data:       map[string]string{},
+	})
+	runtime := &KubeRuntime{
+		client:  client,
+		enabled: true,
+	}
+	manager := NewHotplugQueueManager(runtime, "default", NewDriverMetrics("test", "test"), time.Second, 0)
+	snapshot := HotplugQueueNodeSnapshot{
+		Node:        "node-a",
+		QueuedCount: 1,
+		Queued: []HotplugQueueItemSnapshot{{
+			ID:        1,
+			Node:      "node-a",
+			Operation: "attach",
+			Volume:    "vol-a",
+			Priority:  hotplugQueuePriorityNormal,
+		}},
+	}
+
+	manager.persistSnapshotNow(snapshot)
+	actionsAfterFirstPersist := len(client.Actions())
+	manager.persistSnapshotNow(snapshot)
+
+	assert.Equal(t, actionsAfterFirstPersist, len(client.Actions()))
+}

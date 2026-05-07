@@ -20,9 +20,10 @@ const (
 )
 
 type DatastoreSelectionConfig struct {
-	Identifiers  []string
-	Policy       DatastoreSelectionPolicy
-	AllowedTypes []string
+	Identifiers              []string
+	Policy                   DatastoreSelectionPolicy
+	AllowedTypes             []string
+	RequiredSystemDatastores []int
 }
 
 type Datastore struct {
@@ -69,6 +70,14 @@ func (e *datastoreCapacityError) Error() string {
 	return e.message
 }
 
+type datastoreTopologyError struct {
+	message string
+}
+
+func (e *datastoreTopologyError) Error() string {
+	return e.message
+}
+
 func IsDatastoreConfigError(err error) bool {
 	_, ok := err.(*datastoreConfigError)
 	return ok
@@ -76,6 +85,11 @@ func IsDatastoreConfigError(err error) bool {
 
 func IsDatastoreCapacityError(err error) bool {
 	_, ok := err.(*datastoreCapacityError)
+	return ok
+}
+
+func IsDatastoreTopologyError(err error) bool {
+	_, ok := err.(*datastoreTopologyError)
 	return ok
 }
 
@@ -131,6 +145,7 @@ func ResolveDatastores(pool []datastoreSchema.Datastore, selection DatastoreSele
 
 	resolved := make([]Datastore, 0, len(selection.Identifiers))
 	seen := make(map[int]struct{}, len(selection.Identifiers))
+	topologyFiltered := make([]int, 0)
 	for _, identifier := range selection.Identifiers {
 		candidate, err := resolveDatastoreIdentifier(identifier, poolByID, defaultDatastore)
 		if err != nil {
@@ -160,8 +175,13 @@ func ResolveDatastores(pool []datastoreSchema.Datastore, selection DatastoreSele
 			return nil, err
 		}
 		normalized.Backend = profile.Type
+		normalized.CompatibleSystemDatastores = EffectiveCompatibleSystemDatastores(candidate, pool)
 
 		if _, ok := seen[normalized.ID]; ok {
+			continue
+		}
+		if !datastoreSatisfiesRequiredSystemDatastores(normalized, selection.RequiredSystemDatastores) {
+			topologyFiltered = append(topologyFiltered, normalized.ID)
 			continue
 		}
 		seen[normalized.ID] = struct{}{}
@@ -169,10 +189,35 @@ func ResolveDatastores(pool []datastoreSchema.Datastore, selection DatastoreSele
 	}
 
 	if len(resolved) == 0 {
+		if len(topologyFiltered) > 0 {
+			return nil, &datastoreTopologyError{message: fmt.Sprintf("no configured datastores are compatible with required system datastores %v; filtered datastores: %v", selection.RequiredSystemDatastores, topologyFiltered)}
+		}
 		return nil, &datastoreConfigError{message: "no eligible datastores found for provisioning"}
 	}
 
 	return resolved, nil
+}
+
+func datastoreSatisfiesRequiredSystemDatastores(datastore Datastore, required []int) bool {
+	if len(required) == 0 {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(datastore.Backend), datastoreTypeCephFS) {
+		return true
+	}
+	if len(datastore.CompatibleSystemDatastores) == 0 {
+		return false
+	}
+	allowed := make(map[int]struct{}, len(datastore.CompatibleSystemDatastores))
+	for _, id := range datastore.CompatibleSystemDatastores {
+		allowed[id] = struct{}{}
+	}
+	for _, id := range required {
+		if _, ok := allowed[id]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func OrderDatastores(candidates []Datastore, policy DatastoreSelectionPolicy) ([]Datastore, error) {
@@ -285,6 +330,66 @@ func compatibleSystemDatastores(ds datastoreSchema.Datastore) []int {
 	}
 
 	return ids
+}
+
+func EffectiveCompatibleSystemDatastores(imageDS datastoreSchema.Datastore, pool []datastoreSchema.Datastore) []int {
+	declared := compatibleSystemDatastores(imageDS)
+	if len(declared) == 0 {
+		return nil
+	}
+	byID := make(map[int]datastoreSchema.Datastore, len(pool))
+	for _, datastore := range pool {
+		byID[datastore.ID] = datastore
+	}
+	effective := make([]int, 0, len(declared))
+	seen := make(map[int]struct{}, len(declared))
+	for _, id := range declared {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		systemDS, ok := byID[id]
+		if !ok {
+			continue
+		}
+		if err := ValidateImageSystemDatastoreCompatibility(imageDS, systemDS); err != nil {
+			continue
+		}
+		seen[id] = struct{}{}
+		effective = append(effective, id)
+	}
+	sort.Ints(effective)
+	return effective
+}
+
+func ValidateImageSystemDatastoreCompatibility(imageDS, systemDS datastoreSchema.Datastore) error {
+	if isLocalLVMImageDatastore(imageDS) && isCephSystemDatastore(systemDS) {
+		return &datastoreConfigError{message: fmt.Sprintf(
+			"local LVM image datastore %d (%s/TM_MAD=%s) is not compatible with Ceph system datastore %d (%s/TM_MAD=%s)",
+			imageDS.ID,
+			imageDS.Name,
+			strings.TrimSpace(imageDS.TMMad),
+			systemDS.ID,
+			systemDS.Name,
+			strings.TrimSpace(systemDS.TMMad),
+		)}
+	}
+	return nil
+}
+
+func isLocalLVMImageDatastore(ds datastoreSchema.Datastore) bool {
+	if normalizeDatastoreCategory(ds) != string(datastoreSchema.Image) {
+		return false
+	}
+	tmMad := strings.ToLower(strings.TrimSpace(ds.TMMad))
+	dsMad := strings.ToLower(strings.TrimSpace(ds.DSMad))
+	return strings.Contains(tmMad, "fs_lvm") || strings.Contains(dsMad, "fs_lvm")
+}
+
+func isCephSystemDatastore(ds datastoreSchema.Datastore) bool {
+	if normalizeDatastoreCategory(ds) != string(datastoreSchema.System) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(ds.TMMad), datastoreTypeCeph)
 }
 
 func datastoreCephAttributes(source datastoreSchema.Datastore) *CephDatastoreAttributes {

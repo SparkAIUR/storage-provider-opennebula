@@ -425,6 +425,40 @@ func TestValidateCompatibleSystemDatastore(t *testing.T) {
 	assert.Contains(t, err.Error(), "COMPATIBLE_SYS_DS")
 }
 
+func TestEffectiveCompatibleSystemDatastoresFiltersCephForLocalLVM(t *testing.T) {
+	imageDS := newTypedTestDatastore(131, "PRODKUBE2", "fs", "fs_lvm_ssh", "0", map[string]string{
+		"COMPATIBLE_SYS_DS": "104,123",
+	})
+	localSystem := newTypedTestDatastore(104, "DEVONeb1", "", "fs_lvm_ssh", "1", nil)
+	cephSystem := newTypedTestDatastore(123, "ceph-system", "", "ceph", "1", map[string]string{
+		"DISK_TYPE": "RBD",
+	})
+
+	effective := EffectiveCompatibleSystemDatastores(imageDS, []datastoreSchema.Datastore{imageDS, localSystem, cephSystem})
+
+	assert.Equal(t, []int{104}, effective)
+}
+
+func TestResolveDatastoresFiltersRequiredSystemDatastore(t *testing.T) {
+	localImage := newTypedTestDatastore(131, "PRODKUBE2", "fs", "fs_lvm_ssh", "0", map[string]string{
+		"COMPATIBLE_SYS_DS": "104,123",
+	})
+	localSystem := newTypedTestDatastore(104, "DEVONeb1", "", "fs_lvm_ssh", "1", nil)
+	cephSystem := newTypedTestDatastore(123, "ceph-system", "", "ceph", "1", map[string]string{
+		"DISK_TYPE": "RBD",
+	})
+
+	_, err := ResolveDatastores([]datastoreSchema.Datastore{localImage, localSystem, cephSystem}, DatastoreSelectionConfig{
+		Identifiers:              []string{"131"},
+		AllowedTypes:             []string{"local"},
+		RequiredSystemDatastores: []int{123},
+	})
+
+	require.Error(t, err)
+	assert.True(t, IsDatastoreTopologyError(err))
+	assert.Contains(t, err.Error(), "required system datastores")
+}
+
 func TestSumDatastoreCapacityAggregatesConfiguredPool(t *testing.T) {
 	total := SumDatastoreCapacity([]Datastore{
 		{ID: 100, FreeBytes: 10},

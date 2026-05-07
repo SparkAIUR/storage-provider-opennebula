@@ -111,7 +111,7 @@ spec:
               value: {{ $leaderElectionRenewDeadline | quote }}
             - name: ONE_CSI_CONTROLLER_LEADER_ELECTION_RETRY_PERIOD_SECONDS
               value: {{ $leaderElectionRetryPeriod | quote }}
-{{ include "opennebula-csi.driverCommonEnv" . | nindent 12 }}
+{{ include "opennebula-csi.driverCommonEnv" (dict "context" . "component" "controller") | nindent 12 }}
             {{- with .Values.controller.extraEnv }}
 {{ toYaml . | nindent 12 }}
             {{- end }}
@@ -144,6 +144,10 @@ spec:
             - "--leader-election"
             - "--default-fstype=ext4"
             - "--extra-create-metadata"
+            {{- if .Values.featureGates.topologyAccessibility }}
+            - "--feature-gates=Topology=true"
+            - "--strict-topology"
+            {{- end }}
             {{- if .Values.metrics.enabled }}
             - "--http-endpoint=:{{ .Values.metrics.ports.provisioner }}"
             {{- end }}

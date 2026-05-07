@@ -103,6 +103,9 @@ driver:
     sampleWindow: 20
     p95MultiplierPercent: 400
     maxSeconds: 1800
+  kubeAPI:
+    qps: 20
+    burst: 40
   allowedDatastoreTypes:
     - "local"
     - "ceph"
@@ -121,7 +124,7 @@ featureGates:
   cephfsKernelMounts: false
   localRWOStaleMountRecovery: false
   localRWOAutoProtection: false
-  topologyAccessibility: false
+  topologyAccessibility: true
 
 controller:
   replicaCount: 1
@@ -148,6 +151,9 @@ controller:
   affinity: {}
   extraArgs: []
   extraEnv: []
+  kubeAPI:
+    qps: 50
+    burst: 100
 
 inventoryController:
   enabled: false
@@ -203,6 +209,9 @@ inventoryController:
   affinity: {}
   extraArgs: []
   extraEnv: []
+  kubeAPI:
+    qps: 20
+    burst: 40
 
 node:
   podAnnotations: {}
@@ -213,6 +222,9 @@ node:
   affinity: {}
   extraArgs: []
   extraEnv: []
+  kubeAPI:
+    qps: 20
+    burst: 40
 
 metrics:
   enabled: true

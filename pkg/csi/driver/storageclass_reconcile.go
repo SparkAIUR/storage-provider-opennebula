@@ -9,6 +9,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -38,27 +39,29 @@ type StorageClassReconcileOptions struct {
 }
 
 type StorageClassReconcileDesired struct {
-	Name              string            `json:"name"`
-	ReleaseName       string            `json:"releaseName"`
-	ReleaseNamespace  string            `json:"releaseNamespace"`
-	SpecHash          string            `json:"specHash,omitempty"`
-	Annotations       map[string]string `json:"annotations,omitempty"`
-	Labels            map[string]string `json:"labels,omitempty"`
-	Provisioner       string            `json:"provisioner"`
-	ReclaimPolicy     string            `json:"reclaimPolicy,omitempty"`
-	AllowExpansion    bool              `json:"allowVolumeExpansion"`
-	MountOptions      []string          `json:"mountOptions,omitempty"`
-	VolumeBindingMode string            `json:"volumeBindingMode,omitempty"`
-	Parameters        map[string]string `json:"parameters,omitempty"`
+	Name              string                        `json:"name"`
+	ReleaseName       string                        `json:"releaseName"`
+	ReleaseNamespace  string                        `json:"releaseNamespace"`
+	SpecHash          string                        `json:"specHash,omitempty"`
+	Annotations       map[string]string             `json:"annotations,omitempty"`
+	Labels            map[string]string             `json:"labels,omitempty"`
+	Provisioner       string                        `json:"provisioner"`
+	ReclaimPolicy     string                        `json:"reclaimPolicy,omitempty"`
+	AllowExpansion    bool                          `json:"allowVolumeExpansion"`
+	AllowedTopologies []corev1.TopologySelectorTerm `json:"allowedTopologies,omitempty"`
+	MountOptions      []string                      `json:"mountOptions,omitempty"`
+	VolumeBindingMode string                        `json:"volumeBindingMode,omitempty"`
+	Parameters        map[string]string             `json:"parameters,omitempty"`
 }
 
 type storageClassSpecFingerprint struct {
-	Provisioner       string            `json:"provisioner"`
-	ReclaimPolicy     string            `json:"reclaimPolicy,omitempty"`
-	AllowExpansion    bool              `json:"allowVolumeExpansion"`
-	MountOptions      []string          `json:"mountOptions,omitempty"`
-	VolumeBindingMode string            `json:"volumeBindingMode,omitempty"`
-	Parameters        map[string]string `json:"parameters,omitempty"`
+	Provisioner       string                        `json:"provisioner"`
+	ReclaimPolicy     string                        `json:"reclaimPolicy,omitempty"`
+	AllowExpansion    bool                          `json:"allowVolumeExpansion"`
+	AllowedTopologies []corev1.TopologySelectorTerm `json:"allowedTopologies,omitempty"`
+	MountOptions      []string                      `json:"mountOptions,omitempty"`
+	VolumeBindingMode string                        `json:"volumeBindingMode,omitempty"`
+	Parameters        map[string]string             `json:"parameters,omitempty"`
 }
 
 type storageClassReconcileResult struct {
@@ -67,12 +70,13 @@ type storageClassReconcileResult struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-func RunStorageClassReconcileCommand(ctx context.Context, opts StorageClassReconcileOptions, w io.Writer) error {
-	cfg, err := rest.InClusterConfig()
+func RunStorageClassReconcileCommand(ctx context.Context, pluginConfig config.CSIPluginConfig, opts StorageClassReconcileOptions, w io.Writer) error {
+	restConfig, err := rest.InClusterConfig()
 	if err != nil {
 		return err
 	}
-	client, err := kubernetes.NewForConfig(cfg)
+	config.ApplyKubeAPIClientRateLimit(restConfig, pluginConfig)
+	client, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
 		return err
 	}
@@ -214,6 +218,9 @@ func desiredStorageClassObject(desired StorageClassReconcileDesired, desiredHash
 		Parameters:   cloneStringMap(desired.Parameters),
 		MountOptions: normalizeStorageClassMountOptions(desired.MountOptions),
 	}
+	if len(desired.AllowedTopologies) > 0 {
+		sc.AllowedTopologies = append([]corev1.TopologySelectorTerm(nil), desired.AllowedTopologies...)
+	}
 	if reclaim := strings.TrimSpace(desired.ReclaimPolicy); reclaim != "" {
 		value := corev1.PersistentVolumeReclaimPolicy(reclaim)
 		sc.ReclaimPolicy = &value
@@ -253,6 +260,7 @@ func storageClassDesiredSpecHash(desired StorageClassReconcileDesired) string {
 		Provisioner:       firstNonEmpty(strings.TrimSpace(desired.Provisioner), DefaultDriverName),
 		ReclaimPolicy:     strings.TrimSpace(desired.ReclaimPolicy),
 		AllowExpansion:    desired.AllowExpansion,
+		AllowedTopologies: append([]corev1.TopologySelectorTerm(nil), desired.AllowedTopologies...),
 		MountOptions:      normalizeStorageClassMountOptions(desired.MountOptions),
 		VolumeBindingMode: strings.TrimSpace(desired.VolumeBindingMode),
 		Parameters:        cloneStringMap(desired.Parameters),
@@ -279,6 +287,7 @@ func storageClassLiveSpecHash(sc *storagev1.StorageClass) string {
 		Provisioner:       strings.TrimSpace(sc.Provisioner),
 		ReclaimPolicy:     reclaim,
 		AllowExpansion:    allow,
+		AllowedTopologies: append([]corev1.TopologySelectorTerm(nil), sc.AllowedTopologies...),
 		MountOptions:      normalizeStorageClassMountOptions(sc.MountOptions),
 		VolumeBindingMode: mode,
 		Parameters:        cloneStringMap(sc.Parameters),
@@ -292,6 +301,7 @@ func storageClassSpecHash(spec storageClassSpecFingerprint) string {
 	spec.MountOptions = normalizeStorageClassMountOptions(spec.MountOptions)
 	payload, err := json.Marshal(map[string]interface{}{
 		"allowVolumeExpansion": spec.AllowExpansion,
+		"allowedTopologies":    spec.AllowedTopologies,
 		"mountOptions":         spec.MountOptions,
 		"parameters":           spec.Parameters,
 		"provisioner":          spec.Provisioner,

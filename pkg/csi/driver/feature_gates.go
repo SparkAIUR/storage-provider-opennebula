@@ -33,7 +33,7 @@ func defaultFeatureGates() FeatureGates {
 		CephFSKernelMounts:          false,
 		LocalRWOStaleMountRecovery:  false,
 		LocalRWOAutoProtection:      false,
-		TopologyAccessibility:       false,
+		TopologyAccessibility:       true,
 	}
 }
 

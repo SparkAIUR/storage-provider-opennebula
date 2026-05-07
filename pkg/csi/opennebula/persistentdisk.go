@@ -550,6 +550,9 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		if conflict, ok := p.classifyHostArtifactConflict(ctx, nodeID, report, hostArtifactTarget, err); ok {
 			return conflict
 		}
+		if vmError := strings.TrimSpace(p.latestVMError(ctx, nodeID)); vmError != "" {
+			err = fmt.Errorf("%w (latest OpenNebula VM error: %s)", err, vmError)
+		}
 		if attachErr != nil {
 			return fmt.Errorf("%w (initial attach error: %v)", err, attachErr)
 		}
@@ -782,6 +785,9 @@ func (p *PersistentDiskVolumeProvider) inspectAttachmentEnvironment(ctx context.
 	report.DeploymentMode = resolveDeploymentMode(systemDatastore)
 
 	if err := validateCompatibleSystemDatastore(imageDatastore, systemDatastoreID); err != nil {
+		return nil, err
+	}
+	if err := ValidateImageSystemDatastoreCompatibility(imageDatastore, systemDatastore); err != nil {
 		return nil, err
 	}
 

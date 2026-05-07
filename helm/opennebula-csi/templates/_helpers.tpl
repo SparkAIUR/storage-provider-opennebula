@@ -86,17 +86,21 @@ Create chart name and version as used by the chart label.
 {{- range $key, $value := (default dict .parameters) -}}
 {{- $_ := set $params $key (printf "%v" $value) -}}
 {{- end -}}
-{{- $spec := dict "allowVolumeExpansion" (default false .allowVolumeExpansion) "mountOptions" (default (list) .mountOptions) "parameters" $params "provisioner" "csi.opennebula.io" "reclaimPolicy" (default "Delete" .reclaimPolicy) "volumeBindingMode" (default "Immediate" .volumeBindingMode) -}}
+{{- $spec := dict "allowVolumeExpansion" (default false .allowVolumeExpansion) "allowedTopologies" (default (list) .allowedTopologies) "mountOptions" (default (list) .mountOptions) "parameters" $params "provisioner" "csi.opennebula.io" "reclaimPolicy" (default "Delete" .reclaimPolicy) "volumeBindingMode" (default "Immediate" .volumeBindingMode) -}}
 {{- toJson $spec | sha256sum -}}
 {{- end }}
 
 {{- define "opennebula-csi.driverCommonEnv" -}}
 {{- $root := . -}}
+{{- $componentKey := "driver" -}}
 {{- $inventoryEnabledOverrideSet := false -}}
 {{- $inventoryEnabledOverride := false -}}
 {{- if kindIs "map" . -}}
   {{- if hasKey . "context" -}}
     {{- $root = get . "context" -}}
+  {{- end -}}
+  {{- if hasKey . "component" -}}
+    {{- $componentKey = get . "component" -}}
   {{- end -}}
   {{- if hasKey . "inventoryEnabledOverride" -}}
     {{- $inventoryEnabledOverrideSet = true -}}
@@ -104,6 +108,11 @@ Create chart name and version as used by the chart label.
   {{- end -}}
 {{- end -}}
 {{- $inventory := (get $root.Values "inventoryController") | default dict -}}
+{{- $componentValues := (get $root.Values $componentKey) | default dict -}}
+{{- $driverKubeAPI := (get $root.Values.driver "kubeAPI") | default dict -}}
+{{- $componentKubeAPI := (get $componentValues "kubeAPI") | default dict -}}
+{{- $kubeAPIQPS := (get $componentKubeAPI "qps") | default ((get $driverKubeAPI "qps") | default 20) -}}
+{{- $kubeAPIBurst := (get $componentKubeAPI "burst") | default ((get $driverKubeAPI "burst") | default 40) -}}
 {{- $inventoryResync := (get $inventory "resyncSeconds") | default dict -}}
 {{- $inventoryValidation := (get $inventory "validation") | default dict -}}
 {{- $nodeExpand := (get $root.Values.driver "nodeExpand") | default dict -}}
@@ -346,6 +355,10 @@ Create chart name and version as used by the chart label.
   value: {{ $adaptiveTimeoutMaxSeconds | quote }}
 - name: ONE_CSI_PREFLIGHT_LOCAL_IMMEDIATE_BINDING_POLICY
   value: {{ $root.Values.preflight.localImmediateBindingPolicy | quote }}
+- name: ONE_CSI_KUBE_API_QPS
+  value: {{ $kubeAPIQPS | quote }}
+- name: ONE_CSI_KUBE_API_BURST
+  value: {{ $kubeAPIBurst | quote }}
 - name: ONE_CSI_INVENTORY_CONTROLLER_ENABLED
   value: {{ $inventoryEnabled | quote }}
 - name: ONE_CSI_INVENTORY_DATASTORE_AUTHORITY_MODE
