@@ -6,5 +6,5 @@ home: https://github.com/SparkAIUR/storage-provider-opennebula
 sources:
   - https://github.com/SparkAIUR/storage-provider-opennebula
 # https://github.com/helm/helm/issues/9298
-version: 0.5.22
-appVersion: "v0.5.22"
+version: 0.5.23
+appVersion: "v0.5.23"
