@@ -59,10 +59,12 @@ func TestLastNodePreferenceWebhookInjectsSoftAffinity(t *testing.T) {
 
 	raw, err := json.Marshal(patch)
 	require.NoError(t, err)
-	assert.Contains(t, string(raw), jsonPointerEscape(annotationPreferredNodeInjected))
+	assert.Contains(t, string(raw), jsonPointerEscape(annotationRequiredNodeInjected))
 	assert.Contains(t, string(raw), jsonPointerEscape(annotationPlacementSource))
 	assert.Contains(t, string(raw), jsonPointerEscape(annotationPlacementDecision))
+	assert.Contains(t, string(raw), "requiredDuringSchedulingIgnoredDuringExecution")
 	assert.Contains(t, string(raw), "host-a")
+	assert.NotContains(t, string(raw), "preferredDuringSchedulingIgnoredDuringExecution")
 }
 
 func TestLastNodePreferenceWebhookInjectsHardAffinityDuringMaintenance(t *testing.T) {
@@ -188,9 +190,10 @@ func TestLastNodePreferenceWebhookSkipsConflictingPVCs(t *testing.T) {
 			},
 		},
 	})
-	require.NoError(t, err)
+	require.Error(t, err)
 	assert.Empty(t, patch)
 	assert.NotEmpty(t, warnings)
+	assert.Contains(t, warnings[len(warnings)-1], "conflicting local RWO volumes require different manual or protected nodes")
 }
 
 func TestLastNodePreferenceWebhookHonorsOptOut(t *testing.T) {
@@ -217,8 +220,15 @@ func TestLastNodePreferenceWebhookHonorsOptOut(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	assert.Empty(t, patch)
+	require.NotEmpty(t, patch)
 	assert.Empty(t, warnings)
+
+	raw, err := json.Marshal(patch)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), jsonPointerEscape(annotationRequiredNodeInjected))
+	assert.Contains(t, string(raw), "requiredDuringSchedulingIgnoredDuringExecution")
+	assert.Contains(t, string(raw), hostLabel("a"))
+	assert.NotContains(t, string(raw), "preferredDuringSchedulingIgnoredDuringExecution")
 }
 
 func TestLastNodePreferenceWebhookInjectsExplicitRequiredNode(t *testing.T) {
@@ -420,10 +430,10 @@ func TestLastNodePreferenceWebhookSkipsMissingHistoricalLastAttachedNode(t *test
 			}},
 		},
 	})
-	require.NoError(t, err)
+	require.Error(t, err)
 	assert.Empty(t, patch)
-	assert.NotEmpty(t, warnings)
-	assert.Contains(t, warnings[0], "historical last-attached-node was ignored")
+	assert.Empty(t, warnings)
+	assert.Contains(t, err.Error(), "node-missing")
 }
 
 func TestLastNodePreferenceWebhookSkipsTombstonedHistoricalLastAttachedNode(t *testing.T) {
@@ -476,12 +486,12 @@ func TestLastNodePreferenceWebhookSkipsTombstonedHistoricalLastAttachedNode(t *t
 		},
 	})
 	require.NoError(t, err)
-	assert.NotEmpty(t, warnings)
+	assert.Empty(t, warnings)
 	raw, err := json.Marshal(patch)
 	require.NoError(t, err)
-	assert.NotContains(t, string(raw), jsonPointerEscape(annotationPreferredNodeInjected))
-	assert.Contains(t, warnings[0], "historical last-attached-node was ignored")
-	assert.Contains(t, warnings[0], "tombstoned")
+	assert.Contains(t, string(raw), jsonPointerEscape(annotationRequiredNodeInjected))
+	assert.Contains(t, string(raw), "requiredDuringSchedulingIgnoredDuringExecution")
+	assert.NotContains(t, string(raw), "preferredDuringSchedulingIgnoredDuringExecution")
 }
 
 func TestLastNodePreferenceWebhookSkipsMissingExplicitPreferredNode(t *testing.T) {
@@ -557,8 +567,10 @@ func TestLastNodePreferenceWebhookIgnoresExpiredExplicitRequiredNode(t *testing.
 	assert.NotEmpty(t, warnings)
 	raw, err := json.Marshal(patch)
 	require.NoError(t, err)
-	assert.Contains(t, string(raw), jsonPointerEscape(annotationPreferredNodeInjected))
+	assert.Contains(t, string(raw), jsonPointerEscape(annotationRequiredNodeInjected))
+	assert.Contains(t, string(raw), "requiredDuringSchedulingIgnoredDuringExecution")
 	assert.Contains(t, string(raw), hostLabel("a"))
+	assert.NotContains(t, string(raw), "preferredDuringSchedulingIgnoredDuringExecution")
 }
 
 func hostLabel(suffix string) string {

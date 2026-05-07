@@ -576,6 +576,13 @@ func volumeHistoryHasLocalHistoricalEvidence(state VolumeHistoryRecord, runtimeC
 	return state.Bootstrapped && strings.TrimSpace(state.LastSuccessfulNodeName) != ""
 }
 
+func historySupportsSameNodeProtection(state VolumeHistoryRecord, runtimeCtx *VolumeRuntimeContext) bool {
+	if strings.TrimSpace(state.LastSuccessfulNodeName) == "" {
+		return false
+	}
+	return volumeHistoryHasLocalHistoricalEvidence(state, runtimeCtx)
+}
+
 func buildVolumeHistoryBootstrapEvidence(ctx context.Context, runtime *KubeRuntime, volumeID string, runtimeCtx *VolumeRuntimeContext) (VolumeHistoryRecord, bool) {
 	volumeID = strings.TrimSpace(volumeID)
 	if volumeID == "" || runtimeCtx == nil {

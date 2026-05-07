@@ -147,10 +147,11 @@ func TestLocalRWOProtectionDecisionFallsBackAfterExpiredRequiredNode(t *testing.
 
 	decision, err := localRWOProtectionDecisionForDriver(context.Background(), driver, "vol-expired", "")
 	require.NoError(t, err)
-	assert.False(t, decision.Protected)
+	assert.True(t, decision.Protected)
 	assert.True(t, decision.ExplicitRequiredNodeExpired)
-	assert.Equal(t, "node-a", decision.PreferredNode)
-	assert.Equal(t, placementSourceLastAttachedNode, decision.PlacementSource)
+	assert.Equal(t, "node-a", decision.RequiredNode)
+	assert.Equal(t, protectionReasonHistory, decision.Reason)
+	assert.Equal(t, protectionSourceHistoricalOwnership, decision.Source)
 	assert.NotEmpty(t, decision.Warnings)
 }
 
@@ -162,10 +163,12 @@ func TestLocalRWOProtectionDecisionSkipsMissingHistoricalLastAttachedNode(t *tes
 
 	decision, err := localRWOProtectionDecisionForDriver(context.Background(), driver, "vol-missing-last", "")
 	require.NoError(t, err)
-	assert.Empty(t, decision.PreferredNode)
+	assert.True(t, decision.Protected)
+	assert.Equal(t, "node-missing", decision.RequiredNode)
+	assert.Equal(t, protectionReasonHistory, decision.Reason)
+	assert.Equal(t, protectionSourceHistoricalOwnership, decision.Source)
 	assert.False(t, decision.Invalid)
-	assert.NotEmpty(t, decision.Warnings)
-	assert.Contains(t, decision.Warnings[0], "historical last-attached-node was ignored")
+	assert.Empty(t, decision.Warnings)
 }
 
 func TestLocalRWOProtectionDecisionSkipsTopologyIncompatibleHistoricalLastAttachedNode(t *testing.T) {
@@ -199,11 +202,12 @@ func TestLocalRWOProtectionDecisionSkipsTopologyIncompatibleHistoricalLastAttach
 
 	decision, err := localRWOProtectionDecisionForDriver(context.Background(), driver, "vol-incompatible-last", "")
 	require.NoError(t, err)
-	assert.Empty(t, decision.PreferredNode)
+	assert.True(t, decision.Protected)
+	assert.Equal(t, "node-a", decision.RequiredNode)
+	assert.Equal(t, protectionReasonHistory, decision.Reason)
+	assert.Equal(t, protectionSourceHistoricalOwnership, decision.Source)
 	assert.False(t, decision.Invalid)
-	assert.NotEmpty(t, decision.Warnings)
-	assert.Contains(t, decision.Warnings[0], "historical last-attached-node was ignored")
-	assert.Contains(t, decision.Warnings[0], "incompatible")
+	assert.Empty(t, decision.Warnings)
 }
 
 func TestLocalRWOProtectionDecisionWarnsOnInvalidExplicitPreferredNode(t *testing.T) {

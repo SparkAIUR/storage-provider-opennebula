@@ -206,6 +206,60 @@ func TestVolumeHistoryBootstrapUsesPlacementSummaryFallback(t *testing.T) {
 	require.True(t, record.LastSuccessfulStageTime.IsZero())
 }
 
+func TestLocalRWOProtectionDecisionUsesBootstrappedHistoryForSameNodeProtection(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-bootstrap-protect", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv.Annotations[annotationLastAttachedNode] = "node-old"
+	driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true), newReadyNode("node-new", true))
+
+	decision, err := localRWOProtectionDecisionForDriver(context.Background(), driver, "vol-bootstrap-protect", "node-new")
+	require.NoError(t, err)
+	require.True(t, decision.Protected)
+	require.Equal(t, "node-old", decision.RequiredNode)
+	require.Equal(t, protectionReasonHistory, decision.Reason)
+	require.Equal(t, protectionSourceHistoricalOwnership, decision.Source)
+	require.True(t, decision.History.Bootstrapped)
+	require.True(t, decision.History.LastSuccessfulPublishTime.IsZero())
+	require.True(t, decision.History.LastSuccessfulStageTime.IsZero())
+
+	record, ok := driver.volumeHistory.Get("vol-bootstrap-protect")
+	require.True(t, ok)
+	require.True(t, record.Bootstrapped)
+	require.Equal(t, "node-old", record.LastSuccessfulNodeName)
+	require.True(t, record.LastSuccessfulPublishTime.IsZero())
+	require.True(t, record.LastSuccessfulStageTime.IsZero())
+}
+
+func TestHistorySupportsSameNodeProtectionKeepsSafeReleaseSeparate(t *testing.T) {
+	bootstrapped := VolumeHistoryRecord{
+		VolumeID:               "vol-bootstrap",
+		Backend:                "local",
+		Bootstrapped:           true,
+		EvidenceSource:         volumeHistoryEvidenceSourceBootstrap,
+		LastSuccessfulNodeName: "node-a",
+	}
+	require.True(t, historySupportsSameNodeProtection(bootstrapped, nil))
+	require.False(t, historyRequiresSafeRelease(bootstrapped))
+
+	unknown := VolumeHistoryRecord{
+		VolumeID:               "vol-unknown",
+		Bootstrapped:           true,
+		EvidenceSource:         volumeHistoryEvidenceSourceBootstrap,
+		LastSuccessfulNodeName: "node-a",
+	}
+	require.False(t, historySupportsSameNodeProtection(unknown, nil))
+
+	observed := VolumeHistoryRecord{
+		VolumeID:                     "vol-observed",
+		Backend:                      "local",
+		LastSuccessfulNodeName:       "node-a",
+		LastSuccessfulPublishTime:    time.Now().UTC(),
+		LastSuccessfulStageTime:      time.Now().UTC(),
+		LastSuccessfulOpenNebulaVMID: 1,
+	}
+	require.True(t, historySupportsSameNodeProtection(observed, nil))
+	require.True(t, historyRequiresSafeRelease(observed))
+}
+
 func TestValidateHotplugQueueRequestAllowsOrphanDetachAfterHistoryRefresh(t *testing.T) {
 	record := VolumeHistoryRecord{
 		Version:                   stateObjectVersion,

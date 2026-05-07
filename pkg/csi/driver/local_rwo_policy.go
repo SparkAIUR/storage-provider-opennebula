@@ -105,6 +105,9 @@ func (s *ControllerServer) localRWOProtectionDecision(ctx context.Context, volum
 	if localRWOHistoryRuntimeContextDegraded(runtimeCtx) {
 		history = s.refreshVolumeHistory(ctx, volumeID)
 	}
+	if !volumeHistoryHasObservedSuccess(history) {
+		history = s.bootstrapVolumeHistoryEvidence(ctx, volumeID, runtimeCtx, history)
+	}
 	decision.History = history
 
 	explicitPlacement := explicitNodePlacementForRuntimeContext(runtimeCtx)
@@ -281,7 +284,7 @@ func (s *ControllerServer) inferredLocalRWORequiredNode(ctx context.Context, vol
 			source = protectionSourceExplicitMaintenance
 		}
 	}
-	if requiredNode == "" && historyRequiresSafeRelease(history) {
+	if requiredNode == "" && historySupportsSameNodeProtection(history, runtimeCtx) {
 		requiredNode = strings.TrimSpace(history.LastSuccessfulNodeName)
 		reason = protectionReasonHistory
 		source = protectionSourceHistoricalOwnership
