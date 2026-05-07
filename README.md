@@ -722,7 +722,7 @@ Each item under `storageClasses` supports:
 - `volumeBindingMode`
 - `parameters`
 
-The Helm chart fingerprints rendered StorageClasses with `storage-provider.opennebula.sparkaiur.io/*` annotations. During upgrades, `storageClassReconcile.enabled=true` creates a pre-upgrade hook that recreates only chart-owned, unmodified StorageClasses whose desired immutable spec changed. User-created or manually changed classes fail the hook by default (`manualMutationPolicy: fail`) unless explicitly set to `skip`.
+The Helm chart fingerprints rendered StorageClasses with `storage-provider.opennebula.sparkaiur.io/*` annotations. During upgrades, operators can opt in with `storageClassReconcile.enabled=true` to create a pre-upgrade hook that recreates only chart-owned, unmodified StorageClasses whose desired immutable spec changed. User-created or manually changed classes fail the hook by default (`manualMutationPolicy: fail`) unless explicitly set to `skip`.
 
 ## Example values files
 

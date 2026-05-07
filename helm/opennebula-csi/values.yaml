@@ -260,7 +260,7 @@ preflight:
   provisionerSecretRefs: []
 
 storageClassReconcile:
-  enabled: true
+  enabled: false
   manualMutationPolicy: "fail"
   adoptUnannotated: true
   image:

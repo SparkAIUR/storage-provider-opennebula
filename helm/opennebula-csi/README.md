@@ -698,11 +698,11 @@ For local-backed classes, preflight now checks `volumeBindingMode` and warns by 
 | `storageClasses[].volumeBindingMode` | StorageClass binding mode. | none | No |
 | `storageClasses[].parameters` | Driver parameters injected into the StorageClass. | none | No |
 
-Rendered StorageClasses are fingerprinted with `storage-provider.opennebula.sparkaiur.io/*` annotations. On Helm upgrade, the optional `storageClassReconcile` pre-upgrade hook recreates chart-owned classes only when the live spec still matches the previously applied chart hash; manual/user mutations are blocked by default.
+Rendered StorageClasses are fingerprinted with `storage-provider.opennebula.sparkaiur.io/*` annotations. On Helm upgrade, operators may explicitly enable the optional `storageClassReconcile` pre-upgrade hook to recreate chart-owned classes only when the live spec still matches the previously applied chart hash; manual/user mutations are blocked by default.
 
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
-| `storageClassReconcile.enabled` | Enable the pre-upgrade StorageClass fingerprint/recreate hook when `storageClasses[]` is non-empty. | `true` | No |
+| `storageClassReconcile.enabled` | Enable the pre-upgrade StorageClass fingerprint/recreate hook when `storageClasses[]` is non-empty. | `false` | No |
 | `storageClassReconcile.manualMutationPolicy` | Policy when a chart-owned StorageClass was manually changed; `fail` or `skip`. | `fail` | No |
 | `storageClassReconcile.adoptUnannotated` | Adopt unannotated legacy StorageClasses only when their live spec exactly matches the desired chart spec. | `true` | No |
 | `storageClassReconcile.image.repository` | Override image repository for the reconcile hook. Empty falls back to `image.repository`. | `""` | No |

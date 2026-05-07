@@ -1,5 +1,5 @@
 {{- $storageClassReconcile := (get .Values "storageClassReconcile") | default dict -}}
-{{- $storageClassReconcileEnabled := (get $storageClassReconcile "enabled") | default true -}}
+{{- $storageClassReconcileEnabled := (get $storageClassReconcile "enabled") | default false -}}
 {{- if and $storageClassReconcileEnabled .Values.storageClasses }}
 {{- $desired := list -}}
 {{- range .Values.storageClasses }}

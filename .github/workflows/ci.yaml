@@ -48,3 +48,6 @@ jobs:
 
       - name: Render chart with CephFS dynamic example
         run: helm template opennebula-csi helm/opennebula-csi --values examples/helm-values-cephfs-dynamic.yaml
+
+      - name: Validate StorageClass reconcile render guard
+        run: bash hack/validate-storageclass-reconcile-render.sh
