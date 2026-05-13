@@ -694,23 +694,7 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 		if va.Spec.NodeName != node.Name || va.Spec.Source.PersistentVolumeName == nil {
 			continue
 		}
-		status.ActiveHotplugPressure++
-		pv, ok := pvByName[*va.Spec.Source.PersistentVolumeName]
-		if !ok || pv.Spec.CSI == nil {
-			continue
-		}
-		status.Storage.AttachedVolumeCount++
-		status.Storage.AttachedVolumeIDs = append(status.Storage.AttachedVolumeIDs, pv.Spec.CSI.VolumeHandle)
-		diskID := persistentDiskIDFromVM(vmInfo, pv.Spec.CSI.VolumeHandle)
-		summary := inventoryv1alpha1.AttachedDiskSummary{
-			VolumeHandle:     pv.Spec.CSI.VolumeHandle,
-			PersistentDiskID: diskID,
-		}
-		if pv.Spec.ClaimRef != nil {
-			summary.ClaimNamespace = pv.Spec.ClaimRef.Namespace
-			summary.ClaimName = pv.Spec.ClaimRef.Name
-		}
-		status.Storage.AttachedPersistentDisks = append(status.Storage.AttachedPersistentDisks, summary)
+		recordNodeVolumeAttachmentStatus(&status, va, pvByName, vmInfo)
 	}
 	sort.Strings(status.Storage.AttachedVolumeIDs)
 	status.AttachedVolumeHandlesDisplay = attachedVolumeHandlesDisplay(status.Storage.AttachedVolumeIDs)
@@ -742,6 +726,31 @@ func (s *Syncer) buildNodeStatus(ctx context.Context, item inventoryv1alpha1.Ope
 		newCondition("HotplugPressureAcceptable", boolCondition(status.ActiveHotplugPressure < 8), boolReason(status.ActiveHotplugPressure < 8, "HotplugPressureNormal", "HotplugPressureHigh"), fmt.Sprintf("Node has %d active CSI attachment(s)", status.ActiveHotplugPressure)),
 	}
 	return status
+}
+
+func recordNodeVolumeAttachmentStatus(status *inventoryv1alpha1.OpenNebulaNodeStatus, va storagev1.VolumeAttachment, pvByName map[string]corev1.PersistentVolume, vmInfo *vmSchema.VM) {
+	if status == nil {
+		return
+	}
+	status.ActiveHotplugPressure++
+	if !va.Status.Attached || va.Spec.Source.PersistentVolumeName == nil {
+		return
+	}
+	pv, ok := pvByName[*va.Spec.Source.PersistentVolumeName]
+	if !ok || pv.Spec.CSI == nil {
+		return
+	}
+	status.Storage.AttachedVolumeCount++
+	status.Storage.AttachedVolumeIDs = append(status.Storage.AttachedVolumeIDs, pv.Spec.CSI.VolumeHandle)
+	summary := inventoryv1alpha1.AttachedDiskSummary{
+		VolumeHandle:     pv.Spec.CSI.VolumeHandle,
+		PersistentDiskID: persistentDiskIDFromVM(vmInfo, pv.Spec.CSI.VolumeHandle),
+	}
+	if pv.Spec.ClaimRef != nil {
+		summary.ClaimNamespace = pv.Spec.ClaimRef.Namespace
+		summary.ClaimName = pv.Spec.ClaimRef.Name
+	}
+	status.Storage.AttachedPersistentDisks = append(status.Storage.AttachedPersistentDisks, summary)
 }
 
 func (s *Syncer) syncNodeTopologyLabel(ctx context.Context, node corev1.Node, systemDSID int) error {
@@ -2469,6 +2478,9 @@ func latestHistoryDatastoreIDForInventory(vmInfo *vmSchema.VM) (int, error) {
 }
 
 func persistentDiskIDFromVM(vmInfo *vmSchema.VM, volumeHandle string) int {
+	if vmInfo == nil {
+		return 0
+	}
 	for _, disk := range vmInfo.Template.GetDisks() {
 		imageID, err := disk.GetI(shared.ImageID)
 		if err != nil {

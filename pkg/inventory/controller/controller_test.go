@@ -669,6 +669,72 @@ func TestNodeDisplayState(t *testing.T) {
 	}
 }
 
+func TestRecordNodeVolumeAttachmentStatusSeparatesPressureFromAttachedStorage(t *testing.T) {
+	pvAttached := "pv-attached"
+	pvFailed := "pv-failed"
+	pvByName := map[string]corev1.PersistentVolume{
+		pvAttached: {
+			Spec: corev1.PersistentVolumeSpec{
+				ClaimRef: &corev1.ObjectReference{Namespace: "monitoring", Name: "prometheus-db"},
+				PersistentVolumeSource: corev1.PersistentVolumeSource{
+					CSI: &corev1.CSIPersistentVolumeSource{
+						VolumeHandle: "pvc-attached",
+					},
+				},
+			},
+		},
+		pvFailed: {
+			Spec: corev1.PersistentVolumeSpec{
+				ClaimRef: &corev1.ObjectReference{Namespace: "monitoring", Name: "prometheus-pending-db"},
+				PersistentVolumeSource: corev1.PersistentVolumeSource{
+					CSI: &corev1.CSIPersistentVolumeSource{
+						VolumeHandle: "pvc-failed",
+					},
+				},
+			},
+		},
+	}
+
+	status := inventoryv1alpha1.OpenNebulaNodeStatus{}
+	recordNodeVolumeAttachmentStatus(&status, storagev1.VolumeAttachment{
+		Spec: storagev1.VolumeAttachmentSpec{
+			Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pvFailed},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: false},
+	}, pvByName, nil)
+
+	if status.ActiveHotplugPressure != 1 {
+		t.Fatalf("expected failed VolumeAttachment to count as hotplug pressure, got %d", status.ActiveHotplugPressure)
+	}
+	if status.Storage.AttachedVolumeCount != 0 || len(status.Storage.AttachedVolumeIDs) != 0 || len(status.Storage.AttachedPersistentDisks) != 0 {
+		t.Fatalf("expected failed VolumeAttachment not to report attached storage, got storage=%#v", status.Storage)
+	}
+
+	recordNodeVolumeAttachmentStatus(&status, storagev1.VolumeAttachment{
+		Spec: storagev1.VolumeAttachmentSpec{
+			Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pvAttached},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: true},
+	}, pvByName, nil)
+
+	if status.ActiveHotplugPressure != 2 {
+		t.Fatalf("expected both VolumeAttachments to count as hotplug pressure, got %d", status.ActiveHotplugPressure)
+	}
+	if status.Storage.AttachedVolumeCount != 1 {
+		t.Fatalf("expected only attached VolumeAttachment to count as attached storage, got %d", status.Storage.AttachedVolumeCount)
+	}
+	if len(status.Storage.AttachedVolumeIDs) != 1 || status.Storage.AttachedVolumeIDs[0] != "pvc-attached" {
+		t.Fatalf("unexpected attached volume IDs: %#v", status.Storage.AttachedVolumeIDs)
+	}
+	if len(status.Storage.AttachedPersistentDisks) != 1 {
+		t.Fatalf("expected one attached disk summary, got %#v", status.Storage.AttachedPersistentDisks)
+	}
+	summary := status.Storage.AttachedPersistentDisks[0]
+	if summary.VolumeHandle != "pvc-attached" || summary.ClaimNamespace != "monitoring" || summary.ClaimName != "prometheus-db" {
+		t.Fatalf("unexpected attached disk summary: %#v", summary)
+	}
+}
+
 func TestSelectedDatastoreFromPVReadsProvisionedAnnotations(t *testing.T) {
 	pv := corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
