@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"reflect"
@@ -81,7 +82,7 @@ func (ns *NodeServer) handleSharedFilesystemStage(req *csi.NodeStageVolumeReques
 
 	notMountPoint, err := ns.mounter.Interface.IsLikelyNotMountPoint(stagingTargetPath)
 	if err == nil && !notMountPoint {
-		if staleErr := detectStaleSharedFilesystemMount(stagingTargetPath); staleErr == nil {
+		if staleErr := detectSharedFilesystemMount(stagingTargetPath); staleErr == nil {
 			ns.recordSharedFilesystemSession(session)
 			return &csi.NodeStageVolumeResponse{}, nil
 		} else {
@@ -125,7 +126,7 @@ func (ns *NodeServer) handleSharedFilesystemUnstage(req *csi.NodeUnstageVolumeRe
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
-func (ns *NodeServer) handleSharedFilesystemPublish(req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+func (ns *NodeServer) handleSharedFilesystemPublish(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 	release := ns.acquireSharedFilesystemOperationLock(req.GetVolumeId())
 	defer release()
 
@@ -143,6 +144,13 @@ func (ns *NodeServer) handleSharedFilesystemPublish(req *csi.NodePublishVolumeRe
 		return nil, status.Error(codes.InvalidArgument, "staging target path and target path are required")
 	}
 
+	if err := ns.ensureSharedFilesystemStageReady(ctx, req); err != nil {
+		klog.V(0).ErrorS(err, "Shared filesystem staging target is not ready",
+			"method", "handleSharedFilesystemPublish", "volumeID", req.GetVolumeId(),
+			"stagingTargetPath", stagingTargetPath, "targetPath", targetPath)
+		return nil, err
+	}
+
 	target := sharedFilesystemTargetFromPublishRequest(req)
 	if err := ns.publishSharedFilesystemTarget(stagingTargetPath, target); err != nil {
 		klog.V(0).ErrorS(err, "Failed to publish shared filesystem volume",
@@ -155,6 +163,58 @@ func (ns *NodeServer) handleSharedFilesystemPublish(req *csi.NodePublishVolumeRe
 	ns.updateSharedFilesystemPublishedTarget(req.GetVolumeId(), target)
 
 	return &csi.NodePublishVolumeResponse{}, nil
+}
+
+func (ns *NodeServer) ensureSharedFilesystemStageReady(ctx context.Context, req *csi.NodePublishVolumeRequest) error {
+	volumeID := strings.TrimSpace(req.GetVolumeId())
+	stagingTargetPath := strings.TrimSpace(req.GetStagingTargetPath())
+	if volumeID == "" || stagingTargetPath == "" {
+		return status.Error(codes.InvalidArgument, "volume ID and staging target path are required")
+	}
+
+	if _, err := ns.ensureSharedFilesystemSessionForPublish(req); err != nil {
+		klog.V(2).ErrorS(err, "Failed to seed shared filesystem session before publish",
+			"volumeID", volumeID, "stagingTargetPath", stagingTargetPath)
+	}
+
+	stageCheck, err := ns.checkMountPoint("", stagingTargetPath, nil)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to inspect shared filesystem staging target %s: %v", stagingTargetPath, err)
+	}
+	if !stageCheck.targetIsMountPoint {
+		if ns.sharedFilesystemRecovery != nil {
+			ns.sharedFilesystemRecovery.enqueue(volumeID, "publish_stage_missing")
+		}
+		return status.Errorf(codes.FailedPrecondition, "shared filesystem staging target %s is not mounted; restage the volume before publishing", stagingTargetPath)
+	}
+	if err := detectSharedFilesystemMount(stagingTargetPath); err == nil {
+		return nil
+	} else if !isDisconnectedSharedFilesystemError(err) {
+		return status.Errorf(codes.Internal, "failed to validate shared filesystem staging target %s: %v", stagingTargetPath, err)
+	} else {
+		if ns.Driver != nil && ns.Driver.metrics != nil {
+			ns.Driver.metrics.RecordCephFSSubvolume("stale_mount_detected", "failure")
+		}
+		if ns.Driver != nil && ns.Driver.featureGates.CephFSSelfHealing && ns.sharedFilesystemRecovery != nil {
+			if recoverErr := ns.sharedFilesystemRecovery.recoverVolume(ctx, volumeID); recoverErr != nil {
+				ns.sharedFilesystemRecovery.enqueue(volumeID, "publish_stage_stale")
+				return status.Errorf(codes.Unavailable, "stale shared filesystem staging target %s detected and recovery failed: %v", stagingTargetPath, recoverErr)
+			}
+			stageCheck, checkErr := ns.checkMountPoint("", stagingTargetPath, nil)
+			if checkErr != nil {
+				return status.Errorf(codes.Internal, "failed to inspect recovered shared filesystem staging target %s: %v", stagingTargetPath, checkErr)
+			}
+			if stageCheck.targetIsMountPoint {
+				if staleErr := detectSharedFilesystemMount(stagingTargetPath); staleErr == nil {
+					return nil
+				}
+			}
+		}
+		if ns.sharedFilesystemRecovery != nil {
+			ns.sharedFilesystemRecovery.enqueue(volumeID, "publish_stage_stale")
+		}
+		return status.Errorf(codes.Unavailable, "stale shared filesystem staging target %s detected; recovery queued and publish should be retried", stagingTargetPath)
+	}
 }
 
 func mountCleanup(stagingTargetPath string, ns *NodeServer) error {
@@ -344,6 +404,8 @@ func detectStaleSharedFilesystemMount(stagingTargetPath string) error {
 	}
 	return nil
 }
+
+var detectSharedFilesystemMount = detectStaleSharedFilesystemMount
 
 func isDisconnectedSharedFilesystemError(err error) bool {
 	if err == nil {

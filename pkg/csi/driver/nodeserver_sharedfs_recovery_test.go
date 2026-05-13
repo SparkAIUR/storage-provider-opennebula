@@ -12,6 +12,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	mount "k8s.io/mount-utils"
 )
 
@@ -125,6 +128,100 @@ func TestSharedFilesystemRecoveryRebindsMissingTarget(t *testing.T) {
 	check, err := ns.checkMountPoint(stagePath, targetPath, nil)
 	require.NoError(t, err)
 	assert.True(t, check.targetIsMountPoint)
+}
+
+func TestSharedFilesystemPublishRejectsStaleStageWithoutBinding(t *testing.T) {
+	withSharedFilesystemTestPaths(t)
+
+	baseDir, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	stagePath := filepath.Join(baseDir, "globalmount")
+	targetPath := filepath.Join(baseDir, "target")
+	volumeID := "cephfs:test-stale-stage-publish"
+	ns := getTestNodeServer(nil)
+	ns.Driver.featureGates.CephFSSelfHealing = false
+
+	_, err = ns.NodeStageVolume(context.Background(), newSharedFilesystemStageRequest(volumeID, stagePath, "fuse"))
+	require.NoError(t, err)
+
+	originalDetect := detectSharedFilesystemMount
+	detectSharedFilesystemMount = func(path string) error {
+		if path == stagePath {
+			return errors.New("transport endpoint is not connected")
+		}
+		return originalDetect(path)
+	}
+	t.Cleanup(func() {
+		detectSharedFilesystemMount = originalDetect
+	})
+
+	resp, err := ns.NodePublishVolume(context.Background(), newSharedFilesystemPublishRequest(volumeID, stagePath, targetPath))
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Contains(t, err.Error(), "stale shared filesystem staging target")
+
+	check, checkErr := ns.checkMountPoint(stagePath, targetPath, nil)
+	require.NoError(t, checkErr)
+	assert.False(t, check.targetIsMountPoint)
+}
+
+func TestSharedFilesystemPublishRehydratesMissingSession(t *testing.T) {
+	withSharedFilesystemTestPaths(t)
+
+	baseDir, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	stagePath := filepath.Join(baseDir, "globalmount")
+	targetPath := filepath.Join(baseDir, "target")
+	volumeID := "cephfs:test-publish-session-rehydrate"
+	ns := getTestNodeServer(nil)
+
+	stageReq := newSharedFilesystemStageRequest(volumeID, stagePath, "fuse")
+	_, err = ns.NodeStageVolume(context.Background(), stageReq)
+	require.NoError(t, err)
+	ns.deleteSharedFilesystemSession(volumeID)
+
+	publishReq := newSharedFilesystemPublishRequest(volumeID, stagePath, targetPath)
+	for key, value := range stageReq.GetPublishContext() {
+		publishReq.PublishContext[key] = value
+	}
+
+	_, err = ns.NodePublishVolume(context.Background(), publishReq)
+	require.NoError(t, err)
+
+	session, exists, err := ns.sharedFilesystemRecovery.store.Load(volumeID)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.Equal(t, "csi-node", session.UserID)
+	require.Len(t, session.PublishedTargets, 1)
+	assert.Equal(t, targetPath, session.PublishedTargets[0].TargetPath)
+}
+
+func TestSharedFilesystemGarbageCollectSkipsWhenPodLookupUnknown(t *testing.T) {
+	withSharedFilesystemTestPaths(t)
+
+	ns := getTestNodeServer(nil)
+	client := fake.NewSimpleClientset()
+	client.Fake.PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("api unavailable")
+	})
+	ns.Driver.kubeRuntime = &KubeRuntime{client: client, enabled: true}
+
+	volumeID := "cephfs:test-gc-pod-lookup-unknown"
+	session := sharedFilesystemSession{
+		VolumeID:          volumeID,
+		StagingTargetPath: filepath.Join(t.TempDir(), "globalmount"),
+		PublishedTargets: []sharedFilesystemPublishedTarget{
+			{TargetPath: "/var/lib/kubelet/pods/test-pod-uid/volumes/kubernetes.io~csi/pvc-test/mount"},
+		},
+	}
+	ns.recordSharedFilesystemSession(session)
+
+	collected := ns.sharedFilesystemRecovery.garbageCollectOrphanedSession(context.Background(), session)
+	assert.False(t, collected)
+
+	_, exists, err := ns.sharedFilesystemRecovery.store.Load(volumeID)
+	require.NoError(t, err)
+	assert.True(t, exists)
 }
 
 func TestMountSharedFilesystemSessionRecreatesMissingStagePath(t *testing.T) {

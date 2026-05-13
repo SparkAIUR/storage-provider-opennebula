@@ -370,7 +370,7 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	}
 
 	if isSharedFilesystemRequest(volumeID, req.GetPublishContext()) {
-		return ns.handleSharedFilesystemPublish(req)
+		return ns.handleSharedFilesystemPublish(ctx, req)
 	}
 
 	volumeContext := req.GetPublishContext()

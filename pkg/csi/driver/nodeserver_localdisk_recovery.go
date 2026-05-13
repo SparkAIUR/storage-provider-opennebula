@@ -812,11 +812,20 @@ func (ns *NodeServer) recordLocalDiskPVCWarning(session localDiskSession, reason
 }
 
 func (ns *NodeServer) podUIDExists(ctx context.Context, uid string) bool {
+	exists, known := ns.podUIDExistsKnown(ctx, uid)
+	return known && exists
+}
+
+func (ns *NodeServer) podUIDExistsKnown(ctx context.Context, uid string) (bool, bool) {
 	if ns == nil || ns.Driver == nil || ns.Driver.kubeRuntime == nil {
-		return false
+		return false, false
 	}
 	exists, err := ns.Driver.kubeRuntime.PodUIDExists(ctx, uid)
-	return err == nil && exists
+	if err != nil {
+		klog.V(2).InfoS("Failed to confirm pod UID liveness", "podUID", uid, "err", err)
+		return false, false
+	}
+	return exists, true
 }
 
 func (ns *NodeServer) mountPointForPath(path string) (mount.MountPoint, bool, error) {

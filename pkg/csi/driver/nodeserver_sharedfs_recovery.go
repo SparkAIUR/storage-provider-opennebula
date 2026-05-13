@@ -290,6 +290,8 @@ func (m *sharedFilesystemRecoveryManager) recoverQueuedVolume(ctx context.Contex
 }
 
 func (m *sharedFilesystemRecoveryManager) enqueueUnhealthySessions(ctx context.Context, reason string) {
+	m.seedSessionsFromMounts(ctx)
+
 	sessions, err := m.store.List()
 	if err != nil {
 		klog.ErrorS(err, "Failed to list shared filesystem sessions for recovery")
@@ -310,7 +312,6 @@ func (m *sharedFilesystemRecoveryManager) enqueueUnhealthySessions(ctx context.C
 		}
 	}
 
-	m.seedSessionsFromMounts(ctx)
 }
 
 func (m *sharedFilesystemRecoveryManager) garbageCollectOrphanedSession(ctx context.Context, session sharedFilesystemSession) bool {
@@ -324,7 +325,13 @@ func (m *sharedFilesystemRecoveryManager) garbageCollectOrphanedSession(ctx cont
 			allPodsGone = false
 			break
 		}
-		if m.ns.podUIDExists(ctx, podUID) {
+		exists, known := m.ns.podUIDExistsKnown(ctx, podUID)
+		if !known {
+			klog.V(2).InfoS("Skipping CephFS session GC because pod liveness could not be confirmed", "volumeID", session.VolumeID, "podUID", podUID)
+			allPodsGone = false
+			break
+		}
+		if exists {
 			allPodsGone = false
 			break
 		}
@@ -334,6 +341,9 @@ func (m *sharedFilesystemRecoveryManager) garbageCollectOrphanedSession(ctx cont
 	}
 	if m.ns.Driver != nil && m.ns.Driver.kubeRuntime != nil {
 		if _, err := m.ns.Driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, session.VolumeID); err == nil {
+			return false
+		} else if !strings.Contains(strings.ToLower(err.Error()), "persistent volume for handle") {
+			klog.V(2).InfoS("Skipping CephFS session GC because volume runtime context could not be confirmed", "volumeID", session.VolumeID, "err", err)
 			return false
 		}
 	}
@@ -365,6 +375,13 @@ func (m *sharedFilesystemRecoveryManager) recoverVolume(ctx context.Context, vol
 	session, exists, err := m.store.Load(volumeID)
 	if err != nil {
 		return err
+	}
+	if !exists {
+		m.seedSessionsFromMounts(ctx)
+		session, exists, err = m.store.Load(volumeID)
+		if err != nil {
+			return err
+		}
 	}
 	if !exists {
 		return nil
@@ -496,7 +513,7 @@ func (ns *NodeServer) evaluateSharedFilesystemSession(session sharedFilesystemSe
 		health.Reason = "stage_missing"
 		return health, nil
 	}
-	if err := detectStaleSharedFilesystemMount(session.StagingTargetPath); err != nil {
+	if err := detectSharedFilesystemMount(session.StagingTargetPath); err != nil {
 		health.RecoverStage = true
 		health.Reason = "stage_stale"
 		return health, nil
@@ -623,6 +640,91 @@ func (ns *NodeServer) deleteSharedFilesystemSession(volumeID string) {
 	}
 }
 
+func (ns *NodeServer) ensureSharedFilesystemSessionForPublish(req *csi.NodePublishVolumeRequest) (sharedFilesystemSession, error) {
+	if ns == nil || ns.sharedFilesystemRecovery == nil || req == nil {
+		return sharedFilesystemSession{}, nil
+	}
+	volumeID := strings.TrimSpace(req.GetVolumeId())
+	if volumeID == "" {
+		return sharedFilesystemSession{}, nil
+	}
+
+	session, exists, err := ns.sharedFilesystemRecovery.store.Load(volumeID)
+	if err != nil {
+		return sharedFilesystemSession{}, err
+	}
+	if exists {
+		return session, nil
+	}
+
+	session, ok, err := ns.sharedFilesystemSessionFromPublishRequest(req)
+	if err != nil || !ok {
+		return session, err
+	}
+	if err := ns.sharedFilesystemRecovery.store.Save(session); err != nil {
+		return sharedFilesystemSession{}, err
+	}
+	return session, nil
+}
+
+func (ns *NodeServer) sharedFilesystemSessionFromPublishRequest(req *csi.NodePublishVolumeRequest) (sharedFilesystemSession, bool, error) {
+	if req == nil {
+		return sharedFilesystemSession{}, false, nil
+	}
+	stagingTargetPath := strings.TrimSpace(req.GetStagingTargetPath())
+	publishContext := req.GetPublishContext()
+	monitors := splitCSV(publishContext[sharedPublishContextCephFSMonitors])
+	fsName := strings.TrimSpace(publishContext[sharedPublishContextCephFSFSName])
+	subpath := strings.TrimSpace(publishContext[sharedPublishContextCephFSSubpath])
+	if stagingTargetPath == "" || len(monitors) == 0 || fsName == "" || subpath == "" {
+		return sharedFilesystemSession{}, false, nil
+	}
+
+	mounterName, err := normalizeSharedFilesystemMounter(firstNonEmpty(
+		publishContext[sharedPublishContextCephFSMounter],
+		req.GetVolumeContext()[storageClassParamCephFSMounter],
+	))
+	if err != nil {
+		return sharedFilesystemSession{}, false, err
+	}
+	if mountPoint, mounted, err := ns.mountPointForPath(stagingTargetPath); err == nil && mounted {
+		mounterName = sharedFilesystemMounterFromMountType(mountPoint.Type)
+	}
+
+	keyringPath := sharedCephFSKeyringPath(stagingTargetPath)
+	userID := sharedFilesystemUserIDFromKeyring(keyringPath)
+	if userID == "" {
+		return sharedFilesystemSession{}, false, nil
+	}
+
+	return sharedFilesystemSession{
+		VolumeID:          req.GetVolumeId(),
+		Mounter:           mounterName,
+		UserID:            userID,
+		StagingTargetPath: stagingTargetPath,
+		Monitors:          monitors,
+		FSName:            fsName,
+		Subpath:           subpath,
+		StageMountOptions: sharedFilesystemStageMountOptionsFromPublishRequest(req),
+		KeyringPath:       keyringPath,
+		SecretFilePath:    sharedCephFSSecretPath(stagingTargetPath),
+	}, true, nil
+}
+
+func sharedFilesystemStageMountOptionsFromPublishRequest(req *csi.NodePublishVolumeRequest) []string {
+	if req == nil {
+		return nil
+	}
+	options := splitCSV(req.GetPublishContext()[sharedPublishContextCephFSMounts])
+	if capability := req.GetVolumeCapability(); capability != nil && capability.GetMount() != nil {
+		options = append(options, capability.GetMount().GetMountFlags()...)
+	}
+	if strings.EqualFold(strings.TrimSpace(req.GetPublishContext()[sharedPublishContextCephFSReadonly]), "true") {
+		options = append(options, "ro")
+	}
+	return uniqueStrings(options)
+}
+
 func (ns *NodeServer) updateSharedFilesystemPublishedTarget(volumeID string, target sharedFilesystemPublishedTarget) {
 	if ns == nil || ns.sharedFilesystemRecovery == nil || strings.TrimSpace(volumeID) == "" {
 		return
@@ -684,7 +786,11 @@ func (ns *NodeServer) cleanupOrphanedSharedFilesystemTargetOnUnpublish(ctx conte
 		return false
 	}
 	podUID := podUIDFromKubeletPath(targetPath)
-	if podUID == "" || ns.podUIDExists(ctx, podUID) {
+	if podUID == "" {
+		return false
+	}
+	exists, known := ns.podUIDExistsKnown(ctx, podUID)
+	if !known || exists {
 		return false
 	}
 	if mountPoint, mounted, err := ns.mountPointForPath(targetPath); err == nil && mounted {
