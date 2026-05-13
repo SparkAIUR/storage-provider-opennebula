@@ -773,35 +773,37 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	immutableVolume := req.VolumeCapability.AccessMode.Mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
 
 	if opennebula.IsSharedFilesystemVolumeID(req.VolumeId) {
+		recordCephFSPublish := func(outcome string) {
+			elapsed := time.Since(started)
+			s.driver.metrics.RecordOperation("controller_publish_volume", "cephfs", outcome, elapsed)
+			s.driver.metrics.RecordControllerPublishDuration("cephfs", outcome, elapsed)
+		}
+
 		if s.sharedFilesystemProvider == nil {
+			recordCephFSPublish("failed_precondition")
 			return nil, status.Error(codes.FailedPrecondition, "shared filesystem provider is not configured")
 		}
 
-		nodeID, err := s.volumeProvider.NodeExists(ctx, req.NodeId)
-		if err != nil || nodeID == -1 {
-			s.driver.metrics.RecordOperation("controller_publish_volume", "cephfs", "not_found", time.Since(started))
-			klog.V(0).ErrorS(err, "Node does not exist", "method", "ControllerPublishVolume", "nodeID", req.NodeId)
-			return nil, status.Error(codes.NotFound, "node not found")
-		}
+		klog.V(1).InfoS("Publishing shared filesystem volume through node-agnostic controller path",
+			"method", "ControllerPublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
 
 		publishContext, err := s.sharedFilesystemProvider.PublishSharedVolume(ctx, req.VolumeId, req.GetReadonly() || immutableVolume)
 		if err != nil {
 			switch {
 			case opennebula.IsDatastoreConfigError(err):
-				s.driver.metrics.RecordOperation("controller_publish_volume", "cephfs", "failed_precondition", time.Since(started))
+				recordCephFSPublish("failed_precondition")
 				return nil, status.Error(codes.FailedPrecondition, err.Error())
 			case opennebula.IsDatastoreCapacityError(err):
-				s.driver.metrics.RecordOperation("controller_publish_volume", "cephfs", "resource_exhausted", time.Since(started))
+				recordCephFSPublish("resource_exhausted")
 				return nil, status.Error(codes.ResourceExhausted, err.Error())
 			}
-			s.driver.metrics.RecordOperation("controller_publish_volume", "cephfs", "internal", time.Since(started))
+			recordCephFSPublish("internal")
 			klog.V(0).ErrorS(err, "Failed to publish shared filesystem volume",
 				"method", "ControllerPublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
 			return nil, status.Error(codes.Internal, "failed to publish volume")
 		}
 
-		s.driver.metrics.RecordOperation("controller_publish_volume", "cephfs", "success", time.Since(started))
-		_ = nodeID
+		recordCephFSPublish("success")
 		if requestedMounter := strings.TrimSpace(req.GetVolumeContext()[storageClassParamCephFSMounter]); requestedMounter != "" {
 			publishContext[sharedPublishContextCephFSMounter] = requestedMounter
 		}
@@ -1110,6 +1112,8 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	}
 
 	if opennebula.IsSharedFilesystemVolumeID(req.VolumeId) {
+		klog.V(1).InfoS("Skipping shared filesystem controller unpublish because volume is node-agnostic",
+			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 

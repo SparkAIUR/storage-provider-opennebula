@@ -44,8 +44,9 @@ import (
 )
 
 const (
-	volumeSize    = 10 * 1024 * 1024
-	datastoreSize = 100 * 1024 * 1024 * 1024
+	volumeSize                   = 10 * 1024 * 1024
+	datastoreSize                = 100 * 1024 * 1024 * 1024
+	sharedFilesystemTestVolumeID = "cephfs:eyJiYWNrZW5kIjoiY2VwaGZzIiwiZGF0YXN0b3JlSUQiOjMwMCwiZnNOYW1lIjoiY2VwaGZzLXByb2QiLCJtb2RlIjoiZHluYW1pYyIsInN1YnZvbHVtZUdyb3VwIjoiY3NpIiwic3VicGF0aCI6Ii9rdWJlcm5ldGVzL2R5bmFtaWMvb25lLWNzaS1kZW1vIiwic3Vidm9sdW1lTmFtZSI6Im9uZS1jc2ktZGVtbyJ9"
 )
 
 func getTestControllerServer(mockProvider *MockOpenNebulaVolumeProviderTestify) *ControllerServer {
@@ -1124,8 +1125,7 @@ func TestControllerPublishVolumeReturnsSharedFilesystemPublishContext(t *testing
 	sharedProvider := new(MockSharedFilesystemProviderTestify)
 	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local,cephfs")
 
-	mockProvider.On("NodeExists", mock.Anything, "test-node-id").Return(1, nil)
-	sharedProvider.On("PublishSharedVolume", mock.Anything, mock.Anything, false).Return(map[string]string{
+	sharedProvider.On("PublishSharedVolume", mock.Anything, sharedFilesystemTestVolumeID, false).Return(map[string]string{
 		"shareBackend":   "cephfs",
 		"cephfsMonitors": "mon1,mon2",
 		"cephfsFSName":   "cephfs-prod",
@@ -1133,8 +1133,89 @@ func TestControllerPublishVolumeReturnsSharedFilesystemPublishContext(t *testing
 		"cephfsReadonly": "false",
 	}, nil)
 
-	resp, err := cs.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
-		VolumeId: "cephfs:eyJiYWNrZW5kIjoiY2VwaGZzIiwiZGF0YXN0b3JlSUQiOjMwMCwiZnNOYW1lIjoiY2VwaGZzLXByb2QiLCJtb2RlIjoiZHluYW1pYyIsInN1YnZvbHVtZUdyb3VwIjoiY3NpIiwic3VicGF0aCI6Ii9rdWJlcm5ldGVzL2R5bmFtaWMvb25lLWNzaS1kZW1vIiwic3Vidm9sdW1lTmFtZSI6Im9uZS1jc2ktZGVtbyJ9",
+	resp, err := cs.ControllerPublishVolume(context.Background(), newSharedFilesystemControllerPublishReq())
+
+	assert.NoError(t, err)
+	assert.Equal(t, "cephfs", resp.GetPublishContext()["shareBackend"])
+	mockProvider.AssertNotCalled(t, "NodeExists", mock.Anything, "test-node-id")
+	mockProvider.AssertExpectations(t)
+	sharedProvider.AssertExpectations(t)
+}
+
+func TestControllerPublishVolumeAppliesSharedFilesystemMounterOverride(t *testing.T) {
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	sharedProvider := new(MockSharedFilesystemProviderTestify)
+	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local,cephfs")
+
+	sharedProvider.On("PublishSharedVolume", mock.Anything, sharedFilesystemTestVolumeID, false).Return(map[string]string{
+		"shareBackend":                    "cephfs",
+		sharedPublishContextCephFSMounter: "fuse",
+	}, nil)
+
+	req := newSharedFilesystemControllerPublishReq()
+	req.VolumeContext = map[string]string{storageClassParamCephFSMounter: "kernel"}
+
+	resp, err := cs.ControllerPublishVolume(context.Background(), req)
+
+	require.NoError(t, err)
+	assert.Equal(t, "kernel", resp.GetPublishContext()[sharedPublishContextCephFSMounter])
+	mockProvider.AssertNotCalled(t, "NodeExists", mock.Anything, "test-node-id")
+	mockProvider.AssertExpectations(t)
+	sharedProvider.AssertExpectations(t)
+}
+
+func TestControllerPublishVolumeMapsSharedFilesystemProviderErrors(t *testing.T) {
+	tcs := []struct {
+		name       string
+		publishErr error
+		code       codes.Code
+	}{
+		{name: "config", publishErr: opennebula.NewDatastoreConfigError("cephfs config invalid"), code: codes.FailedPrecondition},
+		{name: "capacity", publishErr: opennebula.NewDatastoreCapacityError("cephfs capacity exhausted"), code: codes.ResourceExhausted},
+		{name: "internal", publishErr: errors.New("cephfs publish failed"), code: codes.Internal},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+			sharedProvider := new(MockSharedFilesystemProviderTestify)
+			cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local,cephfs")
+
+			sharedProvider.On("PublishSharedVolume", mock.Anything, sharedFilesystemTestVolumeID, false).Return(nil, tc.publishErr)
+
+			_, err := cs.ControllerPublishVolume(context.Background(), newSharedFilesystemControllerPublishReq())
+
+			require.Error(t, err)
+			assert.Equal(t, tc.code, status.Code(err))
+			mockProvider.AssertNotCalled(t, "NodeExists", mock.Anything, "test-node-id")
+			mockProvider.AssertExpectations(t)
+			sharedProvider.AssertExpectations(t)
+		})
+	}
+}
+
+func TestControllerUnpublishVolumeSkipsSharedFilesystemNodeValidation(t *testing.T) {
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	sharedProvider := new(MockSharedFilesystemProviderTestify)
+	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local,cephfs")
+
+	resp, err := cs.ControllerUnpublishVolume(context.Background(), &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: sharedFilesystemTestVolumeID,
+		NodeId:   "test-node-id",
+	})
+
+	require.NoError(t, err)
+	assert.NotNil(t, resp)
+	mockProvider.AssertNotCalled(t, "VolumeExists", mock.Anything, sharedFilesystemTestVolumeID)
+	mockProvider.AssertNotCalled(t, "NodeExists", mock.Anything, "test-node-id")
+	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+	mockProvider.AssertExpectations(t)
+	sharedProvider.AssertExpectations(t)
+}
+
+func newSharedFilesystemControllerPublishReq() *csi.ControllerPublishVolumeRequest {
+	return &csi.ControllerPublishVolumeRequest{
+		VolumeId: sharedFilesystemTestVolumeID,
 		NodeId:   "test-node-id",
 		VolumeCapability: &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Mount{
@@ -1144,12 +1225,7 @@ func TestControllerPublishVolumeReturnsSharedFilesystemPublishContext(t *testing
 				Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
 			},
 		},
-	})
-
-	assert.NoError(t, err)
-	assert.Equal(t, "cephfs", resp.GetPublishContext()["shareBackend"])
-	mockProvider.AssertExpectations(t)
-	sharedProvider.AssertExpectations(t)
+	}
 }
 
 func TestDeleteVolumeRoutesSharedFilesystemVolumes(t *testing.T) {
@@ -1163,7 +1239,7 @@ func TestDeleteVolumeRoutesSharedFilesystemVolumes(t *testing.T) {
 	}).Return(nil)
 
 	resp, err := cs.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{
-		VolumeId: "cephfs:eyJiYWNrZW5kIjoiY2VwaGZzIiwiZGF0YXN0b3JlSUQiOjMwMCwiZnNOYW1lIjoiY2VwaGZzLXByb2QiLCJtb2RlIjoiZHluYW1pYyIsInN1YnZvbHVtZUdyb3VwIjoiY3NpIiwic3VicGF0aCI6Ii9rdWJlcm5ldGVzL2R5bmFtaWMvb25lLWNzaS1kZW1vIiwic3Vidm9sdW1lTmFtZSI6Im9uZS1jc2ktZGVtbyJ9",
+		VolumeId: sharedFilesystemTestVolumeID,
 		Secrets: map[string]string{
 			"adminID":  "csi-admin",
 			"adminKey": "super-secret",
