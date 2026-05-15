@@ -163,6 +163,13 @@ func (w *LastNodePreferenceWebhook) buildPatch(ctx context.Context, pod *corev1.
 			w.driver.metrics.RecordLastNodePreference("error", "node_lookup_failed")
 			return nil, warnings, err
 		}
+		if placement.Source == protectionSourceHistoricalOwnership {
+			if validation := nodeSchedulingValidation(node, pod, placement.TargetNode, "historical owner"); !validation.Valid() {
+				warnings = append(warnings, historicalOwnershipSchedulerWarning(validation))
+				w.driver.metrics.RecordLastNodePreference("skipped", softPlacementMetricReason(validation.Status))
+				return buildPodMutationPatch(pod, annotations, affinityChanged, ensureAffinity), warnings, nil
+			}
+		}
 		hostname := strings.TrimSpace(node.Labels[corev1.LabelHostname])
 		if hostname == "" {
 			hostname = placement.TargetNode

@@ -182,6 +182,15 @@ func (s *ControllerServer) localRWOProtectionDecision(ctx context.Context, volum
 	}
 
 	if inferredRequiredNode != "" {
+		if inferredSource == protectionSourceHistoricalOwnership && strings.TrimSpace(requestedNode) != "" && strings.TrimSpace(requestedNode) != strings.TrimSpace(inferredRequiredNode) && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
+			validation := s.driver.kubeRuntime.inspectNodeSchedulingReadiness(ctx, inferredRequiredNode, "historical owner")
+			if validation.SchedulerUnavailable() {
+				decision.PlacementDecision = placementDecisionIgnored
+				decision.Message = historicalOwnershipSchedulerWarning(validation)
+				decision.Warnings = append(decision.Warnings, decision.Message)
+				return decision, nil
+			}
+		}
 		decision.Protected = true
 		decision.RequiredNode = inferredRequiredNode
 		decision.Reason = inferredReason

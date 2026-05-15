@@ -35,6 +35,9 @@ const (
 	nodeCandidateValidationTopologyIncompatible    = "topology_incompatible"
 	nodeCandidateValidationInventoryLookupFailed   = "inventory_lookup_failed"
 	nodeCandidateValidationKubernetesLookupFailed  = "kubernetes_lookup_failed"
+	nodeCandidateValidationUnschedulableK8sNode    = "unschedulable_k8s_node"
+	nodeCandidateValidationNotReadyK8sNode         = "not_ready_k8s_node"
+	nodeCandidateValidationUntoleratedTaint        = "untolerated_taint"
 )
 
 type explicitNodePlacement struct {
@@ -60,6 +63,15 @@ type nodeCandidateValidation struct {
 
 func (v nodeCandidateValidation) Valid() bool {
 	return strings.TrimSpace(v.Status) == nodeCandidateValidationValid
+}
+
+func (v nodeCandidateValidation) SchedulerUnavailable() bool {
+	switch strings.TrimSpace(v.Status) {
+	case nodeCandidateValidationUnschedulableK8sNode, nodeCandidateValidationNotReadyK8sNode, nodeCandidateValidationUntoleratedTaint:
+		return true
+	default:
+		return false
+	}
 }
 
 func hasManualNodeTargetingAnnotations(runtimeCtx *VolumeRuntimeContext) bool {
@@ -417,6 +429,120 @@ func (r *KubeRuntime) inspectNodeCandidate(ctx context.Context, runtimeCtx *Volu
 		return validation
 	}
 	return validation
+}
+
+func (r *KubeRuntime) inspectNodeSchedulingReadiness(ctx context.Context, nodeName, targetKind string) nodeCandidateValidation {
+	validation := nodeCandidateValidation{
+		Node:   strings.TrimSpace(nodeName),
+		Status: nodeCandidateValidationValid,
+	}
+	if r == nil || !r.enabled {
+		validation.Status = nodeCandidateValidationKubernetesLookupFailed
+		validation.Message = "kubernetes runtime is not enabled"
+		return validation
+	}
+	if validation.Node == "" {
+		validation.Status = nodeCandidateValidationMissingKubernetesNode
+		validation.Message = fmt.Sprintf("%s is empty", targetKind)
+		return validation
+	}
+	node, err := r.GetNode(ctx, validation.Node)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			validation.Status = nodeCandidateValidationMissingKubernetesNode
+			validation.Message = fmt.Sprintf("%s %s does not exist in Kubernetes", targetKind, validation.Node)
+			return validation
+		}
+		validation.Status = nodeCandidateValidationKubernetesLookupFailed
+		validation.Message = fmt.Sprintf("failed to look up %s %s in Kubernetes: %v", targetKind, validation.Node, err)
+		return validation
+	}
+	return nodeSchedulingValidation(node, nil, validation.Node, targetKind)
+}
+
+func nodeSchedulingValidation(node *corev1.Node, pod *corev1.Pod, nodeName, targetKind string) nodeCandidateValidation {
+	validation := nodeCandidateValidation{
+		Node:   strings.TrimSpace(nodeName),
+		Status: nodeCandidateValidationValid,
+	}
+	if node != nil {
+		if validation.Node == "" {
+			validation.Node = strings.TrimSpace(node.Name)
+		}
+		validation.Hostname = strings.TrimSpace(node.Labels[corev1.LabelHostname])
+	}
+	if validation.Node == "" {
+		validation.Status = nodeCandidateValidationMissingKubernetesNode
+		validation.Message = fmt.Sprintf("%s is empty", targetKind)
+		return validation
+	}
+	if node == nil {
+		validation.Status = nodeCandidateValidationMissingKubernetesNode
+		validation.Message = fmt.Sprintf("%s %s does not exist in Kubernetes", targetKind, validation.Node)
+		return validation
+	}
+	if validation.Hostname == "" {
+		validation.Hostname = validation.Node
+	}
+	if node.Spec.Unschedulable {
+		validation.Status = nodeCandidateValidationUnschedulableK8sNode
+		validation.Message = fmt.Sprintf("%s %s is marked unschedulable", targetKind, validation.Node)
+		return validation
+	}
+	if status, reason := nodeReadyConditionStatus(node); status != corev1.ConditionTrue {
+		validation.Status = nodeCandidateValidationNotReadyK8sNode
+		if strings.TrimSpace(reason) != "" {
+			validation.Message = fmt.Sprintf("%s %s is not Ready (%s: %s)", targetKind, validation.Node, status, reason)
+		} else {
+			validation.Message = fmt.Sprintf("%s %s is not Ready (%s)", targetKind, validation.Node, status)
+		}
+		return validation
+	}
+	if pod != nil {
+		for _, taint := range node.Spec.Taints {
+			if taint.Effect != corev1.TaintEffectNoSchedule && taint.Effect != corev1.TaintEffectNoExecute {
+				continue
+			}
+			if podToleratesTaint(pod, taint) {
+				continue
+			}
+			validation.Status = nodeCandidateValidationUntoleratedTaint
+			validation.Message = fmt.Sprintf("%s %s has untolerated taint %s=%s:%s", targetKind, validation.Node, taint.Key, taint.Value, taint.Effect)
+			return validation
+		}
+	}
+	return validation
+}
+
+func nodeReadyConditionStatus(node *corev1.Node) (corev1.ConditionStatus, string) {
+	if node == nil {
+		return corev1.ConditionUnknown, "node missing"
+	}
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady {
+			return condition.Status, firstNonEmpty(condition.Reason, condition.Message)
+		}
+	}
+	return corev1.ConditionUnknown, "Ready condition missing"
+}
+
+func podToleratesTaint(pod *corev1.Pod, taint corev1.Taint) bool {
+	if pod == nil {
+		return false
+	}
+	for _, toleration := range pod.Spec.Tolerations {
+		if toleration.ToleratesTaint(&taint) {
+			return true
+		}
+	}
+	return false
+}
+
+func historicalOwnershipSchedulerWarning(validation nodeCandidateValidation) string {
+	if strings.TrimSpace(validation.Message) == "" {
+		return fmt.Sprintf("historical ownership required-node was ignored: %s", strings.TrimSpace(validation.Status))
+	}
+	return fmt.Sprintf("historical ownership required-node was ignored: %s", validation.Message)
 }
 
 func softPlacementWarning(source string, validation nodeCandidateValidation) string {

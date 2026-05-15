@@ -210,6 +210,24 @@ func TestLocalRWOProtectionDecisionSkipsTopologyIncompatibleHistoricalLastAttach
 	assert.Empty(t, decision.Warnings)
 }
 
+func TestLocalRWOProtectionDecisionIgnoresHistoricalOwnerWhenUnschedulableForCrossNodePublish(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-cordoned-last", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv.Annotations[annotationLastAttachedNode] = "node-old"
+	pvc.Spec.VolumeName = pv.Name
+	nodeOld := newReadyNode("node-old", true)
+	nodeOld.Spec.Unschedulable = true
+	nodeNew := newReadyNode("node-new", true)
+	driver := newStickyTestDriver(t, pv, pvc, nodeOld, nodeNew)
+
+	decision, err := localRWOProtectionDecisionForDriver(context.Background(), driver, "vol-cordoned-last", "node-new")
+	require.NoError(t, err)
+	assert.False(t, decision.Protected)
+	assert.Empty(t, decision.RequiredNode)
+	assert.Equal(t, placementDecisionIgnored, decision.PlacementDecision)
+	require.NotEmpty(t, decision.Warnings)
+	assert.Contains(t, decision.Warnings[len(decision.Warnings)-1], "historical ownership required-node was ignored")
+}
+
 func TestLocalRWOProtectionDecisionWarnsOnInvalidExplicitPreferredNode(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-invalid-preferred", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 	pvc.Spec.VolumeName = pv.Name
