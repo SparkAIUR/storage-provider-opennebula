@@ -163,7 +163,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 		if pv == nil || pv.Spec.CSI == nil {
 			continue
 		}
-		if r.skipVolume(ctx, volumeHandle) {
+		if r.skipDiskAttachmentReconcile(ctx, volumeHandle, pv) {
 			continue
 		}
 		pvcKey := pvcKeyForPV(pv)
@@ -230,7 +230,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			continue
 		}
 		volumeHandle := pv.Spec.CSI.VolumeHandle
-		if r.skipVolume(ctx, volumeHandle) {
+		if r.skipDiskAttachmentReconcile(ctx, volumeHandle, pv) {
 			continue
 		}
 		if _, ok := attachmentByVolumeNode[volumeHandle+"@"+va.Spec.NodeName]; ok {
@@ -342,6 +342,29 @@ func nodeMissing(existingNodes map[string]struct{}, node string) bool {
 	}
 	_, ok := existingNodes[node]
 	return !ok
+}
+
+func (r *AttachmentReconciler) skipDiskAttachmentReconcile(ctx context.Context, volumeHandle string, pv *corev1.PersistentVolume) bool {
+	if r.skipVolume(ctx, volumeHandle) {
+		return true
+	}
+	// The stuck attachment reconciler compares Kubernetes VolumeAttachment
+	// objects to OpenNebula VM disk inventory. Shared filesystem volumes are
+	// intentionally node-agnostic and never appear in that disk inventory, so
+	// treating their VolumeAttachments as stale creates an endless
+	// delete/republish loop for healthy CephFS RWX workloads.
+	if opennebula.IsSharedFilesystemVolumeID(volumeHandle) {
+		return true
+	}
+	if pv != nil {
+		if strings.EqualFold(strings.TrimSpace(pv.Annotations[annotationBackend]), "cephfs") {
+			return true
+		}
+		if pv.Spec.CSI != nil && strings.EqualFold(strings.TrimSpace(pv.Spec.CSI.VolumeAttributes[annotationBackend]), "cephfs") {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *AttachmentReconciler) skipVolume(ctx context.Context, volumeHandle string) bool {

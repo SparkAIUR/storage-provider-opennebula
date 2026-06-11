@@ -88,6 +88,142 @@ func TestAttachmentReconcilerDeletesStaleVolumeAttachment(t *testing.T) {
 	mockProvider.AssertExpectations(t)
 }
 
+func TestAttachmentReconcilerSkipsSharedFilesystemVolumeAttachments(t *testing.T) {
+	sharedID, err := opennebula.EncodeSharedVolumeID(opennebula.SharedVolumeMetadata{
+		DatastoreID:    125,
+		Mode:           opennebula.SharedVolumeModeDynamic,
+		FSName:         "cephfs",
+		SubvolumeGroup: "csi",
+		Subpath:        "/volumes/csi/test",
+		Backend:        "cephfs",
+		SubvolumeName:  "test",
+	})
+	require.NoError(t, err)
+
+	sharedPrefixPV := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-cephfs-prefix"},
+		Spec: corev1.PersistentVolumeSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+			ClaimRef: &corev1.ObjectReference{
+				Namespace: "default",
+				Name:      "pvc-cephfs-prefix",
+			},
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{
+					Driver:       DefaultDriverName,
+					VolumeHandle: sharedID,
+				},
+			},
+		},
+	}
+	sharedPrefixPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pvc-cephfs-prefix",
+		},
+	}
+
+	metadataPV := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pv-cephfs-metadata",
+			Annotations: map[string]string{
+				annotationBackend: "cephfs",
+			},
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+			ClaimRef: &corev1.ObjectReference{
+				Namespace: "default",
+				Name:      "pvc-cephfs-metadata",
+			},
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{
+					Driver:       DefaultDriverName,
+					VolumeHandle: "legacy-sharedfs-handle",
+					VolumeAttributes: map[string]string{
+						annotationBackend: "cephfs",
+					},
+				},
+			},
+		},
+	}
+	metadataPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pvc-cephfs-metadata",
+		},
+	}
+
+	vaPrefixA := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "va-cephfs-prefix-a"},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: DefaultDriverName,
+			NodeName: "node-a",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &sharedPrefixPV.Name,
+			},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: true},
+	}
+	vaPrefixB := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "va-cephfs-prefix-b"},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: DefaultDriverName,
+			NodeName: "node-b",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &sharedPrefixPV.Name,
+			},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: true},
+	}
+	vaMetadata := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "va-cephfs-metadata"},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: DefaultDriverName,
+			NodeName: "node-c",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &metadataPV.Name,
+			},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: true},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "cephfs-user",
+		},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: sharedPrefixPVC.Name,
+					},
+				},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	driver := newAttachmentTestDriver(sharedPrefixPV, sharedPrefixPVC, metadataPV, metadataPVC, vaPrefixA, vaPrefixB, vaMetadata, pod)
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	mockProvider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil).Once()
+
+	server := NewControllerServer(driver, mockProvider, &MockSharedFilesystemProviderTestify{})
+	reconciler := NewAttachmentReconciler(server)
+	reconciler.staleVASeen["va-cephfs-prefix-a"] = time.Now().Add(-2 * reconciler.staleVAGrace)
+	reconciler.staleVASeen["va-cephfs-prefix-b"] = time.Now().Add(-2 * reconciler.staleVAGrace)
+	reconciler.staleVASeen["va-cephfs-metadata"] = time.Now().Add(-2 * reconciler.staleVAGrace)
+
+	require.NoError(t, reconciler.ReconcileOnce(context.Background()))
+
+	for _, name := range []string{"va-cephfs-prefix-a", "va-cephfs-prefix-b", "va-cephfs-metadata"} {
+		_, err := driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(context.Background(), name, metav1.GetOptions{})
+		assert.NoError(t, err, "shared filesystem VolumeAttachment %s should not be deleted", name)
+		assert.NotContains(t, reconciler.staleVASeen, name, "shared filesystem VolumeAttachment %s should not be tracked as stale", name)
+	}
+	mockProvider.AssertExpectations(t)
+}
+
 func TestAttachmentReconcilerPrunesDeletedVolumeState(t *testing.T) {
 	driver := newAttachmentTestDriver()
 	require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
