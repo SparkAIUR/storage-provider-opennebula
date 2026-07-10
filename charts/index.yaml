@@ -2,8 +2,21 @@ apiVersion: v1
 entries:
   opennebula-csi:
   - apiVersion: v2
+    appVersion: v0.5.27
+    created: "2026-07-10T15:59:12.441890814Z"
+    description: OpenNebula CSI Plugin Helm Chart
+    digest: 5d6ff80c41aca36bf1ca3928ecc1dcb1bf59904db2af61b743b88154830c3012
+    home: https://github.com/SparkAIUR/storage-provider-opennebula
+    name: opennebula-csi
+    sources:
+    - https://github.com/SparkAIUR/storage-provider-opennebula
+    type: application
+    urls:
+    - https://sparkaiur.github.io/storage-provider-opennebula/charts/opennebula-csi-0.5.27.tgz
+    version: 0.5.27
+  - apiVersion: v2
     appVersion: v0.5.26
-    created: "2026-06-11T15:46:11.776402639Z"
+    created: "2026-07-10T15:59:12.440374118Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 7bf99ccd2a944a1a457c4a5878b72b62d9ffdf3df321b120bb7987c1beeb9305
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -16,7 +29,7 @@ entries:
     version: 0.5.26
   - apiVersion: v2
     appVersion: v0.5.25
-    created: "2026-06-11T15:46:11.774839563Z"
+    created: "2026-07-10T15:59:12.438851922Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: f720dbc6c2241443c774f79d5f991fd976f9d437c092a4c5af9f25fd978b2854
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -29,7 +42,7 @@ entries:
     version: 0.5.25
   - apiVersion: v2
     appVersion: v0.5.24
-    created: "2026-06-11T15:46:11.773268085Z"
+    created: "2026-07-10T15:59:12.436415438Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 4f3ae3830adfa65e791a20bab56d932c38df25cf99a2ec7401faf30c810e5a3d
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -42,7 +55,7 @@ entries:
     version: 0.5.24
   - apiVersion: v2
     appVersion: v0.5.23
-    created: "2026-06-11T15:46:11.770770166Z"
+    created: "2026-07-10T15:59:12.434909773Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 896f84c0e159811dfad8ed3d35ebc95b2ad2f35d5cca5918fbb3e808f1275f31
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -55,7 +68,7 @@ entries:
     version: 0.5.23
   - apiVersion: v2
     appVersion: v0.5.22
-    created: "2026-06-11T15:46:11.769191927Z"
+    created: "2026-07-10T15:59:12.433212409Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: fcf0800985480d162d7a3e0a6a107fb5341796b3e2dfd71a8b3e7dcad7550a5e
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -68,7 +81,7 @@ entries:
     version: 0.5.22
   - apiVersion: v2
     appVersion: v0.5.21
-    created: "2026-06-11T15:46:11.767639388Z"
+    created: "2026-07-10T15:59:12.431601757Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: ca9ac35096a7201c4734c19ffe22d78b0063facbf1eb1bd4035defbf6b3525fc
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -81,7 +94,7 @@ entries:
     version: 0.5.21
   - apiVersion: v2
     appVersion: v0.5.20
-    created: "2026-06-11T15:46:11.766022209Z"
+    created: "2026-07-10T15:59:12.428749265Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 0bcb700a01fabf5d925300962b9dfed1dec9bf1a89142198d6ab8b46e0786025
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -94,7 +107,7 @@ entries:
     version: 0.5.20
   - apiVersion: v2
     appVersion: v0.5.19
-    created: "2026-06-11T15:46:11.762646786Z"
+    created: "2026-07-10T15:59:12.426308471Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: df671f61188498faf9951adf09aa5ed10b9a6aaa88f320856f152727ef50e4f9
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -107,7 +120,7 @@ entries:
     version: 0.5.19
   - apiVersion: v2
     appVersion: v0.5.18
-    created: "2026-06-11T15:46:11.761101497Z"
+    created: "2026-07-10T15:59:12.424866845Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: aec98084f8be183284f2e8c5c274bc3cf806a71b84c4bda4750a129e218b410e
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -120,7 +133,7 @@ entries:
     version: 0.5.18
   - apiVersion: v2
     appVersion: v0.5.17
-    created: "2026-06-11T15:46:11.759567076Z"
+    created: "2026-07-10T15:59:12.42236108Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 747fb4413029add08dbb2ff50d7d8ff9376d9d01376ef4711acbdb5a5aaaf165
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -133,7 +146,7 @@ entries:
     version: 0.5.17
   - apiVersion: v2
     appVersion: v0.5.16
-    created: "2026-06-11T15:46:11.757289559Z"
+    created: "2026-07-10T15:59:12.421126502Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: c0f2e58adf08b3da28e680207ad9932189035d2ac474e6e81f97b83fadeb565e
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -146,7 +159,7 @@ entries:
     version: 0.5.16
   - apiVersion: v2
     appVersion: v0.5.15
-    created: "2026-06-11T15:46:11.756075879Z"
+    created: "2026-07-10T15:59:12.419939522Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: b6de99502adf45b520a6a7f08618b1fbc74a830718cd72041810e7bd4069ea9a
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -159,7 +172,7 @@ entries:
     version: 0.5.15
   - apiVersion: v2
     appVersion: v0.5.14
-    created: "2026-06-11T15:46:11.75479777Z"
+    created: "2026-07-10T15:59:12.41864422Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: f0f01b1d9bb62d8515c56ce9079526b949fe310353914609826ec460eb26aa4c
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -172,7 +185,7 @@ entries:
     version: 0.5.14
   - apiVersion: v2
     appVersion: v0.5.13
-    created: "2026-06-11T15:46:11.753519721Z"
+    created: "2026-07-10T15:59:12.416256738Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: b14c826a0d54c2d90dc5f8f7c3d3bb2610ee0343102a690356418e3b3c47255e
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -185,7 +198,7 @@ entries:
     version: 0.5.13
   - apiVersion: v2
     appVersion: v0.5.12
-    created: "2026-06-11T15:46:11.75141773Z"
+    created: "2026-07-10T15:59:12.415084145Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: a26454a9529199ee632df25c39e4a170c1e52fb853a6f0a41af11dcb960d13d1
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -198,7 +211,7 @@ entries:
     version: 0.5.12
   - apiVersion: v2
     appVersion: v0.5.11
-    created: "2026-06-11T15:46:11.750153001Z"
+    created: "2026-07-10T15:59:12.413897166Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 2e7bc60a813cc7ccadd984c11c0919133a156e713ed24dc35cf24af58b0e335d
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -211,7 +224,7 @@ entries:
     version: 0.5.11
   - apiVersion: v2
     appVersion: v0.5.10
-    created: "2026-06-11T15:46:11.748805886Z"
+    created: "2026-07-10T15:59:12.412599649Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 4aa25cde2fcc92cd14683e42d250dc79f2e1f8b68eba97129859e37284894ab2
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -224,7 +237,7 @@ entries:
     version: 0.5.10
   - apiVersion: v2
     appVersion: v0.5.9
-    created: "2026-06-11T15:46:11.784717693Z"
+    created: "2026-07-10T15:59:12.450414891Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 7679f82ace35b38a6604000d8f8909122820765f8fe169b288199b826bb57853
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -237,7 +250,7 @@ entries:
     version: 0.5.9
   - apiVersion: v2
     appVersion: v0.5.8
-    created: "2026-06-11T15:46:11.78360641Z"
+    created: "2026-07-10T15:59:12.449187574Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 8501ef0db550c4ee33ed0b03458f169dbdddb8a69035b65ea9447a8a596f8494
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -250,7 +263,7 @@ entries:
     version: 0.5.8
   - apiVersion: v2
     appVersion: v0.5.7
-    created: "2026-06-11T15:46:11.782519193Z"
+    created: "2026-07-10T15:59:12.448095211Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 00aae1dff79459b780bf2ae7355717b185bf85676472b7846304ab0e93f71798
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -263,7 +276,7 @@ entries:
     version: 0.5.7
   - apiVersion: v2
     appVersion: v0.5.6
-    created: "2026-06-11T15:46:11.781454372Z"
+    created: "2026-07-10T15:59:12.447020431Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: deacf7f0f3c8da66d1f0769c0fb4f894198554e77abd2bf99a1674c50fd4c88c
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -276,7 +289,7 @@ entries:
     version: 0.5.6
   - apiVersion: v2
     appVersion: v0.5.5
-    created: "2026-06-11T15:46:11.780358472Z"
+    created: "2026-07-10T15:59:12.445970909Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 6b4f07ae3a04f2c36418d71aecaf3fe2f8b3958dcda8a24054dd36a62ced65db
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -289,7 +302,7 @@ entries:
     version: 0.5.5
   - apiVersion: v2
     appVersion: v0.5.4
-    created: "2026-06-11T15:46:11.77842572Z"
+    created: "2026-07-10T15:59:12.4444837Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: e51b87b686112c6d98595dde13b494ca13b8d2aa2214e880bf0db74ffef01989
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -302,7 +315,7 @@ entries:
     version: 0.5.4
   - apiVersion: v2
     appVersion: v0.5.3
-    created: "2026-06-11T15:46:11.777420479Z"
+    created: "2026-07-10T15:59:12.442896174Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 07a64fe6ed64ccac4f5196fa88e4e7623058b400af44bd0899880a4b18dac1bc
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -315,7 +328,7 @@ entries:
     version: 0.5.3
   - apiVersion: v2
     appVersion: v0.5.2
-    created: "2026-06-11T15:46:11.763677626Z"
+    created: "2026-07-10T15:59:12.427318861Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 8bc5b03f76dd49bf8047a50fd62ca147d632e8c3b648f3929c9d976bc3211961
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -328,7 +341,7 @@ entries:
     version: 0.5.2
   - apiVersion: v2
     appVersion: v0.5.1
-    created: "2026-06-11T15:46:11.747612688Z"
+    created: "2026-07-10T15:59:12.410449802Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 24e4ff7e8a4aa89b011e21227307018c73a9daf6ef138ca8894cfd79f89eead7
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -341,7 +354,7 @@ entries:
     version: 0.5.1
   - apiVersion: v2
     appVersion: v0.5.0
-    created: "2026-06-11T15:46:11.745833567Z"
+    created: "2026-07-10T15:59:12.409450193Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: e10ddee5764e1a88afb39b2a681a18a741cfe82fadc0d5111b2c27b77c0fbbab
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -354,7 +367,7 @@ entries:
     version: 0.5.0
   - apiVersion: v2
     appVersion: v0.4.7
-    created: "2026-06-11T15:46:11.744749986Z"
+    created: "2026-07-10T15:59:12.408434293Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 2484a4f5de8368130fe34959050f684af87f6602c71b8ac1db902c6ecc1de972
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -367,7 +380,7 @@ entries:
     version: 0.4.7
   - apiVersion: v2
     appVersion: v0.4.6
-    created: "2026-06-11T15:46:11.743713207Z"
+    created: "2026-07-10T15:59:12.407413685Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 31334293173c0cc22281093a828afc47d57b087e91a604745d6717d5bed99f4a
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -380,7 +393,7 @@ entries:
     version: 0.4.6
   - apiVersion: v2
     appVersion: v0.4.5
-    created: "2026-06-11T15:46:11.742786065Z"
+    created: "2026-07-10T15:59:12.406476712Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 567834a3ceb53341abb66cfe3f4db65758692608c6ddf31236b507e23681f470
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -393,7 +406,7 @@ entries:
     version: 0.4.5
   - apiVersion: v2
     appVersion: v0.4.4
-    created: "2026-06-11T15:46:11.741844942Z"
+    created: "2026-07-10T15:59:12.405571219Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: e55d289e38e96c0f7d7dcd5cdc664ec31164daa8973fda9d3e71b4d2dea0bef2
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -406,7 +419,7 @@ entries:
     version: 0.4.4
   - apiVersion: v2
     appVersion: v0.4.3
-    created: "2026-06-11T15:46:11.741013236Z"
+    created: "2026-07-10T15:59:12.403805255Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 8187c143a533f724d61f39d4f04999c99650ce5db6f556e079ec70b4381d1a37
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -419,7 +432,7 @@ entries:
     version: 0.4.3
   - apiVersion: v2
     appVersion: v0.4.2
-    created: "2026-06-11T15:46:11.739198052Z"
+    created: "2026-07-10T15:59:12.403024444Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: fe3a8fbfcd32832890bba0a664ea923f0751f1bbd1e1e0a33066d03939df1724
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -432,7 +445,7 @@ entries:
     version: 0.4.2
   - apiVersion: v2
     appVersion: v0.4.1
-    created: "2026-06-11T15:46:11.738583309Z"
+    created: "2026-07-10T15:59:12.402376984Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 4590c2499916de99fcce7033081dbd33e86b699b7189c248dc6fb42486f3d276
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -445,7 +458,7 @@ entries:
     version: 0.4.1
   - apiVersion: v2
     appVersion: v0.4.0
-    created: "2026-06-11T15:46:11.737928596Z"
+    created: "2026-07-10T15:59:12.401733049Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: d63fe276d833683ca4815f2d68b32e6c2810e0d6cf29e4769d1d54e852e59f5c
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -458,7 +471,7 @@ entries:
     version: 0.4.0
   - apiVersion: v2
     appVersion: v0.4.0-rc0
-    created: "2026-06-11T15:46:11.7373249Z"
+    created: "2026-07-10T15:59:12.401157203Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 6f1fe5a181d50707fe60b7fd0c9e986f8f1af94b15b925800f28b9014a0ade70
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -471,7 +484,7 @@ entries:
     version: 0.4.0-rc0
   - apiVersion: v2
     appVersion: v0.3.1
-    created: "2026-06-11T15:46:11.736953671Z"
+    created: "2026-07-10T15:59:12.400796097Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: d4133ae6dbe00b92b98641decb61ce4329a2d54fe2c92449d5dece171184940c
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -484,7 +497,7 @@ entries:
     version: 0.3.1
   - apiVersion: v2
     appVersion: v0.3.0
-    created: "2026-06-11T15:46:11.736634151Z"
+    created: "2026-07-10T15:59:12.400459057Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 5fba359c869d722611bcf1624578126dc1910028fb2f854a5fdd652421b8e545
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -497,7 +510,7 @@ entries:
     version: 0.3.0
   - apiVersion: v2
     appVersion: v0.2.2
-    created: "2026-06-11T15:46:11.736269281Z"
+    created: "2026-07-10T15:59:12.400082142Z"
     description: OpenNebula CSI Plugin Helm Chart
     digest: 5a9dacae030e6fa15c2b6dd4e8df17a39fbc1f876014ffbe2aa65a13fdebd291
     home: https://github.com/SparkAIUR/storage-provider-opennebula
@@ -508,4 +521,4 @@ entries:
     urls:
     - https://sparkaiur.github.io/storage-provider-opennebula/charts/opennebula-csi-0.2.2.tgz
     version: 0.2.2
-generated: "2026-06-11T15:46:11.735734611Z"
+generated: "2026-07-10T15:59:12.399593619Z"
