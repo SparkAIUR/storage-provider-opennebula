@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -627,7 +628,7 @@ func TestNodeGetVolumeStats(t *testing.T) {
 			return originalStat(name)
 		}
 		nodeVolumePathFS = func(path string, buf *unix.Statfs_t) error {
-			return errors.New("transport endpoint is not connected")
+			return syscall.ENOTCONN
 		}
 
 		response, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{

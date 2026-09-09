@@ -41,7 +41,7 @@ The user selected `hplmon` for live validation and requested subagents instead o
 
    ```bash
    rtk proxy python3 hack/validate-cephfs-recovery.py \
-     --cluster hplmon --expected-context hplmon \
+     --cluster hplmon --expected-context spark-hplmon \
      --node <candidate-node> --peer-node <peer-node> \
      --expected-image-digest sha256:<manifest-digest>
    ```
@@ -90,3 +90,25 @@ was created by the failed runner.
 The hplmon two-volume failure test and drained Bravo canary have not run.
 The chart/version metadata is prepared for v0.5.28; no semantic release or
 production recovery is claimed.
+
+## First hplmon candidate test
+
+Candidate source `ba7d01f806e9e042c2e72fb61027c056fe8cf400`, image manifest
+`sha256:8363d0dc024f700c1be3e4a5ba0cdd535ee90e1074fa5b41c8718694e395d434`,
+ran on hplmonw03 with zero plugin restarts. The peer was hplmonw02.
+The live test killed only its own volume A FUSE client. Recovery stopped
+because Alpine/musl stat reported `Socket not connected`, which the candidate
+did not classify as ENOTCONN. This candidate did not pass the release gate.
+Both test volume checksums remained unchanged and readable from the peer;
+volume B remained readable on the candidate node. The test namespace, claims,
+PVs and mounts were removed normally after diagnosis.
+
+The follow-up maps exact stat diagnostics for the probed path to typed ENOTCONN
+for both musl and glibc, with a fixed C locale. Unknown errors and cancellation
+remain failures. A second candidate and complete failure test are required.
+
+During preflight Flux reverted plain kubectl-patch suspension. The effective
+maintenance hold uses the resource reconciliation-disabled annotation and the
+`flux-client-side-apply` field manager, plus suspension. Both the CSI Flux
+Kustomization and HelmRelease holds survived an explicit root reconciliation.
+The hplmon context name is `spark-hplmon`; its kc alias is `hplmon`.

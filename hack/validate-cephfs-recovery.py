@@ -18,7 +18,7 @@ import uuid
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cluster", required=True, help="kc cluster alias")
-    parser.add_argument("--expected-context", default="hplmon")
+    parser.add_argument("--expected-context", default="spark-hplmon")
     parser.add_argument("--node", required=True)
     parser.add_argument("--peer-node", required=True)
     parser.add_argument("--storage-class", default="cephfs")

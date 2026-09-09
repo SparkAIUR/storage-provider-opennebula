@@ -3,6 +3,7 @@
 ## v0.5.28, unreleased
 
 - Fix recursive locking during stale CephFS publishing and serialize shared-volume lifecycle operations.
+- Translate both Alpine/musl and glibc stat diagnostics into typed ENOTCONN errors; unknown probe failures do not authorize recovery.
 - Run independent recovery attempts with deadlines and executable filesystem probes.
 - Enforce explicit read-only publishes even when capability flags contain conflicting `rw` options.
 - Reject symlink mount leaves and verify effective read-only/security flags after partial binds.

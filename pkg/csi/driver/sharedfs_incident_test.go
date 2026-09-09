@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	"k8s.io/client-go/kubernetes/fake"
@@ -30,7 +29,7 @@ func TestSharedFilesystemStalePublishDoesNotReenterVolumeLock(t *testing.T) {
 	ns.Driver.featureGates.CephFSSelfHealing = true
 	id, stage, target := stageSharedFilesystemFixture(t, ns, "lock-regression")
 	original := detectSharedFilesystemMount
-	detectSharedFilesystemMount = func(string) error { return errors.New("transport endpoint is not connected") }
+	detectSharedFilesystemMount = func(string) error { return syscall.ENOTCONN }
 	t.Cleanup(func() { detectSharedFilesystemMount = original })
 	done := make(chan error, 1)
 	go func() {

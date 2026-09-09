@@ -75,7 +75,7 @@ func TestNodeGetVolumeStatsQueuesRecoveryForStaleCephFSMount(t *testing.T) {
 		return originalStat(name)
 	}
 	nodeVolumePathFS = func(path string, buf *unix.Statfs_t) error {
-		return errors.New("transport endpoint is not connected")
+		return syscall.ENOTCONN
 	}
 
 	resp, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
@@ -136,7 +136,7 @@ func TestSharedFilesystemPublishRejectsStaleStageWithoutBinding(t *testing.T) {
 	originalDetect := detectSharedFilesystemMount
 	detectSharedFilesystemMount = func(path string) error {
 		if path == stagePath {
-			return errors.New("transport endpoint is not connected")
+			return syscall.ENOTCONN
 		}
 		return originalDetect(path)
 	}

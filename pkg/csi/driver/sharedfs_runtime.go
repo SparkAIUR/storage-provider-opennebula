@@ -35,7 +35,20 @@ func newSharedFilesystemRuntime(ns *NodeServer) *sharedFilesystemRuntime {
 	r := &sharedFilesystemRuntime{run: runSharedFilesystemCommand}
 	r.mountInfo = func() ([]mount.MountInfo, error) { return mount.ParseMountInfo("/proc/self/mountinfo") }
 	r.probe = func(ctx context.Context, path string) error {
-		_, err := r.run(ctx, "stat", "-L", "--format=%F", "--", path)
+		output, err := r.run(ctx, "stat", "-L", "--format=%F", "--", path)
+		if err == nil || errors.Is(err, syscall.ENOTCONN) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		// stat exposes errno only as a diagnostic. Alpine/musl and glibc use
+		// different ENOTCONN messages. Match the complete diagnostic for this
+		// exact path; a message embedded in a pathname cannot authorize recovery.
+		diagnostic := strings.TrimSpace(string(output))
+		for _, operation := range []string{"cannot statx", "cannot stat"} {
+			prefix := fmt.Sprintf("stat: %s '%s': ", operation, path)
+			if diagnostic == prefix+"Socket not connected" || diagnostic == prefix+"Transport endpoint is not connected" {
+				return &os.PathError{Op: "stat", Path: path, Err: errors.Join(syscall.ENOTCONN, err)}
+			}
+		}
 		return err
 	}
 	r.bind = func(ctx context.Context, stage, target string, options []string) error {
@@ -60,6 +73,10 @@ func newSharedFilesystemRuntime(ns *NodeServer) *sharedFilesystemRuntime {
 
 func sharedFilesystemCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, name, args...)
+	if name == "stat" {
+		// Keep the stat diagnostic used for errno translation locale-independent.
+		cmd.Env = append(os.Environ(), "LC_ALL=C")
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
