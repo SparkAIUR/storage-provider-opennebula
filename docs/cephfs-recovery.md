@@ -112,3 +112,22 @@ maintenance hold uses the resource reconciliation-disabled annotation and the
 `flux-client-side-apply` field manager, plus suspension. Both the CSI Flux
 Kustomization and HelmRelease holds survived an explicit root reconciliation.
 The hplmon context name is `spark-hplmon`; its kc alias is `hplmon`.
+
+## Passing hplmon validation
+
+Runtime source `c381e1f2c44ff8e62e9c698c5a0ab8ba8bc4bcc1` passed the full
+two-volume test on September 9. Image manifest
+`sha256:63c8e03db77e5c2c4d97e383edbdc5d10a61d635e49e415ba45597d56374b7ef`
+ran on hplmonw03 with peer hplmonw02. Host mounts recovered in 1.985 seconds.
+The healthy volume client, mount identities and container stayed unchanged,
+and the plugin had zero restarts. Old and new data matched from both nodes.
+
+The first post-recovery write took 53.375 seconds. Earlier MDS operation history
+proved a 50.644-second write-lock wait for this test pattern, with the killed
+client stale and the replacement open. The live filesystem session timeout is
+60 seconds. The harness now bounds the remote first write to 120 seconds and
+reports its duration. This is MDS lock waiting after an abrupt client exit,
+not a stuck CSI recovery worker.
+
+The test deleted only its own namespace after passing. Production drain and
+canary verification remain required before claiming the Bravo incident resolved.

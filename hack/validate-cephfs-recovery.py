@@ -67,8 +67,8 @@ def main():
                 return pod
         return None
 
-    def in_pod(pod, *command):
-        return kc("exec", "-n", namespace, pod["metadata"]["name"], "--", *command)
+    def in_pod(pod, *command, timeout=30):
+        return kc("exec", "-n", namespace, pod["metadata"]["name"], "--", *command, timeout=timeout)
 
     context = kc("config", "current-context")
     if context != args.expected_context or context in {"spark-bravo", "bravo"}:
@@ -193,6 +193,7 @@ try:
 finally:
  os.close(fd)
 """, str(clients["a"]["pid"]), clients["a"]["start"], subpaths["a"])
+    injected_at = time.monotonic()
     print(json.dumps({"phase": "injected", "namespace": namespace, "client": clients["a"]}), flush=True)
     stage = "/var/lib/kubelet/plugins/kubernetes.io/csi/csi.opennebula.io/" + hashlib.sha256(handles["a"].encode()).hexdigest() + "/globalmount"
     eventually(lambda: driver_exec("import os,sys; os.stat(sys.argv[1]); print('ready')", stage) == "ready", "host staging mount recovery")
@@ -204,6 +205,7 @@ finally:
     if json.loads(driver_exec(mount_snapshot, healthy_stage, host_targets["b"])) != healthy_mounts:
         raise RuntimeError("healthy volume mount identity changed")
     eventually(lambda: driver_exec("import hashlib,pathlib,sys; print(hashlib.sha256((pathlib.Path(sys.argv[1])/'checkpoint').read_bytes()).hexdigest())", host_targets["a"]) == expected["a"], "host target bind recovery")
+    host_recovered_seconds = time.monotonic() - injected_at
     if checksum(pods["b"], "b") != expected["b"]:
         raise RuntimeError("healthy volume checksum changed")
     # Existing container namespaces can retain the dead bind. Recreate only the
@@ -221,14 +223,18 @@ finally:
     if after_b["restartCount"] != before_b["restartCount"] or after_b["containerID"] != before_b["containerID"]:
         raise RuntimeError("healthy consumer container restarted")
     fresh_payload = namespace + ":after-recovery"
-    in_pod(new_a, "sh", "-c", 'printf %s "$1" > /a/recovery-checkpoint; sync /a/recovery-checkpoint', "test", fresh_payload)
+    # The killed Ceph client can retain capabilities until the MDS session
+    # timeout. hplmon reports 60 seconds; keep this write bounded beyond it.
+    first_write_at = time.monotonic()
+    in_pod(new_a, "timeout", "120", "sh", "-c", 'printf %s "$1" > /a/recovery-checkpoint; sync /a/recovery-checkpoint', "test", fresh_payload, timeout=130)
+    first_write_seconds = time.monotonic() - first_write_at
     fresh_hash = in_pod(pods["peer"], "sha256sum", "/a/recovery-checkpoint").split()[0]
     if fresh_hash != hashlib.sha256(fresh_payload.encode()).hexdigest():
         raise RuntimeError("new post-recovery write was not visible on the peer node")
     if json.loads(driver_exec(find_client, subpaths["b"])) != clients["b"] or json.loads(driver_exec(mount_snapshot, healthy_stage, host_targets["b"])) != healthy_mounts:
         raise RuntimeError("healthy volume changed during consumer recreation")
     verify_driver_unchanged()
-    print(json.dumps({"phase": "passed", "namespace": namespace, "node": args.node, "peerNode": args.peer_node, "driver": driver_before, "healthyClientUnchanged": True, "crossNodeChecksums": expected}), flush=True)
+    print(json.dumps({"phase": "passed", "namespace": namespace, "node": args.node, "peerNode": args.peer_node, "driver": driver_before, "healthyClientUnchanged": True, "hostRecoveredSeconds": round(host_recovered_seconds, 3), "firstWriteSeconds": round(first_write_seconds, 3), "crossNodeChecksums": expected}), flush=True)
     if get("namespace", namespace, ns=None)["metadata"]["labels"].get("test-run") != namespace:
         raise RuntimeError("test namespace ownership changed; refusing cleanup")
     kc("delete", "namespace", namespace, "--wait=false")
