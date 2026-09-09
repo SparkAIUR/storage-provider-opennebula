@@ -99,12 +99,20 @@ func (ns *NodeServer) handleSharedFilesystemStage(ctx context.Context, req *csi.
 		}
 		session.PublishedTargets = old.PublishedTargets
 	}
-	if err := ns.verifySharedFilesystemSession(ctx, session); err != nil {
-		return nil, status.Error(codes.FailedPrecondition, err.Error())
-	}
 	_, mounted, err := ns.mountPointForPath(stagingTargetPath)
 	if err != nil {
 		return nil, err
+	}
+	if !exists && mounted {
+		// A preexisting client may have no session record. Reconstruct every
+		// provable bind before recovery so remounting cannot abandon its targets.
+		session.PublishedTargets, err = ns.discoverSharedFilesystemTargets(session.VolumeID, stagingTargetPath)
+		if err != nil {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
+	}
+	if err := ns.verifySharedFilesystemSession(ctx, session); err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
 	if mounted {
 		if err := ns.sharedFS.probe(ctx, stagingTargetPath); err == nil {
@@ -121,16 +129,29 @@ func (ns *NodeServer) handleSharedFilesystemStage(ctx context.Context, req *csi.
 		} else if !isDisconnectedSharedFilesystemError(err) || !ns.Driver.featureGates.CephFSSelfHealing {
 			return nil, status.Errorf(codes.FailedPrecondition, "stale CephFS mount detected at %s: %v", stagingTargetPath, err)
 		}
-		// Recover the persisted volume with all its binds, under this one lock.
+		// Recovery treats an absent record as a completed unstage. Persist this
+		// validated stage intent first, including any reconstructed bind targets.
+		if err := ns.recordSharedFilesystemSession(session); err != nil {
+			return nil, err
+		}
 		if err := ns.sharedFilesystemRecovery.recoverVolumeLocked(ctx, req.GetVolumeId()); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "CephFS stage recovery failed: %v", err)
+		}
+		if err := ns.confirmSharedFilesystemStage(ctx, session.VolumeID, stagingTargetPath); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "CephFS stage recovery did not establish a healthy mount: %v", err)
 		}
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
 	if exists && len(session.PublishedTargets) > 0 {
+		if err := ns.recordSharedFilesystemSession(session); err != nil {
+			return nil, err
+		}
 		if err := ns.sharedFilesystemRecovery.recoverVolumeLocked(ctx, session.VolumeID); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "CephFS stage recovery failed: %v", err)
+		}
+		if err := ns.confirmSharedFilesystemStage(ctx, session.VolumeID, stagingTargetPath); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "CephFS stage recovery did not establish a healthy mount: %v", err)
 		}
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
@@ -390,15 +411,19 @@ func (ns *NodeServer) mountSharedFilesystemSession(ctx context.Context, session 
 	if err != nil {
 		return err
 	}
-	if err := ns.verifySharedFilesystemStage(session.VolumeID, session.StagingTargetPath); err != nil {
+	return ns.confirmSharedFilesystemStage(ctx, session.VolumeID, session.StagingTargetPath)
+}
+
+func (ns *NodeServer) confirmSharedFilesystemStage(ctx context.Context, volumeID, stagingTargetPath string) error {
+	if err := ns.verifySharedFilesystemStage(volumeID, stagingTargetPath); err != nil {
 		return err
 	}
-	if _, mounted, err := ns.mountPointForPath(session.StagingTargetPath); err != nil {
+	if _, mounted, err := ns.mountPointForPath(stagingTargetPath); err != nil {
 		return err
 	} else if !mounted {
 		return fmt.Errorf("CephFS stage was not mounted at the requested path")
 	}
-	return ns.sharedFS.probe(ctx, session.StagingTargetPath)
+	return ns.sharedFS.probe(ctx, stagingTargetPath)
 }
 
 func (ns *NodeServer) mountSharedFilesystemFuse(ctx context.Context, session sharedFilesystemSession) error {

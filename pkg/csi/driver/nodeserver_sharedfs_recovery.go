@@ -977,13 +977,34 @@ func sharedFilesystemStageMountOptions(req *csi.NodeStageVolumeRequest) []string
 
 func sharedFilesystemBindMountOptions(req *csi.NodePublishVolumeRequest) []string {
 	options := make([]string, 0, 4)
+	if capability := req.GetVolumeCapability(); capability != nil && capability.GetMount() != nil {
+		for _, flags := range capability.GetMount().GetMountFlags() {
+			for _, option := range splitCSV(flags) {
+				// The CSI readonly field is authoritative even when mount flags
+				// contain rw, including inside a comma-separated option string.
+				if req.GetReadonly() && (option == "ro" || option == "rw") {
+					continue
+				}
+				options = append(options, option)
+			}
+		}
+	}
 	if req.GetReadonly() {
 		options = append(options, "ro")
 	}
-	if capability := req.GetVolumeCapability(); capability != nil && capability.GetMount() != nil {
-		options = append(options, capability.GetMount().GetMountFlags()...)
+	// Keep the final occurrence of each option. Deduplicating the first ro in
+	// ro,rw,ro would change the effective permission when the intent is saved.
+	last := make(map[string]int, len(options))
+	for i, option := range options {
+		last[option] = i
 	}
-	return uniqueStrings(options)
+	result := make([]string, 0, len(last))
+	for i, option := range options {
+		if last[option] == i {
+			result = append(result, option)
+		}
+	}
+	return result
 }
 
 func sharedFilesystemSessionFromStageRequest(req *csi.NodeStageVolumeRequest) (sharedFilesystemSession, error) {

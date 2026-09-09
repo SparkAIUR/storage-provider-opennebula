@@ -23,7 +23,7 @@ Foreground FUSE clients are reaped and report their exit status. `opennebula_csi
 
 1. Run the Go suite, race regressions, Helm lint, rendered-manifest checks, and `hack/validate-chart-version-alignment.sh v0.5.28`.
 2. Build the candidate for Linux AMD64 with its exact Git commit in build metadata.
-3. Complete the existing hplcsi release lab and a two-volume CephFS failure test. Stop only the FUSE process matching the test volume's exact subpath. Verify host-stage and target recovery, unchanged bytes and mount identity on the other volume, then a fresh container reading the recovered volume.
+3. Complete independent subagent review and the two-volume CephFS failure test on `hplmon`, the user-authorized replacement for the retired `hplcsi` lab. Stop only the FUSE process matching the test volume's exact subpath. Verify host-stage and target recovery, unchanged bytes and mount identity on the other volume, then a fresh container reading the recovered volume.
 4. Pin existing wildcard chart consumers before publishing a new semantic chart. Tag publication automatically publishes images, the chart index, and a GitHub release.
 5. On Bravo, pin the chart and use a node-only image override with `OnDelete` updates. Hold AMD's pending rollout and scheduled restart. Drain the healthy Frauditor FUSE consumer on `hplbravoxla02` before replacing that node plugin.
 6. Recreate affected application containers, verify queue registration and successful jobs, then advance one Bravo node at a time after draining its affected FUSE clients.
@@ -31,9 +31,29 @@ Foreground FUSE clients are reaped and report their exit status. `opennebula_csi
 
 Never delete AMD's PVC/PV, force-delete its pod, or recursively clean its mount directories. CSI replacement also terminates healthy FUSE clients owned by that container, so a blind plugin restart is not an isolated AMD repair.
 
+## hplmon test procedure
+
+The user selected `hplmon` for live validation and requested subagents instead of Claude or Oracle review. The retired lab endpoint and the expired Claude session are no longer release prerequisites.
+
+1. Read the live HelmRelease, node DaemonSet, pods, mount tables, and PVC consumers. The September 9 preflight found the hplmon node image at v0.5.21 while the HelmRelease had failed attempts through chart 0.5.27; its storage-class reconciliation hook had failed. Do not treat the attempted chart version as the deployed version or run a full Helm upgrade to establish this test.
+2. Hold automatic chart reconciliation and use an `OnDelete` node update with the exact candidate manifest digest. Select a node without existing FUSE clients, checking the process and mount tables immediately before replacing its plugin. If there are existing FUSE clients, drain their consumers before replacement. Preserve the existing controller and storage classes. Confirm the plugin's readiness and actual image ID after the candidate starts.
+3. Select a distinct Ready, schedulable peer node. Run the following command with the verified node names and registry manifest digest:
+
+   ```bash
+   rtk proxy python3 hack/validate-cephfs-recovery.py \
+     --cluster hplmon --expected-context hplmon \
+     --node <candidate-node> --peer-node <peer-node> \
+     --expected-image-digest sha256:<manifest-digest>
+   ```
+
+4. Save the JSON result with the candidate source commit and deployment evidence. The script checks process-file-descriptor support before creating a unique namespace containing only two new RWX claims and three test consumers. It checks claim ownership, exact driver image identity, checksums on a second node, and the PID/start time/subpath of the FUSE client before killing it through a process file descriptor. The healthy test volume's client, mount identities, pod UID, and container restart count must remain unchanged, and the candidate plugin must not restart during the test. A new write after recovery must also be visible from the peer node.
+5. The script deletes only its own labeled namespace after passing and retains it on failure. Wait for its test PVC/PV and FUSE cleanup, then verify existing hplmon workloads and storage health. Keep reconciliation held until the desired node image and update strategy are deliberately restored or advanced; resuming the previously failed HelmRelease can trigger its pending upgrade.
+
+This test proves isolated FUSE recovery and data preservation for the candidate. It does not prove that a full hplmon Helm upgrade succeeds or replace the drained Bravo canary and observation period.
+
 ## Candidate validation status
 
-Runtime source checkpoint: `1562b16e52a203b269a98bf7970de4b065aee7be` on
+Earlier runtime source checkpoint: `1562b16e52a203b269a98bf7970de4b065aee7be` on
 `fix/cephfs-recovery`. The full Go suite, shared-filesystem race tests, Helm
 lint, chart-version alignment, and Linux AMD64 build passed. Earlier Linux
 container runs covered the main recovery suite; the final image also exercises
@@ -60,11 +80,13 @@ contract.
 
 The no-mistakes run `01M23HTXVQTTDBATCNHXDD3KMQ` stopped before code review
 because its configured Claude runner reported an expired OAuth session.
-It returned branch custody without changing the submitted commit. Rerun with
-`--base-branch v0.5.x` after authentication is restored. No PR was created.
+It returned branch custody without changing the submitted commit. The user
+subsequently requested independent subagent review and explicitly skipped
+Claude and further Oracle review. The replacement reviews found a missing-session stale-stage false success
+and a read-only flag override. Both are fixed with regressions that failed
+before the changes. Independent rereview found no remaining blockers. No PR
+was created by the failed runner.
 
-The hplcsi two-volume failure test and drained Bravo canary have not run. The
-saved lab endpoint `https://omni.on.lab.sprkinfra.com:8100` was unreachable on
-September 9, and no replacement was found in the other saved kubeconfigs.
-Obtain current lab access before advancing. The chart/version metadata is
-prepared for v0.5.28; no semantic release or production recovery is claimed.
+The hplmon two-volume failure test and drained Bravo canary have not run.
+The chart/version metadata is prepared for v0.5.28; no semantic release or
+production recovery is claimed.

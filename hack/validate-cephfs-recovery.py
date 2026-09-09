@@ -9,6 +9,7 @@ import argparse
 import base64
 import hashlib
 import json
+import re
 import subprocess
 import time
 import uuid
@@ -17,14 +18,14 @@ import uuid
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cluster", required=True, help="kc cluster alias")
-    parser.add_argument("--expected-context", default="hplcsi")
+    parser.add_argument("--expected-context", default="hplmon")
     parser.add_argument("--node", required=True)
     parser.add_argument("--peer-node", required=True)
     parser.add_argument("--storage-class", default="cephfs")
     parser.add_argument("--expected-image-digest", required=True)
     args = parser.parse_args()
-    if not args.expected_image_digest.startswith("sha256:"):
-        parser.error("an immutable image digest is required")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", args.expected_image_digest):
+        parser.error("a complete immutable sha256 image digest is required")
     if args.node == args.peer_node:
         parser.error("two different lab nodes are required")
     namespace = "csi-recovery-" + uuid.uuid4().hex[:12]
@@ -73,18 +74,36 @@ def main():
     if context != args.expected_context or context in {"spark-bravo", "bravo"}:
         raise RuntimeError(f"refusing fault injection in context {context!r}; expected a lab")
     for node in [args.node, args.peer_node]:
-        get("node", node, ns=None)
+        obj = get("node", node, ns=None)
+        if obj["metadata"].get("labels", {}).get("kubernetes.io/hostname") != node:
+            raise RuntimeError("node selector does not uniquely identify the requested node")
+        if obj["spec"].get("unschedulable") or not any(c["type"] == "Ready" and c["status"] == "True" for c in obj.get("status", {}).get("conditions", [])):
+            raise RuntimeError(f"test node {node!r} is not ready and schedulable")
     driver_pods = json.loads(kc("get", "pods", "-n", "kube-system", "-l", "app.kubernetes.io/name=opennebula-csi,app.kubernetes.io/component=node", "--field-selector", "spec.nodeName=" + args.node, "-o", "json"))["items"]
     if len(driver_pods) != 1:
         raise RuntimeError("expected exactly one node plugin on the test node")
     driver_pod = driver_pods[0]
-    image_id = next(c["imageID"] for c in driver_pod["status"]["containerStatuses"] if c["name"] == "opennebula-csi")
-    if not image_id.endswith(args.expected_image_digest):
-        raise RuntimeError("test node is not running the required immutable candidate")
+
+    def driver_identity(pod):
+        status = next(c for c in pod["status"]["containerStatuses"] if c["name"] == "opennebula-csi")
+        if pod["metadata"].get("deletionTimestamp") or not status.get("ready"):
+            raise RuntimeError("test node plugin is not ready")
+        if not status["imageID"].endswith(args.expected_image_digest):
+            raise RuntimeError("test node is not running the required immutable candidate")
+        return {"uid": pod["metadata"]["uid"], "imageID": status["imageID"], "restartCount": status["restartCount"]}
+
+    driver_before = driver_identity(driver_pod)
+
+    def verify_driver_unchanged():
+        if driver_identity(get("pod", driver_pod["metadata"]["name"], ns="kube-system")) != driver_before:
+            raise RuntimeError("node plugin changed during the recovery test")
 
     def driver_exec(code, *params):
         return kc("exec", "-n", "kube-system", driver_pod["metadata"]["name"], "-c", "opennebula-csi", "--", "python3", "-c", code, *params)
 
+    # Probe process-descriptor support without signaling another process. A
+    # missing kernel/runtime capability must fail before creating test data.
+    driver_exec("import os,signal; fd=os.pidfd_open(os.getpid()); signal.pidfd_send_signal(fd,0); os.close(fd)")
     kc("create", "-f", "-", payload={"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": namespace, "labels": labels}})
     print(json.dumps({"phase": "created", "namespace": namespace}), flush=True)
     # On failure retain only this unique test namespace for diagnosis. No
@@ -113,8 +132,11 @@ def main():
     for name in ["a", "b"]:
         pvc = get("pvc", name)
         pv = get("pv", pvc["spec"]["volumeName"], ns=None)
-        if pv["spec"].get("claimRef", {}).get("uid") != pvc["metadata"]["uid"]:
+        claim = pv["spec"].get("claimRef", {})
+        if claim.get("uid") != pvc["metadata"]["uid"] or claim.get("namespace") != namespace or claim.get("name") != name:
             raise RuntimeError("test PV claim ownership mismatch")
+        if pv["spec"].get("csi", {}).get("driver") != "csi.opennebula.io":
+            raise RuntimeError("test storage class did not use the OpenNebula CSI driver")
         handle = pv["spec"]["csi"]["volumeHandle"]
         if not handle.startswith("cephfs:"):
             raise RuntimeError("test storage class did not provision CephFS")
@@ -122,6 +144,8 @@ def main():
         pv_names[name] = pvc["spec"]["volumeName"]
         encoded = handle.split(":", 1)[1]
         subpaths[name] = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))["subpath"]
+        if not subpaths[name].startswith("/") or subpaths[name] == "/":
+            raise RuntimeError("test volume has no isolated CephFS subpath")
         payload = namespace + ":" + name
         expected[name] = hashlib.sha256(payload.encode()).hexdigest()
         in_pod(pods[name], "sh", "-c", 'printf %s "$1" > "$2"; sync "$2"', "test", payload, "/" + name + "/checkpoint")
@@ -153,16 +177,21 @@ if len(found) != 1: raise RuntimeError('expected exactly one matching FUSE clien
 print(json.dumps(found[0]))
 """
     clients = {name: json.loads(driver_exec(find_client, subpaths[name])) for name in ["a", "b"]}
-    if clients["a"]["pid"] == clients["b"]["pid"]:
+    if handles["a"] == handles["b"] or subpaths["a"] == subpaths["b"] or clients["a"]["pid"] == clients["b"]["pid"]:
         raise RuntimeError("two test volumes unexpectedly share one FUSE client")
+    verify_driver_unchanged()
     driver_exec("""
 import os,pathlib,signal,sys
 pid=int(sys.argv[1]); path=pathlib.Path('/proc')/str(pid)
-args=(path/'cmdline').read_bytes().decode().strip('\\0').split('\\0')
-assert pathlib.Path(args[0]).name == 'ceph-fuse'
-assert args[args.index('--client_mountpoint')+1] == sys.argv[3]
-assert (path/'stat').read_text().rsplit(')',1)[1].split()[19] == sys.argv[2]
-os.kill(pid, signal.SIGKILL)
+fd=os.pidfd_open(pid)
+try:
+ args=(path/'cmdline').read_bytes().decode().strip('\\0').split('\\0')
+ assert pathlib.Path(args[0]).name == 'ceph-fuse'
+ assert args[args.index('--client_mountpoint')+1] == sys.argv[3]
+ assert (path/'stat').read_text().rsplit(')',1)[1].split()[19] == sys.argv[2]
+ signal.pidfd_send_signal(fd, signal.SIGKILL)
+finally:
+ os.close(fd)
 """, str(clients["a"]["pid"]), clients["a"]["start"], subpaths["a"])
     print(json.dumps({"phase": "injected", "namespace": namespace, "client": clients["a"]}), flush=True)
     stage = "/var/lib/kubelet/plugins/kubernetes.io/csi/csi.opennebula.io/" + hashlib.sha256(handles["a"].encode()).hexdigest() + "/globalmount"
@@ -184,9 +213,22 @@ os.kill(pid, signal.SIGKILL)
     for pod, name in [(new_a, "a"), (pods["peer"], "a"), (pods["b"], "b"), (pods["peer"], "b")]:
         if checksum(pod, name) != expected[name]:
             raise RuntimeError("checksum changed after recovery")
-    if pod_for("b")["metadata"]["uid"] != pods["b"]["metadata"]["uid"]:
+    current_b = pod_for("b")
+    if not current_b or current_b["metadata"]["uid"] != pods["b"]["metadata"]["uid"]:
         raise RuntimeError("healthy consumer restarted")
-    print(json.dumps({"phase": "passed", "namespace": namespace, "imageID": image_id, "healthyClientUnchanged": True, "crossNodeChecksums": expected}), flush=True)
+    before_b = next(c for c in pods["b"]["status"]["containerStatuses"] if c["name"] == "test")
+    after_b = next(c for c in current_b["status"]["containerStatuses"] if c["name"] == "test")
+    if after_b["restartCount"] != before_b["restartCount"] or after_b["containerID"] != before_b["containerID"]:
+        raise RuntimeError("healthy consumer container restarted")
+    fresh_payload = namespace + ":after-recovery"
+    in_pod(new_a, "sh", "-c", 'printf %s "$1" > /a/recovery-checkpoint; sync /a/recovery-checkpoint', "test", fresh_payload)
+    fresh_hash = in_pod(pods["peer"], "sha256sum", "/a/recovery-checkpoint").split()[0]
+    if fresh_hash != hashlib.sha256(fresh_payload.encode()).hexdigest():
+        raise RuntimeError("new post-recovery write was not visible on the peer node")
+    if json.loads(driver_exec(find_client, subpaths["b"])) != clients["b"] or json.loads(driver_exec(mount_snapshot, healthy_stage, host_targets["b"])) != healthy_mounts:
+        raise RuntimeError("healthy volume changed during consumer recreation")
+    verify_driver_unchanged()
+    print(json.dumps({"phase": "passed", "namespace": namespace, "node": args.node, "peerNode": args.peer_node, "driver": driver_before, "healthyClientUnchanged": True, "crossNodeChecksums": expected}), flush=True)
     if get("namespace", namespace, ns=None)["metadata"]["labels"].get("test-run") != namespace:
         raise RuntimeError("test namespace ownership changed; refusing cleanup")
     kc("delete", "namespace", namespace, "--wait=false")

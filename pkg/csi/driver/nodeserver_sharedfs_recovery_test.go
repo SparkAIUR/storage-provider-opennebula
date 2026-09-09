@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
@@ -175,6 +177,146 @@ func TestSharedFilesystemPublishRehydratesMissingSession(t *testing.T) {
 	assert.Equal(t, "csi-node", session.UserID)
 	require.Len(t, session.PublishedTargets, 1)
 	assert.Equal(t, targetPath, session.PublishedTargets[0].TargetPath)
+}
+
+func TestSharedFilesystemRestageRehydratesStaleSession(t *testing.T) {
+	for _, mountBecomesHealthy := range []bool{true, false} {
+		name := "recovered"
+		if !mountBecomesHealthy {
+			name = "still-disconnected"
+		}
+		t.Run(name, func(t *testing.T) {
+			withSharedFilesystemTestPaths(t)
+			ns := getTestNodeServer(nil)
+			ns.Driver.featureGates.CephFSSelfHealing = true
+			id, stage, target := stageSharedFilesystemFixture(t, ns, "restage-missing-record")
+			_, err := ns.NodePublishVolume(context.Background(), newSharedFilesystemPublishRequest(id, stage, target))
+			require.NoError(t, err)
+			// A client can outlive a missing session record. Kubelet's adjacent
+			// metadata and the existing mount identities still prove its targets.
+			require.NoError(t, ns.deleteSharedFilesystemSession(id))
+			healthy := false
+			ns.sharedFS.probe = func(context.Context, string) error {
+				if !healthy {
+					return syscall.ENOTCONN
+				}
+				return nil
+			}
+			mountAttempts := 0
+			originalFuse := ns.sharedFS.fuse
+			ns.sharedFS.fuse = func(ctx context.Context, session sharedFilesystemSession, args []string) error {
+				mountAttempts++
+				persisted, exists, err := ns.sharedFilesystemRecovery.store.Load(id)
+				require.NoError(t, err)
+				require.True(t, exists, "mount intent must be durable before remount")
+				require.Len(t, persisted.PublishedTargets, 1)
+				require.Equal(t, target, persisted.PublishedTargets[0].TargetPath)
+				healthy = mountBecomesHealthy
+				return originalFuse(ctx, session, args)
+			}
+
+			response, err := ns.NodeStageVolume(context.Background(), newSharedFilesystemStageRequest(id, stage, "fuse"))
+			if mountBecomesHealthy {
+				require.NoError(t, err)
+				require.NotNil(t, response)
+				require.NoError(t, ns.verifySharedFilesystemBind(stage, target))
+			} else {
+				require.Error(t, err, "a disconnected stage cannot be acknowledged as staged")
+				require.Nil(t, response)
+			}
+			require.Equal(t, 1, mountAttempts, "restage must actually recover the disconnected mount")
+			persisted, exists, err := ns.sharedFilesystemRecovery.store.Load(id)
+			require.NoError(t, err)
+			require.True(t, exists)
+			require.Len(t, persisted.PublishedTargets, 1, "discovered bind intent must survive recovery failures")
+		})
+	}
+}
+
+func TestSharedFilesystemReadonlyPublishOverridesWritableCapabilityFlags(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		flags []string
+		keep  []string
+	}{
+		{name: "rw", flags: []string{"rw"}},
+		{name: "comma-separated", flags: []string{"noexec,rw,nodev"}, keep: []string{"noexec", "nodev"}},
+		{name: "duplicates", flags: []string{"ro", "rw", "ro"}},
+		{name: "mixed-duplicates", flags: []string{"ro,rw,ro", "nosuid,rw"}, keep: []string{"nosuid"}},
+	} {
+		for _, partial := range []bool{false, true} {
+			name := test.name + "/complete-bind"
+			if partial {
+				name = test.name + "/partial-bind"
+			}
+			t.Run(name, func(t *testing.T) {
+				withSharedFilesystemTestPaths(t)
+				ns := getTestNodeServer(nil)
+				id, stage, target := stageSharedFilesystemFixture(t, ns, "readonly-capability")
+				req := newSharedFilesystemPublishRequest(id, stage, target)
+				req.Readonly = true
+				req.VolumeCapability.GetMount().MountFlags = test.flags
+				bind := ns.sharedFS.bind
+				leaveWritable := partial
+				ns.sharedFS.bind = func(ctx context.Context, stage, target string, options []string) error {
+					// Model mount's effective ro/rw state, including comma-separated
+					// options. Mountinfo reports that effective state, not the input.
+					readonly := false
+					var effective []string
+					for _, argument := range options {
+						for _, option := range strings.Split(argument, ",") {
+							switch option = strings.TrimSpace(option); option {
+							case "ro":
+								readonly = true
+							case "rw":
+								readonly = false
+							default:
+								effective = append(effective, option)
+							}
+						}
+					}
+					if readonly && !leaveWritable {
+						effective = append(effective, "ro")
+					} else {
+						effective = append(effective, "rw")
+					}
+					if err := bind(ctx, stage, target, effective); err != nil {
+						return err
+					}
+					if leaveWritable {
+						return syscall.EIO
+					}
+					return nil
+				}
+
+				_, err := ns.NodePublishVolume(context.Background(), req)
+				if partial {
+					require.Error(t, err)
+					_, err = ns.NodePublishVolume(context.Background(), req)
+					require.Error(t, err, "readonly retry cannot accept a writable partial bind")
+					session, _, err := ns.sharedFilesystemRecovery.store.Load(id)
+					require.NoError(t, err)
+					health, err := ns.evaluateSharedFilesystemSession(context.Background(), session)
+					require.NoError(t, err)
+					require.Len(t, health.TargetsToRebind, 1)
+					leaveWritable = false
+					require.NoError(t, ns.sharedFilesystemRecovery.recoverVolume(context.Background(), id))
+				} else {
+					require.NoError(t, err)
+				}
+				actual, mounted, err := ns.mountPointForPath(target)
+				require.NoError(t, err)
+				require.True(t, mounted)
+				require.Contains(t, actual.Opts, "ro", "explicit readonly must determine the effective bind permission")
+				require.NotContains(t, actual.Opts, "rw")
+				for _, option := range test.keep {
+					require.Contains(t, actual.Opts, option)
+				}
+				_, err = ns.NodePublishVolume(context.Background(), req)
+				require.NoError(t, err)
+			})
+		}
+	}
 }
 
 func TestSharedFilesystemGarbageCollectSkipsWhenPodLookupUnknown(t *testing.T) {
