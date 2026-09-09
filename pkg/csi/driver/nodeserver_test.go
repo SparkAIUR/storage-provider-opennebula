@@ -93,7 +93,64 @@ func getTestNodeServerWithMountPoints(mountPointList []mount.MountPoint) *NodeSe
 			},
 		}, // using fake exec implementation
 	)
-	return NewNodeServer(driver, mounter)
+	ns := NewNodeServer(driver, mounter)
+	ns.sharedFS.run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return mounter.Exec.CommandContext(ctx, name, args...).CombinedOutput()
+	}
+	ns.sharedFS.probe = func(ctx context.Context, path string) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return detectSharedFilesystemMount(path)
+	}
+	ns.sharedFS.mkdir = func(ctx context.Context, path string) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return os.MkdirAll(path, 0750)
+	}
+	ns.sharedFS.rmdir = func(ctx context.Context, path string) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return os.Remove(path)
+	}
+	ns.sharedFS.unmount = func(ctx context.Context, path string) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return mounter.Interface.Unmount(path)
+	}
+	ns.sharedFS.bind = func(ctx context.Context, stage, target string, options []string) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		mp, _, _ := ns.mountPointForPath(stage)
+		return mounter.Interface.Mount(stage, target, mp.Type, options)
+	}
+	ns.sharedFS.fuse = func(ctx context.Context, session sharedFilesystemSession, args []string) error {
+		_, err := ns.sharedFS.run(ctx, "ceph-fuse", args...)
+		return err
+	}
+	ns.sharedFS.mountInfo = func() ([]mount.MountInfo, error) {
+		points, err := mounter.List()
+		if err != nil {
+			return nil, err
+		}
+		devices := map[string]int{}
+		var result []mount.MountInfo
+		for _, mp := range points {
+			if devices[mp.Device] == 0 {
+				devices[mp.Device] = len(devices) + 1
+			}
+			result = append(result, mount.MountInfo{MountPoint: mp.Path, Major: 0, Minor: devices[mp.Device], Root: "/", Source: mp.Device, FsType: mp.Type, MountOptions: mp.Opts})
+		}
+		return result, nil
+	}
+	return ns
 }
 
 func withTestDiskPath(t *testing.T) string {
@@ -356,33 +413,10 @@ func TestResolveDevicePath(t *testing.T) {
 }
 
 func TestStageSharedFilesystemVolume(t *testing.T) {
-	tempDir := t.TempDir()
-	ns := getTestNodeServer([]string{})
-
-	resp, err := ns.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
-		VolumeId:          "cephfs:eyJiYWNrZW5kIjoiY2VwaGZzIiwiZGF0YXN0b3JlSUQiOjMwMCwiZnNOYW1lIjoiY2VwaGZzLXByb2QiLCJtb2RlIjoic3RhdGljIiwic3VicGF0aCI6Ii9rdWJlcm5ldGVzL3N0YXRpYy9tb2RlbC1jYWNoZSJ9",
-		StagingTargetPath: tempDir,
-		VolumeCapability: &csi.VolumeCapability{
-			AccessType: &csi.VolumeCapability_Mount{
-				Mount: &csi.VolumeCapability_MountVolume{FsType: "xfs"},
-			},
-			AccessMode: &csi.VolumeCapability_AccessMode{
-				Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
-			},
-		},
-		PublishContext: map[string]string{
-			"shareBackend":   "cephfs",
-			"cephfsMonitors": "mon1,mon2",
-			"cephfsFSName":   "cephfs-prod",
-			"cephfsSubpath":  "/kubernetes/static/model-cache",
-			"cephfsReadonly": "false",
-		},
-		Secrets: map[string]string{
-			"userID":  "csi-node",
-			"userKey": "super-secret",
-		},
-	})
-
+	withSharedFilesystemTestPaths(t)
+	ns := getTestNodeServer(nil)
+	id, stage, _ := sharedFilesystemFixturePaths(t, ns, "stage-volume")
+	resp, err := ns.NodeStageVolume(context.Background(), newSharedFilesystemStageRequest(id, stage, "fuse"))
 	assert.NoError(t, err)
 	assert.Equal(t, &csi.NodeStageVolumeResponse{}, resp)
 }
@@ -483,30 +517,10 @@ func TestPublishVolume(t *testing.T) {
 }
 
 func TestPublishSharedFilesystemVolume(t *testing.T) {
-	tempDir := t.TempDir()
-	ns := getTestNodeServer([]string{tempDir})
-
-	resp, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
-		VolumeId:          "cephfs:eyJiYWNrZW5kIjoiY2VwaGZzIiwiZGF0YXN0b3JlSUQiOjMwMCwiZnNOYW1lIjoiY2VwaGZzLXByb2QiLCJtb2RlIjoiZHluYW1pYyIsInN1YnBhdGgiOiIva3ViZXJuZXRlcy9keW5hbWljL29uZS1jc2ktZGVtbyJ9",
-		StagingTargetPath: tempDir,
-		TargetPath:        targetPath,
-		VolumeCapability: &csi.VolumeCapability{
-			AccessType: &csi.VolumeCapability_Mount{
-				Mount: &csi.VolumeCapability_MountVolume{FsType: "xfs"},
-			},
-			AccessMode: &csi.VolumeCapability_AccessMode{
-				Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
-			},
-		},
-		PublishContext: map[string]string{
-			"shareBackend":   "cephfs",
-			"cephfsMonitors": "mon1,mon2",
-			"cephfsFSName":   "cephfs-prod",
-			"cephfsSubpath":  "/kubernetes/dynamic/one-csi-demo",
-			"cephfsReadonly": "false",
-		},
-	})
-
+	withSharedFilesystemTestPaths(t)
+	ns := getTestNodeServer(nil)
+	id, stage, target := stageSharedFilesystemFixture(t, ns, "publish-volume")
+	resp, err := ns.NodePublishVolume(context.Background(), newSharedFilesystemPublishRequest(id, stage, target))
 	assert.NoError(t, err)
 	assert.Equal(t, &csi.NodePublishVolumeResponse{}, resp)
 }

@@ -53,6 +53,7 @@ Features that remain gated by default:
   `ghcr.io/sparkaiur/opennebula-csi:<tag>`
   `docker.io/nudevco/opennebula-csi:<tag>`
 - Latest release: `v0.5.27`
+- Next candidate: `v0.5.28`. See [CephFS recovery and rollout](docs/cephfs-recovery.md) for the failure contract and release gates.
 - Helm repo: `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
 - Chart name: `opennebula-csi`
 - Source repo: `https://github.com/SparkAIUR/storage-provider-opennebula`

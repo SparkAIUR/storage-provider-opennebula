@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,9 +34,8 @@ func TestLoadFeatureGatesIncludesCephFSRecoveryDefaults(t *testing.T) {
 func TestStageSharedFilesystemPersistsSessionAndCredentials(t *testing.T) {
 	withSharedFilesystemTestPaths(t)
 
-	stagePath := filepath.Join(t.TempDir(), "globalmount")
-	volumeID := "cephfs:test-stage-session"
 	ns := getTestNodeServer(nil)
+	volumeID, stagePath, _ := sharedFilesystemFixturePaths(t, ns, "test")
 
 	resp, err := ns.NodeStageVolume(context.Background(), newSharedFilesystemStageRequest(volumeID, stagePath, "fuse"))
 	require.NoError(t, err)
@@ -94,15 +94,9 @@ func TestNodeGetVolumeStatsQueuesRecoveryForStaleCephFSMount(t *testing.T) {
 func TestSharedFilesystemRecoveryRebindsMissingTarget(t *testing.T) {
 	withSharedFilesystemTestPaths(t)
 
-	baseDir, err := filepath.EvalSymlinks(t.TempDir())
-	require.NoError(t, err)
-	stagePath := filepath.Join(baseDir, "globalmount")
-	targetPath := filepath.Join(baseDir, "target")
-	volumeID := "cephfs:test-rebind"
 	ns := getTestNodeServer(nil)
-
-	_, err = ns.NodeStageVolume(context.Background(), newSharedFilesystemStageRequest(volumeID, stagePath, "fuse"))
-	require.NoError(t, err)
+	volumeID, stagePath, targetPath := stageSharedFilesystemFixture(t, ns, "rebind")
+	var err error
 
 	_, err = ns.NodePublishVolume(context.Background(), newSharedFilesystemPublishRequest(volumeID, stagePath, targetPath))
 	require.NoError(t, err)
@@ -133,16 +127,9 @@ func TestSharedFilesystemRecoveryRebindsMissingTarget(t *testing.T) {
 func TestSharedFilesystemPublishRejectsStaleStageWithoutBinding(t *testing.T) {
 	withSharedFilesystemTestPaths(t)
 
-	baseDir, err := filepath.EvalSymlinks(t.TempDir())
-	require.NoError(t, err)
-	stagePath := filepath.Join(baseDir, "globalmount")
-	targetPath := filepath.Join(baseDir, "target")
-	volumeID := "cephfs:test-stale-stage-publish"
 	ns := getTestNodeServer(nil)
 	ns.Driver.featureGates.CephFSSelfHealing = false
-
-	_, err = ns.NodeStageVolume(context.Background(), newSharedFilesystemStageRequest(volumeID, stagePath, "fuse"))
-	require.NoError(t, err)
+	volumeID, stagePath, targetPath := stageSharedFilesystemFixture(t, ns, "stale-stage-publish")
 
 	originalDetect := detectSharedFilesystemMount
 	detectSharedFilesystemMount = func(path string) error {
@@ -168,17 +155,11 @@ func TestSharedFilesystemPublishRejectsStaleStageWithoutBinding(t *testing.T) {
 func TestSharedFilesystemPublishRehydratesMissingSession(t *testing.T) {
 	withSharedFilesystemTestPaths(t)
 
-	baseDir, err := filepath.EvalSymlinks(t.TempDir())
-	require.NoError(t, err)
-	stagePath := filepath.Join(baseDir, "globalmount")
-	targetPath := filepath.Join(baseDir, "target")
-	volumeID := "cephfs:test-publish-session-rehydrate"
 	ns := getTestNodeServer(nil)
-
+	volumeID, stagePath, targetPath := stageSharedFilesystemFixture(t, ns, "rehydrate")
 	stageReq := newSharedFilesystemStageRequest(volumeID, stagePath, "fuse")
-	_, err = ns.NodeStageVolume(context.Background(), stageReq)
-	require.NoError(t, err)
-	ns.deleteSharedFilesystemSession(volumeID)
+	require.NoError(t, ns.deleteSharedFilesystemSession(volumeID))
+	var err error
 
 	publishReq := newSharedFilesystemPublishRequest(volumeID, stagePath, targetPath)
 	for key, value := range stageReq.GetPublishContext() {
@@ -216,7 +197,8 @@ func TestSharedFilesystemGarbageCollectSkipsWhenPodLookupUnknown(t *testing.T) {
 	}
 	ns.recordSharedFilesystemSession(session)
 
-	collected := ns.sharedFilesystemRecovery.garbageCollectOrphanedSession(context.Background(), session)
+	collected, gcErr := ns.sharedFilesystemRecovery.garbageCollectOrphanedSession(context.Background(), session)
+	require.NoError(t, gcErr)
 	assert.False(t, collected)
 
 	_, exists, err := ns.sharedFilesystemRecovery.store.Load(volumeID)
@@ -227,9 +209,8 @@ func TestSharedFilesystemGarbageCollectSkipsWhenPodLookupUnknown(t *testing.T) {
 func TestMountSharedFilesystemSessionRecreatesMissingStagePath(t *testing.T) {
 	withSharedFilesystemTestPaths(t)
 
-	stagePath := filepath.Join(t.TempDir(), "globalmount")
-	volumeID := "cephfs:test-missing-stage-path"
 	ns := getTestNodeServer(nil)
+	volumeID, stagePath, _ := sharedFilesystemFixturePaths(t, ns, "missing-stage-path")
 
 	_, err := ns.NodeStageVolume(context.Background(), newSharedFilesystemStageRequest(volumeID, stagePath, "fuse"))
 	require.NoError(t, err)
@@ -243,7 +224,7 @@ func TestMountSharedFilesystemSessionRecreatesMissingStagePath(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, exists)
 
-	require.NoError(t, ns.mountSharedFilesystemSession(session))
+	require.NoError(t, ns.mountSharedFilesystemSession(context.Background(), session))
 
 	info, err := os.Stat(stagePath)
 	require.NoError(t, err)
@@ -253,10 +234,9 @@ func TestMountSharedFilesystemSessionRecreatesMissingStagePath(t *testing.T) {
 func TestStageSharedFilesystemKernelMounterRequiresFeatureGate(t *testing.T) {
 	withSharedFilesystemTestPaths(t)
 
-	stagePath := filepath.Join(t.TempDir(), "globalmount")
 	ns := getTestNodeServer(nil)
-
-	_, err := ns.NodeStageVolume(context.Background(), newSharedFilesystemStageRequest("cephfs:test-kernel-gate", stagePath, "kernel"))
+	volumeID, stagePath, _ := sharedFilesystemFixturePaths(t, ns, "kernel-gate")
+	_, err := ns.NodeStageVolume(context.Background(), newSharedFilesystemStageRequest(volumeID, stagePath, "kernel"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cephfsKernelMounts=true")
 }
@@ -268,9 +248,8 @@ func TestStageSharedFilesystemKernelMounterSucceedsWhenEnabled(t *testing.T) {
 	require.NoError(t, os.WriteFile(procFile, []byte("nodev\tceph\n"), 0o644))
 	sharedFilesystemProcFilesystemsPath = procFile
 
-	stagePath := filepath.Join(t.TempDir(), "globalmount")
-	volumeID := "cephfs:test-kernel-success"
 	ns := getTestNodeServer(nil)
+	volumeID, stagePath, _ := sharedFilesystemFixturePaths(t, ns, "kernel-success")
 	ns.Driver.featureGates.CephFSKernelMounts = true
 
 	resp, err := ns.NodeStageVolume(context.Background(), newSharedFilesystemStageRequest(volumeID, stagePath, "kernel"))
@@ -315,6 +294,10 @@ func withSharedFilesystemTestPaths(t *testing.T) {
 }
 
 func newSharedFilesystemStageRequest(volumeID, stagePath, mounter string) *csi.NodeStageVolumeRequest {
+	subpath := "/kubernetes/dynamic/test"
+	if metadata, err := opennebula.DecodeSharedVolumeID(volumeID); err == nil {
+		subpath = metadata.Subpath
+	}
 	return &csi.NodeStageVolumeRequest{
 		VolumeId:          volumeID,
 		StagingTargetPath: stagePath,
@@ -333,7 +316,7 @@ func newSharedFilesystemStageRequest(volumeID, stagePath, mounter string) *csi.N
 			sharedPublishContextShareBackend:   "cephfs",
 			sharedPublishContextCephFSMonitors: "mon1,mon2",
 			sharedPublishContextCephFSFSName:   "cephfs-prod",
-			sharedPublishContextCephFSSubpath:  "/kubernetes/dynamic/test",
+			sharedPublishContextCephFSSubpath:  subpath,
 			sharedPublishContextCephFSReadonly: "false",
 		},
 		Secrets: map[string]string{

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -54,6 +55,7 @@ type sharedFilesystemPublishedTarget struct {
 }
 
 type sharedFilesystemSession struct {
+	Unstaging         bool                              `json:"unstaging,omitempty"`
 	VolumeID          string                            `json:"volumeID"`
 	Mounter           sharedFilesystemMounter           `json:"mounter"`
 	UserID            string                            `json:"userID"`
@@ -85,6 +87,8 @@ type sharedFilesystemRecoveryManager struct {
 	mu           sync.Mutex
 	queued       map[string]struct{}
 	lastFailures map[string]time.Time
+	again        map[string]bool
+	failures     map[string]int
 }
 
 func newSharedFilesystemRecoveryManager(ns *NodeServer) *sharedFilesystemRecoveryManager {
@@ -97,6 +101,8 @@ func newSharedFilesystemRecoveryManager(ns *NodeServer) *sharedFilesystemRecover
 		queue:        make(chan string, 128),
 		queued:       make(map[string]struct{}),
 		lastFailures: make(map[string]time.Time),
+		again:        make(map[string]bool),
+		failures:     make(map[string]int),
 	}
 }
 
@@ -111,6 +117,12 @@ func newSharedFilesystemSessionStore(root string) *sharedFilesystemSessionStore 
 func (s *sharedFilesystemSessionStore) Save(session sharedFilesystemSession) error {
 	if strings.TrimSpace(session.VolumeID) == "" {
 		return fmt.Errorf("shared filesystem session is missing volume ID")
+	}
+	if session.KeyringPath == "" && session.StagingTargetPath != "" {
+		session.KeyringPath = sharedCephFSKeyringPath(session.StagingTargetPath)
+	}
+	if session.SecretFilePath == "" && session.StagingTargetPath != "" {
+		session.SecretFilePath = sharedCephFSSecretPath(session.StagingTargetPath)
 	}
 	session.StageMountOptions = uniqueStrings(session.StageMountOptions)
 	session.PublishedTargets = normalizeSharedFilesystemPublishedTargets(session.PublishedTargets)
@@ -128,10 +140,7 @@ func (s *sharedFilesystemSessionStore) Save(session sharedFilesystemSession) err
 
 	targetPath := s.pathForVolume(session.VolumeID)
 	tmpPath := targetPath + ".tmp"
-	if err := os.WriteFile(tmpPath, payload, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, targetPath)
+	return durableSharedFilesystemWrite(tmpPath, targetPath, payload)
 }
 
 func (s *sharedFilesystemSessionStore) Load(volumeID string) (sharedFilesystemSession, bool, error) {
@@ -152,6 +161,12 @@ func (s *sharedFilesystemSessionStore) loadLocked(volumeID string) (sharedFilesy
 	if err := json.Unmarshal(payload, &session); err != nil {
 		return sharedFilesystemSession{}, false, err
 	}
+	if session.KeyringPath == "" && session.StagingTargetPath != "" {
+		session.KeyringPath = sharedCephFSKeyringPath(session.StagingTargetPath)
+	}
+	if session.SecretFilePath == "" && session.StagingTargetPath != "" {
+		session.SecretFilePath = sharedCephFSSecretPath(session.StagingTargetPath)
+	}
 	session.StageMountOptions = uniqueStrings(session.StageMountOptions)
 	session.PublishedTargets = normalizeSharedFilesystemPublishedTargets(session.PublishedTargets)
 	if session.Mounter == "" {
@@ -166,7 +181,21 @@ func (s *sharedFilesystemSessionStore) Delete(volumeID string) error {
 	if err := os.Remove(s.pathForVolume(volumeID)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	return nil
+	// After unstage has proved that all references are gone, cleanup intents
+	// for this volume can no longer protect a recoverable mount.
+	prefix := strings.TrimSuffix(filepath.Base(s.pathForVolume(volumeID)), ".json") + "-"
+	entries, err := os.ReadDir(s.root)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasPrefix(entry.Name(), prefix) && strings.HasSuffix(entry.Name(), ".unpublish") {
+			if err := os.Remove(filepath.Join(s.root, entry.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	return syncSharedFilesystemDirectory(s.root)
 }
 
 func (s *sharedFilesystemSessionStore) List() ([]sharedFilesystemSession, error) {
@@ -194,6 +223,12 @@ func (s *sharedFilesystemSessionStore) List() ([]sharedFilesystemSession, error)
 		if err := json.Unmarshal(payload, &session); err != nil {
 			return nil, err
 		}
+		if session.KeyringPath == "" && session.StagingTargetPath != "" {
+			session.KeyringPath = sharedCephFSKeyringPath(session.StagingTargetPath)
+		}
+		if session.SecretFilePath == "" && session.StagingTargetPath != "" {
+			session.SecretFilePath = sharedCephFSSecretPath(session.StagingTargetPath)
+		}
 		session.StageMountOptions = uniqueStrings(session.StageMountOptions)
 		session.PublishedTargets = normalizeSharedFilesystemPublishedTargets(session.PublishedTargets)
 		if session.Mounter == "" {
@@ -220,27 +255,38 @@ func (m *sharedFilesystemRecoveryManager) Start(ctx context.Context) {
 }
 
 func (m *sharedFilesystemRecoveryManager) run(ctx context.Context) {
+	var workers sync.WaitGroup
+	defer workers.Wait()
+	for i := 0; i < 2; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case volumeID := <-m.queue:
+					m.recoverQueuedVolume(ctx, volumeID)
+				}
+			}
+		}()
+	}
 	select {
 	case <-ctx.Done():
 		return
 	case <-time.After(sharedFilesystemRecoveryStartupDelay):
 	}
-
-	m.seedSessionsFromMounts(ctx)
-	m.enqueueUnhealthySessions(ctx, "startup")
-
 	ticker := time.NewTicker(sharedFilesystemRecoveryInterval)
 	defer ticker.Stop()
-
 	for {
+		attempt, cancel := context.WithTimeout(ctx, sharedFilesystemAttemptTimeout)
+		m.seedSessionsFromMounts(attempt)
+		cancel()
+		m.enqueueUnhealthySessions(ctx, "sweep")
 		select {
 		case <-ctx.Done():
 			return
-		case volumeID := <-m.queue:
-			m.recoverQueuedVolume(ctx, volumeID)
 		case <-ticker.C:
-			m.seedSessionsFromMounts(ctx)
-			m.enqueueUnhealthySessions(ctx, "periodic")
 		}
 	}
 }
@@ -252,6 +298,9 @@ func (m *sharedFilesystemRecoveryManager) enqueue(volumeID, reason string) {
 
 	m.mu.Lock()
 	if _, ok := m.queued[volumeID]; ok {
+		if reason != "sweep" {
+			m.again[volumeID] = true
+		}
 		m.mu.Unlock()
 		return
 	}
@@ -270,53 +319,76 @@ func (m *sharedFilesystemRecoveryManager) enqueue(volumeID, reason string) {
 }
 
 func (m *sharedFilesystemRecoveryManager) recoverQueuedVolume(ctx context.Context, volumeID string) {
-	defer func() {
-		m.mu.Lock()
-		delete(m.queued, volumeID)
-		m.mu.Unlock()
-	}()
-
-	if err := m.recoverVolume(ctx, volumeID); err != nil {
-		m.mu.Lock()
+	started := time.Now()
+	err := m.recoverVolume(ctx, volumeID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	retry := m.again[volumeID] || err != nil
+	delete(m.again, volumeID)
+	delete(m.queued, volumeID)
+	if err == nil && !retry {
+		delete(m.failures, volumeID)
+		delete(m.lastFailures, volumeID)
+	} else if err != nil {
 		lastFailure := m.lastFailures[volumeID]
-		if time.Since(lastFailure) > 10*time.Minute {
-			klog.ErrorS(err, "Shared filesystem recovery failed", "volumeID", volumeID)
+		if lastFailure.IsZero() || time.Since(lastFailure) > 10*time.Minute {
+			klog.ErrorS(err, "Shared filesystem recovery failed", "volumeID", volumeID, "duration", time.Since(started))
 			m.lastFailures[volumeID] = time.Now()
-		} else {
-			klog.V(3).InfoS("Shared filesystem recovery still failing", "volumeID", volumeID, "err", err)
 		}
-		m.mu.Unlock()
+		outcome := "failed"
+		if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
+			outcome = "timeout"
+		}
+		m.ns.Driver.metrics.RecordCephFSSubvolume("recovery_attempt", outcome)
+	}
+	m.ns.Driver.metrics.cephFSRecoveryPending.Set(float64(len(m.lastFailures)))
+	if retry && ctx.Err() == nil {
+		m.failures[volumeID]++
+		backoff := 5 * time.Second
+		for i := 1; i < m.failures[volumeID] && backoff < sharedFilesystemRecoveryInterval; i++ {
+			backoff *= 2
+		}
+		if backoff > sharedFilesystemRecoveryInterval {
+			backoff = sharedFilesystemRecoveryInterval
+		}
+		time.AfterFunc(backoff, func() {
+			if ctx.Err() == nil {
+				m.enqueue(volumeID, "retry")
+			}
+		})
 	}
 }
 
+// Enqueue without probing paths: a blocked volume must not starve the sweep.
 func (m *sharedFilesystemRecoveryManager) enqueueUnhealthySessions(ctx context.Context, reason string) {
-	m.seedSessionsFromMounts(ctx)
-
 	sessions, err := m.store.List()
 	if err != nil {
-		klog.ErrorS(err, "Failed to list shared filesystem sessions for recovery")
+		klog.ErrorS(err, "Failed to list shared filesystem sessions")
 		return
 	}
+	present := make(map[string]bool, len(sessions))
 	for _, session := range sessions {
-		if m.garbageCollectOrphanedSession(ctx, session) {
-			continue
-		}
-		health, err := m.ns.evaluateSharedFilesystemSession(session)
-		if err != nil {
-			klog.ErrorS(err, "Failed to evaluate shared filesystem session health", "volumeID", session.VolumeID)
-			continue
-		}
-		if health.RecoverStage || len(health.TargetsToRebind) > 0 {
-			m.ns.Driver.metrics.RecordCephFSSubvolume("recovery_detected_"+string(session.Mounter), "observed")
-			m.enqueue(session.VolumeID, reason)
+		present[session.VolumeID] = true
+	}
+	m.mu.Lock()
+	for id := range m.lastFailures {
+		if !present[id] {
+			delete(m.lastFailures, id)
 		}
 	}
-
+	m.ns.Driver.metrics.cephFSRecoveryPending.Set(float64(len(m.lastFailures)))
+	m.mu.Unlock()
+	for _, session := range sessions {
+		if ctx.Err() != nil {
+			return
+		}
+		m.enqueue(session.VolumeID, reason)
+	}
 }
 
-func (m *sharedFilesystemRecoveryManager) garbageCollectOrphanedSession(ctx context.Context, session sharedFilesystemSession) bool {
-	if m == nil || m.ns == nil || strings.TrimSpace(session.VolumeID) == "" || len(session.PublishedTargets) == 0 {
-		return false
+func (m *sharedFilesystemRecoveryManager) garbageCollectOrphanedSession(ctx context.Context, session sharedFilesystemSession) (bool, error) {
+	if m == nil || m.ns == nil || m.ns.Driver == nil || m.ns.Driver.kubeRuntime == nil || !m.ns.Driver.kubeRuntime.enabled || strings.TrimSpace(session.VolumeID) == "" {
+		return false, nil
 	}
 	allPodsGone := true
 	for _, target := range session.PublishedTargets {
@@ -337,71 +409,99 @@ func (m *sharedFilesystemRecoveryManager) garbageCollectOrphanedSession(ctx cont
 		}
 	}
 	if !allPodsGone {
-		return false
+		return false, nil
 	}
 	if m.ns.Driver != nil && m.ns.Driver.kubeRuntime != nil {
 		if _, err := m.ns.Driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, session.VolumeID); err == nil {
-			return false
+			return false, nil
 		} else if !strings.Contains(strings.ToLower(err.Error()), "persistent volume for handle") {
 			klog.V(2).InfoS("Skipping CephFS session GC because volume runtime context could not be confirmed", "volumeID", session.VolumeID, "err", err)
-			return false
+			return false, nil
 		}
 	}
+	if err := m.ns.verifySharedFilesystemSessionMode(ctx, session, true); err != nil {
+		return false, nil
+	}
+	// Preflight every target before committing the cleanup direction.
 	for _, target := range session.PublishedTargets {
-		if mp, mounted, err := m.ns.mountPointForPath(target.TargetPath); err == nil && mounted {
-			if _, statErr := nodeVolumePathStat(target.TargetPath); statErr == nil {
-				klog.V(2).InfoS("Skipping CephFS session GC because target still appears mounted", "volumeID", session.VolumeID, "target", target.TargetPath, "source", mp.Device)
-				return false
+		if _, mounted, err := m.ns.mountPointForPath(target.TargetPath); err != nil {
+			return false, err
+		} else if mounted {
+			if err := m.ns.sharedFS.probe(ctx, target.TargetPath); !isDisconnectedSharedFilesystemError(err) {
+				return false, nil
 			}
 		}
-		_ = mount.CleanupMountPoint(target.TargetPath, m.ns.mounter.Interface, true)
-		_ = os.RemoveAll(target.TargetPath)
 	}
-	if err := m.store.Delete(session.VolumeID); err != nil {
-		klog.ErrorS(err, "Failed to delete orphaned CephFS session", "volumeID", session.VolumeID)
-		return false
+	session.Unstaging = true
+	if err := m.store.Save(session); err != nil {
+		return false, err
 	}
-	if m.ns.Driver != nil && m.ns.Driver.metrics != nil {
-		m.ns.Driver.metrics.RecordCephFSSubvolume("session_gc", "succeeded")
+	for _, target := range session.PublishedTargets {
+		if err := m.store.setUnpublishIntent(session.VolumeID, target.TargetPath, true); err != nil {
+			return false, err
+		}
 	}
+	if err := m.ns.finishSharedFilesystemUnstage(ctx, session); err != nil {
+		return false, err
+	}
+	m.ns.Driver.metrics.RecordCephFSSubvolume("session_gc", "succeeded")
 	klog.InfoS("Garbage collected orphaned CephFS session", "volumeID", session.VolumeID)
-	return true
+	return true, nil
 }
 
 func (m *sharedFilesystemRecoveryManager) recoverVolume(ctx context.Context, volumeID string) error {
 	if m == nil || m.ns == nil {
 		return nil
 	}
+	release, acquired := m.ns.Driver.operationLocks.TryAcquire("sharedfs:" + strings.TrimSpace(volumeID))
+	if !acquired {
+		return status.Error(codes.Aborted, "shared filesystem operation already in progress")
+	}
+	ctx, cancel := context.WithTimeout(ctx, sharedFilesystemAttemptTimeout)
+	defer cancel()
+	ctx, release = fenceSharedFilesystemOperation(ctx, release, func() { m.enqueue(volumeID, "process_reaped") })
+	defer release()
+	return m.recoverVolumeLocked(ctx, volumeID)
+}
+
+// The caller owns sharedfs:<volumeID>. Never acquire that lock again here.
+func (m *sharedFilesystemRecoveryManager) recoverVolumeLocked(ctx context.Context, volumeID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	session, exists, err := m.store.Load(volumeID)
 	if err != nil {
 		return err
 	}
 	if !exists {
-		m.seedSessionsFromMounts(ctx)
-		session, exists, err = m.store.Load(volumeID)
-		if err != nil {
-			return err
-		}
+		return nil // A queued exit can race a completed unstage.
 	}
-	if !exists {
-		return nil
+	if session.Unstaging {
+		return m.ns.finishSharedFilesystemUnstage(ctx, session)
 	}
-
-	release := m.ns.acquireSharedFilesystemOperationLock(volumeID)
-	defer release()
-
-	session, exists, err = m.store.Load(volumeID)
-	if err != nil {
+	if err := m.ns.pruneSharedFilesystemUnpublishedTargets(ctx, &session); err != nil {
 		return err
 	}
-	if !exists {
-		return nil
-	}
-	if m.garbageCollectOrphanedSession(ctx, session) {
-		return nil
+	if collected, err := m.garbageCollectOrphanedSession(ctx, session); collected || err != nil {
+		return err
 	}
 
-	health, err := m.ns.evaluateSharedFilesystemSession(session)
+	if err := m.ns.verifySharedFilesystemSession(ctx, session); err != nil {
+		m.ns.Driver.metrics.RecordCephFSSubvolume("recovery_ownership", "rejected")
+		return err
+	}
+	if runtime := m.ns.Driver.kubeRuntime; runtime != nil {
+		runtimeContext, err := runtime.ResolveVolumeRuntimeContext(ctx, session.VolumeID)
+		if err != nil {
+			return fmt.Errorf("cannot confirm recovery PV ownership: %w", err)
+		}
+		for _, target := range session.PublishedTargets {
+			if filepath.Base(filepath.Dir(target.TargetPath)) != runtimeContext.PVName {
+				return fmt.Errorf("target does not belong to recovery PV")
+			}
+		}
+	}
+	health, err := m.ns.evaluateSharedFilesystemSession(ctx, session)
 	if err != nil {
 		return err
 	}
@@ -413,37 +513,43 @@ func (m *sharedFilesystemRecoveryManager) recoverVolume(ctx context.Context, vol
 
 	if health.RecoverStage {
 		for _, target := range session.PublishedTargets {
-			if err := mount.CleanupMountPoint(target.TargetPath, m.ns.mounter.Interface, true); err != nil {
+			if err := m.ns.cleanupSharedFilesystemPath(ctx, target.TargetPath); err != nil {
 				return fmt.Errorf("failed to cleanup stale target %s before stage recovery: %w", target.TargetPath, err)
 			}
 		}
-		if err := mountCleanup(session.StagingTargetPath, m.ns); err != nil {
+		if err := m.ns.cleanupSharedFilesystemPath(ctx, session.StagingTargetPath); err != nil {
 			return status.Errorf(codes.Internal, "failed to cleanup stale shared filesystem stage %s: %v", session.StagingTargetPath, err)
 		}
-		if err := m.ns.mountSharedFilesystemSession(session); err != nil {
+		if err := m.ns.mountSharedFilesystemSession(ctx, session); err != nil {
 			m.ns.Driver.metrics.RecordCephFSSubvolume("recovery_"+string(session.Mounter), "failed")
 			return err
 		}
 		for _, target := range session.PublishedTargets {
-			if err := m.ns.publishSharedFilesystemTarget(session.StagingTargetPath, target); err != nil {
+			if err := m.ns.publishSharedFilesystemTarget(ctx, session.StagingTargetPath, target); err != nil {
 				m.ns.Driver.metrics.RecordCephFSSubvolume("recovery_"+string(session.Mounter), "failed")
 				return err
 			}
+		}
+		if err := m.ns.confirmSharedFilesystemRecovery(ctx, session); err != nil {
+			return err
 		}
 		m.ns.Driver.metrics.RecordCephFSSubvolume("recovery_"+string(session.Mounter), "succeeded")
 		return nil
 	}
 
 	for _, target := range health.TargetsToRebind {
-		if err := mount.CleanupMountPoint(target.TargetPath, m.ns.mounter.Interface, true); err != nil {
+		if err := m.ns.cleanupSharedFilesystemPath(ctx, target.TargetPath); err != nil {
 			return fmt.Errorf("failed to cleanup shared filesystem target %s before rebinding: %w", target.TargetPath, err)
 		}
-		if err := m.ns.publishSharedFilesystemTarget(session.StagingTargetPath, target); err != nil {
+		if err := m.ns.publishSharedFilesystemTarget(ctx, session.StagingTargetPath, target); err != nil {
 			m.ns.Driver.metrics.RecordCephFSSubvolume("recovery_"+string(session.Mounter), "failed")
 			return err
 		}
 	}
 
+	if err := m.ns.confirmSharedFilesystemRecovery(ctx, session); err != nil {
+		return err
+	}
 	m.ns.Driver.metrics.RecordCephFSSubvolume("recovery_"+string(session.Mounter), "succeeded")
 	return nil
 }
@@ -461,44 +567,62 @@ func (m *sharedFilesystemRecoveryManager) seedSessionsFromMounts(ctx context.Con
 
 	datastoreCache := make(map[int]opennebula.Datastore)
 	for _, mountPoint := range mountPoints {
-		volumeID := sharedFilesystemVolumeIDFromStagingPath(mountPoint.Path)
-		if volumeID == "" {
+		volumeID, metaErr := sharedFilesystemStageVolumeID(mountPoint.Path)
+		if metaErr != nil {
 			continue
 		}
 
-		session, exists, err := m.store.Load(volumeID)
-		if err != nil {
-			klog.ErrorS(err, "Failed to load shared filesystem session during seed", "volumeID", volumeID)
+		release, acquired := m.ns.Driver.operationLocks.TryAcquire("sharedfs:" + volumeID)
+		if !acquired {
 			continue
 		}
-		if !exists {
-			session, err = m.ns.reconstructSharedFilesystemSessionFromMount(ctx, mountPoint, mountPoints, datastoreCache)
+		func() {
+			defer release()
+			session, exists, err := m.store.Load(volumeID)
 			if err != nil {
-				klog.V(2).ErrorS(err, "Failed to reconstruct shared filesystem session from mount state", "stagePath", mountPoint.Path)
-				continue
+				klog.ErrorS(err, "Failed to load shared filesystem session during seed", "volumeID", volumeID)
+				return
 			}
-		}
+			if exists && session.Unstaging {
+				return
+			}
+			if !exists {
+				session, err = m.ns.reconstructSharedFilesystemSessionFromMount(ctx, mountPoint, mountPoints, datastoreCache)
+				if err != nil {
+					klog.V(2).ErrorS(err, "Failed to reconstruct shared filesystem session from mount state", "stagePath", mountPoint.Path)
+					return
+				}
+			}
 
-		session.StagingTargetPath = mountPoint.Path
-		session.Mounter = sharedFilesystemMounterFromMountType(mountPoint.Type)
-		if session.KeyringPath == "" {
-			session.KeyringPath = sharedCephFSKeyringPath(mountPoint.Path)
-		}
-		if session.SecretFilePath == "" {
-			session.SecretFilePath = sharedCephFSSecretPath(mountPoint.Path)
-		}
-		if session.UserID == "" {
-			session.UserID = sharedFilesystemUserIDFromKeyring(session.KeyringPath)
-		}
-		session.StageMountOptions = uniqueStrings(append(session.StageMountOptions, sharedFilesystemMountOptionsFromMountPoint(mountPoint)...))
-		session.PublishedTargets = sharedFilesystemPublishedTargetsFromMounts(mountPoints, mountPoint)
-		if err := m.store.Save(session); err != nil {
-			klog.ErrorS(err, "Failed to persist seeded shared filesystem session", "volumeID", volumeID)
-		}
+			if exists && session.StagingTargetPath != mountPoint.Path {
+				klog.ErrorS(fmt.Errorf("persisted staging path mismatch"), "Refusing CephFS session seed", "volumeID", volumeID)
+				return
+			}
+			session.StagingTargetPath = mountPoint.Path
+			session.Mounter = sharedFilesystemMounterFromMountType(mountPoint.Type)
+			if session.KeyringPath == "" {
+				session.KeyringPath = sharedCephFSKeyringPath(mountPoint.Path)
+			}
+			if session.SecretFilePath == "" {
+				session.SecretFilePath = sharedCephFSSecretPath(mountPoint.Path)
+			}
+			if session.UserID == "" {
+				session.UserID = sharedFilesystemUserIDFromKeyring(session.KeyringPath)
+			}
+			targets, err := m.ns.discoverSharedFilesystemTargets(volumeID, mountPoint.Path)
+			if err != nil {
+				klog.ErrorS(err, "Cannot prove CephFS mount ownership", "stagePath", mountPoint.Path)
+				return
+			}
+			session.PublishedTargets = normalizeSharedFilesystemPublishedTargets(append(session.PublishedTargets, targets...))
+			if err := m.store.Save(session); err != nil {
+				klog.ErrorS(err, "Failed to persist seeded shared filesystem session", "volumeID", volumeID)
+			}
+		}()
 	}
 }
 
-func (ns *NodeServer) evaluateSharedFilesystemSession(session sharedFilesystemSession) (sharedFilesystemSessionHealth, error) {
+func (ns *NodeServer) evaluateSharedFilesystemSession(ctx context.Context, session sharedFilesystemSession) (sharedFilesystemSessionHealth, error) {
 	health := sharedFilesystemSessionHealth{}
 	if strings.TrimSpace(session.StagingTargetPath) == "" {
 		return health, nil
@@ -513,7 +637,10 @@ func (ns *NodeServer) evaluateSharedFilesystemSession(session sharedFilesystemSe
 		health.Reason = "stage_missing"
 		return health, nil
 	}
-	if err := detectSharedFilesystemMount(session.StagingTargetPath); err != nil {
+	if err := ns.sharedFS.probe(ctx, session.StagingTargetPath); err != nil {
+		if !isDisconnectedSharedFilesystemError(err) {
+			return health, err
+		}
 		health.RecoverStage = true
 		health.Reason = "stage_stale"
 		return health, nil
@@ -528,7 +655,10 @@ func (ns *NodeServer) evaluateSharedFilesystemSession(session sharedFilesystemSe
 			health.TargetsToRebind = append(health.TargetsToRebind, target)
 			continue
 		}
-		if _, err := nodeVolumePathStat(target.TargetPath); err != nil && isDisconnectedSharedFilesystemError(err) {
+		if err := ns.sharedFS.probe(ctx, target.TargetPath); err != nil {
+			if !isDisconnectedSharedFilesystemError(err) {
+				return health, err
+			}
 			health.TargetsToRebind = append(health.TargetsToRebind, target)
 		}
 	}
@@ -537,8 +667,8 @@ func (ns *NodeServer) evaluateSharedFilesystemSession(session sharedFilesystemSe
 }
 
 func (ns *NodeServer) reconstructSharedFilesystemSessionFromMount(ctx context.Context, stageMount mount.MountPoint, mountPoints []mount.MountPoint, datastoreCache map[int]opennebula.Datastore) (sharedFilesystemSession, error) {
-	volumeID := sharedFilesystemVolumeIDFromStagingPath(stageMount.Path)
-	if volumeID == "" {
+	volumeID, metaErr := sharedFilesystemStageVolumeID(stageMount.Path)
+	if metaErr != nil {
 		return sharedFilesystemSession{}, fmt.Errorf("stage path %s does not map to a shared filesystem volume", stageMount.Path)
 	}
 
@@ -564,10 +694,9 @@ func (ns *NodeServer) reconstructSharedFilesystemSessionFromMount(ctx context.Co
 		Monitors:          append([]string(nil), datastore.CephFS.Monitors...),
 		FSName:            metadata.FSName,
 		Subpath:           metadata.Subpath,
-		StageMountOptions: uniqueStrings(append(append([]string(nil), datastore.CephFS.MountOptions...), sharedFilesystemMountOptionsFromMountPoint(stageMount)...)),
+		StageMountOptions: uniqueStrings(datastore.CephFS.MountOptions),
 		KeyringPath:       sharedCephFSKeyringPath(stageMount.Path),
 		SecretFilePath:    sharedCephFSSecretPath(stageMount.Path),
-		PublishedTargets:  sharedFilesystemPublishedTargetsFromMounts(mountPoints, stageMount),
 	}
 	return session, nil
 }
@@ -622,22 +751,18 @@ func (ns *NodeServer) handleDisconnectedSharedFilesystemPath(volumeID, volumePat
 	return status.Errorf(codes.FailedPrecondition, "stale CephFS mount detected at %s: %v; restage the volume to recover", volumePath, err)
 }
 
-func (ns *NodeServer) recordSharedFilesystemSession(session sharedFilesystemSession) {
+func (ns *NodeServer) recordSharedFilesystemSession(session sharedFilesystemSession) error {
 	if ns == nil || ns.sharedFilesystemRecovery == nil {
-		return
+		return fmt.Errorf("shared filesystem session store is unavailable")
 	}
-	if err := ns.sharedFilesystemRecovery.store.Save(session); err != nil {
-		klog.ErrorS(err, "Failed to persist shared filesystem session", "volumeID", session.VolumeID)
-	}
+	return ns.sharedFilesystemRecovery.store.Save(session)
 }
 
-func (ns *NodeServer) deleteSharedFilesystemSession(volumeID string) {
+func (ns *NodeServer) deleteSharedFilesystemSession(volumeID string) error {
 	if ns == nil || ns.sharedFilesystemRecovery == nil {
-		return
+		return fmt.Errorf("shared filesystem session store is unavailable")
 	}
-	if err := ns.sharedFilesystemRecovery.store.Delete(volumeID); err != nil {
-		klog.ErrorS(err, "Failed to delete shared filesystem session", "volumeID", volumeID)
-	}
+	return ns.sharedFilesystemRecovery.store.Delete(volumeID)
 }
 
 func (ns *NodeServer) ensureSharedFilesystemSessionForPublish(req *csi.NodePublishVolumeRequest) (sharedFilesystemSession, error) {
@@ -654,12 +779,21 @@ func (ns *NodeServer) ensureSharedFilesystemSessionForPublish(req *csi.NodePubli
 		return sharedFilesystemSession{}, err
 	}
 	if exists {
+		if session.Unstaging {
+			return session, fmt.Errorf("volume is being unstaged")
+		}
+		if session.StagingTargetPath != req.GetStagingTargetPath() {
+			return session, fmt.Errorf("staging path differs from persisted session")
+		}
 		return session, nil
 	}
 
 	session, ok, err := ns.sharedFilesystemSessionFromPublishRequest(req)
-	if err != nil || !ok {
+	if err != nil {
 		return session, err
+	}
+	if !ok {
+		return session, fmt.Errorf("cannot reconstruct session from publish request")
 	}
 	if err := ns.sharedFilesystemRecovery.store.Save(session); err != nil {
 		return sharedFilesystemSession{}, err
@@ -725,87 +859,37 @@ func sharedFilesystemStageMountOptionsFromPublishRequest(req *csi.NodePublishVol
 	return uniqueStrings(options)
 }
 
-func (ns *NodeServer) updateSharedFilesystemPublishedTarget(volumeID string, target sharedFilesystemPublishedTarget) {
-	if ns == nil || ns.sharedFilesystemRecovery == nil || strings.TrimSpace(volumeID) == "" {
-		return
-	}
+func (ns *NodeServer) updateSharedFilesystemPublishedTarget(volumeID string, target sharedFilesystemPublishedTarget) error {
 	session, exists, err := ns.sharedFilesystemRecovery.store.Load(volumeID)
-	if err != nil || !exists {
-		if err != nil {
-			klog.ErrorS(err, "Failed to load shared filesystem session for publish update", "volumeID", volumeID)
-		}
-		return
+	if err != nil {
+		return err
 	}
-
+	if !exists {
+		return fmt.Errorf("shared filesystem session is missing")
+	}
 	targets := make([]sharedFilesystemPublishedTarget, 0, len(session.PublishedTargets)+1)
-	replaced := false
 	for _, existing := range session.PublishedTargets {
-		if existing.TargetPath == target.TargetPath {
-			targets = append(targets, target)
-			replaced = true
-			continue
+		if existing.TargetPath != target.TargetPath {
+			targets = append(targets, existing)
 		}
-		targets = append(targets, existing)
 	}
-	if !replaced {
-		targets = append(targets, target)
-	}
-	session.PublishedTargets = targets
-	ns.recordSharedFilesystemSession(session)
+	session.PublishedTargets = append(targets, target)
+	return ns.recordSharedFilesystemSession(session)
 }
 
-func (ns *NodeServer) removeSharedFilesystemPublishedTarget(volumeID, targetPath string) {
-	if ns == nil || ns.sharedFilesystemRecovery == nil || strings.TrimSpace(volumeID) == "" {
-		return
-	}
+func (ns *NodeServer) removeSharedFilesystemPublishedTarget(volumeID, targetPath string) error {
 	session, exists, err := ns.sharedFilesystemRecovery.store.Load(volumeID)
 	if err != nil || !exists {
-		if err != nil {
-			klog.ErrorS(err, "Failed to load shared filesystem session for target removal", "volumeID", volumeID)
-		}
-		return
+		return err
 	}
-
 	filtered := make([]sharedFilesystemPublishedTarget, 0, len(session.PublishedTargets))
 	for _, target := range session.PublishedTargets {
-		if target.TargetPath == targetPath {
-			continue
+		if target.TargetPath != targetPath {
+			filtered = append(filtered, target)
 		}
-		filtered = append(filtered, target)
 	}
 	session.PublishedTargets = filtered
-	if len(filtered) == 0 && strings.TrimSpace(session.StagingTargetPath) == "" {
-		ns.deleteSharedFilesystemSession(volumeID)
-		return
-	}
-	ns.recordSharedFilesystemSession(session)
-}
-
-func (ns *NodeServer) cleanupOrphanedSharedFilesystemTargetOnUnpublish(ctx context.Context, volumeID, targetPath string, cause error) bool {
-	if ns == nil || ns.sharedFilesystemRecovery == nil {
-		return false
-	}
-	podUID := podUIDFromKubeletPath(targetPath)
-	if podUID == "" {
-		return false
-	}
-	exists, known := ns.podUIDExistsKnown(ctx, podUID)
-	if !known || exists {
-		return false
-	}
-	if mountPoint, mounted, err := ns.mountPointForPath(targetPath); err == nil && mounted {
-		if _, statErr := nodeVolumePathStat(targetPath); statErr == nil {
-			klog.V(2).InfoS("Skipping orphaned CephFS target cleanup because target still appears usable", "volumeID", volumeID, "targetPath", targetPath, "source", mountPoint.Device)
-			return false
-		}
-	}
-	ns.removeSharedFilesystemPublishedTarget(volumeID, targetPath)
-	_ = os.RemoveAll(targetPath)
-	if ns.Driver != nil && ns.Driver.metrics != nil {
-		ns.Driver.metrics.RecordCephFSSubvolume("target_gc", "succeeded")
-	}
-	klog.InfoS("Cleaned orphaned CephFS target during unpublish", "volumeID", volumeID, "targetPath", targetPath, "cause", cause)
-	return true
+	return ns.recordSharedFilesystemSession(session)
 }
 
 func normalizeSharedFilesystemPublishedTargets(targets []sharedFilesystemPublishedTarget) []sharedFilesystemPublishedTarget {
@@ -832,23 +916,6 @@ func normalizeSharedFilesystemPublishedTargets(targets []sharedFilesystemPublish
 	return normalized
 }
 
-func sharedFilesystemPublishedTargetsFromMounts(mountPoints []mount.MountPoint, stageMount mount.MountPoint) []sharedFilesystemPublishedTarget {
-	targets := make([]sharedFilesystemPublishedTarget, 0)
-	for _, mountPoint := range mountPoints {
-		if mountPoint.Path == stageMount.Path {
-			continue
-		}
-		if mountPoint.Device != stageMount.Path && mountPoint.Device != stageMount.Device {
-			continue
-		}
-		targets = append(targets, sharedFilesystemPublishedTarget{
-			TargetPath:   mountPoint.Path,
-			MountOptions: sharedFilesystemMountOptionsFromMountPoint(mountPoint),
-		})
-	}
-	return normalizeSharedFilesystemPublishedTargets(targets)
-}
-
 func sharedFilesystemMountOptionsFromMountPoint(mountPoint mount.MountPoint) []string {
 	options := make([]string, 0, len(mountPoint.Opts))
 	for _, option := range mountPoint.Opts {
@@ -861,18 +928,6 @@ func sharedFilesystemMountOptionsFromMountPoint(mountPoint mount.MountPoint) []s
 		}
 	}
 	return uniqueStrings(options)
-}
-
-func sharedFilesystemVolumeIDFromStagingPath(stagingTargetPath string) string {
-	cleaned := filepath.Clean(stagingTargetPath)
-	if filepath.Base(cleaned) != "globalmount" {
-		return ""
-	}
-	volumeID := filepath.Base(filepath.Dir(cleaned))
-	if !opennebula.IsSharedFilesystemVolumeID(volumeID) {
-		return ""
-	}
-	return volumeID
 }
 
 func normalizeSharedFilesystemMounter(raw string) (sharedFilesystemMounter, error) {
@@ -1067,4 +1122,23 @@ func sharedFilesystemKernelMonitorOption(monitors []string) string {
 		return ""
 	}
 	return strings.Join(uniqueStrings(monitors), "/")
+}
+
+func (ns *NodeServer) lockSharedFilesystemOperation(ctx context.Context, volumeID string) (context.Context, func(), error) {
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return ctx, nil, status.FromContextError(err).Err()
+		}
+		if release, ok := ns.Driver.operationLocks.TryAcquire("sharedfs:" + strings.TrimSpace(volumeID)); ok {
+			ctx, release = fenceSharedFilesystemOperation(ctx, release, func() { ns.sharedFilesystemRecovery.enqueue(volumeID, "process_reaped") })
+			return ctx, release, nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx, nil, status.FromContextError(ctx.Err()).Err()
+		case <-ticker.C:
+		}
+	}
 }
