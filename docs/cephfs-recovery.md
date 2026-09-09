@@ -1,5 +1,25 @@
 # CephFS recovery and v0.5.28 rollout
 
+## Release and rollout status
+
+[`v0.5.28`](https://github.com/SparkAIUR/storage-provider-opennebula/releases/tag/v0.5.28)
+was released on September 9, 2026 from source
+`fa2d08077ac3b7d443937d06061add863f17ee2d`.
+[Release workflow 34391722704](https://github.com/SparkAIUR/storage-provider-opennebula/actions/runs/34391722704)
+completed successfully. The hplmon failure test and the drained Bravo canary
+passed. The staged production rollout is in progress, and the 24-hour
+production observation period is pending.
+
+| Artifact | Verified digest |
+| --- | --- |
+| Docker Hub and GHCR `v0.5.28` image index | `sha256:0a9b5132f54e0e1ce983bd34314a63a1956fc69f976bc81b15ae8e30987e3f30` |
+| Linux AMD64 image manifest in both registries | `sha256:6f23bb1d4716c891dd63aae199f03cb067007e0b71d98e6e9c172da035959fef` |
+| Helm chart `0.5.28`, app version `v0.5.28` | `sha256:02cc064df5fd1c94bd15cfea36dd0f535a2e91768ce06b706fdb0a5e08bee492` |
+
+GHCR was inspected independently and matched the Docker Hub image index and
+AMD64 manifest. The freshly pulled released AMD64 image passed the musl stat
+diagnostic regression.
+
 ## Incident evidence
 
 On 2026-09-09, AMD worker 0 on `hplbravoxla02` was unable to create a container because its shared CephFS bind returned `ENOTCONN`. The staging mount was absent and a disconnected pod bind remained. The FUSE client started with the pod on September 1 and exited with status 255. Retained logs do not establish why it exited.
@@ -51,25 +71,17 @@ The user selected `hplmon` for live validation and requested subagents instead o
 
 This test proves isolated FUSE recovery and data preservation for the candidate. It does not prove that a full hplmon Helm upgrade succeeds or replace the drained Bravo canary and observation period.
 
-## Candidate validation status
+## Validation and review
 
-Earlier runtime source checkpoint: `1562b16e52a203b269a98bf7970de4b065aee7be` on
-`fix/cephfs-recovery`. The full Go suite, shared-filesystem race tests, Helm
-lint, chart-version alignment, and Linux AMD64 build passed. Earlier Linux
-container runs covered the main recovery suite; the final image also exercises
-the added partial-bind and symlink regressions.
+Validation covered the full Go suite, shared-filesystem race tests, Helm lint,
+chart-version alignment, Linux AMD64 builds, and container regression tests.
+The release also passed the live hplmon failure test described below.
 
-Local image: `opennebula-csi:cephfs-1562b16`.
-Local image ID:
-`sha256:b8989701550c1cc72708efbb64df6f4b68657f44d6a920d7c6b17337fe7ce247`.
-The image embeds `v0.5.28-candidate` and the exact source commit. A local image
-ID is not a registry manifest digest or deployed image. Nothing was pushed.
-
-Oracle reviews `amd-cephfs-v0528-review` and `amd-cephfs-final-review` found
-ownership, interrupted cleanup, partial-bind permissions, and leaf-symlink
-issues. The final candidate addresses every reported finding with regression
-coverage. This is remediation verified locally; no subsequent external review
-has issued a passing verdict on the final commit.
+Reviews found ownership, interrupted cleanup, partial-bind permissions,
+leaf-symlink, missing-session stale-stage, and read-only flag override issues.
+Each finding was fixed with regression coverage. Independent subagent rereviews
+found no remaining blockers. The live hplmon test then exposed a musl errno
+translation defect, which was fixed and independently reviewed before release.
 
 Publish checks effective read-only, nosuid, nodev, and noexec flags on existing
 and newly created binds. A partial bind with incorrect flags requires repair.
@@ -77,19 +89,6 @@ Unmounted leaves must be absent or real directories, and successful commands
 must establish the expected mount at the requested path. Kubelet path ancestors
 must remain trusted; concurrent privileged path replacement is outside this
 contract.
-
-The no-mistakes run `01M23HTXVQTTDBATCNHXDD3KMQ` stopped before code review
-because its configured Claude runner reported an expired OAuth session.
-It returned branch custody without changing the submitted commit. The user
-subsequently requested independent subagent review and explicitly skipped
-Claude and further Oracle review. The replacement reviews found a missing-session stale-stage false success
-and a read-only flag override. Both are fixed with regressions that failed
-before the changes. Independent rereview found no remaining blockers. No PR
-was created by the failed runner.
-
-The hplmon two-volume failure test and drained Bravo canary have not run.
-The chart/version metadata is prepared for v0.5.28; no semantic release or
-production recovery is claimed.
 
 ## First hplmon candidate test
 
@@ -105,7 +104,8 @@ PVs and mounts were removed normally after diagnosis.
 
 The follow-up maps exact stat diagnostics for the probed path to typed ENOTCONN
 for both musl and glibc, with a fixed C locale. Unknown errors and cancellation
-remain failures. A second candidate and complete failure test are required.
+remain failures. The corrected candidate passed the complete failure test
+described below.
 
 During preflight Flux reverted plain kubectl-patch suspension. The effective
 maintenance hold uses the resource reconciliation-disabled annotation and the
@@ -129,5 +129,25 @@ client stale and the replacement open. The live filesystem session timeout is
 reports its duration. This is MDS lock waiting after an abrupt client exit,
 not a stuck CSI recovery worker.
 
-The test deleted only its own namespace after passing. Production drain and
-canary verification remain required before claiming the Bravo incident resolved.
+The test deleted only its own namespace after passing.
+
+## Bravo canary evidence
+
+At 19:07 UTC on September 9, the v0.5.28 canary on `hplbravoxla02` had
+automatically recovered AMD's missing staging mount and disconnected pod target.
+AMD worker 0 became Ready, and both API pods were Ready. Actual async jobs
+finished on each worker and preserved the Bravo response contract.
+
+| Worker | Completed job |
+| --- | --- |
+| AMD worker 0 | `7e916665-af3e-4b8d-9077-99651067c45c` |
+| AMD worker 1 | `9cbbaf14-e2bd-4f30-9c3d-2b7ec82c90ca` |
+
+The Frauditor global-search writer was drained before CSI replacement. It exited
+with status 130 and resumed with its checkpoint matching the pre-drain baseline.
+
+This proves recovery on the affected Bravo node. The remaining production work
+is the staged node rollout, verification and restoration of maintenance settings,
+and 24 hours of observation. Advance only after each node's affected FUSE clients
+are drained and its storage and application checks pass. The observation period
+has not yet completed.

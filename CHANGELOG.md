@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5.28, unreleased
+## v0.5.28, 2026-09-09
 
 - Fix recursive locking during stale CephFS publishing and serialize shared-volume lifecycle operations.
 - Translate both Alpine/musl and glibc stat diagnostics into typed ENOTCONN errors; unknown probe failures do not authorize recovery.
@@ -15,4 +15,4 @@
 - Supervise foreground CephFS clients, reap exited processes, and record their exits.
 - Export a gauge for volumes with unresolved recovery failures.
 
-Lab validation, image publication, and the drained Bravo canary remain release gates.
+Published after independent subagent review and a passing two-volume FUSE failure test on hplmon. The drained Bravo canary on `hplbravoxla02` recovered the AMD mount, and actual async jobs completed on both AMD workers. The staged production rollout remains in progress; the 24-hour observation period is pending. See [release and rollout evidence](docs/cephfs-recovery.md).
