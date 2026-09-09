@@ -33,40 +33,38 @@ Never delete AMD's PVC/PV, force-delete its pod, or recursively clean its mount 
 
 ## Candidate validation status
 
-The complete Go suite, shared-filesystem race tests, Helm lint, chart-version alignment, and Linux AMD64 container helper checks passed locally. Regression coverage includes the original nested-lock failure, failed unmount and state writes, interrupted unstage, foreign mount identities, missing kubelet target metadata, v0.5.27 session loading, in-flight recovery events, and unreaped child isolation.
+Runtime source checkpoint: `1562b16e52a203b269a98bf7970de4b065aee7be` on
+`fix/cephfs-recovery`. The full Go suite, shared-filesystem race tests, Helm
+lint, chart-version alignment, and Linux AMD64 build passed. Earlier Linux
+container runs covered the main recovery suite; the final image also exercises
+the added partial-bind and symlink regressions.
 
-The live two-volume failure test has not run. The saved hplcsi endpoint was unreachable on September 9. No semantic tag or production rollout is claimed by this change.
+Local image: `opennebula-csi:cephfs-1562b16`.
+Local image ID:
+`sha256:b8989701550c1cc72708efbb64df6f4b68657f44d6a920d7c6b17337fe7ce247`.
+The image embeds `v0.5.28-candidate` and the exact source commit. A local image
+ID is not a registry manifest digest or deployed image. Nothing was pushed.
 
-Earlier build checkpoint: `993fdfc98ec9cf5a56a2b7db8cc6d7b91e1e51fc`.
-Subsequent record-ownership and interrupted-GC fixes require a fresh build.
-The local Linux AMD64 image `opennebula-csi:cephfs-993fdfc` built successfully
-with `VERSION=v0.5.28-candidate` and that exact commit; local image ID is
-`sha256:80f5be9cc4eb7c8eab93ab5a173f583854f96559caae4769e7dfc17280ddbb82`.
-This is a local image ID, not a registry manifest digest or deployed image.
-Linux AMD64 regression tests also passed inside the Alpine runtime.
+Oracle reviews `amd-cephfs-v0528-review` and `amd-cephfs-final-review` found
+ownership, interrupted cleanup, partial-bind permissions, and leaf-symlink
+issues. The final candidate addresses every reported finding with regression
+coverage. This is remediation verified locally; no subsequent external review
+has issued a passing verdict on the final commit.
+
+Publish checks effective read-only, nosuid, nodev, and noexec flags on existing
+and newly created binds. A partial bind with incorrect flags requires repair.
+Unmounted leaves must be absent or real directories, and successful commands
+must establish the expected mount at the requested path. Kubelet path ancestors
+must remain trusted; concurrent privileged path replacement is outside this
+contract.
 
 The no-mistakes run `01M23HTXVQTTDBATCNHXDD3KMQ` stopped before code review
-because the configured Claude runner reported an expired OAuth session.
-It returned branch custody without changing the submitted commit. No branch
-was pushed and no PR was created. Automated review must be rerun after runner
-authentication is restored. Oracle follow-up `amd-cephfs-final-review` is the
-independent review of that source checkpoint. It completed in 28 minutes and
-reported partial-bind flag validation, leaf symlinks, and interrupted orphan
-cleanup as blockers. The later candidate addresses all three, with regressions
-for read-only/security flags after failed or cancelled binds, symlink stage and
-target leaves, and interrupted cleanup replay. This is verified remediation of
-the findings, not a claim of a subsequent passing external review.
+because its configured Claude runner reported an expired OAuth session.
+It returned branch custody without changing the submitted commit. Rerun with
+`--base-branch v0.5.x` after authentication is restored. No PR was created.
 
-The latest source checkpoint, `1da640c6a8e4f482092ec164119bb6dd40aa72da`,
-passed the full Go suite and shared-filesystem race checks. Its local Linux
-AMD64 image is `opennebula-csi:cephfs-1da640c`, image ID
-`sha256:700ff62757f2805e555cd761202250858ec9e4c54c92e304e9f9ec5e2c3ec8da`.
-The added session-key and orphan-cleanup regressions also passed inside that
-image. No registry manifest digest exists yet because no image was pushed.
-
-The final publish path checks effective read-only, nosuid, nodev, and noexec
-flags on existing and newly created binds. Recovery classifies a partial bind
-with incorrect flags as requiring repair. Missing or symlink mount leaves are
-checked before mounting, and successful mount commands must establish the
-expected mount at the literal requested path. Host kubelet path ancestors must
-remain trusted; concurrent privileged path replacement is outside this contract.
+The hplcsi two-volume failure test and drained Bravo canary have not run. The
+saved lab endpoint `https://omni.on.lab.sprkinfra.com:8100` was unreachable on
+September 9, and no replacement was found in the other saved kubeconfigs.
+Obtain current lab access before advancing. The chart/version metadata is
+prepared for v0.5.28; no semantic release or production recovery is claimed.
