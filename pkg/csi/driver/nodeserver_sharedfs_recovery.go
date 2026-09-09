@@ -668,6 +668,11 @@ func (ns *NodeServer) evaluateSharedFilesystemSession(ctx context.Context, sessi
 				return health, err
 			}
 			health.TargetsToRebind = append(health.TargetsToRebind, target)
+		} else if err := ns.verifySharedFilesystemTargetFlags(target); err != nil {
+			if !errors.Is(err, errSharedFilesystemTargetFlags) {
+				return health, err
+			}
+			health.TargetsToRebind = append(health.TargetsToRebind, target)
 		}
 	}
 	health.TargetsToRebind = normalizeSharedFilesystemPublishedTargets(health.TargetsToRebind)

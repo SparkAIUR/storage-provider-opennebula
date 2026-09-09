@@ -54,7 +54,7 @@ jobs:
           provenance: false
           platforms: linux/amd64
           build-args: |
-            VERSION=v0.5.28-candidate
+            VERSION=staging-${{ github.sha }}
             COMMIT=${{ github.sha }}
           tags: ${{ env.CSI_IMAGE_REPOSITORY }}:${{ env.CSI_IMAGE_TAG }}
 

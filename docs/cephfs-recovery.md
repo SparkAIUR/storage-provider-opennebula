@@ -50,5 +50,23 @@ because the configured Claude runner reported an expired OAuth session.
 It returned branch custody without changing the submitted commit. No branch
 was pushed and no PR was created. Automated review must be rerun after runner
 authentication is restored. Oracle follow-up `amd-cephfs-final-review` is the
-independent review of this source checkpoint; its final result must be recorded
-before release.
+independent review of that source checkpoint. It completed in 28 minutes and
+reported partial-bind flag validation, leaf symlinks, and interrupted orphan
+cleanup as blockers. The later candidate addresses all three, with regressions
+for read-only/security flags after failed or cancelled binds, symlink stage and
+target leaves, and interrupted cleanup replay. This is verified remediation of
+the findings, not a claim of a subsequent passing external review.
+
+The latest source checkpoint, `1da640c6a8e4f482092ec164119bb6dd40aa72da`,
+passed the full Go suite and shared-filesystem race checks. Its local Linux
+AMD64 image is `opennebula-csi:cephfs-1da640c`, image ID
+`sha256:700ff62757f2805e555cd761202250858ec9e4c54c92e304e9f9ec5e2c3ec8da`.
+The added session-key and orphan-cleanup regressions also passed inside that
+image. No registry manifest digest exists yet because no image was pushed.
+
+The final publish path checks effective read-only, nosuid, nodev, and noexec
+flags on existing and newly created binds. Recovery classifies a partial bind
+with incorrect flags as requiring repair. Missing or symlink mount leaves are
+checked before mounting, and successful mount commands must establish the
+expected mount at the literal requested path. Host kubelet path ancestors must
+remain trusted; concurrent privileged path replacement is outside this contract.

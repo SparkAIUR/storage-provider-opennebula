@@ -511,3 +511,88 @@ func TestSharedFilesystemOrphanUnmountFailurePreservesVolumeBytes(t *testing.T) 
 	require.NoError(t, err)
 	require.True(t, exists)
 }
+
+func TestSharedFilesystemPartialBindCannotWeakenRequestedFlags(t *testing.T) {
+	for _, flag := range []string{"ro", "nosuid", "nodev", "noexec"} {
+		for _, failure := range []error{syscall.EIO, context.DeadlineExceeded} {
+			t.Run(flag+"/"+failure.Error(), func(t *testing.T) {
+				withSharedFilesystemTestPaths(t)
+				ns := getTestNodeServer(nil)
+				id, stage, target := stageSharedFilesystemFixture(t, ns, "partial-bind")
+				req := newSharedFilesystemPublishRequest(id, stage, target)
+				req.VolumeCapability.GetMount().MountFlags = []string{flag}
+				req.Readonly = flag == "ro"
+				bind := ns.sharedFS.bind
+				ns.sharedFS.bind = func(ctx context.Context, stage, target string, options []string) error {
+					var partial []string
+					for _, option := range options {
+						if option != flag {
+							partial = append(partial, option)
+						}
+					}
+					if err := bind(ctx, stage, target, partial); err != nil {
+						return err
+					}
+					return failure
+				}
+				_, err := ns.NodePublishVolume(context.Background(), req)
+				require.Error(t, err)
+				// The writable/permissive first bind survived. A retry must reject it.
+				_, err = ns.NodePublishVolume(context.Background(), req)
+				require.Error(t, err)
+				session, _, err := ns.sharedFilesystemRecovery.store.Load(id)
+				require.NoError(t, err)
+				health, err := ns.evaluateSharedFilesystemSession(context.Background(), session)
+				require.NoError(t, err)
+				require.Len(t, health.TargetsToRebind, 1)
+				ns.sharedFS.bind = bind
+				require.NoError(t, ns.sharedFilesystemRecovery.recoverVolume(context.Background(), id))
+				require.NoError(t, ns.verifySharedFilesystemTargetFlags(session.PublishedTargets[0]))
+				_, err = ns.NodePublishVolume(context.Background(), req)
+				require.NoError(t, err)
+			})
+		}
+	}
+}
+
+func TestSharedFilesystemRejectsUnmountedLeafSymlinks(t *testing.T) {
+	for _, leaf := range []string{"stage", "target"} {
+		t.Run(leaf, func(t *testing.T) {
+			withSharedFilesystemTestPaths(t)
+			ns := getTestNodeServer(nil)
+			id, stage, target := sharedFilesystemFixturePaths(t, ns, "leaf-symlink")
+			destination := t.TempDir()
+			sentinel := filepath.Join(destination, "keep.bin")
+			require.NoError(t, os.WriteFile(sentinel, []byte("untouched"), 0600))
+			if leaf == "stage" {
+				require.NoError(t, os.Symlink(destination, stage))
+				_, err := ns.NodeStageVolume(context.Background(), newSharedFilesystemStageRequest(id, stage, "fuse"))
+				require.ErrorContains(t, err, "not a real directory")
+			} else {
+				_, err := ns.NodeStageVolume(context.Background(), newSharedFilesystemStageRequest(id, stage, "fuse"))
+				require.NoError(t, err)
+				require.NoError(t, os.Symlink(destination, target))
+				_, err = ns.NodePublishVolume(context.Background(), newSharedFilesystemPublishRequest(id, stage, target))
+				require.ErrorContains(t, err, "not a real directory")
+			}
+			points, err := ns.mounter.List()
+			require.NoError(t, err)
+			for _, point := range points {
+				require.NotEqual(t, destination, point.Path)
+				require.NotEqual(t, target, point.Path)
+			}
+			payload, err := os.ReadFile(sentinel)
+			require.NoError(t, err)
+			require.Equal(t, "untouched", string(payload))
+		})
+	}
+}
+
+func TestSharedFilesystemPublishRequiresActualBindPostcondition(t *testing.T) {
+	withSharedFilesystemTestPaths(t)
+	ns := getTestNodeServer(nil)
+	id, stage, target := stageSharedFilesystemFixture(t, ns, "missing-bind-postcondition")
+	ns.sharedFS.bind = func(context.Context, string, string, []string) error { return nil }
+	_, err := ns.NodePublishVolume(context.Background(), newSharedFilesystemPublishRequest(id, stage, target))
+	require.Error(t, err)
+}

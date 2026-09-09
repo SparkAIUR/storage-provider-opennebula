@@ -238,8 +238,8 @@ func (ns *NodeServer) handleSharedFilesystemPublish(ctx context.Context, req *cs
 		return nil, err
 	}
 	if err := ns.publishSharedFilesystemTarget(ctx, stagingTargetPath, target); err != nil {
-		if isDisconnectedSharedFilesystemError(err) && ns.sharedFilesystemRecovery != nil {
-			ns.sharedFilesystemRecovery.enqueue(req.GetVolumeId(), "publish_target_stale")
+		if ns.sharedFilesystemRecovery != nil {
+			ns.sharedFilesystemRecovery.enqueue(req.GetVolumeId(), "publish_target_failed")
 		}
 		klog.V(0).ErrorS(err, "Failed to publish shared filesystem volume",
 			"method", "handleSharedFilesystemPublish", "stagingTargetPath", stagingTargetPath, "targetPath", targetPath, "accessType", reflect.TypeOf(volumeCapability.GetAccessType()).String())
@@ -344,33 +344,61 @@ func (ns *NodeServer) publishSharedFilesystemTarget(ctx context.Context, staging
 		if err := ns.verifySharedFilesystemBind(stagingTargetPath, targetPath); err != nil {
 			return err
 		}
-		return nil
+		return ns.verifySharedFilesystemTargetFlags(target)
 	}
 
+	if err := verifySharedFilesystemUnmountedLeaf(targetPath); err != nil {
+		return err
+	}
 	if err := ns.sharedFS.mkdir(ctx, targetPath); err != nil {
 		return err
 	}
 	options := append([]string{"bind"}, uniqueStrings(target.MountOptions)...)
-	if err := ns.sharedFS.bind(ctx, stagingTargetPath, targetPath, options); err != nil {
-		return fmt.Errorf("failed to bind shared filesystem target %s: %w", targetPath, err)
+	bindErr := ns.sharedFS.bind(ctx, stagingTargetPath, targetPath, options)
+	// Inspect even a failed bind: its first syscall may have left a writable
+	// target. Never accept that target on retry or mark it healthy in recovery.
+	identityErr := ns.verifySharedFilesystemBind(stagingTargetPath, targetPath)
+	flagsErr := ns.verifySharedFilesystemTargetFlags(target)
+	if bindErr != nil {
+		return fmt.Errorf("failed to bind shared filesystem target %s: %w", targetPath, bindErr)
 	}
-
-	return nil
+	if identityErr != nil {
+		return identityErr
+	}
+	if flagsErr != nil {
+		return flagsErr
+	}
+	return ns.sharedFS.probe(ctx, targetPath)
 }
 
 func (ns *NodeServer) mountSharedFilesystemSession(ctx context.Context, session sharedFilesystemSession) error {
+	if err := ns.verifySharedFilesystemStage(session.VolumeID, session.StagingTargetPath); err != nil {
+		return err
+	}
 	if err := ns.sharedFS.mkdir(ctx, session.StagingTargetPath); err != nil {
 		return err
 	}
-
+	var err error
 	switch session.Mounter {
 	case sharedFilesystemMounterKernel:
-		return ns.mountSharedFilesystemKernel(ctx, session)
+		err = ns.mountSharedFilesystemKernel(ctx, session)
 	case sharedFilesystemMounterFuse:
-		return ns.mountSharedFilesystemFuse(ctx, session)
+		err = ns.mountSharedFilesystemFuse(ctx, session)
 	default:
 		return status.Errorf(codes.InvalidArgument, "unsupported CephFS mounter %q", session.Mounter)
 	}
+	if err != nil {
+		return err
+	}
+	if err := ns.verifySharedFilesystemStage(session.VolumeID, session.StagingTargetPath); err != nil {
+		return err
+	}
+	if _, mounted, err := ns.mountPointForPath(session.StagingTargetPath); err != nil {
+		return err
+	} else if !mounted {
+		return fmt.Errorf("CephFS stage was not mounted at the requested path")
+	}
+	return ns.sharedFS.probe(ctx, session.StagingTargetPath)
 }
 
 func (ns *NodeServer) mountSharedFilesystemFuse(ctx context.Context, session sharedFilesystemSession) error {

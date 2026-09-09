@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -114,6 +115,9 @@ func (ns *NodeServer) verifySharedFilesystemTargetMode(volumeID, path string, al
 			}
 		}
 	}
+	if count == 0 {
+		return verifySharedFilesystemUnmountedLeaf(path)
+	}
 	return nil
 }
 
@@ -151,6 +155,9 @@ func (ns *NodeServer) verifySharedFilesystemStage(volumeID, path string) error {
 				return fmt.Errorf("stage mount identity belongs to another volume")
 			}
 		}
+	}
+	if count == 0 {
+		return verifySharedFilesystemUnmountedLeaf(path)
 	}
 	return nil
 }
@@ -267,6 +274,75 @@ func (ns *NodeServer) verifySharedFilesystemBind(stagePath, targetPath string) e
 	}
 	if len(stages) != 1 || len(targets) != 1 || !isCephFSMount(stages[0]) || !sameSharedFilesystemMount(stages[0], targets[0]) {
 		return fmt.Errorf("bind mount ownership mismatch at %s", targetPath)
+	}
+	return nil
+}
+
+// This check is used only after mountinfo proves that the leaf is unmounted;
+// its ancestors and adjacent metadata live on the trusted kubelet host path.
+func verifySharedFilesystemUnmountedLeaf(path string) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("unmounted leaf is not a real directory at %s", path)
+	}
+	return nil
+}
+
+var errSharedFilesystemTargetFlags = errors.New("target mount flags differ from request")
+
+func (ns *NodeServer) verifySharedFilesystemTargetFlags(target sharedFilesystemPublishedTarget) error {
+	infos, err := ns.sharedFS.mountInfo()
+	if err != nil {
+		return err
+	}
+	var actual *mount.MountInfo
+	for i := range infos {
+		if infos[i].MountPoint == target.TargetPath {
+			if actual != nil {
+				return fmt.Errorf("ambiguous target mount")
+			}
+			actual = &infos[i]
+		}
+	}
+	if actual == nil {
+		return fmt.Errorf("target mount is missing at %s", target.TargetPath)
+	}
+	// util-linux may perform bind and flag application as separate syscalls.
+	// Last requested flag wins, matching mount's option semantics.
+	requested := make(map[string]bool)
+	for _, option := range target.MountOptions {
+		switch option {
+		case "ro", "nosuid", "nodev", "noexec":
+			requested[option] = true
+		case "rw":
+			requested["ro"] = false
+		case "suid":
+			requested["nosuid"] = false
+		case "dev":
+			requested["nodev"] = false
+		case "exec":
+			requested["noexec"] = false
+		}
+	}
+	present := make(map[string]bool)
+	for _, option := range actual.MountOptions {
+		present[option] = true
+	}
+	for _, option := range actual.SuperOptions {
+		if option == "ro" {
+			present["ro"] = true
+		}
+	}
+	for flag, want := range requested {
+		if present[flag] != want {
+			return fmt.Errorf("%w: %s at %s", errSharedFilesystemTargetFlags, flag, target.TargetPath)
+		}
 	}
 	return nil
 }
