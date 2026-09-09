@@ -53,6 +53,7 @@ Features that remain gated by default:
   `ghcr.io/sparkaiur/opennebula-csi:<tag>`
   `docker.io/nudevco/opennebula-csi:<tag>`
 - Latest release: `v0.5.27`
+- Next candidate: `v0.5.28`. See [CephFS recovery and rollout](docs/cephfs-recovery.md) for the failure contract and release gates.
 - Helm repo: `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
 - Chart name: `opennebula-csi`
 - Source repo: `https://github.com/SparkAIUR/storage-provider-opennebula`
@@ -843,12 +844,12 @@ These suites are disabled by default because they require real infrastructure:
 
 ## Release flow
 
-Every semantic release must be validated in the `hplcsi` lab before the tag is created.
+Every semantic release must be validated on the approved test cluster before the tag is created. `hplcsi` is retired; the approved target for the v0.5.28 CephFS recovery patch is `hplmon`.
 
 Required release gate:
 
 1. Build the candidate image from the branch under test
-2. Deploy that candidate image into the lab cluster, not the previous tagged release
+2. Deploy that candidate image by immutable digest to a selected test node after checking its existing storage consumers
 3. Validate the feature area touched by the change on live infrastructure
 4. Only after lab validation passes, create or move the semantic tag and publish the release
 
@@ -856,10 +857,12 @@ At minimum, release validation should include:
 
 - `go test ./...`
 - `helm template opennebula-csi ./helm/opennebula-csi ...`
-- `bash hack/validate-release-lab.sh`
+- for v0.5.28, `hack/validate-cephfs-recovery.py --cluster hplmon --node <candidate-node> --peer-node <peer-node> --expected-image-digest sha256:<manifest-digest>` following [the bounded hplmon procedure](docs/cephfs-recovery.md#hplmon-test-procedure)
 - a live lab validation for the feature or hotfix being released, including local attach/mount, local expansion, inventory CRDs, and workload bootstrap/init smoke checks when touching fast-path mount behavior
 
-Push the semantic tag for the release being cut, for example `v0.5.27`, only after that validation to trigger the release workflow.
+The legacy `hack/validate-release-lab.sh` assumes the retired lab and performs Helm ownership changes and broad smoke tests. It is not the hplmon recovery procedure. Use a bounded node canary and isolated test volumes; do not run that script against hplmon without adapting and reviewing its operations.
+
+Push the semantic tag for the release being cut, for example `v0.5.28`, only after that validation to trigger the release workflow.
 
 The workflow will:
 

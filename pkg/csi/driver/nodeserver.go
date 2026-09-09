@@ -78,6 +78,7 @@ type NodeServer struct {
 	mounter                  *mount.SafeFormatAndMount
 	deviceResolver           *NodeDeviceResolver
 	sharedFilesystemRecovery *sharedFilesystemRecoveryManager
+	sharedFS                 *sharedFilesystemRuntime
 	localDiskSessions        *localDiskSessionStore
 	csi.UnimplementedNodeServer
 }
@@ -92,6 +93,7 @@ func NewNodeServer(d *Driver, mounter *mount.SafeFormatAndMount) *NodeServer {
 		deviceResolver: NewNodeDeviceResolver(d.PluginConfig, mounter.Exec, nil),
 	}
 	ns.deviceResolver.deviceCandidatesFn = ns.deviceCandidates
+	ns.sharedFS = newSharedFilesystemRuntime(ns)
 	ns.sharedFilesystemRecovery = newSharedFilesystemRecoveryManager(ns)
 	ns.localDiskSessions = newLocalDiskSessionStore(localDiskSessionRootPath)
 	return ns
@@ -134,7 +136,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 
 	if isSharedFilesystemRequest(volumeID, req.GetPublishContext()) {
-		return ns.handleSharedFilesystemStage(req)
+		return ns.handleSharedFilesystemStage(ctx, req)
 	}
 
 	accessType := volumeCapability.GetAccessType()
@@ -308,7 +310,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
-func (ns *NodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
 	klog.V(1).InfoS("NodeUnstageVolume called", "req", protosanitizer.StripSecrets(req).String())
 
 	volumeID := req.GetVolumeId()
@@ -322,7 +324,7 @@ func (ns *NodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageV
 	}
 
 	if opennebula.IsSharedFilesystemVolumeID(volumeID) {
-		return ns.handleSharedFilesystemUnstage(req)
+		return ns.handleSharedFilesystemUnstage(ctx, req)
 	}
 
 	klog.V(3).InfoS("Cleaning staging target path volume mount point",
@@ -549,7 +551,7 @@ func (ns NodeServer) handleMountVolumePublish(stagingPath, targetPath string, vo
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func (ns *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 	klog.V(1).InfoS("NodeUnpublishVolume called", "req", protosanitizer.StripSecrets(req).String())
 
 	volumeID := req.GetVolumeId()
@@ -562,6 +564,29 @@ func (ns *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubl
 		return nil, status.Error(codes.InvalidArgument, "target path is required")
 	}
 
+	if opennebula.IsSharedFilesystemVolumeID(volumeID) {
+		ctx, cancel := context.WithTimeout(ctx, sharedFilesystemAttemptTimeout)
+		defer cancel()
+		ctx, release, err := ns.lockSharedFilesystemOperation(ctx, volumeID)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		if err := ns.verifySharedFilesystemTarget(volumeID, targetPath); err != nil {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
+		if err := ns.sharedFilesystemRecovery.store.setUnpublishIntent(volumeID, targetPath, true); err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		if err := ns.cleanupSharedFilesystemPath(ctx, targetPath); err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		if err := ns.removeSharedFilesystemPublishedTarget(volumeID, targetPath); err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		return &csi.NodeUnpublishVolumeResponse{}, nil
+	}
+
 	//TODO: Check if the volume with volumeID exists
 
 	klog.V(3).InfoS("Unpublishing volume",
@@ -569,9 +594,6 @@ func (ns *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubl
 
 	err := mount.CleanupMountPoint(targetPath, ns.mounter.Interface, true)
 	if err != nil {
-		if opennebula.IsSharedFilesystemVolumeID(volumeID) && ns.cleanupOrphanedSharedFilesystemTargetOnUnpublish(context.Background(), volumeID, targetPath, err) {
-			return &csi.NodeUnpublishVolumeResponse{}, nil
-		}
 		klog.V(0).ErrorS(err, "Failed to unmount volume at target path",
 			"method", "NodeUnpublishVolume", "volumeID", volumeID, "targetPath", targetPath)
 		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to unmount volume at target path %s: %v", targetPath, err))

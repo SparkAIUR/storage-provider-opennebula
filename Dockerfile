@@ -57,7 +57,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
 FROM alpine:3.22 AS opennebula-csi
 WORKDIR /app
 
-RUN apk add --no-cache ceph-common ceph-fuse e2fsprogs e2fsprogs-extra xfsprogs xfsprogs-extra util-linux udev \
+RUN apk add --no-cache coreutils ceph-common ceph-fuse e2fsprogs e2fsprogs-extra xfsprogs xfsprogs-extra util-linux udev \
     && command -v resize2fs
 
 COPY --from=builder /workspace/opennebula-csi .

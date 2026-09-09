@@ -25,6 +25,7 @@ type DriverMetrics struct {
 	datastoreSelectionTotal      *prometheus.CounterVec
 	attachValidationTotal        *prometheus.CounterVec
 	cephFSSubvolumeTotal         *prometheus.CounterVec
+	cephFSRecoveryPending        prometheus.Gauge
 	localVolumeHealthTotal       *prometheus.CounterVec
 	snapshotTotal                *prometheus.CounterVec
 	preflightTotal               *prometheus.CounterVec
@@ -90,6 +91,10 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 			Name: "opennebula_csi_attach_validation_total",
 			Help: "Total number of attach validation outcomes by backend and deployment mode.",
 		}, []string{"backend", "mode", "outcome"}),
+		cephFSRecoveryPending: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "opennebula_csi_cephfs_recovery_pending_volumes",
+			Help: "CephFS volumes with unresolved node recovery failures.",
+		}),
 		cephFSSubvolumeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "opennebula_csi_cephfs_subvolume_total",
 			Help: "Total number of CephFS subvolume operations by operation and outcome.",
@@ -255,6 +260,7 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 		metrics.datastoreSelectionTotal,
 		metrics.attachValidationTotal,
 		metrics.cephFSSubvolumeTotal,
+		metrics.cephFSRecoveryPending,
 		metrics.localVolumeHealthTotal,
 		metrics.snapshotTotal,
 		metrics.preflightTotal,
