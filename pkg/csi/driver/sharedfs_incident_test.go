@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
+	"k8s.io/client-go/kubernetes/fake"
 	mount "k8s.io/mount-utils"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -435,4 +437,77 @@ func TestSharedFilesystemRecoveryRetainsEventDuringAttempt(t *testing.T) {
 	case <-time.After(7 * time.Second):
 		t.Fatal("event raised during recovery was lost")
 	}
+}
+
+func TestSharedFilesystemRejectsSessionStoredUnderAnotherVolume(t *testing.T) {
+	withSharedFilesystemTestPaths(t)
+	ns := getTestNodeServer(nil)
+	first, _, _ := stageSharedFilesystemFixture(t, ns, "session-owner")
+	second, secondStage, _ := stageSharedFilesystemFixture(t, ns, "session-other")
+	payload, err := os.ReadFile(ns.sharedFilesystemRecovery.store.pathForVolume(second))
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(ns.sharedFilesystemRecovery.store.pathForVolume(first), payload, 0600))
+	require.NoError(t, ns.sharedFS.unmount(context.Background(), secondStage))
+	before, err := ns.mounter.List()
+	require.NoError(t, err)
+	require.Error(t, ns.sharedFilesystemRecovery.recoverVolume(context.Background(), first))
+	after, err := ns.mounter.List()
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+	_, err = ns.sharedFilesystemRecovery.store.List()
+	require.Error(t, err)
+}
+
+func TestSharedFilesystemOrphanCleanupRetriesPartialIntentWrite(t *testing.T) {
+	withSharedFilesystemTestPaths(t)
+	ns := getTestNodeServer(nil)
+	id, stage, target := stageSharedFilesystemFixture(t, ns, "gc-intent")
+	other := strings.Replace(target, "pod-gc-intent", "pod-gc-intent-other", 1)
+	require.NoError(t, os.MkdirAll(filepath.Dir(other), 0750))
+	metadata, err := os.ReadFile(filepath.Join(filepath.Dir(target), "vol_data.json"))
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(other), "vol_data.json"), metadata, 0600))
+	for _, path := range []string{target, other} {
+		_, err := ns.NodePublishVolume(context.Background(), newSharedFilesystemPublishRequest(id, stage, path))
+		require.NoError(t, err)
+		require.NoError(t, ns.sharedFS.unmount(context.Background(), path))
+	}
+	ns.Driver.kubeRuntime = &KubeRuntime{client: fake.NewSimpleClientset(), enabled: true}
+	session, _, err := ns.sharedFilesystemRecovery.store.Load(id)
+	require.NoError(t, err)
+	failedPath := ns.sharedFilesystemRecovery.store.unpublishIntentPath(id, session.PublishedTargets[1].TargetPath) + ".tmp"
+	require.NoError(t, os.Mkdir(failedPath, 0700))
+	collected, err := ns.sharedFilesystemRecovery.garbageCollectOrphanedSession(context.Background(), session)
+	require.Error(t, err)
+	require.False(t, collected)
+	persisted, _, err := ns.sharedFilesystemRecovery.store.Load(id)
+	require.NoError(t, err)
+	require.False(t, persisted.Unstaging)
+	require.NoError(t, os.Remove(failedPath))
+	ns.sharedFilesystemRecovery = newSharedFilesystemRecoveryManager(ns)
+	require.NoError(t, ns.sharedFilesystemRecovery.recoverVolume(context.Background(), id))
+	_, exists, err := ns.sharedFilesystemRecovery.store.Load(id)
+	require.NoError(t, err)
+	require.False(t, exists)
+}
+
+func TestSharedFilesystemOrphanUnmountFailurePreservesVolumeBytes(t *testing.T) {
+	withSharedFilesystemTestPaths(t)
+	ns := getTestNodeServer(nil)
+	id, stage, _ := stageSharedFilesystemFixture(t, ns, "gc-busy")
+	sentinel := filepath.Join(stage, "keep.bin")
+	require.NoError(t, os.WriteFile(sentinel, []byte("preserve orphan bytes"), 0600))
+	ns.Driver.kubeRuntime = &KubeRuntime{client: fake.NewSimpleClientset(), enabled: true}
+	ns.sharedFS.unmount = func(context.Context, string) error { return syscall.EBUSY }
+	session, _, err := ns.sharedFilesystemRecovery.store.Load(id)
+	require.NoError(t, err)
+	collected, err := ns.sharedFilesystemRecovery.garbageCollectOrphanedSession(context.Background(), session)
+	require.Error(t, err)
+	require.False(t, collected)
+	payload, err := os.ReadFile(sentinel)
+	require.NoError(t, err)
+	require.Equal(t, "preserve orphan bytes", string(payload))
+	_, exists, err := ns.sharedFilesystemRecovery.store.Load(id)
+	require.NoError(t, err)
+	require.True(t, exists)
 }

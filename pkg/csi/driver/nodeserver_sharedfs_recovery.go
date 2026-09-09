@@ -161,6 +161,9 @@ func (s *sharedFilesystemSessionStore) loadLocked(volumeID string) (sharedFilesy
 	if err := json.Unmarshal(payload, &session); err != nil {
 		return sharedFilesystemSession{}, false, err
 	}
+	if session.VolumeID != strings.TrimSpace(volumeID) {
+		return sharedFilesystemSession{}, false, fmt.Errorf("persisted session volume does not match its record key")
+	}
 	if session.KeyringPath == "" && session.StagingTargetPath != "" {
 		session.KeyringPath = sharedCephFSKeyringPath(session.StagingTargetPath)
 	}
@@ -222,6 +225,9 @@ func (s *sharedFilesystemSessionStore) List() ([]sharedFilesystemSession, error)
 		var session sharedFilesystemSession
 		if err := json.Unmarshal(payload, &session); err != nil {
 			return nil, err
+		}
+		if entry.Name() != filepath.Base(s.pathForVolume(session.VolumeID)) {
+			return nil, fmt.Errorf("persisted session filename does not match its volume")
 		}
 		if session.KeyringPath == "" && session.StagingTargetPath != "" {
 			session.KeyringPath = sharedCephFSKeyringPath(session.StagingTargetPath)
@@ -432,14 +438,16 @@ func (m *sharedFilesystemRecoveryManager) garbageCollectOrphanedSession(ctx cont
 			}
 		}
 	}
-	session.Unstaging = true
-	if err := m.store.Save(session); err != nil {
-		return false, err
-	}
+	// Save each target's direction first. If interrupted, normal recovery can
+	// prune those targets and repeat GC for the remaining orphaned targets.
 	for _, target := range session.PublishedTargets {
 		if err := m.store.setUnpublishIntent(session.VolumeID, target.TargetPath, true); err != nil {
 			return false, err
 		}
+	}
+	session.Unstaging = true
+	if err := m.store.Save(session); err != nil {
+		return false, err
 	}
 	if err := m.ns.finishSharedFilesystemUnstage(ctx, session); err != nil {
 		return false, err

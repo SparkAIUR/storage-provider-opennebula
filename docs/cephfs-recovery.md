@@ -14,6 +14,7 @@ Stage, publish, unpublish, unstage, and background repair serialize per volume. 
 
 Recovery validates the exact handle from kubelet metadata next to the staging and pod paths. SHA-256 stage directories are resolved through that metadata. Mount comparisons use filesystem type, device major/minor, and root instead of the generic `ceph-fuse` source. Unknown ownership aborts recovery without unmounting anything.
 
+Persisted record keys and filenames must agree with their volume handles.
 Published targets survive discovery and restaging. Session writes sync the file and parent directory. Unpublish tombstones are saved before cleanup, survive reconstruction, and can only be cleared by an explicit publish or completed unstage. Unstage intent also survives restart. Recovery never recreates a target whose kubelet metadata is gone. Unmount failures retain session records. Cleanup rechecks the mount table and removes only empty directories. It never recursively removes a mountpoint or deletes volume contents.
 
 Foreground FUSE clients are reaped and report their exit status. `opennebula_csi_cephfs_recovery_pending_volumes` reports unresolved background recovery failures. Alert when it remains above zero for ten minutes. A host bind repaired by CSI does not replace a bind already held in an application's private mount namespace. Use a storage liveness check to restart that container, or drain and recreate it deliberately.
@@ -35,3 +36,19 @@ Never delete AMD's PVC/PV, force-delete its pod, or recursively clean its mount 
 The complete Go suite, shared-filesystem race tests, Helm lint, chart-version alignment, and Linux AMD64 container helper checks passed locally. Regression coverage includes the original nested-lock failure, failed unmount and state writes, interrupted unstage, foreign mount identities, missing kubelet target metadata, v0.5.27 session loading, in-flight recovery events, and unreaped child isolation.
 
 The live two-volume failure test has not run. The saved hplcsi endpoint was unreachable on September 9. No semantic tag or production rollout is claimed by this change.
+
+Earlier build checkpoint: `993fdfc98ec9cf5a56a2b7db8cc6d7b91e1e51fc`.
+Subsequent record-ownership and interrupted-GC fixes require a fresh build.
+The local Linux AMD64 image `opennebula-csi:cephfs-993fdfc` built successfully
+with `VERSION=v0.5.28-candidate` and that exact commit; local image ID is
+`sha256:80f5be9cc4eb7c8eab93ab5a173f583854f96559caae4769e7dfc17280ddbb82`.
+This is a local image ID, not a registry manifest digest or deployed image.
+Linux AMD64 regression tests also passed inside the Alpine runtime.
+
+The no-mistakes run `01M23HTXVQTTDBATCNHXDD3KMQ` stopped before code review
+because the configured Claude runner reported an expired OAuth session.
+It returned branch custody without changing the submitted commit. No branch
+was pushed and no PR was created. Automated review must be rerun after runner
+authentication is restored. Oracle follow-up `amd-cephfs-final-review` is the
+independent review of this source checkpoint; its final result must be recorded
+before release.
