@@ -24,6 +24,17 @@ type sharedFilesystemVolumeData struct {
 
 // Kubelet stores this on the host filesystem beside, never inside, the mount.
 func sharedFilesystemMetadata(path string) (sharedFilesystemVolumeData, error) {
+	data, err := csiVolumeMetadata(path)
+	if err != nil {
+		return data, err
+	}
+	if data.DriverName != DefaultDriverName || !opennebula.IsSharedFilesystemVolumeID(data.VolumeHandle) {
+		return data, fmt.Errorf("mount metadata does not identify an OpenNebula CephFS volume at %s", path)
+	}
+	return data, nil
+}
+
+func csiVolumeMetadata(path string) (sharedFilesystemVolumeData, error) {
 	var data sharedFilesystemVolumeData
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return data, fmt.Errorf("noncanonical shared filesystem path %q", path)
@@ -44,9 +55,6 @@ func sharedFilesystemMetadata(path string) (sharedFilesystemVolumeData, error) {
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return data, err
-	}
-	if data.DriverName != DefaultDriverName || !opennebula.IsSharedFilesystemVolumeID(data.VolumeHandle) {
-		return data, fmt.Errorf("mount metadata does not identify an OpenNebula CephFS volume at %s", path)
 	}
 	return data, nil
 }
@@ -106,12 +114,19 @@ func (ns *NodeServer) verifySharedFilesystemTargetMode(volumeID, path string, al
 			return fmt.Errorf("ambiguous target mount at %s", path)
 		}
 		for _, other := range infos {
-			if other.MountPoint == path || filepath.Base(other.MountPoint) != "globalmount" || !sameSharedFilesystemMount(target, other) {
+			if other.MountPoint == path || !sameSharedFilesystemMount(target, other) {
 				continue
 			}
-			owner, err := sharedFilesystemStageVolumeID(other.MountPoint)
-			if err != nil || owner != volumeID {
-				return fmt.Errorf("target mount belongs to another volume")
+			if filepath.Base(other.MountPoint) == "globalmount" {
+				owner, err := sharedFilesystemStageVolumeID(other.MountPoint)
+				if err != nil || owner != volumeID {
+					return fmt.Errorf("target mount belongs to another volume")
+				}
+			} else if strings.Contains(other.MountPoint, "/volumes/kubernetes.io~csi/") {
+				owner, err := sharedFilesystemMetadata(other.MountPoint)
+				if err != nil || owner.VolumeHandle != volumeID {
+					return fmt.Errorf("target mount identity has conflicting sibling ownership")
+				}
 			}
 		}
 	}
@@ -221,7 +236,7 @@ func (ns *NodeServer) verifySharedFilesystemSessionMode(ctx context.Context, ses
 					return fmt.Errorf("target %s belongs to another staging mount", target.TargetPath)
 				}
 			}
-			if stage != nil && !sameSharedFilesystemMount(*stage, info) {
+			if stage == nil || !sameSharedFilesystemMount(*stage, info) {
 				if err := ns.sharedFS.probe(ctx, target.TargetPath); !isDisconnectedSharedFilesystemError(err) {
 					return fmt.Errorf("target mount identity mismatch at %s", target.TargetPath)
 				}
@@ -242,18 +257,40 @@ func (ns *NodeServer) discoverSharedFilesystemTargets(volumeID, stagePath string
 			stage = &infos[i]
 		}
 	}
-	if stage == nil || !isCephFSMount(*stage) {
-		return nil, fmt.Errorf("stage mount is missing")
+	if err := ns.verifySharedFilesystemStage(volumeID, stagePath); err != nil {
+		return nil, err
 	}
 	var targets []sharedFilesystemPublishedTarget
 	for _, info := range infos {
-		if info.MountPoint == stagePath || !strings.Contains(info.MountPoint, "/volumes/kubernetes.io~csi/") || !sameSharedFilesystemMount(*stage, info) {
+		if info.MountPoint == stagePath || !strings.Contains(info.MountPoint, "/volumes/kubernetes.io~csi/") || !isCephFSMount(info) {
+			continue
+		}
+		data, err := csiVolumeMetadata(info.MountPoint)
+		if err != nil {
+			return nil, err
+		}
+		if data.DriverName != "" && data.DriverName != DefaultDriverName && data.VolumeHandle != "" && data.VolumeHandle != volumeID && (stage == nil || !sameSharedFilesystemMount(*stage, info)) {
+			continue
+		}
+		if data.DriverName != DefaultDriverName || !opennebula.IsSharedFilesystemVolumeID(data.VolumeHandle) {
+			return nil, fmt.Errorf("mount metadata does not identify an OpenNebula CephFS volume at %s", info.MountPoint)
+		}
+		if data.VolumeHandle != volumeID {
+			if stage != nil && sameSharedFilesystemMount(*stage, info) {
+				return nil, fmt.Errorf("stage mount has a target owned by another volume")
+			}
 			continue
 		}
 		if err := ns.verifySharedFilesystemTarget(volumeID, info.MountPoint); err != nil {
 			return nil, err
 		}
-		targets = append(targets, sharedFilesystemPublishedTarget{TargetPath: info.MountPoint, MountOptions: sharedFilesystemMountOptionsFromMountPoint(mount.MountPoint{Opts: info.MountOptions})})
+		options := append([]string(nil), info.MountOptions...)
+		for _, option := range info.SuperOptions {
+			if option == "ro" {
+				options = append(options, option)
+			}
+		}
+		targets = append(targets, sharedFilesystemPublishedTarget{TargetPath: info.MountPoint, MountOptions: sharedFilesystemMountOptionsFromMountPoint(mount.MountPoint{Opts: options})})
 	}
 	return normalizeSharedFilesystemPublishedTargets(targets), nil
 }

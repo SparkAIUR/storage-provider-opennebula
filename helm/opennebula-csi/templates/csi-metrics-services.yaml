@@ -1,6 +1,6 @@
 {{- $controller := (get .Values "controller") | default dict -}}
 {{- $controllerAttacher := (get $controller "attacher") | default dict -}}
-{{- $controllerAttacherHTTPEnabled := (get $controllerAttacher "httpEndpointEnabled") | default true -}}
+{{- $controllerAttacherHTTPEnabled := dig "httpEndpointEnabled" true $controllerAttacher -}}
 {{- if .Values.metrics.enabled }}
 ---
 apiVersion: v1

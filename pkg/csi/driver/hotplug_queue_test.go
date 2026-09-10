@@ -2,7 +2,9 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,7 +14,10 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 func TestHotplugQueueSequentializesSameNodeRequests(t *testing.T) {
@@ -256,36 +261,139 @@ func TestHotplugQueueSnapshotDebounce(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 
 	manager.persistSnapshot(HotplugQueueNodeSnapshot{Node: "node-a"})
+	waitHotplugSnapshot(t, manager, runtime.client.(*fake.Clientset), "node-a", 0)
 	cm, err = runtime.client.CoreV1().ConfigMaps("default").Get(context.Background(), hotplugQueueStateConfigMapName, metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.NotContains(t, cm.Data, "node-a")
 }
 
+func waitHotplugSnapshot(t *testing.T, manager *HotplugQueueManager, client *fake.Clientset, node string, count int) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		cm, err := client.CoreV1().ConfigMaps("default").Get(context.Background(), hotplugQueueStateConfigMapName, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		if count == 0 {
+			return cm.Data[node] == ""
+		}
+		var snapshot HotplugQueueNodeSnapshot
+		return json.Unmarshal([]byte(cm.Data[node]), &snapshot) == nil && snapshot.QueuedCount == count
+	}, 2*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		manager.snapshotMu.Lock()
+		defer manager.snapshotMu.Unlock()
+		state := manager.snapshots[node]
+		return state != nil && !state.running && state.timer == nil && state.persisted
+	}, 2*time.Second, 10*time.Millisecond)
+}
+
 func TestHotplugQueueSkipsUnchangedSnapshotPersistence(t *testing.T) {
-	client := fake.NewSimpleClientset(&corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: hotplugQueueStateConfigMapName, Namespace: "default"},
-		Data:       map[string]string{},
-	})
-	runtime := &KubeRuntime{
-		client:  client,
-		enabled: true,
-	}
-	manager := NewHotplugQueueManager(runtime, "default", NewDriverMetrics("test", "test"), time.Second, 0)
-	snapshot := HotplugQueueNodeSnapshot{
-		Node:        "node-a",
-		QueuedCount: 1,
-		Queued: []HotplugQueueItemSnapshot{{
-			ID:        1,
-			Node:      "node-a",
-			Operation: "attach",
-			Volume:    "vol-a",
-			Priority:  hotplugQueuePriorityNormal,
-		}},
-	}
+	client := fake.NewSimpleClientset()
+	manager := NewHotplugQueueManager(&KubeRuntime{client: client, enabled: true}, "default", nil, time.Second, 0)
+	var writes atomic.Int32
+	client.PrependReactor("patch", "configmaps", func(ktesting.Action) (bool, runtime.Object, error) { writes.Add(1); return false, nil, nil })
+	snapshot := HotplugQueueNodeSnapshot{Node: "node-a", QueuedCount: 1}
+	manager.persistSnapshot(snapshot)
+	waitHotplugSnapshot(t, manager, client, snapshot.Node, 1)
+	first := writes.Load()
+	manager.persistSnapshot(snapshot)
+	waitHotplugSnapshot(t, manager, client, snapshot.Node, 1)
+	require.Equal(t, first, writes.Load())
+}
 
-	manager.persistSnapshotNow(snapshot)
-	actionsAfterFirstPersist := len(client.Actions())
-	manager.persistSnapshotNow(snapshot)
+func TestHotplugQueueRetriesFailedSnapshotPersistence(t *testing.T) {
+	for _, clear := range []bool{false, true} {
+		t.Run(fmt.Sprint(clear), func(t *testing.T) {
+			client := fake.NewSimpleClientset()
+			manager := NewHotplugQueueManager(&KubeRuntime{client: client, enabled: true}, "default", nil, time.Second, 0)
+			snapshot := HotplugQueueNodeSnapshot{Node: "node-a", QueuedCount: 1}
+			manager.persistSnapshot(snapshot)
+			waitHotplugSnapshot(t, manager, client, snapshot.Node, 1)
+			var calls atomic.Int32
+			client.PrependReactor("patch", "configmaps", func(ktesting.Action) (bool, runtime.Object, error) {
+				if calls.Add(1) <= 2 {
+					return true, nil, errors.New("transient API failure")
+				}
+				return false, nil, nil
+			})
+			snapshot.QueuedCount = 2
+			if clear {
+				snapshot.QueuedCount = 0
+			}
+			manager.persistSnapshot(snapshot)
+			waitHotplugSnapshot(t, manager, client, snapshot.Node, snapshot.QueuedCount)
+			require.EqualValues(t, 3, calls.Load())
+		})
+	}
+}
 
-	assert.Equal(t, actionsAfterFirstPersist, len(client.Actions()))
+func TestHotplugQueueBlockedSnapshotPreservesAdmissionAndCompletionOrder(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	base := client.CoreV1().ConfigMaps("default")
+	entered, release := make(chan struct{}), make(chan struct{})
+	var blocked atomic.Bool
+	manager := NewHotplugQueueManager(reviewRuntime(client, reviewConfigMaps{ConfigMapInterface: base, patch: func(ctx context.Context, name string, pt types.PatchType, payload []byte, opts metav1.PatchOptions, sub ...string) (*corev1.ConfigMap, error) {
+		var patch struct {
+			Data map[string]*string `json:"data"`
+		}
+		require.NoError(t, json.Unmarshal(payload, &patch))
+		if patch.Data["node-a"] != nil && blocked.CompareAndSwap(false, true) {
+			deadline, ok := ctx.Deadline()
+			require.True(t, ok)
+			require.WithinDuration(t, time.Now().Add(hotplugSnapshotTimeout), deadline, time.Second)
+			close(entered)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return base.Patch(ctx, name, pt, payload, opts, sub...)
+	}}), "default", NewDriverMetrics("test", "test"), time.Second, 0)
+	ctx := context.Background()
+	activeDone := make(chan struct{})
+	var activeOnce, releaseOnce sync.Once
+	closeActive := func() { activeOnce.Do(func() { close(activeDone) }) }
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(closeActive)
+	t.Cleanup(closeRelease)
+	a := make(chan error, 1)
+	go func() {
+		a <- manager.Run(ctx, "node-a", "attach", "a", hotplugQueuePriorityNormal, func(context.Context) error { <-activeDone; return nil })
+	}()
+	<-entered
+	b := make(chan error, 1)
+	go func() {
+		b <- manager.Run(ctx, "node-b", "attach", "b", hotplugQueuePriorityNormal, func(context.Context) error { return nil })
+	}()
+	select {
+	case err := <-b:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("node B admission blocked by snapshot A")
+	}
+	cancelCtx, cancel := context.WithCancel(ctx)
+	canceled := make(chan error, 1)
+	go func() {
+		canceled <- manager.Run(cancelCtx, "node-a", "attach", "queued", hotplugQueuePriorityNormal, func(context.Context) error { t.Error("canceled item dispatched"); return nil })
+	}()
+	require.Eventually(t, func() bool { return manager.HasVolume("queued") }, time.Second, time.Millisecond)
+	cancel()
+	select {
+	case err := <-canceled:
+		require.Error(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("queue cancellation blocked by snapshot")
+	}
+	manager.mu.Lock()
+	old := manager.snapshotLocked("node-a")
+	manager.mu.Unlock()
+	closeActive()
+	require.NoError(t, <-a)
+	require.Eventually(t, func() bool { return !manager.HasVolume("a") }, time.Second, time.Millisecond)
+	closeRelease()
+	waitHotplugSnapshot(t, manager, client, "node-a", 0)
+	manager.persistSnapshot(old)
+	waitHotplugSnapshot(t, manager, client, "node-a", 0)
 }

@@ -123,14 +123,14 @@ func getTestNodeServerWithMountPoints(mountPointList []mount.MountPoint) *NodeSe
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return mounter.Interface.Unmount(path)
+		return mounter.Unmount(path)
 	}
 	ns.sharedFS.bind = func(ctx context.Context, stage, target string, options []string) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		mp, _, _ := ns.mountPointForPath(stage)
-		return mounter.Interface.Mount(stage, target, mp.Type, options)
+		return mounter.Mount(stage, target, mp.Type, options)
 	}
 	ns.sharedFS.fuse = func(ctx context.Context, session sharedFilesystemSession, args []string) error {
 		_, err := ns.sharedFS.run(ctx, "ceph-fuse", args...)
@@ -214,6 +214,7 @@ func TestStageVolume(t *testing.T) {
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
 			ns := getTestNodeServer([]string{})
+			ns.localDiskSessions = newLocalDiskSessionStore(t.TempDir())
 			response, err := ns.NodeStageVolume(context.Background(), tc.request)
 			if tc.expectError {
 				assert.Error(t, err)
@@ -248,27 +249,12 @@ func TestStageVolumeKeepsLocalDeviceReportUntilMountSucceeds(t *testing.T) {
 		metrics:      NewDriverMetrics(driverVersion, "test"),
 		kubeRuntime:  &KubeRuntime{client: fake.NewSimpleClientset(), enabled: true},
 	}
-	commandScriptArray := []testingexec.FakeCommandAction{}
-	for i := 0; i < 10; i++ {
-		commandScriptArray = append(commandScriptArray, func(cmd string, args ...string) exec.Cmd {
-			return &testingexec.FakeCmd{
-				Argv:           append([]string{cmd}, args...),
-				Stdout:         nil,
-				Stderr:         nil,
-				DisableScripts: true,
-			}
-		})
-	}
 	mountErr := errors.New("can't read superblock")
 	ns := NewNodeServer(driver, mount.NewSafeFormatAndMount(
 		&failingMountInterface{FakeMounter: mount.NewFakeMounter(nil), err: mountErr},
-		&testingexec.FakeExec{
-			CommandScript: commandScriptArray,
-			LookPathFunc: func(path string) (string, error) {
-				return path, nil
-			},
-		},
+		reviewDeviceSerialFixture(t, func(string) string { return "onecsi-439" }),
 	))
+	ns.localDiskSessions = newLocalDiskSessionStore(t.TempDir())
 	publishContext := map[string]string{
 		"volumeName":                    "sdd",
 		annotationBackend:               "local",
@@ -276,6 +262,7 @@ func TestStageVolumeKeepsLocalDeviceReportUntilMountSucceeds(t *testing.T) {
 		publishContextOpenNebulaImageID: "439",
 	}
 	ns.recordLocalDeviceMissing(context.Background(), "vol-1", "sdd", tempDir, publishContext, errors.New("device not found"))
+	delete(publishContext, publishContextDeviceSerial)
 
 	req := &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-1",
@@ -302,6 +289,7 @@ func TestStageVolumeKeepsLocalDeviceReportUntilMountSucceeds(t *testing.T) {
 	var report LocalDeviceMissingReport
 	assert.NoError(t, json.Unmarshal([]byte(raw), &report))
 	assert.Equal(t, localDeviceFailureClassMountFailed, report.FailureClass)
+	assert.Equal(t, "onecsi-439", report.DeviceSerial)
 	assert.Equal(t, 3, report.Attempts)
 	assert.Equal(t, filepath.Join(diskPath, "sdd"), report.DevicePath)
 }
@@ -735,17 +723,76 @@ func TestNodeExpandVolume(t *testing.T) {
 		assert.Equal(t, &csi.NodeExpandVolumeResponse{CapacityBytes: requiredBytes}, response)
 	})
 
-	t.Run("retries until filesystem reaches target", func(t *testing.T) {
+	t.Run("accepts fully expanded ext4 with metadata overhead", func(t *testing.T) {
 		originalStatfs := nodeVolumePathFS
 		originalSleep := nodeDeviceSleep
 		originalNow := nodeNow
 		originalResizeFS := nodeResizeFS
+		originalNeedsResizeFS := nodeNeedsResizeFS
 		originalGOOS := nodeRuntimeGOOS
 		t.Cleanup(func() {
 			nodeVolumePathFS = originalStatfs
 			nodeDeviceSleep = originalSleep
 			nodeNow = originalNow
 			nodeResizeFS = originalResizeFS
+			nodeNeedsResizeFS = originalNeedsResizeFS
+			nodeRuntimeGOOS = originalGOOS
+		})
+
+		const requiredBytes = int64(42949672960)
+		volumePath := t.TempDir()
+		devicePath := filepath.Join(t.TempDir(), "device")
+		assert.NoError(t, os.WriteFile(devicePath, []byte("x"), 0o644))
+		assert.NoError(t, os.Truncate(devicePath, requiredBytes))
+
+		ns := getTestNodeServerWithMountPoints([]mount.MountPoint{
+			{Path: volumePath, Device: devicePath},
+		})
+		ns.Driver.PluginConfig.OverrideVal(config.NodeExpandVerifyTimeoutSecondsVar, 30)
+		ns.Driver.PluginConfig.OverrideVal(config.NodeExpandRetryIntervalSecondsVar, 2)
+		ns.Driver.PluginConfig.OverrideVal(config.NodeExpandSizeToleranceBytesVar, 536870912)
+
+		nodeRuntimeGOOS = "linux"
+		now := time.Unix(0, 0)
+		nodeNow = func() time.Time { return now }
+		nodeDeviceSleep = func(d time.Duration) { now = now.Add(d) }
+
+		resizeCalls := 0
+		nodeResizeFS = func(_ exec.Interface, _, _ string) (bool, error) {
+			resizeCalls++
+			return true, nil
+		}
+		setFilesystemBytesSequence([]int64{42158374912})
+		geometryChecks := 0
+		nodeNeedsResizeFS = func(_ exec.Interface, _, _ string) (bool, error) {
+			geometryChecks++
+			return false, nil
+		}
+
+		request := makeFilesystemRequest(volumePath)
+		request.CapacityRange.RequiredBytes = requiredBytes
+		request.VolumeCapability.GetMount().FsType = "ext4"
+		response, err := ns.NodeExpandVolume(context.Background(), request)
+		assert.NoError(t, err)
+		assert.Equal(t, &csi.NodeExpandVolumeResponse{CapacityBytes: requiredBytes}, response)
+		assert.Equal(t, 1, resizeCalls)
+		assert.Equal(t, 1, geometryChecks)
+		t.Logf("CSI NodeExpandVolume fixture: required_bytes=%d device_bytes=%d statfs_bytes=42158374912 geometry_needs_resize=false geometry_checks=%d resize_calls=%d response=%v error=%v", requiredBytes, requiredBytes, geometryChecks, resizeCalls, response, err)
+	})
+
+	t.Run("retries until filesystem reaches target", func(t *testing.T) {
+		originalStatfs := nodeVolumePathFS
+		originalSleep := nodeDeviceSleep
+		originalNow := nodeNow
+		originalResizeFS := nodeResizeFS
+		originalNeedsResizeFS := nodeNeedsResizeFS
+		originalGOOS := nodeRuntimeGOOS
+		t.Cleanup(func() {
+			nodeVolumePathFS = originalStatfs
+			nodeDeviceSleep = originalSleep
+			nodeNow = originalNow
+			nodeResizeFS = originalResizeFS
+			nodeNeedsResizeFS = originalNeedsResizeFS
 			nodeRuntimeGOOS = originalGOOS
 		})
 
@@ -776,6 +823,7 @@ func TestNodeExpandVolume(t *testing.T) {
 			requiredBytes / 2,
 			requiredBytes,
 		})
+		nodeNeedsResizeFS = func(_ exec.Interface, _, _ string) (bool, error) { return resizeCalls < 3, nil }
 
 		response, err := ns.NodeExpandVolume(context.Background(), makeFilesystemRequest(volumePath))
 		assert.NoError(t, err)
@@ -788,12 +836,14 @@ func TestNodeExpandVolume(t *testing.T) {
 		originalSleep := nodeDeviceSleep
 		originalNow := nodeNow
 		originalResizeFS := nodeResizeFS
+		originalNeedsResizeFS := nodeNeedsResizeFS
 		originalGOOS := nodeRuntimeGOOS
 		t.Cleanup(func() {
 			nodeVolumePathFS = originalStatfs
 			nodeDeviceSleep = originalSleep
 			nodeNow = originalNow
 			nodeResizeFS = originalResizeFS
+			nodeNeedsResizeFS = originalNeedsResizeFS
 			nodeRuntimeGOOS = originalGOOS
 		})
 
@@ -820,6 +870,7 @@ func TestNodeExpandVolume(t *testing.T) {
 			return true, nil
 		}
 		setFilesystemBytesSequence([]int64{requiredBytes / 2})
+		nodeNeedsResizeFS = func(_ exec.Interface, _, _ string) (bool, error) { return true, nil }
 
 		response, err := ns.NodeExpandVolume(context.Background(), makeFilesystemRequest(volumePath))
 		assert.Nil(t, response)
@@ -834,12 +885,14 @@ func TestNodeExpandVolume(t *testing.T) {
 		originalSleep := nodeDeviceSleep
 		originalNow := nodeNow
 		originalResizeFS := nodeResizeFS
+		originalNeedsResizeFS := nodeNeedsResizeFS
 		originalGOOS := nodeRuntimeGOOS
 		t.Cleanup(func() {
 			nodeVolumePathFS = originalStatfs
 			nodeDeviceSleep = originalSleep
 			nodeNow = originalNow
 			nodeResizeFS = originalResizeFS
+			nodeNeedsResizeFS = originalNeedsResizeFS
 			nodeRuntimeGOOS = originalGOOS
 		})
 
@@ -874,6 +927,7 @@ func TestNodeExpandVolume(t *testing.T) {
 			return true, nil
 		}
 		setFilesystemBytesSequence([]int64{requiredBytes})
+		nodeNeedsResizeFS = func(_ exec.Interface, _, _ string) (bool, error) { return false, nil }
 
 		response, err := ns.NodeExpandVolume(context.Background(), makeFilesystemRequest(volumePath))
 		assert.NoError(t, err)

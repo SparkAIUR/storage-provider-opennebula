@@ -537,9 +537,13 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 	}
 
 	if err := p.waitForAttachState(ctx, hotplugTimeout, p.hotplugPollWait, func() (bool, bool, error) {
-		attached := false
-		if _, infoErr := p.GetVolumeInNode(ctx, volumeID, nodeID); infoErr == nil {
-			attached = true
+		metadata, inspectErr := p.InspectVolumeAttachment(ctx, volume, node)
+		if inspectErr != nil {
+			return false, false, inspectErr
+		}
+		attached, inspectErr := attachmentPresence(metadata, volume, volumeID, nodeID)
+		if inspectErr != nil {
+			return false, false, inspectErr
 		}
 		ready, readyErr := p.nodeReady(nodeID)
 		if readyErr != nil {
@@ -1436,6 +1440,25 @@ func (p *PersistentDiskVolumeProvider) waitForResourceStatus(volumeID int, timeo
 	}
 }
 
+// Absence must be a successful, consistent provider observation, never a lookup error.
+func attachmentPresence(metadata *VolumeAttachmentMetadata, volume string, imageID, nodeID int) (bool, error) {
+	if metadata == nil || metadata.VolumeHandle != volume || metadata.ImageID != imageID || metadata.RequestedNodeID != nodeID || nodeID <= 0 {
+		return false, fmt.Errorf("attachment identity could not be verified")
+	}
+	for _, disk := range metadata.DiskRecords {
+		if disk.NodeID == nodeID {
+			if !metadata.AttachedToRequestedNode || strings.TrimSpace(disk.Target) == "" {
+				return false, fmt.Errorf("requested-node attachment lacks a verified target")
+			}
+			return true, nil
+		}
+	}
+	if metadata.AttachedToRequestedNode || len(metadata.DiskRecords) != 0 || metadata.ImageRunningVMs != 0 || len(metadata.ImageVMIDs) != 0 {
+		return false, fmt.Errorf("attachment absence is contradicted by image or VM usage")
+	}
+	return false, nil
+}
+
 func (p *PersistentDiskVolumeProvider) GetVolumeInNode(ctx context.Context, volumeID int, nodeID int) (string, error) {
 	vmInfo, err := p.ctrl.VM(nodeID).Info(true)
 	if err != nil {
@@ -1549,7 +1572,11 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Conte
 	if err != nil {
 		return nil, fmt.Errorf("failed to list virtual machines while inspecting volume %d attachment metadata: %w", volumeID, err)
 	}
+	requestedNodeSeen := strings.TrimSpace(node) == ""
 	for _, vmInfo := range vmPool.VMs {
+		if vmInfo.ID == requestedNodeID {
+			requestedNodeSeen = true
+		}
 		for _, disk := range vmInfo.Template.GetDisks() {
 			diskImageID, diskErr := disk.GetI(shared.ImageID)
 			if diskErr != nil || diskImageID != volumeID {
@@ -1575,6 +1602,9 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Conte
 		}
 	}
 
+	if !requestedNodeSeen {
+		return nil, fmt.Errorf("requested VM was absent from the attachment inspection")
+	}
 	return metadata, nil
 }
 

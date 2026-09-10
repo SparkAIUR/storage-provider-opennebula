@@ -264,7 +264,7 @@ func volumeAttachmentIsTransitional(va *storagev1.VolumeAttachment, now time.Tim
 	if grace <= 0 {
 		grace = 90 * time.Second
 	}
-	createdAt := va.CreationTimestamp.Time.UTC()
+	createdAt := va.CreationTimestamp.UTC()
 	if createdAt.IsZero() {
 		return false
 	}

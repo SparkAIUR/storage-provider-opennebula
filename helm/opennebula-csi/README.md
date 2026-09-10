@@ -32,7 +32,7 @@ Operator debugging guide:
 - `ReadWriteOnce`, `ReadOnlyMany`, and CephFS-backed filesystem volumes for `ReadWriteOnce`, `ReadOnlyMany`, and `ReadWriteMany`
 - CSI resize, metrics, preflight checks, snapshots, and clone workflows
 - stable detached-disk expansion and dynamic CephFS expansion
-- gated alpha features for CephFS snapshot/clone, CephFS self-healing, and topology accessibility
+- gated alpha features for CephFS snapshot/clone and CephFS self-healing
 
 ## Prerequisites
 
@@ -203,22 +203,16 @@ featureGates:
   cephfsSelfHealing: true
   cephfsPersistentRecovery: true
   cephfsKernelMounts: true
-  topologyAccessibility: true
 ```
 
-When `topologyAccessibility=true`, label nodes with:
-
-```text
-topology.opennebula.sparkaiur.io/system-ds=<opennebula-system-datastore-id>
-```
+For topology setup and inventory-managed node labels, see [topology accessibility](../../README.md#topology-accessibility).
 
 For local-backed StorageClasses:
 
 - prefer `volumeBindingMode: WaitForFirstConsumer`
 - keep `featureGates.compatibilityAwareSelection=true`
 - do not assume the driver will live-migrate local PVC data between nodes
-- the controller uses size-aware hotplug timeouts, allows only one active VM hotplug per node, and returns retryable `Aborted` when another same-node hotplug is already in progress
-- node-side device discovery uses the same per-volume timeout budget that the controller computed during publish
+- see the [local datastore placement guidance](../../README.md#local-datastore-placement-guidance) for hotplug serialization, queue behavior and the node-side discovery budget
 - if a VM stays non-ready through the full timeout, the driver puts that VM into a temporary hotplug cooldown and rejects further hotplug work with retryable `Unavailable`
 - recreating MinIO tenants with local-backed PVCs should still be treated as node-sticky; use Ceph RBD or CephFS if the workload must remain portable across nodes
 - use Ceph RBD for portable attached-disk RWO and CephFS for portable filesystem RWO or RWX
@@ -291,25 +285,17 @@ Repeated matching failures are persisted in `opennebula-csi-volume-quarantine-st
 
 ### Local Device Recovery
 
-When an OpenNebula VM still reports the PVC disk in template metadata but the node plugin cannot discover the device inside the guest, the node records a typed missing-device report in `opennebula-csi-node-device-state`. The controller leader watches those reports and, after the configured threshold, performs same-node-only recovery for eligible local non-CephFS `ReadWriteOnce` volumes.
+When the node plugin cannot discover the device inside the guest, it records a typed missing-device report in `opennebula-csi-node-device-state`. The controller leader watches those reports and, after the configured threshold, evaluates same-node recovery for eligible local non-CephFS `ReadWriteOnce` volumes.
 
-Recovery now has an explicit runtime-confirmation state machine:
-
-- provider-side attach success leaves the report in `pending_runtime_confirmation`
-- only a later successful `NodeStageVolume` clears the active recovery episode
-- if the node never confirms device visibility before the confirmation deadline, the episode transitions to `timed_out_waiting_for_node_confirmation`
-- once the episode exhausts its configured budget, the driver records `same_node_runtime_attach_unconfirmed` in `opennebula-csi-volume-repair-state` and blocks further automatic same-node recovery with `repair_required_runtime_attach_unconfirmed`
+See the [recovery authority and device identity contract](../../docs/v0.5.29-review-followup.md#implemented-corrections) for provider completion, terminal states, and confirmation through filesystem staging or raw-block publishing.
 
 This recovery path never moves a volume to a different node. It skips CephFS, RWX, non-local backends, missing desired state, NotReady Kubernetes nodes, and non-running OpenNebula VMs. Failed recovery attempts are rate-limited with `driver.localDeviceRecovery.cooldownSeconds` and capped with `driver.localDeviceRecovery.maxAttemptsPerVolume`. Repeated missing-device reports for the same `(volume, node, failure-class)` attach to the active recovery episode instead of resetting the counters.
 
-The driver distinguishes two same-node repair methods:
-
-- `runtime_republish`: used only when OpenNebula metadata no longer shows the disk attached and the controller can safely reissue same-node attach
-- `same_node_detach_attach_fallback`: used when metadata still shows the disk attached, because OpenNebula does not expose a safe runtime-only re-hotplug primitive for an already-declared VM disk
+The `runtime_republish` method attaches only after typed inspection proves the image has no VM owner or disk record. Lookup errors do not prove absence. Metadata-attached disks require manual repair after consumers are drained. Automatic recovery never detaches them, and no operator force flag bypasses this restriction.
 
 OpenNebula metadata attachment is no longer treated as final proof of healing. It is sequencing evidence only.
 
-If same-node restage observes a different local block device identity than the last healthy stage, the driver records `wrong_device_identity` in `opennebula-csi-volume-repair-state` and returns `FailedPrecondition`. Clear the matching ConfigMap key only after external repair or after a later healthy publish/stage path clears it automatically.
+If same-node restage observes a different local block device identity than the last healthy stage, the driver records `wrong_device_identity` and returns `FailedPrecondition`. Report and repair-record retirement follow the [recovery authority contract](../../docs/v0.5.29-review-followup.md#implemented-corrections).
 
 `wrong_device_identity` is repair-required only. The controller preserves that failure class in `opennebula-csi-node-device-state`, emits a dedicated skipped-recovery signal, and never re-enters automatic detach/attach recovery for that report. Support bundles now surface asserted controller hints separately from independently observed device evidence, and node-side persisted session identity is available through `--mode=local-disk-sessions`.
 
@@ -417,7 +403,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
-| `image.tag` | Driver image tag. | `"v0.5.28"` | No |
+| `image.tag` | Driver image tag. | See [values.yaml](./values.yaml). | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
 
 ### Driver
@@ -435,7 +421,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.nodeDeviceDiscoveryTimeoutSeconds` | Dedicated node-side device discovery timeout. This stays shorter than the controller hotplug budget so healthy fast-path retries happen quickly. | `30` | No |
 | `driver.nodeExpand.verifyTimeoutSeconds` | Maximum time for node-side resize convergence before returning `DeadlineExceeded`. | `120` | No |
 | `driver.nodeExpand.retryIntervalSeconds` | Retry interval for node-side checks between device visibility, growfs execution, and filesystem size validation. | `2` | No |
-| `driver.nodeExpand.sizeToleranceBytes` | Allowed slack between requested and observed filesystem size to account for filesystem metadata overhead. | `134217728` | No |
+| `driver.nodeExpand.sizeToleranceBytes` | Legacy compatibility setting; see the [node expansion contract](../../docs/node-expansion.md#verification-contract). | See [values.yaml](./values.yaml). | No |
 | `driver.nodeDeviceCache.enabled` | Enable node-local device cache and stable serial/by-id resolution. | `true` | No |
 | `driver.nodeDeviceCache.ttlSeconds` | Cache TTL for confirmed device paths. | `600` | No |
 | `driver.nodeDeviceCache.udevSettleTimeoutSeconds` | Timeout for `udevadm settle` before device rescan on miss. | `10` | No |
@@ -447,7 +433,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.hotplugQueue.perItemWaitSeconds` | Extra wait budget added per active or queued request ahead of a new request. | `60` | No |
 | `driver.hotplugQueue.maxWaitCapSeconds` | Upper bound for dynamic queue wait budgets. | `900` | No |
 | `driver.hotplugQueue.maxActiveSeconds` | Maximum execution time for an active queued hotplug request before it is classified as timed out. | `900` | No |
-| `driver.hotplugQueue.snapshotDebounceSeconds` | Debounce interval for hotplug queue ConfigMap snapshots during recovery churn. Empty queue snapshots still flush immediately. | `2` | No |
+| `driver.hotplugQueue.snapshotDebounceSeconds` | Debounce interval for hotplug queue ConfigMap snapshots during recovery churn. Empty queue snapshots bypass debounce; API writes run independently per node with two-second deadlines and up to five delayed retries. | `2` | No |
 | `driver.hotplugDiagnostics.enabled` | Persist read-only OpenNebula HOTPLUG observations for support bundles, inventory status, and timeout diagnosis. | `true` | No |
 | `driver.hotplugDiagnostics.stuckAfterSeconds` | HOTPLUG age after which an unchanged observation is classified as stuck. | `300` | No |
 | `driver.hotplugDiagnostics.progressWindowSeconds` | Required unchanged observation window before a HOTPLUG VM is classified as stuck. | `60` | No |
@@ -468,7 +454,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.hostArtifactQuarantine.enabled` | Enable read-only quarantine when local `fs_lvm_ssh` attach failures indicate a stale host-side LV such as `lv-one-<vm>-<disk>`. | `true` | No |
 | `driver.hostArtifactQuarantine.failureThreshold` | Matching host-artifact failures required before the VM/disk slot quarantine is active. | `1` | No |
 | `driver.hostArtifactQuarantine.ttlSeconds` | Active host-artifact quarantine duration; after external repair, operators can also clear the matching `opennebula-csi-host-artifact-state` key to retry immediately. | `3600` | No |
-| `driver.localDeviceRecovery.enabled` | Enable controller-driven same-node detach/reattach recovery after node-side local device discovery repeatedly fails. | `true` | No |
+| `driver.localDeviceRecovery.enabled` | Enable same-node attachment recovery after typed inspection proves metadata absence; attached disks require manual repair. | `true` | No |
 | `driver.localDeviceRecovery.minAttempts` | Missing-device reports required from a node before recovery is eligible. | `3` | No |
 | `driver.localDeviceRecovery.minAgeSeconds` | Minimum age of the first missing-device report before recovery is eligible. | `60` | No |
 | `driver.localDeviceRecovery.intervalSeconds` | Controller leader scan interval for `opennebula-csi-node-device-state`. | `15` | No |
@@ -524,7 +510,7 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | `controller.attacher.workerThreads` | `csi-attacher` worker concurrency. Tune down to reduce replay pressure or up to clear healthy backlog faster. | `10` | No |
 | `controller.attacher.retryIntervalStartSeconds` | Initial `csi-attacher` retry backoff for failed work items. | `1` | No |
 | `controller.attacher.retryIntervalMaxSeconds` | Maximum `csi-attacher` retry backoff for failed work items. | `300` | No |
-| `controller.attacher.httpEndpointEnabled` | Enable the `csi-attacher` HTTP metrics endpoint and expose the `att-metrics` container port and Service/ServiceMonitor target when `metrics.enabled=true`. | `true` | No |
+| `controller.attacher.httpEndpointEnabled` | Enable the `csi-attacher` HTTP listener and `att-metrics` container port independently of `metrics.enabled`. Service/ServiceMonitor targets also require their metrics settings. Set `false` to disable the listener and its targets. | `true` | No |
 | `controller.attacher.extraArgs` | Extra CLI args appended only to the `csi-attacher` sidecar. | `[]` | No |
 | `controller.podAnnotations` | Extra annotations for the controller pod template. | `{}` | No |
 | `controller.resources` | Controller pod resource requests and limits. | `{}` | No |
@@ -705,12 +691,14 @@ For local-backed classes, preflight now checks `volumeBindingMode` and warns by 
 | `storageClasses[].allowedTopologies` | Optional Kubernetes StorageClass topology selector. Use this to pre-filter local/LVM classes to compatible `topology.opennebula.sparkaiur.io/system-ds` values. | none | No |
 | `storageClasses[].parameters` | Driver parameters injected into the StorageClass. | none | No |
 
-Rendered StorageClasses are fingerprinted with `storage-provider.opennebula.sparkaiur.io/*` annotations. On Helm upgrade, operators may explicitly enable the optional `storageClassReconcile` pre-upgrade hook to recreate chart-owned classes only when the live spec still matches the previously applied chart hash; manual/user mutations are blocked by default.
+Rendered StorageClasses are fingerprinted with `storage-provider.opennebula.sparkaiur.io/*` annotations. The optional `storageClassReconcile` pre-upgrade hook creates missing classes and recreates chart-owned classes when their desired spec hash changes, provided the live spec still matches the previously applied hash. The hash covers the fields in [storageClassSpecHash](../../pkg/csi/driver/storageclass_reconcile.go), including mutable settings such as expansion and mount options.
+
+Legacy classes without an applied hash can be adopted when their live spec exactly matches the desired spec and `adoptUnannotated` is enabled. Otherwise, unowned classes, missing applied hashes, and manual spec changes fail the hook under `manualMutationPolicy: fail`; `skip` leaves them alone in the hook. Skipping does not make an incompatible immutable change safe for Helm's later upgrade step. The hook changes StorageClass objects only; it does not rewrite PVCs or PVs.
 
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `storageClassReconcile.enabled` | Enable the pre-upgrade StorageClass fingerprint/recreate hook when `storageClasses[]` is non-empty. | `false` | No |
-| `storageClassReconcile.manualMutationPolicy` | Policy when a chart-owned StorageClass was manually changed; `fail` or `skip`. | `fail` | No |
+| `storageClassReconcile.manualMutationPolicy` | Hook policy for unowned classes, missing applied hashes, or manual spec changes; `fail` or `skip`. | `fail` | No |
 | `storageClassReconcile.adoptUnannotated` | Adopt unannotated legacy StorageClasses only when their live spec exactly matches the desired chart spec. | `true` | No |
 | `storageClassReconcile.image.repository` | Override image repository for the reconcile hook. Empty falls back to `image.repository`. | `""` | No |
 | `storageClassReconcile.image.tag` | Override image tag for the reconcile hook. Empty falls back to `image.tag`. | `""` | No |
@@ -737,7 +725,7 @@ Common `storageClasses[].parameters` used by this driver:
 | Default provisioning without StorageClass overrides | `driver.defaultDatastores` |
 | StorageClass-managed provisioning | `storageClasses[].name` plus `storageClasses[].parameters.datastoreIDs` or `driver.defaultDatastores` |
 | CephFS filesystem provisioning | CephFS datastore IDs, StorageClass secret refs, Kubernetes Secrets with `adminID/adminKey` and `userID/userKey` |
-| Topology accessibility alpha | `featureGates.topologyAccessibility=true` plus node labels `topology.opennebula.sparkaiur.io/system-ds=<id>` |
+| Topology accessibility | See [topology requirements](../../README.md#topology-accessibility). |
 | Detached disk expansion | Enabled by default |
 | CephFS expansion | Enabled by default |
 | CephFS snapshots alpha | `featureGates.cephfsSnapshots=true` |

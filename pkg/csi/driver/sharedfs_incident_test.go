@@ -211,7 +211,7 @@ func TestSharedFilesystemSeedKeepsMissingPublishedTarget(t *testing.T) {
 	id, stage, target := stageSharedFilesystemFixture(t, ns, "seed-target")
 	_, err := ns.NodePublishVolume(context.Background(), newSharedFilesystemPublishRequest(id, stage, target))
 	require.NoError(t, err)
-	require.NoError(t, ns.mounter.Interface.Unmount(target))
+	require.NoError(t, ns.mounter.Unmount(target))
 	ns.sharedFilesystemRecovery.seedSessionsFromMounts(context.Background())
 	session, exists, err := ns.sharedFilesystemRecovery.store.Load(id)
 	require.NoError(t, err)
@@ -389,6 +389,19 @@ func TestSharedFilesystemLegacySessionRecoversMissingStage(t *testing.T) {
 	require.NoError(t, os.WriteFile(ns.sharedFilesystemRecovery.store.pathForVolume(id), payload, 0600))
 	require.NoError(t, ns.sharedFS.unmount(context.Background(), stage))
 	require.NoError(t, os.Remove(stage))
+	// A retained bind from the lost FUSE generation must be demonstrably disconnected.
+	probe, fuse := ns.sharedFS.probe, ns.sharedFS.fuse
+	disconnected := true
+	ns.sharedFS.probe = func(ctx context.Context, path string) error {
+		if path == target && disconnected {
+			return syscall.ENOTCONN
+		}
+		return probe(ctx, path)
+	}
+	ns.sharedFS.fuse = func(ctx context.Context, session sharedFilesystemSession, args []string) error {
+		disconnected = false
+		return fuse(ctx, session, args)
+	}
 	ns.sharedFilesystemRecovery = newSharedFilesystemRecoveryManager(ns)
 	require.NoError(t, ns.sharedFilesystemRecovery.recoverVolume(context.Background(), id))
 	require.NoError(t, ns.verifySharedFilesystemBind(stage, target))
@@ -594,4 +607,47 @@ func TestSharedFilesystemPublishRequiresActualBindPostcondition(t *testing.T) {
 	ns.sharedFS.bind = func(context.Context, string, string, []string) error { return nil }
 	_, err := ns.NodePublishVolume(context.Background(), newSharedFilesystemPublishRequest(id, stage, target))
 	require.Error(t, err)
+}
+
+func TestSharedFilesystemAbsentStagesRejectUnprovenRetainedBinds(t *testing.T) {
+	for _, scenario := range []string{"conflicting-sibling", "healthy", "unknown"} {
+		t.Run(scenario, func(t *testing.T) {
+			withSharedFilesystemTestPaths(t)
+			ns := getTestNodeServer(nil)
+			id, stage, target := stageSharedFilesystemFixture(t, ns, "absent-owner")
+			other, otherStage, otherTarget := stageSharedFilesystemFixture(t, ns, "absent-other")
+			_, err := ns.NodePublishVolume(context.Background(), newSharedFilesystemPublishRequest(id, stage, target))
+			require.NoError(t, err)
+			_, err = ns.NodePublishVolume(context.Background(), newSharedFilesystemPublishRequest(other, otherStage, otherTarget))
+			require.NoError(t, err)
+			require.NoError(t, ns.sharedFS.unmount(context.Background(), stage))
+			require.NoError(t, ns.sharedFS.unmount(context.Background(), otherStage))
+			if scenario == "conflicting-sibling" {
+				ns.sharedFS.mountInfo = func() ([]mount.MountInfo, error) {
+					return []mount.MountInfo{
+						{MountPoint: target, Minor: 9, Root: "/", FsType: "fuse.ceph-fuse"},
+						{MountPoint: otherTarget, Minor: 9, Root: "/", FsType: "fuse.ceph-fuse"},
+					}, nil
+				}
+			}
+			ns.sharedFS.probe = func(context.Context, string) error {
+				if scenario == "healthy" {
+					return nil
+				}
+				if scenario == "unknown" {
+					return syscall.EIO
+				}
+				return syscall.ENOTCONN
+			}
+			mounts := 0
+			ns.sharedFS.fuse = func(context.Context, sharedFilesystemSession, []string) error { mounts++; return nil }
+			before, err := ns.mounter.List()
+			require.NoError(t, err)
+			require.Error(t, ns.sharedFilesystemRecovery.recoverVolume(context.Background(), id))
+			after, err := ns.mounter.List()
+			require.NoError(t, err)
+			require.Equal(t, before, after)
+			require.Zero(t, mounts)
+		})
+	}
 }

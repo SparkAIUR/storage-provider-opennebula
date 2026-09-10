@@ -345,9 +345,9 @@ func writeStorageClassReconcileResults(w io.Writer, results []storageClassReconc
 	}
 	for _, result := range results {
 		if result.Reason != "" {
-			fmt.Fprintf(w, "storageclass %s: %s (%s)\n", result.Name, result.Action, result.Reason)
+			_, _ = fmt.Fprintf(w, "storageclass %s: %s (%s)\n", result.Name, result.Action, result.Reason)
 		} else {
-			fmt.Fprintf(w, "storageclass %s: %s\n", result.Name, result.Action)
+			_, _ = fmt.Fprintf(w, "storageclass %s: %s\n", result.Name, result.Action)
 		}
 	}
 }

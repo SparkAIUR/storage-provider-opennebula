@@ -50,6 +50,9 @@ var (
 	nodeResizeFS       = func(exec utilexec.Interface, devicePath, deviceMountPath string) (bool, error) {
 		return mount.NewResizeFs(exec).Resize(devicePath, deviceMountPath)
 	}
+	nodeNeedsResizeFS = func(exec utilexec.Interface, devicePath, deviceMountPath string) (bool, error) {
+		return mount.NewResizeFs(exec).NeedResize(devicePath, deviceMountPath)
+	}
 )
 
 const (
@@ -57,7 +60,6 @@ const (
 	defaultNodeDevicePollPeriod = time.Second
 	defaultNodeExpandTimeout    = 120 * time.Second
 	defaultNodeExpandRetry      = 2 * time.Second
-	defaultNodeExpandTolerance  = int64(128 * 1024 * 1024)
 	minNodeExpandTimeout        = 10 * time.Second
 	minNodeExpandRetry          = time.Second
 )
@@ -150,8 +152,13 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	if len(volName) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "[volumeName] entry is required in volume context")
 	}
+	reportRef, repairRef, reportErr := ns.readLocalDeviceRecoveryAuthority(ctx, volumeID)
+	if reportErr != nil {
+		return nil, reportErr
+	}
 	deviceTimeout := ns.deviceDiscoveryTimeout(volumeContext)
-	devicePath, resolution, err := ns.resolveDevicePathWithContext(volumeID, volName, volumeContext, deviceTimeout)
+	devicePath, resolution, err := ns.resolveDevicePathWithContext(volumeID, volName, volumeContext, deviceTimeout, reportRef)
+	volumeContext = resolution.withExpectedSerial(volumeContext)
 	if err != nil {
 		ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "timeout", time.Since(started))
 		ns.recordLocalDeviceMissing(ctx, volumeID, volName, stagingTargetPath, volumeContext, err)
@@ -184,6 +191,16 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 
 	if accessMode.Mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY {
 		mountFlags = append(mountFlags, "ro")
+	}
+	if repairRef != nil {
+		if err := ns.verifyStageRepairObservation(repairRef, ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext)); err != nil {
+			return nil, err
+		}
+	}
+	if reportRef != nil {
+		if err := verifyLocalDeviceReportIdentity(reportRef, ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext), volumeContext); err != nil {
+			return nil, err
+		}
 	}
 	if session, exists, loadErr := ns.loadLocalDiskSession(volumeID); loadErr == nil && exists && session.Identity != nil {
 		observedIdentity := ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext)
@@ -259,13 +276,13 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		//Check if volume_id is already staged in stagingTargetPath and is identical
 		// to the volumeCapability provided in the request, then return 0 OK response
 		observedIdentity := ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext)
-		report, _ := ns.currentLocalDeviceReport(ctx, volumeID)
-		var reportRef *LocalDeviceMissingReport
-		if strings.TrimSpace(report.VolumeID) != "" {
-			reportRef = &report
-		}
 		ns.recordLocalDiskStageSession(ctx, req, devicePath, fsType, mountFlags, observedIdentity, reportRef)
-		ns.confirmLocalDeviceRecovery(ctx, reportRef, volumeID, devicePath, observedIdentity, volumeContext)
+		if err := ns.confirmLocalDeviceRecovery(ctx, reportRef, volumeID, devicePath, observedIdentity, volumeContext); err != nil {
+			return nil, err
+		}
+		if err := ns.clearObservedStageRepair(ctx, volumeID, repairRef, observedIdentity); err != nil {
+			return nil, err
+		}
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
@@ -300,13 +317,13 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		"stagingTargetPath", stagingTargetPath, "fsType", fsType)
 
 	observedIdentity := ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext)
-	report, _ := ns.currentLocalDeviceReport(ctx, volumeID)
-	var reportRef *LocalDeviceMissingReport
-	if strings.TrimSpace(report.VolumeID) != "" {
-		reportRef = &report
-	}
 	ns.recordLocalDiskStageSession(ctx, req, devicePath, fsType, mountFlags, observedIdentity, reportRef)
-	ns.confirmLocalDeviceRecovery(ctx, reportRef, volumeID, devicePath, observedIdentity, volumeContext)
+	if err := ns.confirmLocalDeviceRecovery(ctx, reportRef, volumeID, devicePath, observedIdentity, volumeContext); err != nil {
+		return nil, err
+	}
+	if err := ns.clearObservedStageRepair(ctx, volumeID, repairRef, observedIdentity); err != nil {
+		return nil, err
+	}
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
@@ -414,8 +431,13 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	var resp *csi.NodePublishVolumeResponse
 	switch accessType.(type) {
 	case *csi.VolumeCapability_Block:
+		reportRef, repairRef, authorityErr := ns.readLocalDeviceRecoveryAuthority(ctx, volumeID)
+		if authorityErr != nil {
+			return nil, authorityErr
+		}
 		deviceTimeout := ns.deviceDiscoveryTimeout(volumeContext)
-		devicePath, resolution, resolveErr := ns.resolveDevicePathWithContext(volumeID, volName, volumeContext, deviceTimeout)
+		devicePath, resolution, resolveErr := ns.resolveDevicePathWithContext(volumeID, volName, volumeContext, deviceTimeout, reportRef)
+		volumeContext = resolution.withExpectedSerial(volumeContext)
 		if resolveErr != nil {
 			ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "timeout", deviceTimeout)
 			ns.recordLocalDeviceMissing(ctx, volumeID, volName, stagingTargetPath, volumeContext, resolveErr)
@@ -424,13 +446,22 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 				"method", "NodePublishVolume", "volumeID", volumeID, "volumeName", volName, "deviceDiscoveryTimeout", deviceTimeout)
 			return nil, status.Error(codes.DeadlineExceeded, resolveErr.Error())
 		}
-		ns.clearLocalDeviceMissing(ctx, volumeID)
 		ns.recordDeviceResolutionFromPublishContext(ctx, volumeContext, resolution)
 		ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "success", resolution.Latency)
 		ns.Driver.observeAdaptiveTimeout(ctx, "device_resolution", ns.publishContextBackend(volumeContext), 0, resolution.Latency)
 		klog.V(2).InfoS("Resolved block device path",
 			"method", "NodePublishVolume", "volumeID", volumeID, "devicePath", devicePath, "deviceDiscoveryTimeout", deviceTimeout,
 			"resolvedBy", resolution.ResolvedBy, "resolutionLatency", resolution.Latency)
+		observedIdentity := ns.observeLocalDiskIdentity(devicePath, "", volumeContext)
+		if err := ns.verifyStageRepairObservation(repairRef, observedIdentity); err != nil {
+			return nil, err
+		}
+		if err := ns.confirmLocalDeviceRecovery(ctx, reportRef, volumeID, devicePath, observedIdentity, volumeContext); err != nil {
+			return nil, err
+		}
+		if err := ns.clearObservedStageRepair(ctx, volumeID, repairRef, observedIdentity); err != nil {
+			return nil, err
+		}
 		resp, err = ns.handleBlockVolumePublish(devicePath, targetPath, volumeCapability, options)
 	case *csi.VolumeCapability_Mount:
 		resp, err = ns.handleMountVolumePublish(stagingTargetPath, targetPath, volumeCapability, options)
@@ -601,11 +632,7 @@ func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 
 	klog.V(1).InfoS("Volume successfully unpublished from target path",
 		"method", "NodeUnpublishVolume", "volumeID", volumeID, "targetPath", targetPath)
-	if opennebula.IsSharedFilesystemVolumeID(volumeID) {
-		ns.removeSharedFilesystemPublishedTarget(volumeID, targetPath)
-	} else {
-		ns.removeLocalDiskPublishedTarget(volumeID, targetPath)
-	}
+	ns.removeLocalDiskPublishedTarget(volumeID, targetPath)
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
@@ -749,10 +776,9 @@ func (ns *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 	}
 
 	policy := ns.nodeExpandPolicy()
-	targetMinBytes := requiredBytes - policy.sizeToleranceBytes
-	if targetMinBytes < 0 {
-		targetMinBytes = 0
-	}
+	// A PVC requests outer device capacity. Filesystem metadata is not
+	// missing storage, and a byte tolerance must not hide a short device.
+	targetMinBytes := requiredBytes
 
 	deadline := nodeNow().Add(policy.verifyTimeout)
 	var (
@@ -816,7 +842,19 @@ func (ns *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 			return nil, status.Errorf(codes.Internal, "failed to collect filesystem size for volume %s at %s: %v", volumeID, volumePath, err)
 		}
 
-		if lastFSBytes >= targetMinBytes {
+		// NeedResize reads filesystem geometry (ext4 block count or XFS data
+		// blocks), including metadata omitted by statfs. Keep statfs for diagnostics.
+		needsResize, err := nodeNeedsResizeFS(ns.mounter.Exec, devicePath, volumePath)
+		if err != nil {
+			ns.recordNodeExpandOperation(started, "disk", "internal")
+			return nil, status.Errorf(codes.Internal, "failed to verify filesystem geometry for volume %s: %v", volumeID, err)
+		}
+		if !resized {
+			ns.recordNodeExpandOperation(started, "disk", "failed_precondition")
+			return nil, status.Errorf(codes.FailedPrecondition, "filesystem resize was not performed for volume %s", volumeID)
+		}
+
+		if !needsResize {
 			ns.recordNodeExpandOperation(started, "disk", "success")
 			klog.V(1).InfoS("NodeExpandVolume converged",
 				"method", "NodeExpandVolume",
@@ -870,16 +908,14 @@ func (ns *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 }
 
 type nodeExpandPolicy struct {
-	verifyTimeout      time.Duration
-	retryInterval      time.Duration
-	sizeToleranceBytes int64
+	verifyTimeout time.Duration
+	retryInterval time.Duration
 }
 
 func (ns *NodeServer) nodeExpandPolicy() nodeExpandPolicy {
 	policy := nodeExpandPolicy{
-		verifyTimeout:      defaultNodeExpandTimeout,
-		retryInterval:      defaultNodeExpandRetry,
-		sizeToleranceBytes: defaultNodeExpandTolerance,
+		verifyTimeout: defaultNodeExpandTimeout,
+		retryInterval: defaultNodeExpandRetry,
 	}
 	if ns == nil || ns.Driver == nil {
 		return policy
@@ -896,12 +932,6 @@ func (ns *NodeServer) nodeExpandPolicy() nodeExpandPolicy {
 		retry := time.Duration(retrySeconds) * time.Second
 		if retry >= minNodeExpandRetry {
 			policy.retryInterval = retry
-		}
-	}
-
-	if toleranceBytes, ok := ns.Driver.PluginConfig.GetInt(config.NodeExpandSizeToleranceBytesVar); ok {
-		if toleranceBytes >= 0 {
-			policy.sizeToleranceBytes = int64(toleranceBytes)
 		}
 	}
 
@@ -1001,61 +1031,29 @@ func (ns *NodeServer) getDeviceName(volumeName string) string {
 }
 
 type deviceResolutionResult struct {
-	ResolvedBy string
-	Latency    time.Duration
+	ResolvedBy     string
+	Latency        time.Duration
+	ExpectedSerial string
+}
+
+func (resolution deviceResolutionResult) withExpectedSerial(publishContext map[string]string) map[string]string {
+	if resolution.ExpectedSerial == "" {
+		return publishContext
+	}
+	result := cloneStringMap(publishContext)
+	result[publishContextDeviceSerial] = resolution.ExpectedSerial
+	return result
 }
 
 func (ns *NodeServer) resolveDevicePath(volumeName string, timeout time.Duration) (string, deviceResolutionResult, error) {
-	return ns.resolveDevicePathWithContext("", volumeName, nil, timeout)
+	return ns.resolveDevicePathWithContext("", volumeName, nil, timeout, nil)
 }
 
-func (ns *NodeServer) resolveDevicePathWithContext(volumeID, volumeName string, publishContext map[string]string, timeout time.Duration) (string, deviceResolutionResult, error) {
-	if ns.deviceResolver != nil {
-		return ns.deviceResolver.Resolve(context.Background(), volumeID, volumeName, publishContext, timeout)
+func (ns *NodeServer) resolveDevicePathWithContext(volumeID, volumeName string, publishContext map[string]string, timeout time.Duration, report *LocalDeviceMissingReport) (string, deviceResolutionResult, error) {
+	if ns.deviceResolver == nil {
+		return "", deviceResolutionResult{}, fmt.Errorf("node device resolver is unavailable")
 	}
-
-	started := time.Now()
-	candidates := ns.deviceCandidates(volumeName)
-	deadline := time.Now().Add(timeout)
-	var lastErr error
-	expected := ns.getDeviceName(volumeName)
-
-	for {
-		for _, candidate := range candidates {
-			if _, err := nodeVolumePathStat(candidate); err == nil {
-				result := deviceResolutionResult{
-					ResolvedBy: "exact",
-					Latency:    time.Since(started),
-				}
-				if candidate != expected {
-					result.ResolvedBy = "alias"
-					klog.V(2).InfoS("Resolved device path via alias",
-						"method", "resolveDevicePath", "volumeName", volumeName, "devicePath", candidate)
-				}
-				return candidate, result, nil
-			} else if !os.IsNotExist(err) {
-				lastErr = err
-			}
-		}
-
-		if time.Now().After(deadline) {
-			break
-		}
-
-		nodeDeviceSleep(defaultNodeDevicePollPeriod)
-	}
-
-	if lastErr != nil {
-		return "", deviceResolutionResult{}, fmt.Errorf(
-			"timed out after %s waiting for device path for volume %q (checked %s, last error: %v)",
-			timeout, volumeName, strings.Join(candidates, ", "), lastErr,
-		)
-	}
-
-	return "", deviceResolutionResult{}, fmt.Errorf(
-		"timed out after %s waiting for device path for volume %q (checked %s)",
-		timeout, volumeName, strings.Join(candidates, ", "),
-	)
+	return ns.deviceResolver.Resolve(context.Background(), volumeID, volumeName, publishContext, timeout, localDeviceReportSerials(report)...)
 }
 
 func (ns *NodeServer) deviceDiscoveryTimeout(publishContext map[string]string) time.Duration {

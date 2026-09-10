@@ -7,7 +7,7 @@
 {{- $controllerAttacherWorkerThreads := (get $controllerAttacher "workerThreads") | default 10 -}}
 {{- $controllerAttacherRetryIntervalStart := (get $controllerAttacher "retryIntervalStartSeconds") | default 1 -}}
 {{- $controllerAttacherRetryIntervalMax := (get $controllerAttacher "retryIntervalMaxSeconds") | default 300 -}}
-{{- $controllerAttacherHTTPEnabled := (get $controllerAttacher "httpEndpointEnabled") | default true -}}
+{{- $controllerAttacherHTTPEnabled := dig "httpEndpointEnabled" true $controllerAttacher -}}
 {{- $lastNodePreference := (get .Values.driver "lastNodePreference") | default dict -}}
 {{- $lastNodePreferenceWebhook := (get $lastNodePreference "webhook") | default dict -}}
 {{- $lastNodePreferenceWebhookEnabled := and ((get $lastNodePreference "enabled") | default true) ((get $lastNodePreferenceWebhook "enabled") | default true) -}}

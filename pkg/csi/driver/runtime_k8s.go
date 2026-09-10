@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	inventoryv1alpha1 "github.com/SparkAIUR/storage-provider-opennebula/pkg/inventory/apis/storageprovider/v1alpha1"
+	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -289,6 +291,44 @@ func (r *KubeRuntime) UpsertConfigMapData(ctx context.Context, namespace, name s
 		_, err = cmClient.Patch(ctx, name, types.MergePatchType, payload, metav1.PatchOptions{})
 	}
 	return err
+}
+
+// Snapshot writes carry the fetched resourceVersion, including deletion. A delayed
+// request that outlives its timeout cannot overwrite a newer successful snapshot.
+func (r *KubeRuntime) setConfigMapSnapshot(ctx context.Context, namespace, name, key, payload string) error {
+	client := r.client.CoreV1().ConfigMaps(namespace)
+	keyHash := sha256.Sum256([]byte(key))
+	annotations := map[string]string{fmt.Sprintf("storage-provider.opennebula.sparkaiur.io/snapshot-%x", keyHash[:16]): uuid.NewString()}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		cm, err := client.Get(ctx, name, metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			data := map[string]string{}
+			if payload != "" {
+				data[key] = payload
+			}
+			_, err = client.Create(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Annotations: annotations}, Data: data}, metav1.CreateOptions{})
+			if errors.IsAlreadyExists(err) {
+				return errors.NewConflict(corev1.Resource("configmaps"), name, err)
+			}
+			return err
+		}
+		if err != nil {
+			return err
+		}
+		var value any
+		if payload != "" {
+			value = payload
+		}
+		patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"resourceVersion": cm.ResourceVersion, "annotations": annotations}, "data": map[string]any{key: value}})
+		if err != nil {
+			return err
+		}
+		_, err = client.Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{})
+		return err
+	})
 }
 
 func (r *KubeRuntime) DeleteConfigMapKey(ctx context.Context, namespace, name, key string) error {

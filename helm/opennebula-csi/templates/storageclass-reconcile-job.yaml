@@ -2,7 +2,7 @@
 {{- $storageClassReconcileEnabled := (get $storageClassReconcile "enabled") | default false -}}
 {{- if and $storageClassReconcileEnabled .Values.storageClasses }}
 {{- $manualMutationPolicy := (get $storageClassReconcile "manualMutationPolicy") | default "fail" -}}
-{{- $adoptUnannotated := (get $storageClassReconcile "adoptUnannotated") | default true -}}
+{{- $adoptUnannotated := dig "adoptUnannotated" true $storageClassReconcile -}}
 ---
 apiVersion: batch/v1
 kind: Job

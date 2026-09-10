@@ -103,7 +103,7 @@ func (ns *NodeServer) handleSharedFilesystemStage(ctx context.Context, req *csi.
 	if err != nil {
 		return nil, err
 	}
-	if !exists && mounted {
+	if !exists {
 		// A preexisting client may have no session record. Reconstruct every
 		// provable bind before recovery so remounting cannot abandon its targets.
 		session.PublishedTargets, err = ns.discoverSharedFilesystemTargets(session.VolumeID, stagingTargetPath)
@@ -143,7 +143,7 @@ func (ns *NodeServer) handleSharedFilesystemStage(ctx context.Context, req *csi.
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
-	if exists && len(session.PublishedTargets) > 0 {
+	if len(session.PublishedTargets) > 0 {
 		if err := ns.recordSharedFilesystemSession(session); err != nil {
 			return nil, err
 		}
@@ -283,7 +283,7 @@ func (ns *NodeServer) ensureSharedFilesystemStageReady(ctx context.Context, req 
 	if err := ns.verifySharedFilesystemStage(volumeID, stagingTargetPath); err != nil {
 		return status.Error(codes.FailedPrecondition, err.Error())
 	}
-	if _, err := ns.ensureSharedFilesystemSessionForPublish(req); err != nil {
+	if _, err := ns.ensureSharedFilesystemSessionForPublish(ctx, req); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "cannot validate shared filesystem session before publish: %v", err)
 	}
 

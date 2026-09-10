@@ -7,8 +7,11 @@ was released on September 9, 2026 from source
 `fa2d08077ac3b7d443937d06061add863f17ee2d`.
 [Release workflow 34391722704](https://github.com/SparkAIUR/storage-provider-opennebula/actions/runs/34391722704)
 completed successfully. The hplmon failure test and the drained Bravo canary
-passed. The staged production rollout is in progress, and the 24-hour
-production observation period is pending.
+passed. At that September 9 checkpoint, the staged production rollout was in
+progress and the 24-hour observation period was pending. For the subsequent
+authorization to advance before that window completed, see the
+[September 10 release decision](../DECISIONS.md#2026-09-10-filesystem-expansion-and-v0529).
+That authorization does not establish completion of the observation period.
 
 | Artifact | Verified digest |
 | --- | --- |
@@ -146,8 +149,7 @@ finished on each worker and preserved the Bravo response contract.
 The Frauditor global-search writer was drained before CSI replacement. It exited
 with status 130 and resumed with its checkpoint matching the pre-drain baseline.
 
-This proves recovery on the affected Bravo node. The remaining production work
-is the staged node rollout, verification and restoration of maintenance settings,
-and 24 hours of observation. Advance only after each node's affected FUSE clients
-are drained and its storage and application checks pass. The observation period
-has not yet completed.
+This proves recovery on the affected Bravo node. Advance only after each node's
+affected FUSE clients are drained and its storage and application checks pass.
+See [release and rollout status](#release-and-rollout-status) for the observation
+checkpoint and subsequent release decision.

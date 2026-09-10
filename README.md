@@ -39,21 +39,15 @@ Staging-validated stable features:
 - `detachedDiskExpansion`
 - `cephfsExpansion`
 
-Features that remain gated by default:
-
-- `cephfsSnapshots`
-- `cephfsClones`
-- `cephfsSelfHealing`
-- `cephfsKernelMounts`
-- `topologyAccessibility`
+See the [feature-gate reference](helm/opennebula-csi/README.md#feature-gates) for optional features and their defaults.
 
 ## Release artifacts
 
 - Container images:
   `ghcr.io/sparkaiur/opennebula-csi:<tag>`
   `docker.io/nudevco/opennebula-csi:<tag>`
-- Latest release: [`v0.5.28`](https://github.com/SparkAIUR/storage-provider-opennebula/releases/tag/v0.5.28), published September 9, 2026.
-- The hplmon failure test and Bravo canary passed. The staged production rollout is in progress, with 24-hour observation pending. See [CephFS recovery and rollout](docs/cephfs-recovery.md) for evidence and remaining checks.
+- Release versions and changes: [CHANGELOG.md](CHANGELOG.md).
+- Validation and rollout evidence: [node expansion](docs/node-expansion.md) and [CephFS recovery](docs/cephfs-recovery.md).
 - Helm repo: `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
 - Chart name: `opennebula-csi`
 - Source repo: `https://github.com/SparkAIUR/storage-provider-opennebula`
@@ -124,15 +118,15 @@ Recommended operator pattern for local-backed StorageClasses:
 
 - use `volumeBindingMode: WaitForFirstConsumer`
 - keep `compatibilityAwareSelection=true`
-- enable `topologyAccessibility` only if you can maintain correct node labels
+- satisfy the [topology labeling requirements](#topology-accessibility) before using local-backed provisioning
 - use local-backed classes for node-sticky RWO workloads, not for workloads that must move freely between nodes
 
 Important limitation:
 
 - the driver does not perform CSI-side host-to-host data migration for local-backed PVCs
-- when a pod lands on a different node, Kubernetes waits for detach/attach, but the underlying storage must already be attachable by OpenNebula from the configured image datastore path
+- cross-node movement is subject to the [local RWO protection rules](#restart-optimization-for-local-statefulsets), and the underlying storage must already be attachable by OpenNebula from the configured image datastore path
 - if OpenNebula cannot resolve the source image path during attach, the fix is in datastore layout or transfer-manager configuration, not in CSI-side file sync
-- the controller serializes attach/detach/expand operations per volume, allows only one active VM hotplug per node at a time, and returns retryable `Aborted` for later same-node requests instead of letting them time out in-line
+- the controller serializes attach/detach/expand operations per volume and allows only one active VM hotplug per node; with the default hotplug queue enabled, later requests wait within a bounded queue budget
 - hotplug attach and detach use a size-aware timeout budget derived from the actual OpenNebula disk size
 - node-side device discovery now uses a smaller dedicated timeout budget so healthy fast-path mounts fail and retry quickly instead of waiting through the full hotplug recovery budget
 - if a VM stays non-ready through the full hotplug timeout, the controller places that VM into a temporary recovery cooldown and rejects new hotplug work with retryable `Unavailable`
@@ -182,14 +176,14 @@ Recommended workload-side guidance:
 
 The local restart path includes a broader CSI performance and stability layer:
 
-- the node plugin now prefers stable `/dev/disk/by-id` resolution using an explicit OpenNebula disk serial and keeps a short-lived in-memory device cache
+- the node plugin prefers `/dev/disk/by-id` resolution and caches device paths subject to the [device identity contract](docs/v0.5.29-review-followup.md#implemented-corrections)
 - same-node hotplug work is queued fairly instead of failing fast with `node_busy`
-- local-device self-heal no longer treats OpenNebula template metadata as proof of recovery success; same-node repair stays pending until a later `NodeStageVolume` proves the guest can see the disk again
-- when metadata still says the disk is attached but the guest runtime cannot see it, the controller keeps recovery same-node only and falls back to detach/attach because OpenNebula does not expose a safe runtime-only re-hotplug primitive for an already-declared VM disk
+- local-device self-heal requires recorded provider completion followed by device verification through `NodeStageVolume` or raw-block `NodePublishVolume`; new and already-bound block publishes reject unfinished or changed recovery authority before exposing the device or returning success
+- when metadata still says the disk is attached but the guest runtime cannot see it, automatic recovery stops with a manual-repair outcome; consumers must be drained before external attachment repair because this release has no node/controller no-mount handoff
 - the controller can inject a soft last-node scheduling preference for local single-writer pods so StatefulSet restarts are more likely to land back on the previous node
 - a conservative stuck-attachment reconciler repairs orphaned OpenNebula attachments and stale `VolumeAttachment` objects
 - OpenNebulaNode `HotplugStuck` inventory status immediately pauses new hotplug work for that node until readiness gates and inventory diagnosis clear
-- hotplug queue state snapshots are debounced during churn while empty-queue snapshots still flush immediately for operator visibility
+- hotplug queue snapshots use independent per-node workers, two-second API deadlines, and up to five delayed retries; completion clears bypass debounce and superseded snapshots cannot overwrite them
 - attach, detach, and device-resolution latencies now feed an adaptive timeout window so slower environments raise budgets without reducing the current static timeout floor
 
 ### Controller maintenance mode
@@ -439,8 +433,7 @@ The chart supports `allowVolumeExpansion`, and the controller deployment now inc
 Current behavior:
 
 - Controller expansion is supported for OpenNebula volumes that are attached to a VM.
-- Filesystem expansion on the node for mounted filesystem volumes enforces a post-condition: `NodeExpandVolume` returns success only after the mounted filesystem reaches requested size (within a configured tolerance).
-- If device or filesystem growth does not converge before timeout, `NodeExpandVolume` returns retriable `DeadlineExceeded` with requested/device/filesystem byte context.
+- Mounted filesystem expansion follows the [node expansion verification contract](docs/node-expansion.md#verification-contract).
 - Block volumes do not require node-side filesystem expansion.
 - CephFS shared-filesystem volumes support expansion for dynamic subvolumes by default.
 - Static CephFS paths created with `sharedFilesystemPath` are not expandable.
@@ -451,7 +444,8 @@ Node resize convergence can be tuned with:
 
 - `driver.nodeExpand.verifyTimeoutSeconds` (`ONE_CSI_NODE_EXPAND_VERIFY_TIMEOUT_SECONDS`, default `120`)
 - `driver.nodeExpand.retryIntervalSeconds` (`ONE_CSI_NODE_EXPAND_RETRY_INTERVAL_SECONDS`, default `2`)
-- `driver.nodeExpand.sizeToleranceBytes` (`ONE_CSI_NODE_EXPAND_SIZE_TOLERANCE_BYTES`, default `134217728`)
+
+For the legacy tolerance setting, see [node expansion compatibility](docs/node-expansion.md#verification-contract).
 
 ## Snapshots and clones
 
@@ -469,18 +463,19 @@ Current limitations:
 
 ## Topology accessibility
 
-Topology accessibility remains alpha and is disabled by default.
+Topology accessibility is enabled by default. Chart configuration is documented in the [feature-gate reference](helm/opennebula-csi/README.md#feature-gates).
 
 When `topologyAccessibility=true`:
 
 - the plugin advertises CSI `VOLUME_ACCESSIBILITY_CONSTRAINTS`
 - the node plugin reads the Kubernetes Node label `topology.opennebula.sparkaiur.io/system-ds`
 - `NodeGetInfo` reports that label as the node’s accessible topology segment
-- `CreateVolume` returns `accessible_topology` when the selected datastore exposes deterministic `COMPATIBLE_SYS_DS` values
+- `CreateVolume` returns `accessible_topology` from the selected datastore's effective compatible system datastores
+- provisioning filters datastores using the selected node's system datastore when available, otherwise the CSI preferred or requisite topology
 
 Operational requirements:
 
-- label Kubernetes nodes with `topology.opennebula.sparkaiur.io/system-ds=<opennebula-system-datastore-id>`
+- when enabled, the inventory controller maintains `topology.opennebula.sparkaiur.io/system-ds` from each node VM's system datastore; otherwise maintain this label yourself
 - ensure the node DaemonSet service account can `get` `nodes`
 - if you need an override during testing, set `ONE_CSI_NODE_TOPOLOGY_SYSTEM_DS` through `driver.env`
 
@@ -606,21 +601,7 @@ Helm can also run preflight as an optional Job, including as a release-blocking 
 
 Stable features are enabled by default. Higher-risk features remain behind feature gates.
 
-Current gates:
-
-- `compatibilityAwareSelection=true`
-- `detachedDiskExpansion=true`
-- `cephfsExpansion=true`
-- `cephfsSnapshots=false`
-- `cephfsClones=false`
-- `cephfsSelfHealing=false`
-- `cephfsPersistentRecovery=true`
-- `cephfsKernelMounts=false`
-- `localRWOStaleMountRecovery=false`
-- `localRWOAutoProtection=false`
-- `topologyAccessibility=false`
-
-The chart renders these into `ONE_CSI_FEATURE_GATES`.
+The chart renders the gates from [values.yaml](helm/opennebula-csi/values.yaml) into `ONE_CSI_FEATURE_GATES`. See the [chart reference](helm/opennebula-csi/README.md#feature-gates) for configuration and [defaultFeatureGates](pkg/csi/driver/feature_gates.go) for standalone driver defaults.
 
 - `detachedDiskExpansion` enables image-level resize for detached persistent disks
 - `cephfsExpansion` enables dynamic CephFS subvolume quota resize
@@ -723,7 +704,7 @@ Each item under `storageClasses` supports:
 - `volumeBindingMode`
 - `parameters`
 
-The Helm chart fingerprints rendered StorageClasses with `storage-provider.opennebula.sparkaiur.io/*` annotations. During upgrades, operators can opt in with `storageClassReconcile.enabled=true` to create a pre-upgrade hook that recreates only chart-owned, unmodified StorageClasses whose desired immutable spec changed. User-created or manually changed classes fail the hook by default (`manualMutationPolicy: fail`) unless explicitly set to `skip`.
+For StorageClass fingerprints, legacy adoption, and upgrade reconciliation, see the [chart StorageClass reference](helm/opennebula-csi/README.md#storageclasses).
 
 ## Example values files
 
@@ -844,7 +825,7 @@ These suites are disabled by default because they require real infrastructure:
 
 ## Release flow
 
-Every semantic release must be validated on the approved test cluster before the tag is created. `hplcsi` is retired; the approved target for the v0.5.28 CephFS recovery patch is `hplmon`.
+Every semantic release must be validated on the approved test cluster before the tag is created. `hplcsi` is retired; use the target and procedure in the release-specific [CephFS recovery](docs/cephfs-recovery.md#hplmon-test-procedure) or [node expansion](docs/node-expansion.md#validation) guide.
 
 Required release gate:
 
@@ -862,7 +843,7 @@ At minimum, release validation should include:
 
 The legacy `hack/validate-release-lab.sh` assumes the retired lab and performs Helm ownership changes and broad smoke tests. It is not the hplmon recovery procedure. Use a bounded node canary and isolated test volumes; do not run that script against hplmon without adapting and reviewing its operations.
 
-Push the semantic tag for the release being cut, for example `v0.5.28`, only after that validation to trigger the release workflow.
+Push the semantic tag for the release being cut only after its validation passes to trigger the release workflow. Follow the release-specific guide for required native checks and evidence.
 
 The workflow will:
 

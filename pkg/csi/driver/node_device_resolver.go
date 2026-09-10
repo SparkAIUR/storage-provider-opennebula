@@ -20,7 +20,6 @@ var (
 	nodeByIDGlob      = filepath.Glob
 	nodeEvalSymlinks  = filepath.EvalSymlinks
 	nodeWriteFile     = os.WriteFile
-	nodeReadlink      = os.Readlink
 	nodeReadDir       = os.ReadDir
 	deviceResolverNow = func() time.Time { return time.Now() }
 )
@@ -79,9 +78,26 @@ func NewNodeDeviceResolver(cfg config.CSIPluginConfig, exec utilexec.Interface, 
 	}
 }
 
-func (r *NodeDeviceResolver) Resolve(ctx context.Context, volumeID, volumeName string, publishContext map[string]string, timeout time.Duration) (string, deviceResolutionResult, error) {
+func (r *NodeDeviceResolver) Resolve(ctx context.Context, volumeID, volumeName string, publishContext map[string]string, timeout time.Duration, expectedSerials ...string) (devicePath string, result deviceResolutionResult, err error) {
 	started := deviceResolverNow()
 	serial := strings.TrimSpace(publishContext[publishContextDeviceSerial])
+	defer func() { result.ExpectedSerial = serial }()
+	for _, expected := range expectedSerials {
+		expected = strings.TrimSpace(expected)
+		if expected == "" {
+			continue
+		}
+		if serial != "" && !strings.EqualFold(serial, expected) {
+			r.Invalidate(volumeID)
+			return "", deviceResolutionResult{}, fmt.Errorf("conflicting expected device serials %q and %q", serial, expected)
+		}
+		serial = expected
+	}
+	if serial == "" && volumeID != "" {
+		r.mu.RLock()
+		serial = r.cache[volumeID].Serial
+		r.mu.RUnlock()
+	}
 	imageID := strings.TrimSpace(publishContext[publishContextOpenNebulaImageID])
 	if volumeID != "" {
 		if path, ok := r.resolveFromCache(volumeID, serial); ok {
@@ -96,7 +112,7 @@ func (r *NodeDeviceResolver) Resolve(ctx context.Context, volumeID, volumeName s
 		}
 	}
 
-	if devicePath, result, err := r.resolveAlias(volumeName, started); err == nil {
+	if devicePath, result, err := r.resolveAlias(volumeName, serial, started); err == nil {
 		r.remember(volumeID, imageID, serial, devicePath, "")
 		return devicePath, result, nil
 	}
@@ -113,7 +129,7 @@ func (r *NodeDeviceResolver) Resolve(ctx context.Context, volumeID, volumeName s
 				return path.DevicePath, deviceResolutionResult{ResolvedBy: "by-id-recovery", Latency: deviceResolverNow().Sub(started)}, nil
 			}
 		}
-		if devicePath, result, err := r.resolveAlias(volumeName, started); err == nil {
+		if devicePath, result, err := r.resolveAlias(volumeName, serial, started); err == nil {
 			r.remember(volumeID, imageID, serial, devicePath, "")
 			if result.ResolvedBy == "exact" {
 				result.ResolvedBy = "exact-recovery"
@@ -143,7 +159,14 @@ func (r *NodeDeviceResolver) Invalidate(volumeID string) {
 		return
 	}
 	r.mu.Lock()
-	delete(r.cache, volumeID)
+	if entry, exists := r.cache[volumeID]; exists && entry.Serial != "" {
+		entry.DevicePath = ""
+		entry.ByIDPath = ""
+		entry.LastConfirmedAt = time.Time{}
+		r.cache[volumeID] = entry
+	} else {
+		delete(r.cache, volumeID)
+	}
 	r.mu.Unlock()
 }
 
@@ -179,7 +202,7 @@ func (r *NodeDeviceResolver) resolveFromCache(volumeID, serial string) (resolved
 		return resolvedDevicePath{}, false
 	}
 	if serial != "" {
-		if !deviceMatchesSerial(r.exec, entry.DevicePath, serial, entry.ByIDPath) {
+		if !deviceMatchesSerial(entry.DevicePath, serial) {
 			r.Invalidate(volumeID)
 			return resolvedDevicePath{}, false
 		}
@@ -207,14 +230,14 @@ func (r *NodeDeviceResolver) resolveByID(serial string) (resolvedDevicePath, boo
 		if _, err := nodeVolumePathStat(resolved); err != nil {
 			continue
 		}
-		if deviceMatchesSerial(r.exec, resolved, serial, candidate) {
+		if deviceMatchesSerial(resolved, serial) {
 			return resolvedDevicePath{DevicePath: resolved, ByIDPath: candidate}, true
 		}
 	}
 	return resolvedDevicePath{}, false
 }
 
-func (r *NodeDeviceResolver) resolveAlias(volumeName string, started time.Time) (string, deviceResolutionResult, error) {
+func (r *NodeDeviceResolver) resolveAlias(volumeName, serial string, started time.Time) (string, deviceResolutionResult, error) {
 	candidates := []string{}
 	if r.deviceCandidatesFn != nil {
 		candidates = r.deviceCandidatesFn(volumeName)
@@ -223,6 +246,9 @@ func (r *NodeDeviceResolver) resolveAlias(volumeName string, started time.Time) 
 	var lastErr error
 	for _, candidate := range candidates {
 		if _, err := nodeVolumePathStat(candidate); err == nil {
+			if !deviceMatchesSerial(candidate, serial) {
+				continue
+			}
 			result := deviceResolutionResult{
 				ResolvedBy: "exact",
 				Latency:    deviceResolverNow().Sub(started),
@@ -303,36 +329,13 @@ func (r *NodeDeviceResolver) remember(volumeID, imageID, serial, devicePath, byI
 	r.mu.Unlock()
 }
 
-func deviceMatchesSerial(exec utilexec.Interface, devicePath, serial, byIDPath string) bool {
+func deviceMatchesSerial(devicePath, serial string) bool {
 	serial = strings.TrimSpace(serial)
 	if serial == "" {
 		return true
 	}
-	if exec != nil {
-		if output, err := exec.Command("udevadm", "info", "--query=property", "--name", devicePath).CombinedOutput(); err == nil {
-			for _, line := range strings.Split(string(output), "\n") {
-				if strings.HasPrefix(line, "ID_SERIAL=") || strings.HasPrefix(line, "ID_SERIAL_SHORT=") {
-					parts := strings.SplitN(line, "=", 2)
-					if len(parts) == 2 && strings.EqualFold(strings.TrimSpace(parts[1]), serial) {
-						return true
-					}
-				}
-			}
-		}
-		if output, err := exec.Command("lsblk", "-ndo", "SERIAL", devicePath).CombinedOutput(); err == nil {
-			if strings.EqualFold(strings.TrimSpace(string(output)), serial) {
-				return true
-			}
-		}
-	}
-	if strings.TrimSpace(byIDPath) != "" && strings.Contains(strings.ToLower(filepath.Base(byIDPath)), strings.ToLower(serial)) {
-		return true
-	}
-	linkTarget, err := nodeReadlink(devicePath)
-	if err == nil && strings.Contains(strings.ToLower(linkTarget), strings.ToLower(serial)) {
-		return true
-	}
-	return false
+	observed, err := currentDeviceSerial(devicePath)
+	return err == nil && observed != "" && strings.EqualFold(observed, serial)
 }
 
 func pathJoin(parts ...string) string {

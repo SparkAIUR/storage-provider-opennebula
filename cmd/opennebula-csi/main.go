@@ -38,7 +38,7 @@ var (
 	driverName                     = flag.String("drivername", driver.DefaultDriverName, "CSI driver name")
 	pluginEndpoint                 = flag.String("endpoint", driver.DefaultGRPCServerEndpoint, "CSI plugin endpoint")
 	nodeID                         = flag.String("nodeid", "", "Node ID")
-	maxVolumesPerNode              = flag.Uint64("maxVolumesPerNode", 255, "Maximum number of volumes that can be attached to a node")
+	_                              = flag.Uint64("maxVolumesPerNode", 255, "Maximum number of volumes that can be attached to a node")
 	mode                           = flag.String("mode", "driver", "Execution mode: driver, preflight, inventory-controller, inventory-validate, support-bundle, volume-health, local-disk-sessions, local-disk-reprobe, hotplug-diagnose, or storageclass-reconcile")
 	output                         = flag.String("output", "text", "Output format for preflight mode: text or json")
 	preflightDatastores            = flag.String("preflight-datastores", "", "Comma-separated datastore identifiers to validate during preflight")

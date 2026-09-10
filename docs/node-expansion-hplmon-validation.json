@@ -1,0 +1,18 @@
+{
+  "cluster": "hplmon",
+  "node": "hplmonw03",
+  "source_storage_class": "one",
+  "image_digest": "sha256:89b9728fca5efdda832bc280ea676cfc404b1f3c961dbc7ea7c4cd3dac5a52c6",
+  "finished_at": "2026-09-10T16:09:39.760882+00:00",
+  "initial_capacity": "10Gi",
+  "final_capacity": "40Gi",
+  "sha256": "36a7e3c0bac976474b04ad615c13853ffeb7a4c59048415b40a92b00db3027c5",
+  "pvc_uid": "7ac209f6-a345-4b00-9c20-c13034e93adc",
+  "replacement_pod_uid": "be32315d-2fed-45ef-993d-e1389c1e81e9",
+  "resize_conditions": [],
+  "filesystem": "Filesystem           1K-blocks      Used Available Use% Mounted on\n/dev/sdb              41170288     16408  39333976   0% /data\n",
+  "convergence_logs": [
+    "I0910 16:06:30.927226       1 nodeserver.go:834] \"NodeExpandVolume converged\" method=\"NodeExpandVolume\" volumeID=\"pvc-7ac209f6-a345-4b00-9c20-c13034e93adc\" volumePath=\"/var/lib/kubelet/pods/4c0fe49f-5161-4d21-8152-3c4e2ae39883/volumes/kubernetes.io~csi/pvc-7ac209f6-a345-4b00-9c20-c13034e93adc/mount\" devicePath=\"/dev/sdb\" requiredBytes=42949672960 targetMinBytes=42949672960 deviceBytes=42949672960 filesystemBytes=42158374912 resized=true attempts=1"
+  ],
+  "cleanup_complete": true
+}

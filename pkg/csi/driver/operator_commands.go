@@ -734,8 +734,8 @@ func runLocalDiskReprobeCommandWithMounter(ctx context.Context, kubeClient kuber
 		if !opts.AllowPublished {
 			return report, fmt.Errorf("volume %s still has published targets; rerun with -allow-published-reprobe and recovery-mode=manual if you intend to unstage it anyway", volumeID)
 		}
-		if !strings.EqualFold(strings.TrimSpace(before.RecoveryMode), recoveryModeManual) {
-			return report, fmt.Errorf("volume %s still has published targets and local-disk-reprobe requires recovery-mode=manual before forcing an unstage", volumeID)
+		if err := requireCurrentManualRecovery(ctx, kubeClient, volumeID); err != nil {
+			return report, err
 		}
 		report.PublishedGuardBypassed = true
 	}
@@ -761,6 +761,29 @@ func runLocalDiskReprobeCommandWithMounter(ctx context.Context, kubeClient kuber
 		}
 	}
 	return report, nil
+}
+
+func requireCurrentManualRecovery(ctx context.Context, kubeClient kubernetes.Interface, volumeID string) error {
+	if kubeClient == nil {
+		return fmt.Errorf("cannot verify current manual recovery for volume %s without Kubernetes", volumeID)
+	}
+	runtime := &KubeRuntime{client: kubeClient, enabled: true}
+	runtimeCtx, err := runtime.ResolveVolumeRuntimeContext(ctx, volumeID)
+	if err != nil {
+		return fmt.Errorf("cannot verify current manual recovery for volume %s: %w", volumeID, err)
+	}
+	if runtimeCtx.PVCName != "" {
+		pvc, err := kubeClient.CoreV1().PersistentVolumeClaims(runtimeCtx.PVCNamespace).Get(ctx, runtimeCtx.PVCName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("cannot verify current PVC recovery annotations: %w", err)
+		}
+		runtimeCtx.PVCAnnotations = cloneStringMap(pvc.Annotations)
+	}
+	control := resolvedRecoveryControlState(volumeID, runtimeCtx, VolumeRecoveryControlState{})
+	if !control.ManualActive() || control.ExpiresAt == nil {
+		return fmt.Errorf("volume %s requires current recovery-mode=manual with a future recovery-mode-until before forcing an unstage", volumeID)
+	}
+	return nil
 }
 
 func controllerPodDiagnostics(pods []corev1.Pod) []ControllerPodDiagnostic {
@@ -1408,18 +1431,18 @@ func supportBundleQueueReason(eventReason, message string) string {
 
 func supportBundleEventObservedAt(event corev1.Event) time.Time {
 	if event.Series != nil && !event.Series.LastObservedTime.IsZero() {
-		return event.Series.LastObservedTime.Time.UTC()
+		return event.Series.LastObservedTime.UTC()
 	}
 	if !event.EventTime.IsZero() {
-		return event.EventTime.Time.UTC()
+		return event.EventTime.UTC()
 	}
 	if !event.LastTimestamp.IsZero() {
-		return event.LastTimestamp.Time.UTC()
+		return event.LastTimestamp.UTC()
 	}
 	if !event.FirstTimestamp.IsZero() {
-		return event.FirstTimestamp.Time.UTC()
+		return event.FirstTimestamp.UTC()
 	}
-	return event.CreationTimestamp.Time.UTC()
+	return event.CreationTimestamp.UTC()
 }
 
 func maxInt(a, b int) int {
