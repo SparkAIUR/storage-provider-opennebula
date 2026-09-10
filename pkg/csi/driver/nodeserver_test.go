@@ -252,7 +252,7 @@ func TestStageVolumeKeepsLocalDeviceReportUntilMountSucceeds(t *testing.T) {
 	mountErr := errors.New("can't read superblock")
 	ns := NewNodeServer(driver, mount.NewSafeFormatAndMount(
 		&failingMountInterface{FakeMounter: mount.NewFakeMounter(nil), err: mountErr},
-		reviewDeviceSerialExec(func(string) string { return "onecsi-439" }),
+		reviewDeviceSerialFixture(t, func(string) string { return "onecsi-439" }),
 	))
 	ns.localDiskSessions = newLocalDiskSessionStore(t.TempDir())
 	publishContext := map[string]string{

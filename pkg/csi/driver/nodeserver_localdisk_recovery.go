@@ -334,7 +334,7 @@ func (ns *NodeServer) evaluateLocalDiskPath(volumeID, path string) (localDiskMou
 			return localDiskMountHealth{}, err
 		}
 		if session, exists, loadErr := ns.loadLocalDiskSession(volumeID); loadErr == nil && exists {
-			if session.DeviceSerial != "" && !deviceMatchesSerial(ns.mounter.Exec, mountPoint.Device, session.DeviceSerial) {
+			if session.DeviceSerial != "" && !deviceMatchesSerial(mountPoint.Device, session.DeviceSerial) {
 				return localDiskMountHealth{Stale: true, Reason: "serial_mismatch", MountSource: mountPoint.Device, Message: "mount source serial does not match expected volume serial"}, nil
 			}
 			if session.Identity != nil {
@@ -479,7 +479,7 @@ func (ns *NodeServer) resolveLocalDiskRecoveryDevice(ctx context.Context, sessio
 	if err != nil {
 		return "", err
 	}
-	if session.DeviceSerial != "" && !deviceMatchesSerial(ns.mounter.Exec, devicePath, session.DeviceSerial) {
+	if session.DeviceSerial != "" && !deviceMatchesSerial(devicePath, session.DeviceSerial) {
 		return "", fmt.Errorf("resolved device %s does not match expected serial %s", devicePath, session.DeviceSerial)
 	}
 	if ok, reason, observed := ns.verifyRecoveredDeviceIdentity(session, devicePath); !ok {
@@ -679,43 +679,11 @@ func observedByIDPath(devicePath string) (string, bool) {
 }
 
 func observedDeviceSerial(ns *NodeServer, devicePath string) string {
-	devicePath = strings.TrimSpace(devicePath)
-	if ns == nil || ns.mounter == nil || ns.mounter.Exec == nil || devicePath == "" {
+	serial, err := currentDeviceSerial(devicePath)
+	if err != nil {
 		return ""
 	}
-	if output, err := ns.mounter.Exec.Command("lsblk", "--json", "-o", "PATH,SERIAL", devicePath).CombinedOutput(); err == nil {
-		var payload struct {
-			Blockdevices []struct {
-				Path   string `json:"path"`
-				Serial string `json:"serial"`
-			} `json:"blockdevices"`
-		}
-		if json.Unmarshal(output, &payload) == nil {
-			for _, device := range payload.Blockdevices {
-				if strings.TrimSpace(device.Path) == "" || strings.TrimSpace(device.Path) == devicePath {
-					if serial := strings.TrimSpace(device.Serial); serial != "" {
-						return serial
-					}
-				}
-			}
-		}
-	}
-	if output, err := ns.mounter.Exec.Command("udevadm", "info", "--query=property", "--name", devicePath).CombinedOutput(); err == nil {
-		for _, line := range strings.Split(string(output), "\n") {
-			if strings.HasPrefix(line, "ID_SERIAL=") || strings.HasPrefix(line, "ID_SERIAL_SHORT=") {
-				parts := strings.SplitN(line, "=", 2)
-				if len(parts) == 2 {
-					if serial := strings.TrimSpace(parts[1]); serial != "" {
-						return serial
-					}
-				}
-			}
-		}
-	}
-	if output, err := ns.mounter.Exec.Command("lsblk", "-ndo", "SERIAL", devicePath).CombinedOutput(); err == nil {
-		return strings.TrimSpace(string(output))
-	}
-	return ""
+	return serial
 }
 
 func sameObservedByIDPath(expected, observed string) bool {

@@ -78,9 +78,10 @@ func NewNodeDeviceResolver(cfg config.CSIPluginConfig, exec utilexec.Interface, 
 	}
 }
 
-func (r *NodeDeviceResolver) Resolve(ctx context.Context, volumeID, volumeName string, publishContext map[string]string, timeout time.Duration, expectedSerials ...string) (string, deviceResolutionResult, error) {
+func (r *NodeDeviceResolver) Resolve(ctx context.Context, volumeID, volumeName string, publishContext map[string]string, timeout time.Duration, expectedSerials ...string) (devicePath string, result deviceResolutionResult, err error) {
 	started := deviceResolverNow()
 	serial := strings.TrimSpace(publishContext[publishContextDeviceSerial])
+	defer func() { result.ExpectedSerial = serial }()
 	for _, expected := range expectedSerials {
 		expected = strings.TrimSpace(expected)
 		if expected == "" {
@@ -158,7 +159,14 @@ func (r *NodeDeviceResolver) Invalidate(volumeID string) {
 		return
 	}
 	r.mu.Lock()
-	delete(r.cache, volumeID)
+	if entry, exists := r.cache[volumeID]; exists && entry.Serial != "" {
+		entry.DevicePath = ""
+		entry.ByIDPath = ""
+		entry.LastConfirmedAt = time.Time{}
+		r.cache[volumeID] = entry
+	} else {
+		delete(r.cache, volumeID)
+	}
 	r.mu.Unlock()
 }
 
@@ -194,7 +202,7 @@ func (r *NodeDeviceResolver) resolveFromCache(volumeID, serial string) (resolved
 		return resolvedDevicePath{}, false
 	}
 	if serial != "" {
-		if !deviceMatchesSerial(r.exec, entry.DevicePath, serial) {
+		if !deviceMatchesSerial(entry.DevicePath, serial) {
 			r.Invalidate(volumeID)
 			return resolvedDevicePath{}, false
 		}
@@ -222,7 +230,7 @@ func (r *NodeDeviceResolver) resolveByID(serial string) (resolvedDevicePath, boo
 		if _, err := nodeVolumePathStat(resolved); err != nil {
 			continue
 		}
-		if deviceMatchesSerial(r.exec, resolved, serial) {
+		if deviceMatchesSerial(resolved, serial) {
 			return resolvedDevicePath{DevicePath: resolved, ByIDPath: candidate}, true
 		}
 	}
@@ -238,7 +246,7 @@ func (r *NodeDeviceResolver) resolveAlias(volumeName, serial string, started tim
 	var lastErr error
 	for _, candidate := range candidates {
 		if _, err := nodeVolumePathStat(candidate); err == nil {
-			if !deviceMatchesSerial(r.exec, candidate, serial) {
+			if !deviceMatchesSerial(candidate, serial) {
 				continue
 			}
 			result := deviceResolutionResult{
@@ -321,29 +329,13 @@ func (r *NodeDeviceResolver) remember(volumeID, imageID, serial, devicePath, byI
 	r.mu.Unlock()
 }
 
-func deviceMatchesSerial(exec utilexec.Interface, devicePath, serial string) bool {
+func deviceMatchesSerial(devicePath, serial string) bool {
 	serial = strings.TrimSpace(serial)
 	if serial == "" {
 		return true
 	}
-	if exec == nil {
-		return false
-	}
-	if output, err := exec.Command("lsblk", "-ndo", "SERIAL", devicePath).CombinedOutput(); err == nil && strings.TrimSpace(string(output)) != "" {
-		return strings.EqualFold(strings.TrimSpace(string(output)), serial)
-	}
-	if output, err := exec.Command("udevadm", "info", "--query=property", "--name", devicePath).CombinedOutput(); err == nil {
-		properties := map[string]string{}
-		for _, line := range strings.Split(string(output), "\n") {
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) == 2 {
-				properties[parts[0]] = strings.TrimSpace(parts[1])
-			}
-		}
-		observed := firstNonEmpty(properties["ID_SERIAL_SHORT"], properties["ID_SERIAL"])
-		return observed != "" && strings.EqualFold(observed, serial)
-	}
-	return false
+	observed, err := currentDeviceSerial(devicePath)
+	return err == nil && observed != "" && strings.EqualFold(observed, serial)
 }
 
 func pathJoin(parts ...string) string {

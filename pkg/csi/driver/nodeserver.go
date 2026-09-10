@@ -158,6 +158,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 	deviceTimeout := ns.deviceDiscoveryTimeout(volumeContext)
 	devicePath, resolution, err := ns.resolveDevicePathWithContext(volumeID, volName, volumeContext, deviceTimeout, reportRef)
+	volumeContext = resolution.withExpectedSerial(volumeContext)
 	if err != nil {
 		ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "timeout", time.Since(started))
 		ns.recordLocalDeviceMissing(ctx, volumeID, volName, stagingTargetPath, volumeContext, err)
@@ -436,6 +437,7 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		}
 		deviceTimeout := ns.deviceDiscoveryTimeout(volumeContext)
 		devicePath, resolution, resolveErr := ns.resolveDevicePathWithContext(volumeID, volName, volumeContext, deviceTimeout, reportRef)
+		volumeContext = resolution.withExpectedSerial(volumeContext)
 		if resolveErr != nil {
 			ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "timeout", deviceTimeout)
 			ns.recordLocalDeviceMissing(ctx, volumeID, volName, stagingTargetPath, volumeContext, resolveErr)
@@ -1029,8 +1031,18 @@ func (ns *NodeServer) getDeviceName(volumeName string) string {
 }
 
 type deviceResolutionResult struct {
-	ResolvedBy string
-	Latency    time.Duration
+	ResolvedBy     string
+	Latency        time.Duration
+	ExpectedSerial string
+}
+
+func (resolution deviceResolutionResult) withExpectedSerial(publishContext map[string]string) map[string]string {
+	if resolution.ExpectedSerial == "" {
+		return publishContext
+	}
+	result := cloneStringMap(publishContext)
+	result[publishContextDeviceSerial] = resolution.ExpectedSerial
+	return result
 }
 
 func (ns *NodeServer) resolveDevicePath(volumeName string, timeout time.Duration) (string, deviceResolutionResult, error) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -265,7 +266,7 @@ func TestReviewBlockPublishRejectsRecycledAlias(t *testing.T) {
 					device := filepath.Join(defaultDiskPath, report.VolumeName)
 					require.NoError(t, os.Remove(filepath.Join(defaultDiskPath, "disk", "by-id", "virtio-onecsi-42")))
 					serial := observed
-					exec := reviewDeviceSerialExec(func(string) string { return serial })
+					exec := reviewDeviceSerialFixture(t, func(string) string { return serial })
 					ns.mounter.Exec = exec
 					ns.deviceResolver.exec = exec
 					key := localDeviceReportKey(report.Node, report.VolumeID)
@@ -332,6 +333,139 @@ func TestReviewBlockPublishRejectsRecycledAlias(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+func TestReviewBlockPublishKernelSerial(t *testing.T) {
+	for _, transport := range []string{"virtio", "scsi"} {
+		for _, bound := range []bool{false, true} {
+			for _, mismatched := range []bool{false, true} {
+				name := fmt.Sprintf("%s/bound=%t/mismatched=%t", transport, bound, mismatched)
+				t.Run(name, func(t *testing.T) {
+					ctx := context.Background()
+					ns, _, report, request := reviewBlockPublishFixture(t, bound)
+					reviewDeviceResolutionClock(t)
+					request.PublishContext[publishContextDeviceDiscoveryTimeoutSeconds] = "1"
+					require.NoError(t, os.Remove(filepath.Join(defaultDiskPath, "disk", "by-id", "virtio-onecsi-42")))
+					kernel := reviewKernelBlockDevice(t)
+					serial, staleSerial := "onecsi-42", ""
+					if mismatched {
+						serial, staleSerial = "onecsi-99", "onecsi-42"
+					}
+					if transport == "virtio" {
+						require.NoError(t, os.WriteFile(filepath.Join(kernel, "serial"), []byte(serial), 0600))
+					} else {
+						require.NoError(t, os.WriteFile(filepath.Join(kernel, "device", "vpd_pg80"), append([]byte{0, 0x80, 0, 9}, []byte(serial)...), 0600))
+					}
+					exec := reviewDeviceCommandExec(staleSerial)
+					ns.mounter.Exec, ns.deviceResolver.exec = exec, exec
+					report.DeviceSerial = "onecsi-42"
+					report.RecoveryToken = "completed-kernel-episode"
+					report.RecoveryMethod = localDeviceRecoveryMethodRuntimeRepublish
+					report.ConfirmationState = localDeviceConfirmationStatePending
+					key := localDeviceReportKey(report.Node, report.VolumeID)
+					require.NoError(t, updateLocalDeviceReport(ctx, ns.Driver.kubeRuntime, namespaceFromServiceAccount(), key, func(current *LocalDeviceMissingReport) { *current = report }))
+					mounter := ns.mounter.Interface.(*mount.FakeMounter)
+					before := mounter.GetLog()
+					response, err := ns.NodePublishVolume(ctx, request)
+					if mismatched {
+						require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+						require.Nil(t, response)
+						require.Equal(t, before, mounter.GetLog())
+						current, exists := ns.currentLocalDeviceReport(ctx, report.VolumeID)
+						require.True(t, exists)
+						require.Equal(t, report.DeviceSerial, current.DeviceSerial)
+						require.Equal(t, report.RecoveryToken, current.RecoveryToken)
+						return
+					}
+					require.NoError(t, err)
+					require.NotNil(t, response)
+					_, exists := ns.currentLocalDeviceReport(ctx, report.VolumeID)
+					require.False(t, exists)
+					_, mounted, err := ns.mountPointForPath(request.TargetPath)
+					require.NoError(t, err)
+					require.True(t, mounted)
+					if bound {
+						require.Equal(t, before, mounter.GetLog())
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestReviewBlockPublishRetainsCacheSerialAcrossRetries(t *testing.T) {
+	for _, bound := range []bool{false, true} {
+		for _, restart := range []bool{false, true} {
+			t.Run(fmt.Sprintf("bound=%t/restart=%t", bound, restart), func(t *testing.T) {
+				ctx := context.Background()
+				ns, _, report, request := reviewBlockPublishFixture(t, bound)
+				reviewDeviceResolutionClock(t)
+				request.PublishContext[publishContextDeviceDiscoveryTimeoutSeconds] = "1"
+				legacyContext := cloneStringMap(request.PublishContext)
+				require.NoError(t, os.Remove(filepath.Join(defaultDiskPath, "disk", "by-id", "virtio-onecsi-42")))
+				kernel := reviewKernelBlockDevice(t)
+				serialPath := filepath.Join(kernel, "serial")
+				require.NoError(t, os.WriteFile(serialPath, []byte("onecsi-42"), 0600))
+				exec := reviewDeviceCommandExec("")
+				ns.mounter.Exec, ns.deviceResolver.exec = exec, exec
+				report.DeviceSerial = "onecsi-42"
+				report.RecoveryToken = "completed-report-only-episode"
+				report.RecoveryMethod = localDeviceRecoveryMethodRuntimeRepublish
+				report.ConfirmationState = localDeviceConfirmationStatePending
+				key := localDeviceReportKey(report.Node, report.VolumeID)
+				require.NoError(t, updateLocalDeviceReport(ctx, ns.Driver.kubeRuntime, namespaceFromServiceAccount(), key, func(current *LocalDeviceMissingReport) { *current = report }))
+				_, err := ns.NodePublishVolume(ctx, request)
+				require.NoError(t, err)
+				_, exists := ns.currentLocalDeviceReport(ctx, report.VolumeID)
+				require.False(t, exists)
+				require.Equal(t, "onecsi-42", ns.deviceResolver.cache[report.VolumeID].Serial)
+				require.Equal(t, legacyContext, request.PublishContext)
+				if !bound {
+					request.TargetPath = filepath.Join(filepath.Dir(request.TargetPath), "retry-block")
+				}
+				mounter := ns.mounter.Interface.(*mount.FakeMounter)
+				before, err := mounter.List()
+				require.NoError(t, err)
+				beforeLog := mounter.GetLog()
+				require.NoError(t, os.WriteFile(serialPath, []byte("onecsi-99"), 0600))
+				for attempt := 0; attempt < 2; attempt++ {
+					response, err := ns.NodePublishVolume(ctx, request)
+					require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+					require.Nil(t, response)
+					current, exists := ns.currentLocalDeviceReport(ctx, report.VolumeID)
+					require.True(t, exists)
+					require.Equal(t, "onecsi-42", current.DeviceSerial)
+					require.Equal(t, legacyContext, request.PublishContext)
+					after, err := mounter.List()
+					require.NoError(t, err)
+					require.Equal(t, before, after)
+					require.Equal(t, beforeLog, mounter.GetLog())
+					if attempt == 0 {
+						require.Equal(t, "onecsi-42", ns.deviceResolver.cache[report.VolumeID].Serial)
+						require.Empty(t, ns.deviceResolver.cache[report.VolumeID].DevicePath)
+						if restart {
+							ns.deviceResolver = NewNodeDeviceResolver(ns.Driver.PluginConfig, exec, ns.deviceCandidates)
+							ns.deviceResolver.udevSettleTimeout = 0
+							ns.deviceResolver.rescanOnMiss = false
+						}
+					}
+				}
+				require.NoError(t, os.WriteFile(serialPath, []byte("onecsi-42"), 0600))
+				response, err := ns.NodePublishVolume(ctx, request)
+				require.NoError(t, err)
+				require.NotNil(t, response)
+				_, exists = ns.currentLocalDeviceReport(ctx, report.VolumeID)
+				require.False(t, exists)
+				_, mounted, err := ns.mountPointForPath(request.TargetPath)
+				require.NoError(t, err)
+				require.True(t, mounted)
+				require.Equal(t, legacyContext, request.PublishContext)
+				if bound {
+					require.Equal(t, beforeLog, mounter.GetLog())
+				}
+			})
 		}
 	}
 }

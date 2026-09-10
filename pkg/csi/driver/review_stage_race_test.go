@@ -269,7 +269,7 @@ func TestReviewNodeStageWrongIdentityPreservesConcurrentRecovery(t *testing.T) {
 				ns, request := reviewLocalStageFixture(t, driver, report, false)
 				device := filepath.Join(defaultDiskPath, report.VolumeName)
 				serial := "onecsi-99"
-				exec := reviewDeviceSerialExec(func(string) string { return serial })
+				exec := reviewDeviceSerialFixture(t, func(string) string { return serial })
 				ns.mounter.Exec = exec
 				ns.deviceResolver.exec = exec
 				session := localDiskSession{VolumeID: report.VolumeID, VolumeName: report.VolumeName, DevicePath: device, DeviceSerial: "onecsi-42", FSType: "ext4", StagingTargetPath: request.StagingTargetPath, Identity: &LocalDiskIdentity{LegacyDeviceSerial: "onecsi-42"}}
@@ -396,6 +396,63 @@ func TestReviewNodeStageWrongIdentityPreservesConcurrentRecovery(t *testing.T) {
 					require.NoError(t, err)
 					require.Equal(t, marker.Data, retainedMarker.Data)
 				}
+			})
+		}
+	}
+}
+
+func TestReviewNodeStageKernelSerial(t *testing.T) {
+	for _, transport := range []string{"virtio", "scsi"} {
+		for _, mismatched := range []bool{false, true} {
+			name := transport + "/matching-current-device"
+			if mismatched {
+				name = transport + "/mismatched-current-device-stale-udev"
+			}
+			t.Run(name, func(t *testing.T) {
+				ctx := context.Background()
+				driver, _, _, _, report := recoveryReviewFixture(t)
+				ns, request := reviewLocalStageFixture(t, driver, report, false)
+				reviewDeviceResolutionClock(t)
+				request.PublishContext[publishContextDeviceDiscoveryTimeoutSeconds] = "1"
+				kernel := reviewKernelBlockDevice(t)
+				serial := "onecsi-42"
+				staleSerial := ""
+				if mismatched {
+					serial = "onecsi-99"
+					staleSerial = "onecsi-42"
+				}
+				if transport == "virtio" {
+					require.NoError(t, os.WriteFile(filepath.Join(kernel, "serial"), []byte(serial), 0600))
+				} else {
+					require.NoError(t, os.WriteFile(filepath.Join(kernel, "device", "vpd_pg80"), append([]byte{0, 0x80, 0, 9}, []byte(serial)...), 0600))
+				}
+				exec := reviewDeviceCommandExec(staleSerial)
+				ns.mounter.Exec, ns.deviceResolver.exec = exec, exec
+				report.DeviceSerial = "onecsi-42"
+				report.RecoveryToken = "completed-kernel-episode"
+				report.RecoveryMethod = localDeviceRecoveryMethodRuntimeRepublish
+				report.ConfirmationState = localDeviceConfirmationStatePending
+				key := localDeviceReportKey(report.Node, report.VolumeID)
+				require.NoError(t, updateLocalDeviceReport(ctx, driver.kubeRuntime, namespaceFromServiceAccount(), key, func(current *LocalDeviceMissingReport) { *current = report }))
+				response, err := ns.NodeStageVolume(ctx, request)
+				if mismatched {
+					require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+					require.Nil(t, response)
+					require.Empty(t, ns.mounter.Interface.(*mount.FakeMounter).GetLog())
+					current, exists := ns.currentLocalDeviceReport(ctx, report.VolumeID)
+					require.True(t, exists)
+					require.Equal(t, report.DeviceSerial, current.DeviceSerial)
+					require.Equal(t, report.RecoveryToken, current.RecoveryToken)
+					return
+				}
+				require.NoError(t, err)
+				require.NotNil(t, response)
+				_, exists := ns.currentLocalDeviceReport(ctx, report.VolumeID)
+				require.False(t, exists)
+				session, exists, err := ns.loadLocalDiskSession(report.VolumeID)
+				require.NoError(t, err)
+				require.True(t, exists)
+				require.Equal(t, "onecsi-42", localDiskObservedDeviceSerial(session.Identity))
 			})
 		}
 	}

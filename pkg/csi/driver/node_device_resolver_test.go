@@ -2,7 +2,6 @@ package driver
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,8 +10,6 @@ import (
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	utilexec "k8s.io/utils/exec"
-	testingexec "k8s.io/utils/exec/testing"
 )
 
 func TestNodeDeviceResolverPrefersByIDAndThenCache(t *testing.T) {
@@ -28,7 +25,7 @@ func TestNodeDeviceResolverPrefersByIDAndThenCache(t *testing.T) {
 	pluginConfig := config.LoadConfiguration()
 	pluginConfig.OverrideVal(config.NodeDeviceRescanOnMissEnabledVar, false)
 	pluginConfig.OverrideVal(config.NodeDeviceUdevSettleTimeoutSecondsVar, 0)
-	resolver := NewNodeDeviceResolver(pluginConfig, reviewDeviceSerialExec(func(string) string { return "onecsi-42" }), func(string) []string {
+	resolver := NewNodeDeviceResolver(pluginConfig, reviewDeviceSerialFixture(t, func(string) string { return "onecsi-42" }), func(string) []string {
 		return []string{filepath.Join(diskPath, "sde"), devicePath}
 	})
 
@@ -59,7 +56,7 @@ func TestNodeDeviceResolverInvalidatesCacheOnSerialMismatch(t *testing.T) {
 	pluginConfig := config.LoadConfiguration()
 	pluginConfig.OverrideVal(config.NodeDeviceRescanOnMissEnabledVar, false)
 	pluginConfig.OverrideVal(config.NodeDeviceUdevSettleTimeoutSecondsVar, 0)
-	resolver := NewNodeDeviceResolver(pluginConfig, reviewDeviceSerialExec(func(string) string { return "onecsi-43" }), func(string) []string {
+	resolver := NewNodeDeviceResolver(pluginConfig, reviewDeviceSerialFixture(t, func(string) string { return "onecsi-43" }), func(string) []string {
 		return []string{newDevicePath}
 	})
 	resolver.remember("vol-1", "42", "onecsi-42", oldDevicePath, filepath.Join(diskPath, "disk", "by-id", "virtio-onecsi-42"))
@@ -70,36 +67,6 @@ func TestNodeDeviceResolverInvalidatesCacheOnSerialMismatch(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, newDevicePath, path)
 	assert.Equal(t, "exact", resolution.ResolvedBy)
-}
-
-func reviewDeviceSerialExec(serialForPath func(string) string) *testingexec.FakeExec {
-	exec := &testingexec.FakeExec{LookPathFunc: func(path string) (string, error) { return path, nil }}
-	for i := 0; i < 512; i++ {
-		exec.CommandScript = append(exec.CommandScript, func(command string, args ...string) utilexec.Cmd {
-			output := ""
-			if len(args) > 0 {
-				device := args[len(args)-1]
-				switch command {
-				case "lsblk":
-					if args[0] == "--json" {
-						payload, _ := json.Marshal(map[string]any{"blockdevices": []map[string]string{{"path": device, "serial": serialForPath(device)}}})
-						output = string(payload)
-					} else {
-						output = serialForPath(device)
-					}
-				case "udevadm":
-					if args[0] == "info" {
-						output = "ID_SERIAL=" + serialForPath(device)
-					}
-				case "blkid":
-					output = "TYPE=ext4\n"
-				}
-			}
-			action := func() ([]byte, []byte, error) { return []byte(output), nil, nil }
-			return &testingexec.FakeCmd{CombinedOutputScript: []testingexec.FakeAction{action}, OutputScript: []testingexec.FakeAction{action}}
-		})
-	}
-	return exec
 }
 
 func TestNodeDeviceResolverRejectsUnverifiedCandidates(t *testing.T) {
@@ -118,7 +85,7 @@ func TestNodeDeviceResolverRejectsUnverifiedCandidates(t *testing.T) {
 				cfg.OverrideVal(config.NodeDeviceRescanOnMissEnabledVar, false)
 				cfg.OverrideVal(config.NodeDeviceUdevSettleTimeoutSecondsVar, 0)
 				serial := observed
-				resolver := NewNodeDeviceResolver(cfg, reviewDeviceSerialExec(func(string) string { return serial }), func(string) []string { return []string{device} })
+				resolver := NewNodeDeviceResolver(cfg, reviewDeviceSerialFixture(t, func(string) string { return serial }), func(string) []string { return []string{device} })
 				if source == "cache" || source == "cache-without-context" || source == "stale-by-id-cache" {
 					resolver.remember("vol-1", "42", "onecsi-42", device, byID)
 					if source == "stale-by-id-cache" {
@@ -143,7 +110,13 @@ func TestNodeDeviceResolverRejectsUnverifiedCandidates(t *testing.T) {
 				path, _, err := resolver.Resolve(context.Background(), "vol-1", "sdd", publishContext, 0)
 				require.Error(t, err)
 				require.Empty(t, path)
-				require.Empty(t, resolver.cache)
+				if source == "cache" || source == "cache-without-context" || source == "stale-by-id-cache" {
+					require.Equal(t, "onecsi-42", resolver.cache["vol-1"].Serial)
+					require.Empty(t, resolver.cache["vol-1"].DevicePath)
+					require.Empty(t, resolver.cache["vol-1"].ByIDPath)
+				} else {
+					require.Empty(t, resolver.cache)
+				}
 				serial = "onecsi-42"
 				publishContext[publishContextDeviceSerial] = serial
 				path, _, err = resolver.Resolve(context.Background(), "vol-1", "sdd", publishContext, 0)
@@ -169,7 +142,7 @@ func TestNodeDeviceResolverRetainedSerialAndRecovery(t *testing.T) {
 			cfg.OverrideVal(config.NodeDeviceRescanOnMissEnabledVar, false)
 			cfg.OverrideVal(config.NodeDeviceUdevSettleTimeoutSecondsVar, 0)
 			serialReads := 0
-			resolver := NewNodeDeviceResolver(cfg, reviewDeviceSerialExec(func(string) string {
+			resolver := NewNodeDeviceResolver(cfg, reviewDeviceSerialFixture(t, func(string) string {
 				serialReads++
 				if scenario == "alias-recovery" && serialReads > 1 {
 					return "onecsi-42"
