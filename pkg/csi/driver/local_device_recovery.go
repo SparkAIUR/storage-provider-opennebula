@@ -288,24 +288,6 @@ func (ns *NodeServer) recordWrongDeviceIdentityReport(ctx context.Context, sessi
 	}, eventReasonWrongDeviceIdentity, wrongDeviceIdentityMessage(volumeID, session.Identity, observed))
 }
 
-func (ns *NodeServer) clearLocalDeviceMissing(ctx context.Context, volumeID string) {
-	if ns == nil || ns.Driver == nil || ns.Driver.kubeRuntime == nil || !ns.Driver.kubeRuntime.enabled {
-		return
-	}
-	node := strings.TrimSpace(ns.Driver.nodeID)
-	volumeID = strings.TrimSpace(volumeID)
-	if node == "" || volumeID == "" {
-		return
-	}
-	report, exists := ns.currentLocalDeviceReport(ctx, volumeID)
-	if !exists || report.ConfirmationState == localDeviceConfirmationStateInProgress || localDeviceFailureClass(report) == localDeviceFailureClassWrongIdentity {
-		return
-	}
-	if err := clearLocalDeviceReportIf(ctx, ns.Driver.kubeRuntime, namespaceFromServiceAccount(), localDeviceReportKey(node, volumeID), report); err != nil {
-		klog.V(3).InfoS("Failed to clear local device missing report", "node", node, "volumeID", volumeID, "err", err)
-	}
-}
-
 func (ns *NodeServer) currentLocalDeviceReport(ctx context.Context, volumeID string) (LocalDeviceMissingReport, bool) {
 	report, exists, _ := ns.readLocalDeviceReport(ctx, volumeID)
 	return report, exists
@@ -339,6 +321,31 @@ func (ns *NodeServer) readLocalDeviceReport(ctx context.Context, volumeID string
 	return report, true, nil
 }
 
+func (ns *NodeServer) readLocalDeviceRecoveryAuthority(ctx context.Context, volumeID string) (*LocalDeviceMissingReport, *VolumeRepairState, error) {
+	report, exists, err := ns.readLocalDeviceReport(ctx, volumeID)
+	if err != nil {
+		return nil, nil, status.Errorf(codes.Unavailable, "cannot read local recovery authority: %v", err)
+	}
+	if report.ConfirmationState == localDeviceConfirmationStateInProgress || (report.RecoveryToken != "" && report.RecoveryMethod == "") {
+		return nil, nil, status.Error(codes.Unavailable, "local device recovery is still in progress; retry node verification")
+	}
+	var reportRef *LocalDeviceMissingReport
+	if exists {
+		reportRef = &report
+	}
+	var repairRef *VolumeRepairState
+	if ns.Driver.volumeRepairState != nil {
+		state, exists, err := ns.Driver.volumeRepairState.GetCurrent(ctx, volumeID)
+		if err != nil {
+			return nil, nil, status.Errorf(codes.Unavailable, "cannot read current repair authority: %v", err)
+		}
+		if exists {
+			repairRef = &state
+		}
+	}
+	return reportRef, repairRef, nil
+}
+
 func (ns *NodeServer) confirmLocalDeviceRecovery(ctx context.Context, report *LocalDeviceMissingReport, volumeID, devicePath string, observed *LocalDiskIdentity, publishContext map[string]string) error {
 	if ns == nil || ns.Driver == nil || ns.Driver.kubeRuntime == nil || !ns.Driver.kubeRuntime.enabled {
 		return nil
@@ -351,16 +358,16 @@ func (ns *NodeServer) confirmLocalDeviceRecovery(ctx context.Context, report *Lo
 	if report == nil {
 		_, exists, err := ns.readLocalDeviceReport(ctx, volumeID)
 		if err != nil || exists {
-			return status.Errorf(codes.Unavailable, "recovery authority changed during staging: %v", err)
+			return status.Errorf(codes.Unavailable, "recovery authority changed during node verification: %v", err)
 		}
 		return nil
 	}
 	if report.ConfirmationState == localDeviceConfirmationStateInProgress || (report.RecoveryToken != "" && report.RecoveryMethod == "") {
-		return status.Error(codes.Unavailable, "local device recovery is still in progress; retry staging")
+		return status.Error(codes.Unavailable, "local device recovery is still in progress; retry node verification")
 	}
 	if localDeviceFailureClass(*report) == localDeviceFailureClassWrongIdentity {
 		if matches, _ := localDiskIdentityMatches(report.ExpectedIdentity, observed); report.ExpectedIdentity == nil || observed == nil || !matches {
-			return status.Error(codes.FailedPrecondition, "staged device does not resolve the observed wrong-identity fault")
+			return status.Error(codes.FailedPrecondition, "verified device does not resolve the observed wrong-identity fault")
 		}
 	}
 	key := localDeviceReportKey(node, volumeID)
@@ -389,7 +396,7 @@ func (ns *NodeServer) confirmLocalDeviceRecovery(ctx context.Context, report *Lo
 		return true
 	})
 	if err != nil || !updated {
-		return status.Errorf(codes.Unavailable, "recovery authority changed during staging; retry: %v", err)
+		return status.Errorf(codes.Unavailable, "recovery authority changed during node verification; retry: %v", err)
 	}
 	if report.RecoveryMethod != "" || report.ConfirmationState != "" {
 		ns.recordPVCEventFromPublishContext(ctx, publishContext, eventReasonLocalDeviceRecoverySucceeded, fmt.Sprintf("node confirmed local device visibility for volume %s on node %s", volumeID, node))
@@ -755,7 +762,7 @@ func (s *ControllerServer) refreshLocalDeviceReportConfirmationState(ctx context
 	if (report.ConfirmationState != localDeviceConfirmationStatePending && report.ConfirmationState != localDeviceConfirmationStateInProgress) || report.ConfirmationDeadline == nil || report.ConfirmationDeadline.IsZero() || report.ConfirmationDeadline.After(now) {
 		return report, false, nil
 	}
-	message := fmt.Sprintf("same-node runtime attach for volume %s on node %s was not confirmed by NodeStageVolume before %s", report.VolumeID, report.Node, report.ConfirmationDeadline.Format(time.RFC3339))
+	message := fmt.Sprintf("same-node runtime attach for volume %s on node %s was not confirmed by NodeStageVolume or raw-block NodePublishVolume before %s", report.VolumeID, report.Node, report.ConfirmationDeadline.Format(time.RFC3339))
 	state := localDeviceConfirmationStateTimedOut
 	eventMessage := message + "; controller will re-evaluate the same-node recovery episode"
 	if maxAttempts := s.localDeviceRecoveryMaxAttempts(); report.ConfirmationState == localDeviceConfirmationStateInProgress || (maxAttempts > 0 && report.RecoveryAttempts >= maxAttempts) {

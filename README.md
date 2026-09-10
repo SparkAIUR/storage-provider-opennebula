@@ -178,7 +178,7 @@ The local restart path includes a broader CSI performance and stability layer:
 
 - the node plugin now prefers stable `/dev/disk/by-id` resolution using an explicit OpenNebula disk serial and keeps a short-lived in-memory device cache
 - same-node hotplug work is queued fairly instead of failing fast with `node_busy`
-- local-device self-heal no longer treats OpenNebula template metadata as proof of recovery success; same-node repair stays pending until a later `NodeStageVolume` proves the guest can see the disk again
+- local-device self-heal requires recorded provider completion followed by device verification through `NodeStageVolume` or raw-block `NodePublishVolume`; new and already-bound block publishes reject unfinished or changed recovery authority before exposing the device or returning success
 - when metadata still says the disk is attached but the guest runtime cannot see it, automatic recovery stops with a manual-repair outcome; consumers must be drained before external attachment repair because this release has no node/controller no-mount handoff
 - the controller can inject a soft last-node scheduling preference for local single-writer pods so StatefulSet restarts are more likely to land back on the previous node
 - a conservative stuck-attachment reconciler repairs orphaned OpenNebula attachments and stale `VolumeAttachment` objects

@@ -25,3 +25,4 @@
 - AI: Use independent per-node snapshot workers with two-second API deadlines and five delayed retries per version. Keep per-volume history write ordering outside the cache lock.
 - AI: Treat existing benchmark resources for the current run generation as durable admission evidence after restart.
 - HUMAN: Fix all four subsequent review findings. Use a per-node annotation token for diagnostic snapshot ordering, retain uncertain provider attempts, distinguish legacy marker persistence from derived report evidence, and preserve ownership checks while excluding unrelated foreign CSI mounts.
+- HUMAN: Raw-block NodePublish must enforce the existing recovery authority protocol for new and already-bound targets. Block NodeStage may remain a no-format, no-mount operation; block expansion is unchanged. The root executor owns the active Oracle review and final native validation.

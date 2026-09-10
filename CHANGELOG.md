@@ -2,6 +2,7 @@
 
 ## v0.5.29, unreleased
 
+- Apply recovery authority and identity verification to raw-block publishing, including already-bound targets, before confirming recovery or exposing the device.
 - Preserve recovery authority after uncertain provider failures, retire verified released legacy repair markers conditionally, advance snapshot revisions for empty clears, and exclude unrelated foreign CSI mounts from CephFS discovery.
 - Block automatic detach of metadata-attached disks; retain wrong-device evidence and bind confirmation to the observed recovery episode.
 - Reconstruct owned CephFS sibling binds across absent stages and older superblocks before recovery.

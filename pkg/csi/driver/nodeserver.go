@@ -152,26 +152,9 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	if len(volName) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "[volumeName] entry is required in volume context")
 	}
-	report, _, reportErr := ns.readLocalDeviceReport(ctx, volumeID)
+	reportRef, repairRef, reportErr := ns.readLocalDeviceRecoveryAuthority(ctx, volumeID)
 	if reportErr != nil {
-		return nil, status.Errorf(codes.Unavailable, "cannot read local recovery authority: %v", reportErr)
-	}
-	if report.ConfirmationState == localDeviceConfirmationStateInProgress {
-		return nil, status.Error(codes.Unavailable, "local device recovery is still in progress; retry staging")
-	}
-	var repairRef *VolumeRepairState
-	if ns.Driver.volumeRepairState != nil {
-		state, exists, err := ns.Driver.volumeRepairState.GetCurrent(ctx, volumeID)
-		if err != nil {
-			return nil, status.Errorf(codes.Unavailable, "cannot read current repair authority: %v", err)
-		}
-		if exists {
-			repairRef = &state
-		}
-	}
-	var reportRef *LocalDeviceMissingReport
-	if strings.TrimSpace(report.VolumeID) != "" {
-		reportRef = &report
+		return nil, reportErr
 	}
 	deviceTimeout := ns.deviceDiscoveryTimeout(volumeContext)
 	devicePath, resolution, err := ns.resolveDevicePathWithContext(volumeID, volName, volumeContext, deviceTimeout)
@@ -213,10 +196,10 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 			return nil, err
 		}
 	}
-	if reportRef != nil && localDeviceFailureClass(report) == localDeviceFailureClassWrongIdentity {
+	if reportRef != nil && localDeviceFailureClass(*reportRef) == localDeviceFailureClassWrongIdentity {
 		observed := ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext)
-		if matches, _ := localDiskIdentityMatches(report.ExpectedIdentity, observed); report.ExpectedIdentity == nil || !matches {
-			return nil, status.Error(codes.FailedPrecondition, wrongDeviceIdentityMessage(volumeID, report.ExpectedIdentity, observed))
+		if matches, _ := localDiskIdentityMatches(reportRef.ExpectedIdentity, observed); reportRef.ExpectedIdentity == nil || !matches {
+			return nil, status.Error(codes.FailedPrecondition, wrongDeviceIdentityMessage(volumeID, reportRef.ExpectedIdentity, observed))
 		}
 	}
 	if session, exists, loadErr := ns.loadLocalDiskSession(volumeID); loadErr == nil && exists && session.Identity != nil {
@@ -448,6 +431,10 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	var resp *csi.NodePublishVolumeResponse
 	switch accessType.(type) {
 	case *csi.VolumeCapability_Block:
+		reportRef, repairRef, authorityErr := ns.readLocalDeviceRecoveryAuthority(ctx, volumeID)
+		if authorityErr != nil {
+			return nil, authorityErr
+		}
 		deviceTimeout := ns.deviceDiscoveryTimeout(volumeContext)
 		devicePath, resolution, resolveErr := ns.resolveDevicePathWithContext(volumeID, volName, volumeContext, deviceTimeout)
 		if resolveErr != nil {
@@ -458,13 +445,22 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 				"method", "NodePublishVolume", "volumeID", volumeID, "volumeName", volName, "deviceDiscoveryTimeout", deviceTimeout)
 			return nil, status.Error(codes.DeadlineExceeded, resolveErr.Error())
 		}
-		ns.clearLocalDeviceMissing(ctx, volumeID)
 		ns.recordDeviceResolutionFromPublishContext(ctx, volumeContext, resolution)
 		ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "success", resolution.Latency)
 		ns.Driver.observeAdaptiveTimeout(ctx, "device_resolution", ns.publishContextBackend(volumeContext), 0, resolution.Latency)
 		klog.V(2).InfoS("Resolved block device path",
 			"method", "NodePublishVolume", "volumeID", volumeID, "devicePath", devicePath, "deviceDiscoveryTimeout", deviceTimeout,
 			"resolvedBy", resolution.ResolvedBy, "resolutionLatency", resolution.Latency)
+		observedIdentity := ns.observeLocalDiskIdentity(devicePath, "", volumeContext)
+		if err := ns.verifyStageRepairObservation(repairRef, observedIdentity); err != nil {
+			return nil, err
+		}
+		if err := ns.confirmLocalDeviceRecovery(ctx, reportRef, volumeID, devicePath, observedIdentity, volumeContext); err != nil {
+			return nil, err
+		}
+		if err := ns.clearObservedStageRepair(ctx, volumeID, repairRef, observedIdentity); err != nil {
+			return nil, err
+		}
 		resp, err = ns.handleBlockVolumePublish(devicePath, targetPath, volumeCapability, options)
 	case *csi.VolumeCapability_Mount:
 		resp, err = ns.handleMountVolumePublish(stagingTargetPath, targetPath, volumeCapability, options)

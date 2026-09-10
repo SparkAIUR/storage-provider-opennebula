@@ -78,7 +78,7 @@ func TestNodeRecordsAndClearsLocalDeviceMissingReport(t *testing.T) {
 	assert.Equal(t, "onecsi-439", report.DeviceSerial)
 	assert.Equal(t, 2, report.Attempts)
 
-	ns.clearLocalDeviceMissing(context.Background(), "vol-1")
+	require.NoError(t, ns.confirmLocalDeviceRecovery(context.Background(), &report, "vol-1", "/dev/sdd", nil, publishContext))
 	cm, err = driver.kubeRuntime.client.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(context.Background(), localDeviceStateConfigMapName, metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.NotContains(t, cm.Data, key)
