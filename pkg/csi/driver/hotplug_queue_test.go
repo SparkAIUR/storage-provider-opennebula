@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -12,7 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 func TestHotplugQueueSequentializesSameNodeRequests(t *testing.T) {
@@ -288,4 +291,47 @@ func TestHotplugQueueSkipsUnchangedSnapshotPersistence(t *testing.T) {
 	manager.persistSnapshotNow(snapshot)
 
 	assert.Equal(t, actionsAfterFirstPersist, len(client.Actions()))
+}
+
+func TestHotplugQueueRetriesFailedSnapshotPersistence(t *testing.T) {
+	for _, clear := range []bool{false, true} {
+		name := "write"
+		if clear {
+			name = "clear"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			client := fake.NewSimpleClientset()
+			manager := NewHotplugQueueManager(&KubeRuntime{client: client, enabled: true}, "default", NewDriverMetrics("test", "test"), time.Second, 0)
+			snapshot := HotplugQueueNodeSnapshot{Node: "node-a", QueuedCount: 1}
+			manager.persistSnapshotNow(snapshot)
+			if clear {
+				snapshot.QueuedCount = 0
+			} else {
+				snapshot.QueuedCount = 2
+			}
+			calls := 0
+			client.PrependReactor("patch", "configmaps", func(ktesting.Action) (bool, runtime.Object, error) {
+				calls++
+				if calls == 1 {
+					return true, nil, errors.New("transient API failure")
+				}
+				return false, nil, nil
+			})
+			manager.persistSnapshotNow(snapshot)
+			manager.persistSnapshotNow(snapshot)
+			require.Equal(t, 2, calls)
+			cm, err := client.CoreV1().ConfigMaps("default").Get(ctx, hotplugQueueStateConfigMapName, metav1.GetOptions{})
+			require.NoError(t, err)
+			if clear {
+				require.NotContains(t, cm.Data, snapshot.Node)
+			} else {
+				var persisted HotplugQueueNodeSnapshot
+				require.NoError(t, json.Unmarshal([]byte(cm.Data[snapshot.Node]), &persisted))
+				require.Equal(t, snapshot, persisted)
+			}
+			manager.persistSnapshotNow(snapshot)
+			require.Equal(t, 2, calls, "successful writes should still be deduplicated")
+		})
+	}
 }

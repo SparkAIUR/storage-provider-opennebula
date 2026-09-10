@@ -486,3 +486,59 @@ func newSharedFilesystemPublishRequest(volumeID, stagePath, targetPath string) *
 		},
 	}
 }
+
+func TestSharedFilesystemPublishRehydratesStaleSessionWithExistingBinds(t *testing.T) {
+	for _, mountBecomesHealthy := range []bool{true, false} {
+		name := "recovered"
+		if !mountBecomesHealthy {
+			name = "still-disconnected"
+		}
+		t.Run(name, func(t *testing.T) {
+			withSharedFilesystemTestPaths(t)
+			ns := getTestNodeServer(nil)
+			ns.Driver.featureGates.CephFSSelfHealing = true
+			id, stage, target := stageSharedFilesystemFixture(t, ns, "publish-missing-record")
+			_, err := ns.NodePublishVolume(context.Background(), newSharedFilesystemPublishRequest(id, stage, target))
+			require.NoError(t, err)
+			require.NoError(t, ns.deleteSharedFilesystemSession(id))
+			healthy := false
+			ns.sharedFS.probe = func(context.Context, string) error {
+				if !healthy {
+					return syscall.ENOTCONN
+				}
+				return nil
+			}
+			mountAttempts := 0
+			originalFuse := ns.sharedFS.fuse
+			ns.sharedFS.fuse = func(ctx context.Context, session sharedFilesystemSession, args []string) error {
+				mountAttempts++
+				persisted, exists, err := ns.sharedFilesystemRecovery.store.Load(id)
+				require.NoError(t, err)
+				require.True(t, exists, "mount intent must be durable before remount")
+				require.Len(t, persisted.PublishedTargets, 1)
+				require.Equal(t, target, persisted.PublishedTargets[0].TargetPath)
+				healthy = mountBecomesHealthy
+				return originalFuse(ctx, session, args)
+			}
+
+			request := newSharedFilesystemPublishRequest(id, stage, target)
+			for key, value := range newSharedFilesystemStageRequest(id, stage, "fuse").PublishContext {
+				request.PublishContext[key] = value
+			}
+			response, err := ns.NodePublishVolume(context.Background(), request)
+			if mountBecomesHealthy {
+				require.NoError(t, err)
+				require.NotNil(t, response)
+				require.NoError(t, ns.verifySharedFilesystemBind(stage, target))
+			} else {
+				require.Error(t, err, "a disconnected stage cannot be acknowledged as published")
+				require.Nil(t, response)
+			}
+			require.Equal(t, 1, mountAttempts, "publish must actually recover the disconnected mount")
+			persisted, exists, err := ns.sharedFilesystemRecovery.store.Load(id)
+			require.NoError(t, err)
+			require.True(t, exists)
+			require.Len(t, persisted.PublishedTargets, 1, "discovered bind intent must survive recovery failures")
+		})
+	}
+}

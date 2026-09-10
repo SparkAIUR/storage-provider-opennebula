@@ -656,6 +656,7 @@ func (m *HotplugQueueManager) persistSnapshotNow(snapshot HotplugQueueNodeSnapsh
 		return
 	}
 	m.snapshotMu.Lock()
+	defer m.snapshotMu.Unlock()
 	if m.lastSnapshots == nil {
 		m.lastSnapshots = map[string]string{}
 	}
@@ -666,34 +667,33 @@ func (m *HotplugQueueManager) persistSnapshotNow(snapshot HotplugQueueNodeSnapsh
 	delete(m.pendingSnapshots, snapshot.Node)
 	if snapshot.Active == nil && snapshot.QueuedCount == 0 {
 		if last, ok := m.lastSnapshots[snapshot.Node]; ok && last == "" {
-			m.snapshotMu.Unlock()
+			return
+		}
+		if err := m.runtime.DeleteConfigMapKey(context.Background(), m.namespace, hotplugQueueStateConfigMapName, snapshot.Node); err != nil {
+			klog.V(4).InfoS("Failed to clear hotplug queue snapshot", "node", snapshot.Node, "err", err)
+			delete(m.lastSnapshots, snapshot.Node)
 			return
 		}
 		m.lastSnapshots[snapshot.Node] = ""
-		m.snapshotMu.Unlock()
-		if err := m.runtime.DeleteConfigMapKey(context.Background(), m.namespace, hotplugQueueStateConfigMapName, snapshot.Node); err != nil {
-			klog.V(4).InfoS("Failed to clear hotplug queue snapshot", "node", snapshot.Node, "err", err)
-		}
 		return
 	}
 	payload, err := json.Marshal(snapshot)
 	if err != nil {
-		m.snapshotMu.Unlock()
 		klog.V(4).InfoS("Failed to marshal hotplug queue snapshot", "node", snapshot.Node, "err", err)
 		return
 	}
 	payloadString := string(payload)
 	if last, ok := m.lastSnapshots[snapshot.Node]; ok && last == payloadString {
-		m.snapshotMu.Unlock()
 		return
 	}
-	m.lastSnapshots[snapshot.Node] = payloadString
-	m.snapshotMu.Unlock()
 	if err := m.runtime.UpsertConfigMapData(context.Background(), m.namespace, hotplugQueueStateConfigMapName, map[string]string{
 		snapshot.Node: payloadString,
 	}); err != nil {
 		klog.V(4).InfoS("Failed to persist hotplug queue snapshot", "node", snapshot.Node, "err", err)
+		delete(m.lastSnapshots, snapshot.Node)
+		return
 	}
+	m.lastSnapshots[snapshot.Node] = payloadString
 }
 
 func requestSnapshot(req *hotplugQueueRequest) HotplugQueueItemSnapshot {

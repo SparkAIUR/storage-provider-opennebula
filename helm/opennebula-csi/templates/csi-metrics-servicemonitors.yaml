@@ -1,6 +1,6 @@
 {{- $controller := (get .Values "controller") | default dict -}}
 {{- $controllerAttacher := (get $controller "attacher") | default dict -}}
-{{- $controllerAttacherHTTPEnabled := (get $controllerAttacher "httpEndpointEnabled") | default true -}}
+{{- $controllerAttacherHTTPEnabled := dig "httpEndpointEnabled" true $controllerAttacher -}}
 {{- if and .Values.metrics.enabled .Values.metrics.controller.serviceMonitor.enabled }}
 ---
 apiVersion: monitoring.coreos.com/v1

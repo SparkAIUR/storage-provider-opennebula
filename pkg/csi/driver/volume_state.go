@@ -9,7 +9,10 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 )
 
@@ -176,19 +179,59 @@ func (m *VolumeHistoryManager) Upsert(ctx context.Context, volumeID string, muta
 	}
 	volumeID = strings.TrimSpace(volumeID)
 	m.mu.Lock()
-	state := m.entries[volumeID]
-	if strings.TrimSpace(state.VolumeID) == "" {
+	defer m.mu.Unlock()
+	apply := func(state *VolumeHistoryRecord) {
 		state.VolumeID = volumeID
+		state.Version = stateObjectVersion
+		mutate(state)
+		state.VolumeID = volumeID
+		normalizeVolumeHistoryRecord(state)
 	}
-	state.Version = stateObjectVersion
-	mutate(&state)
-	state.VolumeID = volumeID
-	normalizeVolumeHistoryRecord(&state)
-	m.entries[volumeID] = state
-	m.mu.Unlock()
-	if err := m.persistEntry(ctx, state); err != nil {
+	state := m.entries[volumeID]
+	if m.runtime == nil || !m.runtime.enabled {
+		apply(&state)
+		m.entries[volumeID] = state
+		return state, nil
+	}
+	cmClient := m.runtime.client.CoreV1().ConfigMaps(m.namespace)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		cm, err := cmClient.Get(ctx, volumeHistoryStateConfigMapName, metav1.GetOptions{})
+		missing := errors.IsNotFound(err)
+		if err != nil && !missing {
+			return err
+		}
+		if missing {
+			cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: volumeHistoryStateConfigMapName, Namespace: m.namespace}}
+		}
+		state = VolumeHistoryRecord{}
+		if raw := strings.TrimSpace(cm.Data[volumeID]); raw != "" {
+			if err := json.Unmarshal([]byte(raw), &state); err != nil {
+				return err
+			}
+		}
+		apply(&state)
+		payload, err := json.Marshal(state)
+		if err != nil {
+			return err
+		}
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		cm.Data[volumeID] = string(payload)
+		if missing {
+			_, err = cmClient.Create(ctx, cm, metav1.CreateOptions{})
+			if errors.IsAlreadyExists(err) {
+				return errors.NewConflict(corev1.Resource("configmaps"), volumeHistoryStateConfigMapName, err)
+			}
+		} else {
+			_, err = cmClient.Update(ctx, cm, metav1.UpdateOptions{})
+		}
+		return err
+	})
+	if err != nil {
 		return state, err
 	}
+	m.entries[volumeID] = state
 	return state, nil
 }
 
@@ -278,19 +321,6 @@ func (m *VolumeHistoryManager) Snapshot() map[string]VolumeHistoryRecord {
 		snapshot[key] = state
 	}
 	return snapshot
-}
-
-func (m *VolumeHistoryManager) persistEntry(ctx context.Context, state VolumeHistoryRecord) error {
-	if m == nil || m.runtime == nil || !m.runtime.enabled {
-		return nil
-	}
-	payload, err := json.Marshal(state)
-	if err != nil {
-		return fmt.Errorf("failed to marshal volume history state: %w", err)
-	}
-	return m.runtime.UpsertConfigMapData(ctx, m.namespace, volumeHistoryStateConfigMapName, map[string]string{
-		state.VolumeID: string(payload),
-	})
 }
 
 type VolumeRepairStateManager struct {

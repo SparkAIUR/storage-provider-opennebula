@@ -808,6 +808,14 @@ func (ns *NodeServer) ensureSharedFilesystemSessionForPublish(req *csi.NodePubli
 	if !ok {
 		return session, fmt.Errorf("cannot reconstruct session from publish request")
 	}
+	if _, mounted, err := ns.mountPointForPath(session.StagingTargetPath); err != nil {
+		return session, err
+	} else if mounted {
+		session.PublishedTargets, err = ns.discoverSharedFilesystemTargets(volumeID, session.StagingTargetPath)
+		if err != nil {
+			return session, err
+		}
+	}
 	if err := ns.sharedFilesystemRecovery.store.Save(session); err != nil {
 		return sharedFilesystemSession{}, err
 	}
