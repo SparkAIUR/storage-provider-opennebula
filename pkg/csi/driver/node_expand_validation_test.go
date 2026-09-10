@@ -28,13 +28,15 @@ func TestNodeExpandVolumeRejectsIncompleteGrowth(t *testing.T) {
 		verifyErr   error
 		code        codes.Code
 		needsResize bool
+		statfsErr   error
 	}{
-		{"device one byte short despite configured tolerance", requiredBytes - 1, true, nil, nil, codes.DeadlineExceeded, false},
-		{"device 512 MiB short despite configured tolerance", requiredBytes - 536870912, true, nil, nil, codes.DeadlineExceeded, false},
-		{"filesystem geometry unavailable", requiredBytes, true, nil, errors.New("invalid superblock"), codes.Internal, false},
-		{"resize command failed", requiredBytes, false, errors.New("resize failed"), nil, codes.Internal, false},
-		{"unformatted device", requiredBytes, false, nil, nil, codes.FailedPrecondition, false},
-		{"filesystem geometry incomplete despite full statfs", requiredBytes, true, nil, nil, codes.DeadlineExceeded, true},
+		{"device one byte short despite configured tolerance", requiredBytes - 1, true, nil, nil, codes.DeadlineExceeded, false, nil},
+		{"device 512 MiB short despite configured tolerance", requiredBytes - 536870912, true, nil, nil, codes.DeadlineExceeded, false, nil},
+		{"filesystem geometry unavailable", requiredBytes, true, nil, errors.New("invalid superblock"), codes.Internal, false, nil},
+		{"resize command failed", requiredBytes, false, errors.New("resize failed"), nil, codes.Internal, false, nil},
+		{"unformatted device", requiredBytes, false, nil, nil, codes.FailedPrecondition, false, nil},
+		{"filesystem geometry incomplete despite full statfs", requiredBytes, true, nil, nil, codes.DeadlineExceeded, true, nil},
+		{"statfs syscall failure remains fatal", requiredBytes, true, nil, nil, codes.Internal, false, unix.EIO},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			oldStatfs, oldSleep, oldNow := nodeVolumePathFS, nodeDeviceSleep, nodeNow
@@ -60,7 +62,7 @@ func TestNodeExpandVolumeRejectsIncompleteGrowth(t *testing.T) {
 			}
 			nodeVolumePathFS = func(_ string, buf *unix.Statfs_t) error {
 				buf.Bsize, buf.Blocks = 4096, uint64(filesystemBytes/4096)
-				return nil
+				return tc.statfsErr
 			}
 			resizeCalls := 0
 			nodeResizeFS = func(_ exec.Interface, _, _ string) (bool, error) {
@@ -77,6 +79,10 @@ func TestNodeExpandVolumeRejectsIncompleteGrowth(t *testing.T) {
 			})
 			require.Nil(t, response)
 			require.Equal(t, tc.code, status.Code(err))
+			if tc.statfsErr != nil {
+				require.ErrorContains(t, err, "failed to collect filesystem size")
+				require.ErrorContains(t, err, tc.statfsErr.Error())
+			}
 			if tc.deviceSize < requiredBytes {
 				require.Zero(t, resizeCalls, "never resize before the device reaches the full request")
 			} else if tc.needsResize {

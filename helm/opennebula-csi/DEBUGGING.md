@@ -666,7 +666,7 @@ To force the unstage anyway, first put the volume into bounded manual recovery m
 opennebula-csi -mode=local-disk-reprobe -volume-id <volume-id> -allow-published-reprobe
 ```
 
-That forced path is accepted only when `recovery-mode=manual` is already active for the volume. It is meant for targeted incident work, not routine operations.
+The forced path reads current PV/PVC annotations and requires `recovery-mode=manual` with a future `recovery-mode-until`. A remembered session mode does not authorize cleanup. Missing Kubernetes access, failed annotation reads, removed annotations, and absent, malformed or expired deadlines prevent cleanup. Coordinate affected consumers before forcing the unstage; manual mode does not authorize automatic detach of a metadata-attached disk. See [requireCurrentManualRecovery](../../pkg/csi/driver/operator_commands.go) for the check.
 
 Use this when:
 

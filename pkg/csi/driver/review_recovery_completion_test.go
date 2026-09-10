@@ -29,7 +29,8 @@ func reviewRecoveryCompletionRPC(t *testing.T, ns *NodeServer, stage *csi.NodeSt
 	t.Helper()
 	if endpoint == "stage" {
 		return func(ctx context.Context) error {
-			_, err := ns.NodeStageVolume(ctx, stage)
+			response, err := ns.NodeStageVolume(ctx, stage)
+			t.Logf("CSI fixture NodeStageVolume volume=%s response=%v code=%s error=%v", stage.VolumeId, response, status.Code(err), err)
 			return err
 		}
 	}
@@ -44,7 +45,8 @@ func reviewRecoveryCompletionRPC(t *testing.T, ns *NodeServer, stage *csi.NodeSt
 		},
 	}
 	return func(ctx context.Context) error {
-		_, err := ns.NodePublishVolume(ctx, request)
+		response, err := ns.NodePublishVolume(ctx, request)
+		t.Logf("CSI fixture NodePublishVolume block volume=%s response=%v code=%s error=%v", request.VolumeId, response, status.Code(err), err)
 		return err
 	}
 }
@@ -57,6 +59,10 @@ func TestReviewNodeStageProviderCompletionAfterConcurrentWrongIdentity(t *testin
 				defer cancel()
 				driver, _, controller, provider, report := recoveryReviewFixture(t)
 				ns, stage := reviewLocalStageFixture(t, driver, report, false)
+				// FakeMounter canonicalizes targets; use the same path on retries on macOS.
+				stagePath, err := filepath.EvalSymlinks(stage.StagingTargetPath)
+				require.NoError(t, err)
+				stage.StagingTargetPath = stagePath
 				device := filepath.Join(defaultDiskPath, report.VolumeName)
 				require.NoError(t, os.Remove(filepath.Join(defaultDiskPath, "disk", "by-id", "virtio-onecsi-42")))
 				serial := "onecsi-99"
@@ -125,8 +131,9 @@ func TestReviewNodeStageProviderCompletionAfterConcurrentWrongIdentity(t *testin
 				}
 				mounter := ns.mounter.Interface.(*mount.FakeMounter)
 				before := mounter.GetLog()
-				_, err := ns.NodeStageVolume(ctx, stage)
+				_, err = ns.NodeStageVolume(ctx, stage)
 				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				t.Logf("CSI fixture concurrent NodeStageVolume observed_serial=%s code=%s error=%v", serial, status.Code(err), err)
 				require.True(t, started)
 				require.NotEmpty(t, episode.RecoveryToken)
 				fault, exists := ns.currentLocalDeviceReport(ctx, report.VolumeID)
@@ -200,6 +207,9 @@ func TestReviewNodeStageProviderCompletionAfterConcurrentWrongIdentity(t *testin
 				expected.MetadataNode = report.Node
 				expected.MetadataTarget = "sdd"
 				require.Equal(t, expected, completed)
+				payload, err := json.Marshal(completed)
+				require.NoError(t, err)
+				t.Logf("CSI fixture persisted ConfigMap %s key=%s after provider completion: %s; completion_write_attempts=%d separate_repair_marker=%t", localDeviceStateConfigMapName, key, payload, writes, markerErr == nil)
 				if markerErr == nil {
 					retained, err := client.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(ctx, volumeRepairStateConfigMapName, metav1.GetOptions{})
 					require.NoError(t, err)
@@ -213,6 +223,7 @@ func TestReviewNodeStageProviderCompletionAfterConcurrentWrongIdentity(t *testin
 				require.Equal(t, completed.ExpectedIdentity, retained.ExpectedIdentity)
 				require.Equal(t, localDeviceFailureClassWrongIdentity, retained.FailureClass)
 				require.Equal(t, before, mounter.GetLog())
+				t.Logf("CSI fixture wrong-device retry observed_serial=%s report_retained=%t token=%s method=%s mount_operations=%v", serial, exists, retained.RecoveryToken, retained.RecoveryMethod, mounter.GetLog())
 				serial = "onecsi-42"
 				require.NoError(t, rpc(ctx))
 				_, exists = ns.currentLocalDeviceReport(ctx, report.VolumeID)
@@ -221,7 +232,11 @@ func TestReviewNodeStageProviderCompletionAfterConcurrentWrongIdentity(t *testin
 				require.NoError(t, err)
 				require.False(t, exists)
 				require.NotEqual(t, before, mounter.GetLog())
+				mounted := mounter.GetLog()
+				t.Logf("CSI fixture matching-device retry observed_serial=%s report_removed=true repair_removed=%t mount_operations=%v", serial, !exists, mounted)
 				require.NoError(t, rpc(ctx))
+				require.Equal(t, mounted, mounter.GetLog(), "an already staged or bound retry must not add another mount")
+				t.Logf("CSI fixture idempotent retry mount_operations=%v", mounter.GetLog())
 				provider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
 				provider.AssertExpectations(t)
 			})
@@ -299,6 +314,9 @@ func TestReviewNodeStageProviderCompletionWriteFailure(t *testing.T) {
 				retained, exists := ns.currentLocalDeviceReport(ctx, report.VolumeID)
 				require.True(t, exists)
 				require.Equal(t, unfinished, retained)
+				payload, marshalErr := json.Marshal(retained)
+				require.NoError(t, marshalErr)
+				t.Logf("CSI fixture completion failure=%s controller_error=%v completion_write_attempts=%d persisted_report=%s", failure, err, writes, payload)
 				mounter := ns.mounter.Interface.(*mount.FakeMounter)
 				before := mounter.GetLog()
 				require.Equal(t, codes.Unavailable, status.Code(rpc(ctx)))
@@ -306,6 +324,7 @@ func TestReviewNodeStageProviderCompletionWriteFailure(t *testing.T) {
 				retained, exists = ns.currentLocalDeviceReport(ctx, report.VolumeID)
 				require.True(t, exists)
 				require.Equal(t, unfinished, retained)
+				t.Logf("CSI fixture uncommitted completion refuses %s retry; report_retained=%t mount_operations=%v", endpoint, exists, mounter.GetLog())
 				provider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
 				provider.AssertExpectations(t)
 			})

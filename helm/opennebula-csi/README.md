@@ -212,8 +212,7 @@ For local-backed StorageClasses:
 - prefer `volumeBindingMode: WaitForFirstConsumer`
 - keep `featureGates.compatibilityAwareSelection=true`
 - do not assume the driver will live-migrate local PVC data between nodes
-- see the [local datastore placement guidance](../../README.md#local-datastore-placement-guidance) for hotplug serialization and queue behavior
-- node-side device discovery uses the same per-volume timeout budget that the controller computed during publish
+- see the [local datastore placement guidance](../../README.md#local-datastore-placement-guidance) for hotplug serialization, queue behavior and the node-side discovery budget
 - if a VM stays non-ready through the full timeout, the driver puts that VM into a temporary hotplug cooldown and rejects further hotplug work with retryable `Unavailable`
 - recreating MinIO tenants with local-backed PVCs should still be treated as node-sticky; use Ceph RBD or CephFS if the workload must remain portable across nodes
 - use Ceph RBD for portable attached-disk RWO and CephFS for portable filesystem RWO or RWX
@@ -286,14 +285,9 @@ Repeated matching failures are persisted in `opennebula-csi-volume-quarantine-st
 
 ### Local Device Recovery
 
-When an OpenNebula VM still reports the PVC disk in template metadata but the node plugin cannot discover the device inside the guest, the node records a typed missing-device report in `opennebula-csi-node-device-state`. The controller leader watches those reports and, after the configured threshold, performs same-node-only recovery for eligible local non-CephFS `ReadWriteOnce` volumes.
+When the node plugin cannot discover the device inside the guest, it records a typed missing-device report in `opennebula-csi-node-device-state`. The controller leader watches those reports and, after the configured threshold, evaluates same-node recovery for eligible local non-CephFS `ReadWriteOnce` volumes.
 
-Recovery now has an explicit runtime-confirmation state machine:
-
-- provider-side attach success leaves the report in `pending_runtime_confirmation`
-- only a later successful `NodeStageVolume` clears the active recovery episode
-- if the node never confirms device visibility before the confirmation deadline, the episode transitions to `timed_out_waiting_for_node_confirmation`
-- once the episode exhausts its configured budget, its durable local-device report becomes `repair_required_runtime_attach_unconfirmed`; controller guards derive `same_node_runtime_attach_unconfirmed` directly from that report, avoiding a separate repair-record commit
+See the [recovery authority and device identity contract](../../docs/v0.5.29-review-followup.md#implemented-corrections) for provider completion, terminal states, and confirmation through filesystem staging or raw-block publishing.
 
 This recovery path never moves a volume to a different node. It skips CephFS, RWX, non-local backends, missing desired state, NotReady Kubernetes nodes, and non-running OpenNebula VMs. Failed recovery attempts are rate-limited with `driver.localDeviceRecovery.cooldownSeconds` and capped with `driver.localDeviceRecovery.maxAttemptsPerVolume`. Repeated missing-device reports for the same `(volume, node, failure-class)` attach to the active recovery episode instead of resetting the counters.
 
@@ -301,7 +295,7 @@ The `runtime_republish` method attaches only after typed inspection proves the i
 
 OpenNebula metadata attachment is no longer treated as final proof of healing. It is sequencing evidence only.
 
-If same-node restage observes a different local block device identity than the last healthy stage, the driver records `wrong_device_identity` in `opennebula-csi-volume-repair-state` and returns `FailedPrecondition`. Clear the matching ConfigMap key only after external repair or after a later healthy publish/stage path clears it automatically.
+If same-node restage observes a different local block device identity than the last healthy stage, the driver records `wrong_device_identity` and returns `FailedPrecondition`. Report and repair-record retirement follow the [recovery authority contract](../../docs/v0.5.29-review-followup.md#implemented-corrections).
 
 `wrong_device_identity` is repair-required only. The controller preserves that failure class in `opennebula-csi-node-device-state`, emits a dedicated skipped-recovery signal, and never re-enters automatic detach/attach recovery for that report. Support bundles now surface asserted controller hints separately from independently observed device evidence, and node-side persisted session identity is available through `--mode=local-disk-sessions`.
 

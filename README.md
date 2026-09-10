@@ -176,7 +176,7 @@ Recommended workload-side guidance:
 
 The local restart path includes a broader CSI performance and stability layer:
 
-- the node plugin now prefers stable `/dev/disk/by-id` resolution using an explicit OpenNebula disk serial and keeps a short-lived in-memory device cache
+- the node plugin prefers `/dev/disk/by-id` resolution and caches device paths subject to the [device identity contract](docs/v0.5.29-review-followup.md#implemented-corrections)
 - same-node hotplug work is queued fairly instead of failing fast with `node_busy`
 - local-device self-heal requires recorded provider completion followed by device verification through `NodeStageVolume` or raw-block `NodePublishVolume`; new and already-bound block publishes reject unfinished or changed recovery authority before exposing the device or returning success
 - when metadata still says the disk is attached but the guest runtime cannot see it, automatic recovery stops with a manual-repair outcome; consumers must be drained before external attachment repair because this release has no node/controller no-mount handoff
