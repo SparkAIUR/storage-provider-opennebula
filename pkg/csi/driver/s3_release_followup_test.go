@@ -447,7 +447,10 @@ func TestRunLocalDiskReprobeCommandRequiresRecoveryModeManualForPublishedTargets
 		}},
 	}))
 
-	report, err := runLocalDiskReprobeCommandWithMounter(context.Background(), nil, LocalDiskReprobeOptions{
+	pv, pvc := newLocalPVAndPVC("vol-published", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationRecoveryMode: recoveryModeManual, annotationRecoveryModeUntil: time.Now().Add(time.Hour).UTC().Format(time.RFC3339)})
+	client := fake.NewSimpleClientset(pv, pvc)
+
+	report, err := runLocalDiskReprobeCommandWithMounter(context.Background(), client, LocalDiskReprobeOptions{
 		VolumeID:       "vol-published",
 		AllowPublished: true,
 	}, mount.NewFakeMounter(nil))

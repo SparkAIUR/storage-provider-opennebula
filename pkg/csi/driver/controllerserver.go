@@ -1990,7 +1990,7 @@ func (s *ControllerServer) attachRequestStale(ctx context.Context, node, volume 
 	if protectionErr == nil && protection.Protected && strings.TrimSpace(protection.RequiredNode) != "" && strings.TrimSpace(protection.RequiredNode) != strings.TrimSpace(node) && !protection.OverrideUsed {
 		return true, queueReasonSameNodeReuseRequired
 	}
-	if state, ok := s.repairStateForQueue(volume); ok && strings.TrimSpace(state.Classification) != "" {
+	if state, ok, err := s.repairStateForQueue(ctx, volume); err != nil || (ok && strings.TrimSpace(state.Classification) != "") {
 		return true, queueReasonRepairRequired
 	}
 	return false, ""

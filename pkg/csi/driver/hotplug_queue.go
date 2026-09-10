@@ -123,6 +123,7 @@ type HotplugQueueItemSnapshot struct {
 }
 
 type HotplugQueueNodeSnapshot struct {
+	version          uint64
 	Node             string                     `json:"node"`
 	Active           *HotplugQueueItemSnapshot  `json:"active,omitempty"`
 	Queued           []HotplugQueueItemSnapshot `json:"queued,omitempty"`
@@ -172,10 +173,21 @@ type HotplugQueueManager struct {
 
 	snapshotMu       sync.Mutex
 	snapshotDebounce time.Duration
-	pendingSnapshots map[string]HotplugQueueNodeSnapshot
-	snapshotTimers   map[string]*time.Timer
-	lastSnapshots    map[string]string
+	snapshotSeq      atomic.Uint64
+	snapshots        map[string]*hotplugSnapshotState
 }
+
+type hotplugSnapshotState struct {
+	latest      HotplugQueueNodeSnapshot
+	running     bool
+	timer       *time.Timer
+	lastPayload string
+	persisted   bool
+	failures    int
+}
+
+const hotplugSnapshotTimeout = 2 * time.Second
+const hotplugSnapshotMaxRetries = 5
 
 func NewHotplugQueueManager(runtime *KubeRuntime, namespace string, metrics *DriverMetrics, maxWait, ageBoost time.Duration) *HotplugQueueManager {
 	return &HotplugQueueManager{
@@ -468,7 +480,7 @@ func (m *HotplugQueueManager) next(node string) *hotplugQueueRequest {
 			nodeQueue.running = false
 			delete(m.nodes, node)
 			m.recordDepthMetricsLocked()
-			go m.persistSnapshot(HotplugQueueNodeSnapshot{Node: node})
+			go m.persistSnapshot(m.snapshotLocked(node))
 		}
 		return nil
 	}
@@ -542,7 +554,7 @@ func (m *HotplugQueueManager) effectiveWaitLimitLocked(nodeQueue *hotplugNodeQue
 }
 
 func (m *HotplugQueueManager) snapshotLocked(node string) HotplugQueueNodeSnapshot {
-	snapshot := HotplugQueueNodeSnapshot{Node: node}
+	snapshot := HotplugQueueNodeSnapshot{Node: node, version: m.snapshotSeq.Add(1)}
 	nodeQueue := m.nodes[node]
 	if nodeQueue == nil {
 		return snapshot
@@ -611,89 +623,99 @@ func (m *HotplugQueueManager) persistSnapshot(snapshot HotplugQueueNodeSnapshot)
 	if m == nil || m.runtime == nil || !m.runtime.enabled || snapshot.Node == "" {
 		return
 	}
-	if snapshot.Active == nil && snapshot.QueuedCount == 0 {
-		m.persistSnapshotNow(snapshot)
-		return
+	if snapshot.version == 0 {
+		snapshot.version = m.snapshotSeq.Add(1)
 	}
-	if m.snapshotDebounce > 0 {
-		m.deferSnapshot(snapshot)
-		return
-	}
-	m.persistSnapshotNow(snapshot)
-}
-
-func (m *HotplugQueueManager) deferSnapshot(snapshot HotplugQueueNodeSnapshot) {
 	m.snapshotMu.Lock()
-	if m.pendingSnapshots == nil {
-		m.pendingSnapshots = map[string]HotplugQueueNodeSnapshot{}
+	defer m.snapshotMu.Unlock()
+	if m.snapshots == nil {
+		m.snapshots = make(map[string]*hotplugSnapshotState)
 	}
-	if m.snapshotTimers == nil {
-		m.snapshotTimers = map[string]*time.Timer{}
+	state := m.snapshots[snapshot.Node]
+	if state == nil {
+		state = &hotplugSnapshotState{}
+		m.snapshots[snapshot.Node] = state
 	}
-	m.pendingSnapshots[snapshot.Node] = snapshot
-	if _, exists := m.snapshotTimers[snapshot.Node]; !exists {
-		node := snapshot.Node
-		m.snapshotTimers[node] = time.AfterFunc(m.snapshotDebounce, func() {
-			m.flushPendingSnapshot(node)
-		})
+	if snapshot.version <= state.latest.version {
+		return
 	}
-	m.snapshotMu.Unlock()
+	state.latest = snapshot
+	state.failures = 0
+	if state.running {
+		return
+	}
+	delay := m.snapshotDebounce
+	if snapshot.Active == nil && snapshot.QueuedCount == 0 {
+		delay = 0
+		if state.timer != nil {
+			state.timer.Stop()
+			state.timer = nil
+		}
+	}
+	if state.timer == nil {
+		state.timer = time.AfterFunc(delay, func() { m.flushPendingSnapshot(snapshot.Node) })
+	}
 }
 
 func (m *HotplugQueueManager) flushPendingSnapshot(node string) {
 	m.snapshotMu.Lock()
-	snapshot, ok := m.pendingSnapshots[node]
-	delete(m.pendingSnapshots, node)
-	delete(m.snapshotTimers, node)
-	m.snapshotMu.Unlock()
-	if ok {
-		m.persistSnapshotNow(snapshot)
-	}
-}
-
-func (m *HotplugQueueManager) persistSnapshotNow(snapshot HotplugQueueNodeSnapshot) {
-	if m == nil || m.runtime == nil || !m.runtime.enabled || snapshot.Node == "" {
+	state := m.snapshots[node]
+	if state == nil || state.running {
+		m.snapshotMu.Unlock()
 		return
 	}
-	m.snapshotMu.Lock()
-	defer m.snapshotMu.Unlock()
-	if m.lastSnapshots == nil {
-		m.lastSnapshots = map[string]string{}
+	if state.timer != nil {
+		state.timer.Stop()
+		state.timer = nil
 	}
-	if timer := m.snapshotTimers[snapshot.Node]; timer != nil {
-		timer.Stop()
-		delete(m.snapshotTimers, snapshot.Node)
-	}
-	delete(m.pendingSnapshots, snapshot.Node)
-	if snapshot.Active == nil && snapshot.QueuedCount == 0 {
-		if last, ok := m.lastSnapshots[snapshot.Node]; ok && last == "" {
+	state.running = true
+	for {
+		snapshot := state.latest
+		payload := ""
+		if snapshot.Active != nil || snapshot.QueuedCount != 0 {
+			encoded, err := json.Marshal(snapshot)
+			if err != nil {
+				state.running = false
+				m.snapshotMu.Unlock()
+				return
+			}
+			payload = string(encoded)
+		}
+		if state.persisted && state.lastPayload == payload {
+			state.running = false
+			m.snapshotMu.Unlock()
 			return
 		}
-		if err := m.runtime.DeleteConfigMapKey(context.Background(), m.namespace, hotplugQueueStateConfigMapName, snapshot.Node); err != nil {
-			klog.V(4).InfoS("Failed to clear hotplug queue snapshot", "node", snapshot.Node, "err", err)
-			delete(m.lastSnapshots, snapshot.Node)
-			return
+		m.snapshotMu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), hotplugSnapshotTimeout)
+		var err error
+		if payload == "" {
+			err = m.runtime.DeleteConfigMapKey(ctx, m.namespace, hotplugQueueStateConfigMapName, node)
+		} else {
+			err = m.runtime.UpsertConfigMapData(ctx, m.namespace, hotplugQueueStateConfigMapName, map[string]string{node: payload})
 		}
-		m.lastSnapshots[snapshot.Node] = ""
+		cancel()
+		m.snapshotMu.Lock()
+		state.persisted = false
+		if state.latest.version != snapshot.version {
+			continue
+		}
+		state.running = false
+		if err == nil {
+			state.lastPayload = payload
+			state.persisted = true
+			state.failures = 0
+		} else {
+			state.failures++
+			klog.V(4).InfoS("Failed to persist hotplug queue snapshot", "node", node, "err", err, "attempt", state.failures)
+			if state.failures <= hotplugSnapshotMaxRetries {
+				delay := 100 * time.Millisecond * time.Duration(1<<(state.failures-1))
+				state.timer = time.AfterFunc(delay, func() { m.flushPendingSnapshot(node) })
+			}
+		}
+		m.snapshotMu.Unlock()
 		return
 	}
-	payload, err := json.Marshal(snapshot)
-	if err != nil {
-		klog.V(4).InfoS("Failed to marshal hotplug queue snapshot", "node", snapshot.Node, "err", err)
-		return
-	}
-	payloadString := string(payload)
-	if last, ok := m.lastSnapshots[snapshot.Node]; ok && last == payloadString {
-		return
-	}
-	if err := m.runtime.UpsertConfigMapData(context.Background(), m.namespace, hotplugQueueStateConfigMapName, map[string]string{
-		snapshot.Node: payloadString,
-	}); err != nil {
-		klog.V(4).InfoS("Failed to persist hotplug queue snapshot", "node", snapshot.Node, "err", err)
-		delete(m.lastSnapshots, snapshot.Node)
-		return
-	}
-	m.lastSnapshots[snapshot.Node] = payloadString
 }
 
 func requestSnapshot(req *hotplugQueueRequest) HotplugQueueItemSnapshot {

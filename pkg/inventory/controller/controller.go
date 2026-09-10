@@ -832,7 +832,11 @@ func (s *Syncer) reconcileBenchmarkRuns(ctx context.Context, discovered map[int]
 			}
 			_ = s.cleanupValidationResources(ctx, current.Status.JobName, current.Status.PVCName)
 		}
-		if blocked, message, healthErr := s.benchmarkPinnedNodeBlocked(ctx, &resolved); healthErr != nil {
+		admitted, admissionErr := s.benchmarkResourcesExist(ctx, &resolved, jobName, pvcName)
+		if admissionErr != nil {
+			return admissionErr
+		}
+		if blocked, message, healthErr := s.benchmarkAdmissionBlocked(ctx, &resolved, admitted); healthErr != nil {
 			return healthErr
 		} else if blocked {
 			now := metav1.Now()
@@ -2009,6 +2013,35 @@ func selectedDatastoreFromPV(pv corev1.PersistentVolume) (int, string, bool) {
 		return 0, "", false
 	}
 	return id, strings.TrimSpace(pv.Annotations[annotationDatastoreName]), true
+}
+
+func (s *Syncer) benchmarkResourcesExist(ctx context.Context, run *inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun, jobName, pvcName string) (bool, error) {
+	for _, object := range []ctrlclient.Object{&corev1.PersistentVolumeClaim{}, &batchv1.Job{}} {
+		name := pvcName
+		if _, ok := object.(*batchv1.Job); ok {
+			name = jobName
+		}
+		if err := s.apiReader.Get(ctx, types.NamespacedName{Namespace: s.namespace, Name: name}, object); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return false, err
+		}
+		for key, value := range benchmarkResourceLabels(run) {
+			if object.GetLabels()[key] != value {
+				return false, fmt.Errorf("benchmark resource %s does not belong to run %s", name, run.Name)
+			}
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func (s *Syncer) benchmarkAdmissionBlocked(ctx context.Context, run *inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun, admitted bool) (bool, string, error) {
+	if admitted {
+		return false, "", nil
+	}
+	return s.benchmarkPinnedNodeBlocked(ctx, run)
 }
 
 func (s *Syncer) benchmarkPinnedNodeBlocked(ctx context.Context, run *inventoryv1alpha1.OpenNebulaDatastoreBenchmarkRun) (bool, string, error) {

@@ -108,6 +108,7 @@ type VolumeRepairState struct {
 	LastKnownTarget         string             `json:"lastKnownTarget,omitempty"`
 	LastKnownDeviceSerial   string             `json:"lastKnownDeviceSerial,omitempty"`
 	EvidenceSource          string             `json:"evidenceSource,omitempty"`
+	RecoveryToken           string             `json:"recoveryToken,omitempty"`
 	FailureCount            int                `json:"failureCount"`
 	FirstObservedAt         time.Time          `json:"firstObservedAt"`
 	LastObservedAt          time.Time          `json:"lastObservedAt"`
@@ -116,10 +117,11 @@ type VolumeRepairState struct {
 }
 
 type VolumeHistoryManager struct {
-	mu        sync.RWMutex
-	runtime   *KubeRuntime
-	namespace string
-	entries   map[string]VolumeHistoryRecord
+	mu         sync.RWMutex
+	runtime    *KubeRuntime
+	namespace  string
+	entries    map[string]VolumeHistoryRecord
+	writeLocks map[string]chan struct{}
 }
 
 func NewVolumeHistoryManager(runtime *KubeRuntime, namespace string) *VolumeHistoryManager {
@@ -178,8 +180,11 @@ func (m *VolumeHistoryManager) Upsert(ctx context.Context, volumeID string, muta
 		return VolumeHistoryRecord{}, nil
 	}
 	volumeID = strings.TrimSpace(volumeID)
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	release, err := m.lockWrite(ctx, volumeID)
+	if err != nil {
+		return VolumeHistoryRecord{}, err
+	}
+	defer release()
 	apply := func(state *VolumeHistoryRecord) {
 		state.VolumeID = volumeID
 		state.Version = stateObjectVersion
@@ -187,14 +192,16 @@ func (m *VolumeHistoryManager) Upsert(ctx context.Context, volumeID string, muta
 		state.VolumeID = volumeID
 		normalizeVolumeHistoryRecord(state)
 	}
-	state := m.entries[volumeID]
+	state, _ := m.Get(volumeID)
 	if m.runtime == nil || !m.runtime.enabled {
 		apply(&state)
+		m.mu.Lock()
 		m.entries[volumeID] = state
+		m.mu.Unlock()
 		return state, nil
 	}
 	cmClient := m.runtime.client.CoreV1().ConfigMaps(m.namespace)
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		cm, err := cmClient.Get(ctx, volumeHistoryStateConfigMapName, metav1.GetOptions{})
 		missing := errors.IsNotFound(err)
 		if err != nil && !missing {
@@ -231,8 +238,29 @@ func (m *VolumeHistoryManager) Upsert(ctx context.Context, volumeID string, muta
 	if err != nil {
 		return state, err
 	}
+	m.mu.Lock()
 	m.entries[volumeID] = state
+	m.mu.Unlock()
 	return state, nil
+}
+
+func (m *VolumeHistoryManager) lockWrite(ctx context.Context, volumeID string) (func(), error) {
+	m.mu.Lock()
+	if m.writeLocks == nil {
+		m.writeLocks = make(map[string]chan struct{})
+	}
+	lock := m.writeLocks[volumeID]
+	if lock == nil {
+		lock = make(chan struct{}, 1)
+		m.writeLocks[volumeID] = lock
+	}
+	m.mu.Unlock()
+	select {
+	case lock <- struct{}{}:
+		return func() { <-lock }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (m *VolumeHistoryManager) Clear(ctx context.Context, volumeID string) error {
@@ -240,13 +268,20 @@ func (m *VolumeHistoryManager) Clear(ctx context.Context, volumeID string) error
 		return nil
 	}
 	volumeID = strings.TrimSpace(volumeID)
+	release, err := m.lockWrite(ctx, volumeID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if m.runtime != nil && m.runtime.enabled {
+		if err := m.runtime.DeleteConfigMapKey(ctx, m.namespace, volumeHistoryStateConfigMapName, volumeID); err != nil {
+			return err
+		}
+	}
 	m.mu.Lock()
 	delete(m.entries, volumeID)
 	m.mu.Unlock()
-	if m.runtime == nil || !m.runtime.enabled {
-		return nil
-	}
-	return m.runtime.DeleteConfigMapKey(ctx, m.namespace, volumeHistoryStateConfigMapName, volumeID)
+	return nil
 }
 
 func (m *VolumeHistoryManager) RefreshEntry(ctx context.Context, volumeID string) error {
@@ -254,6 +289,11 @@ func (m *VolumeHistoryManager) RefreshEntry(ctx context.Context, volumeID string
 		return nil
 	}
 	volumeID = strings.TrimSpace(volumeID)
+	release, err := m.lockWrite(ctx, volumeID)
+	if err != nil {
+		return err
+	}
+	defer release()
 	cm, err := m.runtime.GetConfigMap(ctx, m.namespace, volumeHistoryStateConfigMapName)
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -383,9 +423,110 @@ func (m *VolumeRepairStateManager) Get(volumeID string) (VolumeRepairState, bool
 	return state, ok
 }
 
+func (m *VolumeRepairStateManager) GetCurrent(ctx context.Context, volumeID string) (VolumeRepairState, bool, error) {
+	if m == nil || strings.TrimSpace(volumeID) == "" {
+		return VolumeRepairState{}, false, nil
+	}
+	if m.runtime == nil || !m.runtime.enabled {
+		state, ok := m.Get(volumeID)
+		return state, ok, nil
+	}
+	cm, err := m.runtime.GetConfigMap(ctx, m.namespace, volumeRepairStateConfigMapName)
+	if err != nil && !errors.IsNotFound(err) {
+		return VolumeRepairState{}, false, err
+	}
+	var state VolumeRepairState
+	if err == nil && cm.Data[volumeID] != "" {
+		if err := json.Unmarshal([]byte(cm.Data[volumeID]), &state); err != nil {
+			return state, false, err
+		}
+		if state.Classification != repairClassificationRuntimeAttachUnconfirmed {
+			return state, true, nil
+		}
+	}
+	cm, err = m.runtime.GetConfigMap(ctx, m.namespace, localDeviceStateConfigMapName)
+	if errors.IsNotFound(err) {
+		return VolumeRepairState{}, false, nil
+	}
+	if err != nil {
+		return VolumeRepairState{}, false, err
+	}
+	for _, raw := range cm.Data {
+		var report LocalDeviceMissingReport
+		if err := json.Unmarshal([]byte(raw), &report); err != nil {
+			return VolumeRepairState{}, false, err
+		}
+		if report.VolumeID != volumeID || report.ConfirmationState != localDeviceConfirmationStateRepairRequired {
+			continue
+		}
+		return VolumeRepairState{
+			Version: stateObjectVersion, VolumeID: volumeID,
+			Classification: repairClassificationRuntimeAttachUnconfirmed,
+			Reason:         localDeviceFailureClass(report), Message: report.LastRecoveryError,
+			RequestedNode: report.Node, LastKnownNodeName: report.Node,
+			LastKnownTarget:       firstNonEmpty(report.MetadataTarget, report.ExpectedTarget, report.VolumeName),
+			LastKnownDeviceSerial: report.DeviceSerial, EvidenceSource: "local_device_report", RecoveryToken: report.RecoveryToken,
+			FailureCount: report.RecoveryAttempts, FirstObservedAt: report.FirstObservedAt,
+			LastObservedAt: report.LastObservedAt, LastObservedIdentity: report.ObservedIdentity,
+		}, true, nil
+	}
+	return VolumeRepairState{}, false, nil
+}
+
+func (m *VolumeRepairStateManager) ClearObserved(ctx context.Context, expected VolumeRepairState) error {
+	if m == nil || expected.VolumeID == "" || expected.Classification == repairClassificationRuntimeAttachUnconfirmed {
+		return nil
+	}
+	if m.runtime == nil || !m.runtime.enabled {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if current, ok := m.entries[expected.VolumeID]; ok && sameRepairStateObservation(current, expected) {
+			delete(m.entries, expected.VolumeID)
+		}
+		return nil
+	}
+	cmClient := m.runtime.client.CoreV1().ConfigMaps(m.namespace)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		cm, err := cmClient.Get(ctx, volumeRepairStateConfigMapName, metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var current VolumeRepairState
+		if raw := cm.Data[expected.VolumeID]; raw == "" {
+			return nil
+		} else if err := json.Unmarshal([]byte(raw), &current); err != nil {
+			return err
+		}
+		if !sameRepairStateObservation(current, expected) {
+			return nil
+		}
+		delete(cm.Data, expected.VolumeID)
+		if _, err := cmClient.Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+			return err
+		}
+		m.mu.Lock()
+		if cached, ok := m.entries[expected.VolumeID]; ok && sameRepairStateObservation(cached, expected) {
+			delete(m.entries, expected.VolumeID)
+		}
+		m.mu.Unlock()
+		return nil
+	})
+}
+
+func sameRepairStateObservation(current, expected VolumeRepairState) bool {
+	return sameRepairStateSeries(current, expected) && current.FirstObservedAt.Equal(expected.FirstObservedAt) &&
+		current.LastObservedAt.Equal(expected.LastObservedAt) && current.FailureCount == expected.FailureCount
+}
+
 func (m *VolumeRepairStateManager) Mark(ctx context.Context, state VolumeRepairState) (VolumeRepairState, error) {
 	if m == nil || strings.TrimSpace(state.VolumeID) == "" {
 		return state, nil
+	}
+	if state.Classification == repairClassificationRuntimeAttachUnconfirmed {
+		return state, fmt.Errorf("runtime attachment repair must be committed through its local device report")
 	}
 	state.VolumeID = strings.TrimSpace(state.VolumeID)
 	state.Version = stateObjectVersion
@@ -410,12 +551,14 @@ func (m *VolumeRepairStateManager) Mark(ctx context.Context, state VolumeRepairS
 		state.FirstObservedAt = now
 		state.FailureCount = 1
 	}
-	m.entries[state.VolumeID] = state
 	m.mu.Unlock()
 
 	if err := m.persistEntry(ctx, state); err != nil {
 		return state, err
 	}
+	m.mu.Lock()
+	m.entries[state.VolumeID] = state
+	m.mu.Unlock()
 	return state, nil
 }
 

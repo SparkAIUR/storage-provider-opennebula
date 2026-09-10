@@ -242,18 +242,34 @@ func (ns *NodeServer) discoverSharedFilesystemTargets(volumeID, stagePath string
 			stage = &infos[i]
 		}
 	}
-	if stage == nil || !isCephFSMount(*stage) {
-		return nil, fmt.Errorf("stage mount is missing")
+	if err := ns.verifySharedFilesystemStage(volumeID, stagePath); err != nil {
+		return nil, err
 	}
 	var targets []sharedFilesystemPublishedTarget
 	for _, info := range infos {
-		if info.MountPoint == stagePath || !strings.Contains(info.MountPoint, "/volumes/kubernetes.io~csi/") || !sameSharedFilesystemMount(*stage, info) {
+		if info.MountPoint == stagePath || !strings.Contains(info.MountPoint, "/volumes/kubernetes.io~csi/") || !isCephFSMount(info) {
+			continue
+		}
+		data, err := sharedFilesystemMetadata(info.MountPoint)
+		if err != nil {
+			return nil, err
+		}
+		if data.VolumeHandle != volumeID {
+			if stage != nil && sameSharedFilesystemMount(*stage, info) {
+				return nil, fmt.Errorf("stage mount has a target owned by another volume")
+			}
 			continue
 		}
 		if err := ns.verifySharedFilesystemTarget(volumeID, info.MountPoint); err != nil {
 			return nil, err
 		}
-		targets = append(targets, sharedFilesystemPublishedTarget{TargetPath: info.MountPoint, MountOptions: sharedFilesystemMountOptionsFromMountPoint(mount.MountPoint{Opts: info.MountOptions})})
+		options := append([]string(nil), info.MountOptions...)
+		for _, option := range info.SuperOptions {
+			if option == "ro" {
+				options = append(options, option)
+			}
+		}
+		targets = append(targets, sharedFilesystemPublishedTarget{TargetPath: info.MountPoint, MountOptions: sharedFilesystemMountOptionsFromMountPoint(mount.MountPoint{Opts: options})})
 	}
 	return normalizeSharedFilesystemPublishedTargets(targets), nil
 }

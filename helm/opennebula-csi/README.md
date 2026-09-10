@@ -293,14 +293,11 @@ Recovery now has an explicit runtime-confirmation state machine:
 - provider-side attach success leaves the report in `pending_runtime_confirmation`
 - only a later successful `NodeStageVolume` clears the active recovery episode
 - if the node never confirms device visibility before the confirmation deadline, the episode transitions to `timed_out_waiting_for_node_confirmation`
-- once the episode exhausts its configured budget, the driver records `same_node_runtime_attach_unconfirmed` in `opennebula-csi-volume-repair-state` and blocks further automatic same-node recovery with `repair_required_runtime_attach_unconfirmed`
+- once the episode exhausts its configured budget, its durable local-device report becomes `repair_required_runtime_attach_unconfirmed`; controller guards derive `same_node_runtime_attach_unconfirmed` directly from that report, avoiding a separate repair-record commit
 
 This recovery path never moves a volume to a different node. It skips CephFS, RWX, non-local backends, missing desired state, NotReady Kubernetes nodes, and non-running OpenNebula VMs. Failed recovery attempts are rate-limited with `driver.localDeviceRecovery.cooldownSeconds` and capped with `driver.localDeviceRecovery.maxAttemptsPerVolume`. Repeated missing-device reports for the same `(volume, node, failure-class)` attach to the active recovery episode instead of resetting the counters.
 
-The driver distinguishes two same-node repair methods:
-
-- `runtime_republish`: used only when OpenNebula metadata no longer shows the disk attached and the controller can safely reissue same-node attach
-- `same_node_detach_attach_fallback`: used when metadata still shows the disk attached, because OpenNebula does not expose a safe runtime-only re-hotplug primitive for an already-declared VM disk
+The `runtime_republish` method attaches only after typed inspection proves the image has no VM owner or disk record. Lookup errors do not prove absence. Metadata-attached disks require manual repair after consumers are drained. Automatic recovery never detaches them, and no operator force flag bypasses this restriction.
 
 OpenNebula metadata attachment is no longer treated as final proof of healing. It is sequencing evidence only.
 
@@ -442,7 +439,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.hotplugQueue.perItemWaitSeconds` | Extra wait budget added per active or queued request ahead of a new request. | `60` | No |
 | `driver.hotplugQueue.maxWaitCapSeconds` | Upper bound for dynamic queue wait budgets. | `900` | No |
 | `driver.hotplugQueue.maxActiveSeconds` | Maximum execution time for an active queued hotplug request before it is classified as timed out. | `900` | No |
-| `driver.hotplugQueue.snapshotDebounceSeconds` | Debounce interval for hotplug queue ConfigMap snapshots during recovery churn. Empty queue snapshots still flush immediately. | `2` | No |
+| `driver.hotplugQueue.snapshotDebounceSeconds` | Debounce interval for hotplug queue ConfigMap snapshots during recovery churn. Empty queue snapshots bypass debounce; API writes run independently per node with two-second deadlines and up to five delayed retries. | `2` | No |
 | `driver.hotplugDiagnostics.enabled` | Persist read-only OpenNebula HOTPLUG observations for support bundles, inventory status, and timeout diagnosis. | `true` | No |
 | `driver.hotplugDiagnostics.stuckAfterSeconds` | HOTPLUG age after which an unchanged observation is classified as stuck. | `300` | No |
 | `driver.hotplugDiagnostics.progressWindowSeconds` | Required unchanged observation window before a HOTPLUG VM is classified as stuck. | `60` | No |
@@ -463,7 +460,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.hostArtifactQuarantine.enabled` | Enable read-only quarantine when local `fs_lvm_ssh` attach failures indicate a stale host-side LV such as `lv-one-<vm>-<disk>`. | `true` | No |
 | `driver.hostArtifactQuarantine.failureThreshold` | Matching host-artifact failures required before the VM/disk slot quarantine is active. | `1` | No |
 | `driver.hostArtifactQuarantine.ttlSeconds` | Active host-artifact quarantine duration; after external repair, operators can also clear the matching `opennebula-csi-host-artifact-state` key to retry immediately. | `3600` | No |
-| `driver.localDeviceRecovery.enabled` | Enable controller-driven same-node detach/reattach recovery after node-side local device discovery repeatedly fails. | `true` | No |
+| `driver.localDeviceRecovery.enabled` | Enable same-node attachment recovery after typed inspection proves metadata absence; attached disks require manual repair. | `true` | No |
 | `driver.localDeviceRecovery.minAttempts` | Missing-device reports required from a node before recovery is eligible. | `3` | No |
 | `driver.localDeviceRecovery.minAgeSeconds` | Minimum age of the first missing-device report before recovery is eligible. | `60` | No |
 | `driver.localDeviceRecovery.intervalSeconds` | Controller leader scan interval for `opennebula-csi-node-device-state`. | `15` | No |

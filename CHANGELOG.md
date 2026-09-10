@@ -2,6 +2,11 @@
 
 ## v0.5.29, unreleased
 
+- Block automatic detach of metadata-attached disks; retain wrong-device evidence and bind confirmation to the observed recovery episode.
+- Reconstruct owned CephFS sibling binds across absent stages and older superblocks before recovery.
+- Persist hotplug snapshots independently per node with deadlines, ordering and bounded retries; keep history API writes outside the shared cache lock.
+- Derive runtime repair from durable device reports, require current bounded manual mode for forced reprobe, and preserve benchmark admission across restart.
+
 - Verify mounted filesystem expansion using filesystem geometry instead of statfs capacity, which excludes ext4 metadata. This fixes fully expanded 40 GiB volumes remaining in NodeResizeError and blocking pod startup.
 - Require the full requested block-device size before running the filesystem resizer. The legacy byte-tolerance setting remains accepted but is ignored.
 - Fail closed when resize or geometry inspection fails; retain bounded retries for incomplete growth.

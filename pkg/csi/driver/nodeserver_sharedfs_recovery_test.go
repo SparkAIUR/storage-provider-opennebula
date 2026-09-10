@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -540,5 +541,133 @@ func TestSharedFilesystemPublishRehydratesStaleSessionWithExistingBinds(t *testi
 			require.True(t, exists)
 			require.Len(t, persisted.PublishedTargets, 1, "discovered bind intent must survive recovery failures")
 		})
+	}
+}
+
+func TestSharedFilesystemReconstructionPreservesSiblingGenerations(t *testing.T) {
+	for _, operation := range []string{"stage", "publish"} {
+		for _, generation := range []string{"absent-stage", "new-stage", "ambiguous", "missing-metadata"} {
+			t.Run(operation+"/"+generation, func(t *testing.T) {
+				withSharedFilesystemTestPaths(t)
+				ns := getTestNodeServer(nil)
+				ns.Driver.featureGates.CephFSSelfHealing = true
+				id, stage, first := stageSharedFilesystemFixture(t, ns, "siblings")
+				otherID, otherStage, otherTarget := stageSharedFilesystemFixture(t, ns, "unrelated")
+				_, err := ns.NodePublishVolume(context.Background(), newSharedFilesystemPublishRequest(otherID, otherStage, otherTarget))
+				require.NoError(t, err)
+				second := filepath.Join(filepath.Dir(filepath.Dir(first)), "pvc-sibling", "mount")
+				require.NoError(t, os.MkdirAll(filepath.Dir(second), 0750))
+				payload, err := json.Marshal(sharedFilesystemVolumeData{DriverName: DefaultDriverName, VolumeHandle: id, SpecVolID: "pvc-sibling", NodeName: ns.Driver.nodeID})
+				require.NoError(t, err)
+				require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(second), "vol_data.json"), payload, 0600))
+				for _, target := range []string{first, second} {
+					req := newSharedFilesystemPublishRequest(id, stage, target)
+					req.Readonly = target == second
+					_, err := ns.NodePublishVolume(context.Background(), req)
+					require.NoError(t, err)
+				}
+				fakeMount := ns.mounter.Interface.(*mount.FakeMounter)
+				ns.sharedFS.unmount = func(ctx context.Context, path string) error {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					before, err := fakeMount.List()
+					if err != nil {
+						return err
+					}
+					if err := fakeMount.Unmount(path); err != nil {
+						return err
+					}
+					for i, remaining := range fakeMount.MountPoints {
+						for _, original := range before {
+							if remaining.Path == original.Path {
+								fakeMount.MountPoints[i] = original
+							}
+						}
+					}
+					return nil
+				}
+				for i := range fakeMount.MountPoints {
+					if fakeMount.MountPoints[i].Path == first || fakeMount.MountPoints[i].Path == second {
+						fakeMount.MountPoints[i].Device = "old-superblock"
+					}
+				}
+				if generation == "absent-stage" {
+					require.NoError(t, ns.sharedFS.unmount(context.Background(), stage))
+				}
+				if generation == "ambiguous" {
+					fakeMount.MountPoints = append(fakeMount.MountPoints, mount.MountPoint{Device: "duplicate", Path: second, Type: "fuse.ceph-fuse"})
+				}
+				if generation == "missing-metadata" {
+					require.NoError(t, os.Remove(filepath.Join(filepath.Dir(second), "vol_data.json")))
+				}
+				require.NoError(t, ns.deleteSharedFilesystemSession(id))
+				healthy := false
+				ns.sharedFS.probe = func(_ context.Context, path string) error {
+					if path == otherStage || path == otherTarget || healthy {
+						return nil
+					}
+					return syscall.ENOTCONN
+				}
+				mounts := 0
+				fuse := ns.sharedFS.fuse
+				ns.sharedFS.fuse = func(ctx context.Context, session sharedFilesystemSession, args []string) error {
+					mounts++
+					persisted, exists, err := ns.sharedFilesystemRecovery.store.Load(id)
+					require.NoError(t, err)
+					require.True(t, exists)
+					require.Len(t, persisted.PublishedTargets, 2)
+					for _, target := range persisted.PublishedTargets {
+						if target.TargetPath == second {
+							require.Contains(t, target.MountOptions, "ro")
+						}
+					}
+					healthy = true
+					return fuse(ctx, session, args)
+				}
+				before, err := ns.mounter.List()
+				require.NoError(t, err)
+				if operation == "stage" {
+					_, err = ns.NodeStageVolume(context.Background(), newSharedFilesystemStageRequest(id, stage, "fuse"))
+				} else {
+					req := newSharedFilesystemPublishRequest(id, stage, first)
+					for key, value := range newSharedFilesystemStageRequest(id, stage, "fuse").PublishContext {
+						req.PublishContext[key] = value
+					}
+					_, err = ns.NodePublishVolume(context.Background(), req)
+					if generation == "absent-stage" {
+						require.Error(t, err)
+						require.Zero(t, mounts)
+						require.NoError(t, ns.sharedFilesystemRecovery.recoverVolume(context.Background(), id))
+						_, err = ns.NodePublishVolume(context.Background(), req)
+					}
+				}
+				if generation == "ambiguous" || generation == "missing-metadata" {
+					require.Error(t, err)
+					require.Zero(t, mounts)
+					_, exists, err := ns.sharedFilesystemRecovery.store.Load(id)
+					require.NoError(t, err)
+					require.False(t, exists)
+					after, err := ns.mounter.List()
+					require.NoError(t, err)
+					require.Equal(t, before, after)
+					return
+				}
+				require.NoError(t, err)
+				require.Equal(t, 1, mounts)
+				require.NoError(t, ns.verifySharedFilesystemBind(stage, first))
+				require.NoError(t, ns.verifySharedFilesystemBind(stage, second))
+				require.NoError(t, ns.verifySharedFilesystemTargetFlags(sharedFilesystemPublishedTarget{TargetPath: second, MountOptions: []string{"ro"}}))
+				require.NoError(t, ns.verifySharedFilesystemBind(otherStage, otherTarget))
+				for _, original := range before {
+					if original.Path == otherStage || original.Path == otherTarget {
+						current, mounted, err := ns.mountPointForPath(original.Path)
+						require.NoError(t, err)
+						require.True(t, mounted)
+						require.Equal(t, original, current)
+					}
+				}
+			})
+		}
 	}
 }

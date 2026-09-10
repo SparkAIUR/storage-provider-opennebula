@@ -395,7 +395,10 @@ func (s *ControllerServer) rejectIfActiveRepairState(ctx context.Context, volume
 	if s == nil || s.driver == nil || s.driver.volumeRepairState == nil {
 		return nil
 	}
-	state, ok := s.driver.volumeRepairState.Get(volumeID)
+	state, ok, err := s.driver.volumeRepairState.GetCurrent(ctx, volumeID)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "cannot verify current volume repair state: %v", err)
+	}
 	if !ok {
 		return nil
 	}
@@ -409,8 +412,8 @@ func (s *ControllerServer) clearRepairStateOnSuccess(ctx context.Context, volume
 	if s == nil || s.driver == nil || s.driver.volumeRepairState == nil || strings.TrimSpace(volumeID) == "" {
 		return
 	}
-	if state, ok := s.driver.volumeRepairState.Get(volumeID); ok {
-		if err := s.driver.volumeRepairState.Clear(ctx, volumeID); err == nil {
+	if state, ok, err := s.driver.volumeRepairState.GetCurrent(ctx, volumeID); err == nil && ok {
+		if err := s.driver.volumeRepairState.ClearObserved(ctx, state); err == nil {
 			s.driver.metrics.RecordVolumeRepairState(state.Classification, "cleared")
 		}
 	}
@@ -420,8 +423,8 @@ func (ns *NodeServer) clearRepairStateOnSuccess(ctx context.Context, volumeID st
 	if ns == nil || ns.Driver == nil || ns.Driver.volumeRepairState == nil || strings.TrimSpace(volumeID) == "" {
 		return
 	}
-	if state, ok := ns.Driver.volumeRepairState.Get(volumeID); ok {
-		if err := ns.Driver.volumeRepairState.Clear(ctx, volumeID); err == nil {
+	if state, ok, err := ns.Driver.volumeRepairState.GetCurrent(ctx, volumeID); err == nil && ok {
+		if err := ns.Driver.volumeRepairState.ClearObserved(ctx, state); err == nil {
 			ns.Driver.metrics.RecordVolumeRepairState(state.Classification, "cleared")
 		}
 	}
@@ -855,11 +858,11 @@ func identityField(identity *LocalDiskIdentity, getter func(*LocalDiskIdentity) 
 	return value
 }
 
-func (s *ControllerServer) repairStateForQueue(volumeID string) (VolumeRepairState, bool) {
+func (s *ControllerServer) repairStateForQueue(ctx context.Context, volumeID string) (VolumeRepairState, bool, error) {
 	if s == nil || s.driver == nil || s.driver.volumeRepairState == nil {
-		return VolumeRepairState{}, false
+		return VolumeRepairState{}, false, nil
 	}
-	return s.driver.volumeRepairState.Get(volumeID)
+	return s.driver.volumeRepairState.GetCurrent(ctx, volumeID)
 }
 
 func (s *ControllerServer) recordActiveRepairStateEvent(ctx context.Context, runtimeCtx *VolumeRuntimeContext, state VolumeRepairState) {

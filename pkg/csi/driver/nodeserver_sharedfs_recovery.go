@@ -778,7 +778,7 @@ func (ns *NodeServer) deleteSharedFilesystemSession(volumeID string) error {
 	return ns.sharedFilesystemRecovery.store.Delete(volumeID)
 }
 
-func (ns *NodeServer) ensureSharedFilesystemSessionForPublish(req *csi.NodePublishVolumeRequest) (sharedFilesystemSession, error) {
+func (ns *NodeServer) ensureSharedFilesystemSessionForPublish(ctx context.Context, req *csi.NodePublishVolumeRequest) (sharedFilesystemSession, error) {
 	if ns == nil || ns.sharedFilesystemRecovery == nil || req == nil {
 		return sharedFilesystemSession{}, nil
 	}
@@ -808,13 +808,12 @@ func (ns *NodeServer) ensureSharedFilesystemSessionForPublish(req *csi.NodePubli
 	if !ok {
 		return session, fmt.Errorf("cannot reconstruct session from publish request")
 	}
-	if _, mounted, err := ns.mountPointForPath(session.StagingTargetPath); err != nil {
+	session.PublishedTargets, err = ns.discoverSharedFilesystemTargets(volumeID, session.StagingTargetPath)
+	if err != nil {
 		return session, err
-	} else if mounted {
-		session.PublishedTargets, err = ns.discoverSharedFilesystemTargets(volumeID, session.StagingTargetPath)
-		if err != nil {
-			return session, err
-		}
+	}
+	if err := ns.verifySharedFilesystemSession(ctx, session); err != nil {
+		return session, err
 	}
 	if err := ns.sharedFilesystemRecovery.store.Save(session); err != nil {
 		return sharedFilesystemSession{}, err

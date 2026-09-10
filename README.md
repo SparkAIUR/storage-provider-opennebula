@@ -179,11 +179,11 @@ The local restart path includes a broader CSI performance and stability layer:
 - the node plugin now prefers stable `/dev/disk/by-id` resolution using an explicit OpenNebula disk serial and keeps a short-lived in-memory device cache
 - same-node hotplug work is queued fairly instead of failing fast with `node_busy`
 - local-device self-heal no longer treats OpenNebula template metadata as proof of recovery success; same-node repair stays pending until a later `NodeStageVolume` proves the guest can see the disk again
-- when metadata still says the disk is attached but the guest runtime cannot see it, the controller keeps recovery same-node only and falls back to detach/attach because OpenNebula does not expose a safe runtime-only re-hotplug primitive for an already-declared VM disk
+- when metadata still says the disk is attached but the guest runtime cannot see it, automatic recovery stops with a manual-repair outcome; consumers must be drained before external attachment repair because this release has no node/controller no-mount handoff
 - the controller can inject a soft last-node scheduling preference for local single-writer pods so StatefulSet restarts are more likely to land back on the previous node
 - a conservative stuck-attachment reconciler repairs orphaned OpenNebula attachments and stale `VolumeAttachment` objects
 - OpenNebulaNode `HotplugStuck` inventory status immediately pauses new hotplug work for that node until readiness gates and inventory diagnosis clear
-- hotplug queue state snapshots are debounced during churn while empty-queue snapshots still flush immediately for operator visibility
+- hotplug queue snapshots use independent per-node workers, two-second API deadlines, and up to five delayed retries; completion clears bypass debounce and superseded snapshots cannot overwrite them
 - attach, detach, and device-resolution latencies now feed an adaptive timeout window so slower environments raise budgets without reducing the current static timeout floor
 
 ### Controller maintenance mode

@@ -31,6 +31,9 @@ func localDeviceReportAttachSuccessBlock(report LocalDeviceMissingReport, node, 
 	if volumeID == "" {
 		return false, codes.OK, ""
 	}
+	if report.ConfirmationState == localDeviceConfirmationStateConfirmed && report.LastRecoveryOutcome == localDeviceConfirmationStateConfirmed && localDeviceFailureClass(report) != localDeviceFailureClassWrongIdentity {
+		return false, codes.OK, ""
+	}
 	base := fmt.Sprintf("refusing metadata-only attach success for volume %s on node %s", volumeID, strings.TrimSpace(node))
 	if target = strings.TrimSpace(target); target != "" {
 		base += fmt.Sprintf(" target %s", target)
@@ -38,7 +41,7 @@ func localDeviceReportAttachSuccessBlock(report LocalDeviceMissingReport, node, 
 	switch strings.TrimSpace(report.ConfirmationState) {
 	case localDeviceConfirmationStateRepairRequired:
 		return true, codes.FailedPrecondition, base + ": node-side runtime attachment was not confirmed and now requires manual repair"
-	case localDeviceConfirmationStatePending:
+	case localDeviceConfirmationStatePending, localDeviceConfirmationStateInProgress:
 		return true, codes.Unavailable, base + ": node-side runtime attachment confirmation is still pending"
 	}
 	if localDeviceFailureClass(report) == localDeviceFailureClassWrongIdentity {

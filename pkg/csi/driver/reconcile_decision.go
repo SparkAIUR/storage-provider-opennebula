@@ -215,7 +215,9 @@ func (s *ControllerServer) evaluateVolumeAttachDecision(ctx context.Context, dec
 			fmt.Sprintf("volume %s is already attached to node %s", evidence.VolumeID, evidence.NodeID),
 			evidence.AttachedTarget)
 	}
-	if state, ok := s.repairStateForQueue(evidence.VolumeID); ok {
+	if state, ok, err := s.repairStateForQueue(ctx, evidence.VolumeID); err != nil {
+		return decision.with(VolumeReconcilePause, queueReasonRepairRequired, codes.Unavailable, fmt.Sprintf("cannot verify current volume repair state: %v", err))
+	} else if ok {
 		evidence.RepairState = &state
 		decision = decision.withEvidence(evidence)
 		if evidence.RuntimeCtx != nil {

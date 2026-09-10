@@ -129,112 +129,69 @@ func TestNodeRecordsLocalDeviceMountFailureReport(t *testing.T) {
 	assert.Equal(t, 1, report.Attempts)
 }
 
-func TestLocalDeviceRecoveryReattachesSameNodeAndMarksPendingRuntimeConfirmation(t *testing.T) {
-	for _, outcome := range []string{"pending", "confirmed", "removed", "removed-after-error", "confirmed-before-detach"} {
+func TestLocalDeviceRecoveryRequiresProvenAttachmentAbsence(t *testing.T) {
+	for _, outcome := range []string{"metadata-attached", "unknown", "inspection-error", "other-owner", "absent", "confirmed-before-begin"} {
 		t.Run(outcome, func(t *testing.T) {
-			pv, pvc := newLocalPVAndPVC("vol-device", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
-			pvc.Spec.VolumeName = pv.Name
-			pvName := pv.Name
-			report := LocalDeviceMissingReport{
-				Node:              "node-a",
-				VolumeID:          "vol-device",
-				VolumeName:        "/dev/sdd",
-				ExpectedTarget:    "/dev/sdd",
-				PVCNamespace:      "default",
-				PVCName:           pvc.Name,
-				PVName:            pv.Name,
-				FirstObservedAt:   time.Now().Add(-2 * time.Minute),
-				LastObservedAt:    time.Now().Add(-time.Minute),
-				Attempts:          3,
-				DeviceSerial:      "onecsi-394",
-				OpenNebulaImageID: "394",
-			}
+			_, ns, server, provider, report := recoveryReviewFixture(t)
+			ctx := context.Background()
 			key := localDeviceReportKey(report.Node, report.VolumeID)
-			payload, err := json.Marshal(report)
-			require.NoError(t, err)
-			cm := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: localDeviceStateConfigMapName, Namespace: namespaceFromServiceAccount()},
-				Data:       map[string]string{key: string(payload)},
-			}
-			va := &storagev1.VolumeAttachment{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:              "va-device",
-					CreationTimestamp: metav1.NewTime(time.Now().Add(-30 * time.Second)),
-				},
-				Spec: storagev1.VolumeAttachmentSpec{
-					Attacher: DefaultDriverName,
-					NodeName: "node-a",
-					Source:   storagev1.VolumeAttachmentSource{PersistentVolumeName: &pvName},
-				},
-				Status: storagev1.VolumeAttachmentStatus{Attached: true},
-			}
-			driver := newLocalDeviceRecoveryTestDriver(t, pv, pvc, newReadyNode("node-a", true), va, cm)
-			mockProvider := &MockOpenNebulaVolumeProviderTestify{}
-			mockProvider.On("NodeReady", mock.Anything, "node-a").Return(true, nil).Once()
-			mockProvider.On("VolumeExists", mock.Anything, "vol-device").Return(394, 1, nil).Once()
-			mockProvider.On("NodeExists", mock.Anything, "node-a").Return(208, nil).Once()
-			driver.nodeID = report.Node
-			ns := &NodeServer{Driver: driver}
-			confirm := func() {
-				require.NoError(t, updateLocalDeviceReport(context.Background(), driver.kubeRuntime, namespaceFromServiceAccount(), key, func(current *LocalDeviceMissingReport) {
-					current.ConfirmationState = localDeviceConfirmationStateConfirmed
-					current.RecoveryToken = ""
-					current.ConfirmationDeadline = nil
-				}))
-			}
-			mockProvider.On("GetVolumeInNode", mock.Anything, 394, 208).Run(func(mock.Arguments) {
-				if outcome == "confirmed-before-detach" {
-					confirm()
-				}
-			}).Return("sdd", nil).Once()
-			if outcome != "confirmed-before-detach" {
-				mockProvider.On("DetachVolume", mock.Anything, "vol-device", "node-a").Return(nil).Once()
-				mockProvider.On("AttachVolume", mock.Anything, "vol-device", "node-a", false, mock.Anything).Run(func(mock.Arguments) {
-					current, exists := ns.currentLocalDeviceReport(context.Background(), report.VolumeID)
-					require.True(t, exists)
-					require.Equal(t, localDeviceConfirmationStatePending, current.ConfirmationState)
-					require.NotEmpty(t, current.RecoveryToken)
-					switch outcome {
-					case "confirmed":
-						confirm()
-					case "removed", "removed-after-error":
-						ns.confirmLocalDeviceRecovery(context.Background(), &current, report.VolumeID, "/dev/sdd", nil, nil)
+			provider.On("NodeReady", mock.Anything, report.Node).Return(true, nil).Once()
+			provider.On("VolumeExists", mock.Anything, report.VolumeID).Return(394, 1, nil).Once()
+			provider.On("NodeExists", mock.Anything, report.Node).Return(208, nil).Once()
+			if outcome == "metadata-attached" {
+				provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("sdd", nil).Once()
+			} else {
+				provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("", errors.New("lookup failed")).Once()
+				var metadata *opennebula.VolumeAttachmentMetadata
+				var inspectErr error
+				if outcome == "inspection-error" {
+					inspectErr = errors.New("provider unavailable")
+				} else if outcome != "unknown" {
+					metadata = &opennebula.VolumeAttachmentMetadata{VolumeHandle: report.VolumeID, ImageID: 394, RequestedNodeID: 208}
+					if outcome == "other-owner" {
+						metadata.ImageVMIDs = []int{209}
 					}
+				}
+				provider.On("InspectVolumeAttachment", mock.Anything, report.VolumeID, report.Node).Run(func(mock.Arguments) {
+					if outcome == "confirmed-before-begin" {
+						ns.confirmLocalDeviceRecovery(ctx, &report, report.VolumeID, "/dev/sdd", nil, nil)
+					}
+				}).Return(metadata, inspectErr).Once()
+			}
+			if outcome == "absent" {
+				provider.On("AttachVolume", mock.Anything, report.VolumeID, report.Node, false, mock.Anything).Run(func(mock.Arguments) {
+					inProgress, exists := ns.currentLocalDeviceReport(ctx, report.VolumeID)
+					require.True(t, exists)
+					require.Equal(t, localDeviceConfirmationStateInProgress, inProgress.ConfirmationState)
+					ns.confirmLocalDeviceRecovery(ctx, &report, report.VolumeID, "/dev/sdd", nil, nil)
+					ns.confirmLocalDeviceRecovery(ctx, &inProgress, report.VolumeID, "/dev/sdd", nil, nil)
+					current, _ := ns.currentLocalDeviceReport(ctx, report.VolumeID)
+					require.Equal(t, inProgress, current)
 				}).Return(nil).Once()
-				var lookupErr error
-				if outcome == "removed-after-error" {
-					lookupErr = errors.New("metadata unavailable after node confirmation")
-				}
-				mockProvider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("sdd", lookupErr).Once()
+				provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("sdd", nil).Once()
 			}
-			server := NewControllerServer(driver, mockProvider, nil)
-
-			require.NoError(t, server.recoverLocalDeviceReport(context.Background(), key, report))
-			updated, err := driver.kubeRuntime.client.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(context.Background(), localDeviceStateConfigMapName, metav1.GetOptions{})
-			require.NoError(t, err)
-			if outcome != "pending" {
-				if outcome == "removed" || outcome == "removed-after-error" {
-					require.NotContains(t, updated.Data, key)
-				} else {
-					require.NoError(t, json.Unmarshal([]byte(updated.Data[key]), &report))
-					require.Equal(t, localDeviceConfirmationStateConfirmed, report.ConfirmationState)
-					ready, _ := server.localDeviceReportReady(report, time.Now().Add(time.Hour))
-					require.False(t, ready)
-				}
-				mockProvider.AssertExpectations(t)
-				return
+			require.NoError(t, server.recoverLocalDeviceReport(ctx, key, report))
+			current, exists := ns.currentLocalDeviceReport(ctx, report.VolumeID)
+			if outcome == "confirmed-before-begin" {
+				require.False(t, exists)
+			} else if outcome == "metadata-attached" {
+				require.Equal(t, localDeviceConfirmationStateRepairRequired, current.ConfirmationState)
+				require.Contains(t, current.LastRecoveryError, "drain consumers")
+				require.Error(t, server.rejectIfActiveRepairState(ctx, report.VolumeID, nil))
+				ns.confirmLocalDeviceRecovery(ctx, &current, report.VolumeID, "/dev/sdd", nil, nil)
+				require.NoError(t, server.rejectIfActiveRepairState(ctx, report.VolumeID, nil))
+			} else if outcome == "absent" {
+				require.Equal(t, localDeviceConfirmationStatePending, current.ConfirmationState)
+				require.Equal(t, localDeviceRecoveryMethodRuntimeRepublish, current.RecoveryMethod)
+				require.NotEmpty(t, current.RecoveryToken)
+				ns.confirmLocalDeviceRecovery(ctx, &current, report.VolumeID, "/dev/sdd", nil, nil)
+				_, exists = ns.currentLocalDeviceReport(ctx, report.VolumeID)
+				require.False(t, exists)
+			} else {
+				require.Equal(t, "failed", current.LastRecoveryOutcome)
 			}
-			raw := updated.Data[key]
-			require.NotEmpty(t, raw)
-			require.NoError(t, json.Unmarshal([]byte(raw), &report))
-			assert.Equal(t, localDeviceConfirmationStatePending, report.ConfirmationState)
-			assert.Equal(t, localDeviceRecoveryMethodSameNodeDetachAttachFallback, report.RecoveryMethod)
-			assert.Equal(t, localDeviceAttachmentStateRuntimeUnconfirmed, report.AttachmentState)
-			assert.True(t, report.MetadataAttachedToNode)
-			assert.Equal(t, "sdd", report.MetadataTarget)
-			assert.Equal(t, 1, report.RecoveryAttempts)
-			require.NotNil(t, report.ConfirmationDeadline)
-			mockProvider.AssertExpectations(t)
+			provider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+			provider.AssertExpectations(t)
 		})
 	}
 }
@@ -288,6 +245,7 @@ func TestLocalDeviceRecoveryPersistsHostArtifactQuarantineOnReattachConflict(t *
 	mockProvider.On("VolumeExists", mock.Anything, "vol-device-artifact").Return(575, 1, nil).Once()
 	mockProvider.On("NodeExists", mock.Anything, "node-a").Return(160, nil).Once()
 	mockProvider.On("GetVolumeInNode", mock.Anything, 575, 160).Return("", errors.New("not attached")).Once()
+	mockProvider.On("InspectVolumeAttachment", mock.Anything, report.VolumeID, "node-a").Return(&opennebula.VolumeAttachmentMetadata{VolumeHandle: report.VolumeID, ImageID: 575, RequestedNodeID: 160}, nil).Once()
 	mockProvider.On("AttachVolume", mock.Anything, "vol-device-artifact", "node-a", false, mock.Anything).Return(conflict).Once()
 	server := NewControllerServer(driver, mockProvider, nil)
 
@@ -458,7 +416,8 @@ func TestLocalDeviceRecoveryTimeoutPreservesConcurrentConfirmation(t *testing.T)
 						require.Equal(t, want, current.ConfirmationState)
 					}
 				}
-				_, repairExists := driver.volumeRepairState.Get(report.VolumeID)
+				_, repairExists, repairErr := driver.volumeRepairState.GetCurrent(ctx, report.VolumeID)
+				require.NoError(t, repairErr)
 				require.Equal(t, outcome == "timeout" && attempts == 2, repairExists)
 			})
 		}
@@ -475,8 +434,12 @@ func TestNodeRecordsNewMissingDeviceEpisodeAfterConfirmation(t *testing.T) {
 	report, exists := ns.currentLocalDeviceReport(ctx, "vol-1")
 	require.True(t, exists)
 	client := driver.kubeRuntime.client.(*fake.Clientset)
-	client.PrependReactor("patch", "configmaps", func(ktesting.Action) (bool, runtime.Object, error) {
-		return true, nil, errors.New("report deletion unavailable")
+	client.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+		cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
+		if cm.Data[localDeviceReportKey(driver.nodeID, "vol-1")] == "" {
+			return true, nil, errors.New("report deletion unavailable")
+		}
+		return false, nil, nil
 	})
 	ns.confirmLocalDeviceRecovery(ctx, &report, "vol-1", "/dev/sdd", nil, publishContext)
 	confirmed, exists := ns.currentLocalDeviceReport(ctx, "vol-1")
