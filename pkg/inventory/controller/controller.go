@@ -1995,7 +1995,7 @@ func (s *Syncer) benchmarkSelectedDatastoreForPVC(ctx context.Context, pvc *core
 	if pvc == nil || strings.TrimSpace(pvc.Spec.VolumeName) == "" {
 		return 0, ""
 	}
-	var reader ctrlclient.Reader = s.apiReader
+	reader := s.apiReader
 	if reader == nil {
 		reader = s.client
 	}
@@ -2039,7 +2039,7 @@ func (s *Syncer) benchmarkPinnedNodeBlocked(ctx context.Context, run *inventoryv
 	if nodeName == "" {
 		return false, "", nil
 	}
-	var reader ctrlclient.Reader = s.apiReader
+	reader := s.apiReader
 	if reader == nil {
 		reader = s.client
 	}

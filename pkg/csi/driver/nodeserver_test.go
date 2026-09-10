@@ -775,7 +775,11 @@ func TestNodeExpandVolume(t *testing.T) {
 			return true, nil
 		}
 		setFilesystemBytesSequence([]int64{42158374912})
-		nodeNeedsResizeFS = func(_ exec.Interface, _, _ string) (bool, error) { return false, nil }
+		geometryChecks := 0
+		nodeNeedsResizeFS = func(_ exec.Interface, _, _ string) (bool, error) {
+			geometryChecks++
+			return false, nil
+		}
 
 		request := makeFilesystemRequest(volumePath)
 		request.CapacityRange.RequiredBytes = requiredBytes
@@ -784,6 +788,8 @@ func TestNodeExpandVolume(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, &csi.NodeExpandVolumeResponse{CapacityBytes: requiredBytes}, response)
 		assert.Equal(t, 1, resizeCalls)
+		assert.Equal(t, 1, geometryChecks)
+		t.Logf("CSI NodeExpandVolume fixture: required_bytes=%d device_bytes=%d statfs_bytes=42158374912 geometry_needs_resize=false geometry_checks=%d resize_calls=%d response=%v error=%v", requiredBytes, requiredBytes, geometryChecks, resizeCalls, response, err)
 	})
 
 	t.Run("retries until filesystem reaches target", func(t *testing.T) {

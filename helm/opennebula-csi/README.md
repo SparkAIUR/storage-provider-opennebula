@@ -32,7 +32,7 @@ Operator debugging guide:
 - `ReadWriteOnce`, `ReadOnlyMany`, and CephFS-backed filesystem volumes for `ReadWriteOnce`, `ReadOnlyMany`, and `ReadWriteMany`
 - CSI resize, metrics, preflight checks, snapshots, and clone workflows
 - stable detached-disk expansion and dynamic CephFS expansion
-- gated alpha features for CephFS snapshot/clone, CephFS self-healing, and topology accessibility
+- gated alpha features for CephFS snapshot/clone and CephFS self-healing
 
 ## Prerequisites
 
@@ -203,21 +203,16 @@ featureGates:
   cephfsSelfHealing: true
   cephfsPersistentRecovery: true
   cephfsKernelMounts: true
-  topologyAccessibility: true
 ```
 
-When `topologyAccessibility=true`, label nodes with:
-
-```text
-topology.opennebula.sparkaiur.io/system-ds=<opennebula-system-datastore-id>
-```
+For topology setup and inventory-managed node labels, see [topology accessibility](../../README.md#topology-accessibility).
 
 For local-backed StorageClasses:
 
 - prefer `volumeBindingMode: WaitForFirstConsumer`
 - keep `featureGates.compatibilityAwareSelection=true`
 - do not assume the driver will live-migrate local PVC data between nodes
-- the controller uses size-aware hotplug timeouts, allows only one active VM hotplug per node, and returns retryable `Aborted` when another same-node hotplug is already in progress
+- see the [local datastore placement guidance](../../README.md#local-datastore-placement-guidance) for hotplug serialization and queue behavior
 - node-side device discovery uses the same per-volume timeout budget that the controller computed during publish
 - if a VM stays non-ready through the full timeout, the driver puts that VM into a temporary hotplug cooldown and rejects further hotplug work with retryable `Unavailable`
 - recreating MinIO tenants with local-backed PVCs should still be treated as node-sticky; use Ceph RBD or CephFS if the workload must remain portable across nodes
@@ -417,7 +412,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
-| `image.tag` | Driver image tag. | `"v0.5.28"` | No |
+| `image.tag` | Driver image tag. | See [values.yaml](./values.yaml). | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
 
 ### Driver
@@ -435,7 +430,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.nodeDeviceDiscoveryTimeoutSeconds` | Dedicated node-side device discovery timeout. This stays shorter than the controller hotplug budget so healthy fast-path retries happen quickly. | `30` | No |
 | `driver.nodeExpand.verifyTimeoutSeconds` | Maximum time for node-side resize convergence before returning `DeadlineExceeded`. | `120` | No |
 | `driver.nodeExpand.retryIntervalSeconds` | Retry interval for node-side checks between device visibility, growfs execution, and filesystem size validation. | `2` | No |
-| `driver.nodeExpand.sizeToleranceBytes` | Allowed slack between requested and observed filesystem size to account for filesystem metadata overhead. | `134217728` | No |
+| `driver.nodeExpand.sizeToleranceBytes` | Legacy compatibility setting; see the [node expansion contract](../../docs/node-expansion.md#verification-contract). | See [values.yaml](./values.yaml). | No |
 | `driver.nodeDeviceCache.enabled` | Enable node-local device cache and stable serial/by-id resolution. | `true` | No |
 | `driver.nodeDeviceCache.ttlSeconds` | Cache TTL for confirmed device paths. | `600` | No |
 | `driver.nodeDeviceCache.udevSettleTimeoutSeconds` | Timeout for `udevadm settle` before device rescan on miss. | `10` | No |
@@ -524,7 +519,7 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | `controller.attacher.workerThreads` | `csi-attacher` worker concurrency. Tune down to reduce replay pressure or up to clear healthy backlog faster. | `10` | No |
 | `controller.attacher.retryIntervalStartSeconds` | Initial `csi-attacher` retry backoff for failed work items. | `1` | No |
 | `controller.attacher.retryIntervalMaxSeconds` | Maximum `csi-attacher` retry backoff for failed work items. | `300` | No |
-| `controller.attacher.httpEndpointEnabled` | Enable the `csi-attacher` HTTP metrics endpoint and expose the `att-metrics` container port and Service/ServiceMonitor target when `metrics.enabled=true`. | `true` | No |
+| `controller.attacher.httpEndpointEnabled` | Enable the `csi-attacher` HTTP listener and `att-metrics` container port independently of `metrics.enabled`. Service/ServiceMonitor targets also require their metrics settings. Set `false` to disable the listener and its targets. | `true` | No |
 | `controller.attacher.extraArgs` | Extra CLI args appended only to the `csi-attacher` sidecar. | `[]` | No |
 | `controller.podAnnotations` | Extra annotations for the controller pod template. | `{}` | No |
 | `controller.resources` | Controller pod resource requests and limits. | `{}` | No |
@@ -705,12 +700,14 @@ For local-backed classes, preflight now checks `volumeBindingMode` and warns by 
 | `storageClasses[].allowedTopologies` | Optional Kubernetes StorageClass topology selector. Use this to pre-filter local/LVM classes to compatible `topology.opennebula.sparkaiur.io/system-ds` values. | none | No |
 | `storageClasses[].parameters` | Driver parameters injected into the StorageClass. | none | No |
 
-Rendered StorageClasses are fingerprinted with `storage-provider.opennebula.sparkaiur.io/*` annotations. On Helm upgrade, operators may explicitly enable the optional `storageClassReconcile` pre-upgrade hook to recreate chart-owned classes only when the live spec still matches the previously applied chart hash; manual/user mutations are blocked by default.
+Rendered StorageClasses are fingerprinted with `storage-provider.opennebula.sparkaiur.io/*` annotations. The optional `storageClassReconcile` pre-upgrade hook creates missing classes and recreates chart-owned classes when their desired spec hash changes, provided the live spec still matches the previously applied hash. The hash covers the fields in [storageClassSpecHash](../../pkg/csi/driver/storageclass_reconcile.go), including mutable settings such as expansion and mount options.
+
+Legacy classes without an applied hash can be adopted when their live spec exactly matches the desired spec and `adoptUnannotated` is enabled. Otherwise, unowned classes, missing applied hashes, and manual spec changes fail the hook under `manualMutationPolicy: fail`; `skip` leaves them alone in the hook. Skipping does not make an incompatible immutable change safe for Helm's later upgrade step. The hook changes StorageClass objects only; it does not rewrite PVCs or PVs.
 
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `storageClassReconcile.enabled` | Enable the pre-upgrade StorageClass fingerprint/recreate hook when `storageClasses[]` is non-empty. | `false` | No |
-| `storageClassReconcile.manualMutationPolicy` | Policy when a chart-owned StorageClass was manually changed; `fail` or `skip`. | `fail` | No |
+| `storageClassReconcile.manualMutationPolicy` | Hook policy for unowned classes, missing applied hashes, or manual spec changes; `fail` or `skip`. | `fail` | No |
 | `storageClassReconcile.adoptUnannotated` | Adopt unannotated legacy StorageClasses only when their live spec exactly matches the desired chart spec. | `true` | No |
 | `storageClassReconcile.image.repository` | Override image repository for the reconcile hook. Empty falls back to `image.repository`. | `""` | No |
 | `storageClassReconcile.image.tag` | Override image tag for the reconcile hook. Empty falls back to `image.tag`. | `""` | No |
@@ -737,7 +734,7 @@ Common `storageClasses[].parameters` used by this driver:
 | Default provisioning without StorageClass overrides | `driver.defaultDatastores` |
 | StorageClass-managed provisioning | `storageClasses[].name` plus `storageClasses[].parameters.datastoreIDs` or `driver.defaultDatastores` |
 | CephFS filesystem provisioning | CephFS datastore IDs, StorageClass secret refs, Kubernetes Secrets with `adminID/adminKey` and `userID/userKey` |
-| Topology accessibility alpha | `featureGates.topologyAccessibility=true` plus node labels `topology.opennebula.sparkaiur.io/system-ds=<id>` |
+| Topology accessibility | See [topology requirements](../../README.md#topology-accessibility). |
 | Detached disk expansion | Enabled by default |
 | CephFS expansion | Enabled by default |
 | CephFS snapshots alpha | `featureGates.cephfsSnapshots=true` |

@@ -21,18 +21,20 @@ import (
 func TestNodeExpandVolumeRejectsIncompleteGrowth(t *testing.T) {
 	const requiredBytes int64 = 42949672960
 	for _, tc := range []struct {
-		name       string
-		deviceSize int64
-		resized    bool
-		resizeErr  error
-		verifyErr  error
-		code       codes.Code
+		name        string
+		deviceSize  int64
+		resized     bool
+		resizeErr   error
+		verifyErr   error
+		code        codes.Code
+		needsResize bool
 	}{
-		{"device one byte short despite configured tolerance", requiredBytes - 1, true, nil, nil, codes.DeadlineExceeded},
-		{"device 512 MiB short despite configured tolerance", requiredBytes - 536870912, true, nil, nil, codes.DeadlineExceeded},
-		{"filesystem geometry unavailable", requiredBytes, true, nil, errors.New("invalid superblock"), codes.Internal},
-		{"resize command failed", requiredBytes, false, errors.New("resize failed"), nil, codes.Internal},
-		{"unformatted device", requiredBytes, false, nil, nil, codes.FailedPrecondition},
+		{"device one byte short despite configured tolerance", requiredBytes - 1, true, nil, nil, codes.DeadlineExceeded, false},
+		{"device 512 MiB short despite configured tolerance", requiredBytes - 536870912, true, nil, nil, codes.DeadlineExceeded, false},
+		{"filesystem geometry unavailable", requiredBytes, true, nil, errors.New("invalid superblock"), codes.Internal, false},
+		{"resize command failed", requiredBytes, false, errors.New("resize failed"), nil, codes.Internal, false},
+		{"unformatted device", requiredBytes, false, nil, nil, codes.FailedPrecondition, false},
+		{"filesystem geometry incomplete despite full statfs", requiredBytes, true, nil, nil, codes.DeadlineExceeded, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			oldStatfs, oldSleep, oldNow := nodeVolumePathFS, nodeDeviceSleep, nodeNow
@@ -52,8 +54,12 @@ func TestNodeExpandVolumeRejectsIncompleteGrowth(t *testing.T) {
 			now := time.Unix(0, 0)
 			nodeNow = func() time.Time { return now }
 			nodeDeviceSleep = func(d time.Duration) { now = now.Add(d) }
+			filesystemBytes := int64(42158374912)
+			if tc.needsResize {
+				filesystemBytes = requiredBytes
+			}
 			nodeVolumePathFS = func(_ string, buf *unix.Statfs_t) error {
-				buf.Bsize, buf.Blocks = 4096, 42158374912/4096
+				buf.Bsize, buf.Blocks = 4096, uint64(filesystemBytes/4096)
 				return nil
 			}
 			resizeCalls := 0
@@ -61,7 +67,7 @@ func TestNodeExpandVolumeRejectsIncompleteGrowth(t *testing.T) {
 				resizeCalls++
 				return tc.resized, tc.resizeErr
 			}
-			nodeNeedsResizeFS = func(_ exec.Interface, _, _ string) (bool, error) { return false, tc.verifyErr }
+			nodeNeedsResizeFS = func(_ exec.Interface, _, _ string) (bool, error) { return tc.needsResize, tc.verifyErr }
 			response, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
 				VolumeId: "test-volume", VolumePath: volumePath, StagingTargetPath: volumePath,
 				CapacityRange: &csi.CapacityRange{RequiredBytes: requiredBytes},
@@ -73,9 +79,12 @@ func TestNodeExpandVolumeRejectsIncompleteGrowth(t *testing.T) {
 			require.Equal(t, tc.code, status.Code(err))
 			if tc.deviceSize < requiredBytes {
 				require.Zero(t, resizeCalls, "never resize before the device reaches the full request")
+			} else if tc.needsResize {
+				require.GreaterOrEqual(t, resizeCalls, 2, "retry incomplete geometry even when statfs reports full capacity")
 			} else {
 				require.Equal(t, 1, resizeCalls)
 			}
+			t.Logf("CSI NodeExpandVolume fixture: required_bytes=%d device_bytes=%d statfs_bytes=%d configured_tolerance_bytes=1073741824 geometry_needs_resize=%t resize_calls=%d response=%v error=%v", requiredBytes, tc.deviceSize, filesystemBytes, tc.needsResize, resizeCalls, response, err)
 		})
 	}
 }

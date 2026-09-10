@@ -4,13 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
-	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
@@ -857,18 +855,6 @@ func identityField(identity *LocalDiskIdentity, getter func(*LocalDiskIdentity) 
 	return value
 }
 
-func localRWORepairStateVolumeIDs(snapshot map[string]VolumeRepairState) []string {
-	if len(snapshot) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(snapshot))
-	for key := range snapshot {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
 func (s *ControllerServer) repairStateForQueue(volumeID string) (VolumeRepairState, bool) {
 	if s == nil || s.driver == nil || s.driver.volumeRepairState == nil {
 		return VolumeRepairState{}, false
@@ -913,11 +899,4 @@ func (s *ControllerServer) recordCrossNodeOverrideUsed(ctx context.Context, runt
 		return
 	}
 	s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonCrossNodeOverrideUsed, message)
-}
-
-func localRWOVolumeProtectedError(req *csi.ControllerPublishVolumeRequest, decision LocalRWOProtectionDecision) error {
-	if req == nil {
-		return nil
-	}
-	return status.Error(codes.Unavailable, decision.Message)
 }

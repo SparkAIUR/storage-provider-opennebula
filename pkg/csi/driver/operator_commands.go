@@ -1408,18 +1408,18 @@ func supportBundleQueueReason(eventReason, message string) string {
 
 func supportBundleEventObservedAt(event corev1.Event) time.Time {
 	if event.Series != nil && !event.Series.LastObservedTime.IsZero() {
-		return event.Series.LastObservedTime.Time.UTC()
+		return event.Series.LastObservedTime.UTC()
 	}
 	if !event.EventTime.IsZero() {
-		return event.EventTime.Time.UTC()
+		return event.EventTime.UTC()
 	}
 	if !event.LastTimestamp.IsZero() {
-		return event.LastTimestamp.Time.UTC()
+		return event.LastTimestamp.UTC()
 	}
 	if !event.FirstTimestamp.IsZero() {
-		return event.FirstTimestamp.Time.UTC()
+		return event.FirstTimestamp.UTC()
 	}
-	return event.CreationTimestamp.Time.UTC()
+	return event.CreationTimestamp.UTC()
 }
 
 func maxInt(a, b int) int {

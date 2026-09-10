@@ -4,9 +4,15 @@
 
 Frauditor rqlite requested 40 GiB. Its ext4 superblock contained 10,485,760 blocks of 4,096 bytes, but statfs excluded 193,188 overhead clusters and reported 42,158,374,912 bytes. The prior required-minus-512-MiB comparison falsely timed out after successful resize2fs calls.
 
-The driver now checks that the device reaches the full requested byte capacity, runs the filesystem resizer, and asks Kubernetes mount-utils NeedResize to verify geometry. Ext4 geometry includes metadata. XFS uses its data-block geometry. Statfs remains diagnostic information and is not a capacity gate. Unsupported/unformatted filesystems, failed resizers, and failed geometry reads do not produce success. Incomplete growth retains bounded retries. The legacy sizeToleranceBytes setting is accepted but ignored.
+## Verification contract
+
+The driver checks that the device reaches the full requested byte capacity, runs the filesystem resizer, and asks Kubernetes mount-utils `NeedResize` to verify that filesystem geometry fills the device within one filesystem block. Ext4 geometry includes metadata. XFS uses its data-block geometry. The statfs capacity is diagnostic information and is not a capacity gate. Unsupported or unformatted filesystems, failed resizers, failed statfs reads, and failed geometry reads do not produce success. Incomplete growth retains bounded retries and returns retryable `DeadlineExceeded` with requested, device, and filesystem byte context when the timeout expires.
+
+`driver.nodeExpand.sizeToleranceBytes` and `ONE_CSI_NODE_EXPAND_SIZE_TOLERANCE_BYTES` are deprecated and ignored as of v0.5.29. Existing configuration remains accepted but cannot relax device-capacity or filesystem-geometry verification. The implementation is in [NodeExpandVolume](../pkg/csi/driver/nodeserver.go), with regression coverage in [node_expand_validation_test.go](../pkg/csi/driver/node_expand_validation_test.go).
 
 ## Validation
+
+Before tagging this release, validate a native 10 GiB to 40 GiB ext4 expansion on hplmon, checksum preservation, post-resize writes, normal pod replacement, and cleanup. Candidate evidence below records those checks; it does not establish release publication or a rollout to all clusters.
 
 The exact 40 GiB regression failed against the old implementation and passes after the fix. Go tests also cover a device one byte short, a device 512 MiB short despite a 1 GiB configured tolerance, resize errors, geometry errors, unformatted devices, delayed growth, and non-converging filesystems.
 

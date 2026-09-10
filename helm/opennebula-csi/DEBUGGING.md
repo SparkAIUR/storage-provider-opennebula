@@ -622,8 +622,10 @@ This fails closed if:
 
 - the desired node moved
 - the confirmed serial is wrong
-- the guest-visible device name is guessed
+- the confirmed device name is missing or conflicts with an available node report
 - OpenNebula still shows another owner
+
+The controller accepts the operator-confirmed device name; it does not probe the guest to prove that the name identifies the intended disk. Verify the device and serial on the target node before setting these annotations. See [manualRecoveryAdoptionTarget](../../pkg/csi/driver/recovery_control.go) for the controller checks.
 
 ### 7. When a controller restart is still acceptable
 

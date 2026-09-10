@@ -778,13 +778,6 @@ func localDiskAssertedDiskTarget(identity *LocalDiskIdentity) string {
 	return strings.TrimSpace(identity.AssertedByController.DiskTarget)
 }
 
-func localDiskObservedDevicePath(identity *LocalDiskIdentity) string {
-	if identity == nil || identity.ObservedFromDevice == nil || identity.ObservedFromDevice.Block == nil {
-		return ""
-	}
-	return strings.TrimSpace(identity.ObservedFromDevice.Block.DevicePath)
-}
-
 func localDiskObservedByIDPath(identity *LocalDiskIdentity) string {
 	if identity == nil || identity.ObservedFromDevice == nil || identity.ObservedFromDevice.Block == nil {
 		return ""
@@ -835,18 +828,4 @@ func historyRequiresSafeRelease(state VolumeHistoryRecord) bool {
 		return true
 	}
 	return state.LastSafeDetachTime.Before(state.LastSuccessfulPublishTime)
-}
-
-func sortedRepairStates(snapshot map[string]VolumeRepairState) []VolumeRepairState {
-	if len(snapshot) == 0 {
-		return nil
-	}
-	states := make([]VolumeRepairState, 0, len(snapshot))
-	for _, state := range snapshot {
-		states = append(states, state)
-	}
-	sort.Slice(states, func(i, j int) bool {
-		return states[i].VolumeID < states[j].VolumeID
-	})
-	return states
 }
