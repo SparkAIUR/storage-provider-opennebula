@@ -7,6 +7,8 @@
 - Fail closed when resize or geometry inspection fails; retain bounded retries for incomplete growth.
 - Add a regression using the exact Frauditor disk and statfs sizes, plus undersized-device and error-path tests.
 
+Native hplmon expansion, checksum, replacement-pod, and cleanup checks passed before tagging. See [node expansion verification](docs/node-expansion.md).
+
 ## v0.5.28, 2026-09-09
 
 - Fix recursive locking during stale CephFS publishing and serialize shared-volume lifecycle operations.
