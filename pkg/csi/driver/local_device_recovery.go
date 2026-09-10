@@ -795,16 +795,15 @@ func (s *ControllerServer) updateLocalDeviceRecoveryFailure(ctx context.Context,
 		if current.RecoveryToken == "" {
 			current.RecoveryAttempts++
 			current.LastRecoveryAt = &now
+			current.RecoveryMethod = ""
+			current.ConfirmationState = ""
+			current.ConfirmationDeadline = nil
+			current.ConfirmationObservedAt = nil
+			current.MetadataAttachedToNode = false
+			current.MetadataNode = current.Node
+			current.MetadataTarget = ""
 		}
-		current.RecoveryMethod = ""
-		current.RecoveryToken = ""
-		current.ConfirmationState = ""
-		current.ConfirmationDeadline = nil
-		current.ConfirmationObservedAt = nil
 		current.AttachmentState = localDeviceAttachmentStateRuntimeUnconfirmed
-		current.MetadataAttachedToNode = false
-		current.MetadataNode = current.Node
-		current.MetadataTarget = ""
 		current.LastRecoveryError = message
 		current.LastRecoveryOutcome = "failed"
 		current.LastRecoverySignature = localDeviceRecoverySignature(*current)

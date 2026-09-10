@@ -546,7 +546,7 @@ func TestSharedFilesystemPublishRehydratesStaleSessionWithExistingBinds(t *testi
 
 func TestSharedFilesystemReconstructionPreservesSiblingGenerations(t *testing.T) {
 	for _, operation := range []string{"stage", "publish"} {
-		for _, generation := range []string{"absent-stage", "new-stage", "ambiguous", "missing-metadata"} {
+		for _, generation := range []string{"absent-stage", "new-stage", "ambiguous", "missing-metadata", "foreign-driver-absent-stage", "foreign-driver-new-stage", "foreign-sibling", "foreign-stage", "foreign-volume-handle"} {
 			t.Run(operation+"/"+generation, func(t *testing.T) {
 				withSharedFilesystemTestPaths(t)
 				ns := getTestNodeServer(nil)
@@ -592,7 +592,30 @@ func TestSharedFilesystemReconstructionPreservesSiblingGenerations(t *testing.T)
 						fakeMount.MountPoints[i].Device = "old-superblock"
 					}
 				}
-				if generation == "absent-stage" {
+				if strings.HasPrefix(generation, "foreign-") {
+					for _, path := range []string{otherStage, otherTarget} {
+						payload, err := json.Marshal(sharedFilesystemVolumeData{DriverName: "rook-ceph.cephfs.csi.ceph.com", VolumeHandle: "rook-volume", SpecVolID: "pvc-unrelated", NodeName: ns.Driver.nodeID})
+						require.NoError(t, err)
+						require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(path), "vol_data.json"), payload, 0600))
+					}
+					if generation == "foreign-sibling" || generation == "foreign-stage" {
+						for i := range fakeMount.MountPoints {
+							if fakeMount.MountPoints[i].Path == otherTarget {
+								fakeMount.MountPoints[i].Device = "old-superblock"
+								if generation == "foreign-stage" {
+									fakeMount.MountPoints[i].Device = stage
+								}
+							}
+						}
+					}
+					if generation == "foreign-volume-handle" {
+						payload, err := json.Marshal(sharedFilesystemVolumeData{DriverName: "rook-ceph.cephfs.csi.ceph.com", VolumeHandle: id, SpecVolID: "pvc-unrelated", NodeName: ns.Driver.nodeID})
+						require.NoError(t, err)
+						require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(otherTarget), "vol_data.json"), payload, 0600))
+					}
+				}
+				absentStage := generation == "absent-stage" || generation == "foreign-driver-absent-stage" || generation == "foreign-sibling"
+				if absentStage {
 					require.NoError(t, ns.sharedFS.unmount(context.Background(), stage))
 				}
 				if generation == "ambiguous" {
@@ -635,14 +658,14 @@ func TestSharedFilesystemReconstructionPreservesSiblingGenerations(t *testing.T)
 						req.PublishContext[key] = value
 					}
 					_, err = ns.NodePublishVolume(context.Background(), req)
-					if generation == "absent-stage" {
+					if absentStage && generation != "foreign-sibling" {
 						require.Error(t, err)
 						require.Zero(t, mounts)
 						require.NoError(t, ns.sharedFilesystemRecovery.recoverVolume(context.Background(), id))
 						_, err = ns.NodePublishVolume(context.Background(), req)
 					}
 				}
-				if generation == "ambiguous" || generation == "missing-metadata" {
+				if generation == "ambiguous" || generation == "missing-metadata" || generation == "foreign-sibling" || generation == "foreign-stage" || generation == "foreign-volume-handle" {
 					require.Error(t, err)
 					require.Zero(t, mounts)
 					_, exists, err := ns.sharedFilesystemRecovery.store.Load(id)

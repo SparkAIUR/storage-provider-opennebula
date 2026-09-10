@@ -114,6 +114,8 @@ type VolumeRepairState struct {
 	LastObservedAt          time.Time          `json:"lastObservedAt"`
 	LastObservedIdentity    *LocalDiskIdentity `json:"lastObservedIdentity,omitempty"`
 	LastHealthyIdentity     *LocalDiskIdentity `json:"lastHealthyIdentity,omitempty"`
+	fromLocalDeviceReport   bool
+	persistedRuntimeMarker  string
 }
 
 type VolumeHistoryManager struct {
@@ -402,6 +404,9 @@ func (m *VolumeRepairStateManager) LoadFromConfigMap(ctx context.Context) error 
 		if strings.TrimSpace(state.VolumeID) == "" {
 			state.VolumeID = key
 		}
+		if state.Classification == repairClassificationRuntimeAttachUnconfirmed {
+			state.persistedRuntimeMarker = raw
+		}
 		state.Version = stateObjectVersion
 		normalizeLocalDiskIdentity(state.LastObservedIdentity)
 		normalizeLocalDiskIdentity(state.LastHealthyIdentity)
@@ -443,6 +448,7 @@ func (m *VolumeRepairStateManager) GetCurrent(ctx context.Context, volumeID stri
 		if state.Classification != repairClassificationRuntimeAttachUnconfirmed {
 			return state, true, nil
 		}
+		state.persistedRuntimeMarker = cm.Data[volumeID]
 	}
 	cm, err = m.runtime.GetConfigMap(ctx, m.namespace, localDeviceStateConfigMapName)
 	if errors.IsNotFound(err) {
@@ -464,8 +470,9 @@ func (m *VolumeRepairStateManager) GetCurrent(ctx context.Context, volumeID stri
 			classification = repairClassificationWrongDeviceIdentity
 		}
 		return VolumeRepairState{
-			LastHealthyIdentity: report.ExpectedIdentity,
-			Version:             stateObjectVersion, VolumeID: volumeID,
+			fromLocalDeviceReport: true,
+			LastHealthyIdentity:   report.ExpectedIdentity,
+			Version:               stateObjectVersion, VolumeID: volumeID,
 			Classification: classification,
 			Reason:         localDeviceFailureClass(report), Message: report.LastRecoveryError,
 			RequestedNode: report.Node, LastKnownNodeName: report.Node,
@@ -479,7 +486,7 @@ func (m *VolumeRepairStateManager) GetCurrent(ctx context.Context, volumeID stri
 }
 
 func (m *VolumeRepairStateManager) ClearObserved(ctx context.Context, expected VolumeRepairState) error {
-	if m == nil || expected.VolumeID == "" || expected.EvidenceSource == "local_device_report" {
+	if m == nil || expected.VolumeID == "" || expected.fromLocalDeviceReport {
 		return nil
 	}
 	if m.runtime == nil || !m.runtime.enabled {
@@ -501,6 +508,8 @@ func (m *VolumeRepairStateManager) ClearObserved(ctx context.Context, expected V
 		}
 		var current VolumeRepairState
 		if raw := cm.Data[expected.VolumeID]; raw == "" {
+			return nil
+		} else if expected.persistedRuntimeMarker != "" && raw != expected.persistedRuntimeMarker {
 			return nil
 		} else if err := json.Unmarshal([]byte(raw), &current); err != nil {
 			return err

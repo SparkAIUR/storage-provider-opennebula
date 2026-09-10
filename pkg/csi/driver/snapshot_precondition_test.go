@@ -4,16 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/stretchr/testify/require"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 // Model the API's resourceVersion precondition while a request continues at the
@@ -25,6 +28,7 @@ func TestHotplugSnapshotTimeoutCannotOverwriteNewerClear(t *testing.T) {
 	var once sync.Once
 	defer once.Do(func() { close(release) })
 	patches := 0
+	revision := 1
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == http.MethodGet {
@@ -39,7 +43,8 @@ func TestHotplugSnapshotTimeoutCannotOverwriteNewerClear(t *testing.T) {
 		}
 		var patch struct {
 			Metadata struct {
-				ResourceVersion string `json:"resourceVersion"`
+				ResourceVersion string            `json:"resourceVersion"`
+				Annotations     map[string]string `json:"annotations"`
 			} `json:"metadata"`
 			Data map[string]*string `json:"data"`
 		}
@@ -63,6 +68,7 @@ func TestHotplugSnapshotTimeoutCannotOverwriteNewerClear(t *testing.T) {
 			json.NewEncoder(w).Encode(metav1.Status{TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"}, Status: "Failure", Reason: metav1.StatusReasonConflict, Code: 409})
 			return
 		}
+		before := cm.DeepCopy()
 		for key, value := range patch.Data {
 			if value == nil {
 				delete(cm.Data, key)
@@ -70,7 +76,16 @@ func TestHotplugSnapshotTimeoutCannotOverwriteNewerClear(t *testing.T) {
 				cm.Data[key] = *value
 			}
 		}
-		cm.ResourceVersion = fmt.Sprint(number + 1)
+		if len(patch.Metadata.Annotations) != 0 && cm.Annotations == nil {
+			cm.Annotations = map[string]string{}
+		}
+		for key, value := range patch.Metadata.Annotations {
+			cm.Annotations[key] = value
+		}
+		if !reflect.DeepEqual(before.Data, cm.Data) || !reflect.DeepEqual(before.Annotations, cm.Annotations) {
+			revision++
+			cm.ResourceVersion = fmt.Sprint(revision)
+		}
 		json.NewEncoder(w).Encode(cm)
 	}))
 	defer func() { once.Do(func() { close(release) }); server.Close() }()
@@ -83,10 +98,29 @@ func TestHotplugSnapshotTimeoutCannotOverwriteNewerClear(t *testing.T) {
 	go func() { done <- runtime.setConfigMapSnapshot(ctx, "default", "queue", "node", "old-active") }()
 	<-entered
 	require.Error(t, <-done)
+	cmClient := client.CoreV1().ConfigMaps("default")
+	noop, err := cmClient.Patch(context.Background(), "queue", types.MergePatchType, []byte(`{"metadata":{"resourceVersion":"1"},"data":{"node":null}}`), metav1.PatchOptions{})
+	require.NoError(t, err)
+	require.Equal(t, "1", noop.ResourceVersion)
 	require.NoError(t, runtime.setConfigMapSnapshot(context.Background(), "default", "queue", "node", ""))
+	cleared, err := cmClient.Get(context.Background(), "queue", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotEqual(t, noop.ResourceVersion, cleared.ResourceVersion)
+	require.Len(t, cleared.Annotations, 1)
+	require.NoError(t, runtime.setConfigMapSnapshot(context.Background(), "default", "queue", "node", ""))
+	repeated, err := cmClient.Get(context.Background(), "queue", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotEqual(t, cleared.ResourceVersion, repeated.ResourceVersion)
+	require.Len(t, repeated.Annotations, 1)
+	require.NoError(t, runtime.setConfigMapSnapshot(context.Background(), "default", "queue", "other-node", "active"))
 	once.Do(func() { close(release) })
 	<-finished
 	current, err := client.CoreV1().ConfigMaps("default").Get(context.Background(), "queue", metav1.GetOptions{})
 	require.NoError(t, err)
 	require.NotContains(t, current.Data, "node")
+	require.Equal(t, "active", current.Data["other-node"])
+	require.Len(t, current.Annotations, 2)
+	for key, value := range repeated.Annotations {
+		require.Equal(t, value, current.Annotations[key])
+	}
 }

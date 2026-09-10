@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	inventoryv1alpha1 "github.com/SparkAIUR/storage-provider-opennebula/pkg/inventory/apis/storageprovider/v1alpha1"
+	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -295,6 +297,8 @@ func (r *KubeRuntime) UpsertConfigMapData(ctx context.Context, namespace, name s
 // request that outlives its timeout cannot overwrite a newer successful snapshot.
 func (r *KubeRuntime) setConfigMapSnapshot(ctx context.Context, namespace, name, key, payload string) error {
 	client := r.client.CoreV1().ConfigMaps(namespace)
+	keyHash := sha256.Sum256([]byte(key))
+	annotations := map[string]string{fmt.Sprintf("storage-provider.opennebula.sparkaiur.io/snapshot-%x", keyHash[:16]): uuid.NewString()}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -305,7 +309,7 @@ func (r *KubeRuntime) setConfigMapSnapshot(ctx context.Context, namespace, name,
 			if payload != "" {
 				data[key] = payload
 			}
-			_, err = client.Create(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}, Data: data}, metav1.CreateOptions{})
+			_, err = client.Create(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Annotations: annotations}, Data: data}, metav1.CreateOptions{})
 			if errors.IsAlreadyExists(err) {
 				return errors.NewConflict(corev1.Resource("configmaps"), name, err)
 			}
@@ -318,7 +322,7 @@ func (r *KubeRuntime) setConfigMapSnapshot(ctx context.Context, namespace, name,
 		if payload != "" {
 			value = payload
 		}
-		patch, err := json.Marshal(map[string]any{"metadata": map[string]string{"resourceVersion": cm.ResourceVersion}, "data": map[string]any{key: value}})
+		patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"resourceVersion": cm.ResourceVersion, "annotations": annotations}, "data": map[string]any{key: value}})
 		if err != nil {
 			return err
 		}

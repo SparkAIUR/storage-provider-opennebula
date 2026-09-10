@@ -24,6 +24,17 @@ type sharedFilesystemVolumeData struct {
 
 // Kubelet stores this on the host filesystem beside, never inside, the mount.
 func sharedFilesystemMetadata(path string) (sharedFilesystemVolumeData, error) {
+	data, err := csiVolumeMetadata(path)
+	if err != nil {
+		return data, err
+	}
+	if data.DriverName != DefaultDriverName || !opennebula.IsSharedFilesystemVolumeID(data.VolumeHandle) {
+		return data, fmt.Errorf("mount metadata does not identify an OpenNebula CephFS volume at %s", path)
+	}
+	return data, nil
+}
+
+func csiVolumeMetadata(path string) (sharedFilesystemVolumeData, error) {
 	var data sharedFilesystemVolumeData
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return data, fmt.Errorf("noncanonical shared filesystem path %q", path)
@@ -44,9 +55,6 @@ func sharedFilesystemMetadata(path string) (sharedFilesystemVolumeData, error) {
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return data, err
-	}
-	if data.DriverName != DefaultDriverName || !opennebula.IsSharedFilesystemVolumeID(data.VolumeHandle) {
-		return data, fmt.Errorf("mount metadata does not identify an OpenNebula CephFS volume at %s", path)
 	}
 	return data, nil
 }
@@ -257,9 +265,15 @@ func (ns *NodeServer) discoverSharedFilesystemTargets(volumeID, stagePath string
 		if info.MountPoint == stagePath || !strings.Contains(info.MountPoint, "/volumes/kubernetes.io~csi/") || !isCephFSMount(info) {
 			continue
 		}
-		data, err := sharedFilesystemMetadata(info.MountPoint)
+		data, err := csiVolumeMetadata(info.MountPoint)
 		if err != nil {
 			return nil, err
+		}
+		if data.DriverName != "" && data.DriverName != DefaultDriverName && data.VolumeHandle != "" && data.VolumeHandle != volumeID && (stage == nil || !sameSharedFilesystemMount(*stage, info)) {
+			continue
+		}
+		if data.DriverName != DefaultDriverName || !opennebula.IsSharedFilesystemVolumeID(data.VolumeHandle) {
+			return nil, fmt.Errorf("mount metadata does not identify an OpenNebula CephFS volume at %s", info.MountPoint)
 		}
 		if data.VolumeHandle != volumeID {
 			if stage != nil && sameSharedFilesystemMount(*stage, info) {
