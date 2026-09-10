@@ -255,3 +255,148 @@ func TestReviewNodeStageMustNotAcknowledgeUnconfirmableRecovery(t *testing.T) {
 		}
 	}
 }
+
+func TestReviewNodeStageWrongIdentityPreservesConcurrentRecovery(t *testing.T) {
+	for _, markerFails := range []bool{false, true} {
+		for _, scenario := range []string{"begun-during-discovery", "expired-during-discovery", "advanced-on-conflict", "terminal-before-entry"} {
+			name := scenario + "/marker-persisted"
+			if markerFails {
+				name = scenario + "/marker-write-failed"
+			}
+			t.Run(name, func(t *testing.T) {
+				ctx := context.Background()
+				driver, _, controller, _, report := recoveryReviewFixture(t)
+				ns, request := reviewLocalStageFixture(t, driver, report, false)
+				device := filepath.Join(defaultDiskPath, report.VolumeName)
+				serial := "onecsi-99"
+				exec := reviewDeviceSerialExec(func(string) string { return serial })
+				ns.mounter.Exec = exec
+				ns.deviceResolver.exec = exec
+				session := localDiskSession{VolumeID: report.VolumeID, VolumeName: report.VolumeName, DevicePath: device, DeviceSerial: "onecsi-42", FSType: "ext4", StagingTargetPath: request.StagingTargetPath, Identity: &LocalDiskIdentity{LegacyDeviceSerial: "onecsi-42"}}
+				require.NoError(t, ns.localDiskSessions.Save(session))
+				key := localDeviceReportKey(report.Node, report.VolumeID)
+				var episode LocalDeviceMissingReport
+				begin := func() {
+					var started bool
+					var err error
+					episode, started, err = controller.beginLocalDeviceRecovery(ctx, key, report)
+					require.NoError(t, err)
+					require.True(t, started)
+					if scenario == "expired-during-discovery" || scenario == "terminal-before-entry" {
+						episode, started, err = controller.refreshLocalDeviceReportConfirmationState(ctx, key, episode, episode.ConfirmationDeadline.Add(time.Second))
+						require.NoError(t, err)
+						require.True(t, started)
+						require.Equal(t, localDeviceConfirmationStateRepairRequired, episode.ConfirmationState)
+					}
+				}
+				if scenario == "terminal-before-entry" {
+					begin()
+				}
+				injected := false
+				stat := nodeVolumePathStat
+				nodeVolumePathStat = func(path string) (os.FileInfo, error) {
+					if path == device && !injected && scenario != "terminal-before-entry" {
+						injected = true
+						begin()
+					}
+					return stat(path)
+				}
+				client := driver.kubeRuntime.client.(*fake.Clientset)
+				markerWrites := 0
+				client.PrependReactor("patch", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+					if action.(ktesting.PatchAction).GetName() == volumeRepairStateConfigMapName {
+						markerWrites++
+						if markerFails {
+							return true, nil, errors.New("repair marker API unavailable")
+						}
+					}
+					return false, nil, nil
+				})
+				identityWrites := 0
+				client.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+					cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
+					if cm.Name != localDeviceStateConfigMapName {
+						return false, nil, nil
+					}
+					var proposed LocalDeviceMissingReport
+					require.NoError(t, json.Unmarshal([]byte(cm.Data[key]), &proposed))
+					if proposed.FailureClass != localDeviceFailureClassWrongIdentity {
+						return false, nil, nil
+					}
+					identityWrites++
+					if scenario != "advanced-on-conflict" || identityWrites != 1 {
+						return false, nil, nil
+					}
+					episode.RecoveryToken = "advanced-token-T2"
+					episode.RecoveryAttempts++
+					deadline := episode.ConfirmationDeadline.Add(time.Minute)
+					episode.ConfirmationDeadline = &deadline
+					episode.MetadataAttachedToNode = true
+					episode.MetadataNode = report.Node
+					episode.MetadataTarget = "vdd"
+					payload, err := json.Marshal(episode)
+					require.NoError(t, err)
+					cm.Data[key] = string(payload)
+					require.NoError(t, client.Tracker().Update(corev1.SchemeGroupVersion.WithResource("configmaps"), cm, cm.Namespace))
+					return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), cm.Name, errors.New("controller advanced recovery token"))
+				})
+				mounter := ns.mounter.Interface.(*mount.FakeMounter)
+				before := mounter.GetLog()
+				response, err := ns.NodeStageVolume(ctx, request)
+				require.Nil(t, response)
+				if scenario == "terminal-before-entry" {
+					require.Equal(t, codes.Unavailable, status.Code(err))
+					require.Zero(t, identityWrites)
+					require.Zero(t, markerWrites)
+				} else {
+					require.True(t, injected)
+					require.Equal(t, codes.FailedPrecondition, status.Code(err))
+					require.Positive(t, markerWrites)
+					if scenario == "advanced-on-conflict" {
+						require.Equal(t, 2, identityWrites)
+					} else {
+						require.Equal(t, 1, identityWrites)
+					}
+				}
+				current, exists := ns.currentLocalDeviceReport(ctx, report.VolumeID)
+				require.True(t, exists)
+				require.Equal(t, episode.RecoveryToken, current.RecoveryToken)
+				require.Equal(t, episode.RecoveryMethod, current.RecoveryMethod)
+				require.Equal(t, episode.ConfirmationState, current.ConfirmationState)
+				require.Equal(t, episode.ConfirmationDeadline, current.ConfirmationDeadline)
+				require.Equal(t, episode.ConfirmationObservedAt, current.ConfirmationObservedAt)
+				require.Equal(t, episode.AttachmentState, current.AttachmentState)
+				require.Equal(t, episode.ExpectedTarget, current.ExpectedTarget)
+				require.Equal(t, episode.MetadataAttachedToNode, current.MetadataAttachedToNode)
+				require.Equal(t, episode.MetadataNode, current.MetadataNode)
+				require.Equal(t, episode.MetadataTarget, current.MetadataTarget)
+				require.Equal(t, episode.RecoveryAttempts, current.RecoveryAttempts)
+				if scenario != "terminal-before-entry" {
+					require.Equal(t, localDeviceFailureClassWrongIdentity, current.FailureClass)
+					require.Equal(t, "onecsi-42", localDiskObservedDeviceSerial(current.ExpectedIdentity))
+					require.Equal(t, "onecsi-99", localDiskObservedDeviceSerial(current.ObservedIdentity))
+				}
+				marker, readErr := client.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(ctx, volumeRepairStateConfigMapName, metav1.GetOptions{})
+				if markerFails || scenario == "terminal-before-entry" {
+					require.True(t, apierrors.IsNotFound(readErr))
+				} else {
+					require.NoError(t, readErr)
+					require.NotEmpty(t, marker.Data[report.VolumeID])
+				}
+				serial = "onecsi-42"
+				response, err = ns.NodeStageVolume(ctx, request)
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.Nil(t, response)
+				retained, exists := ns.currentLocalDeviceReport(ctx, report.VolumeID)
+				require.True(t, exists)
+				require.Equal(t, current, retained)
+				require.Equal(t, before, mounter.GetLog())
+				if readErr == nil {
+					retainedMarker, err := client.CoreV1().ConfigMaps(namespaceFromServiceAccount()).Get(ctx, volumeRepairStateConfigMapName, metav1.GetOptions{})
+					require.NoError(t, err)
+					require.Equal(t, marker.Data, retainedMarker.Data)
+				}
+			})
+		}
+	}
+}

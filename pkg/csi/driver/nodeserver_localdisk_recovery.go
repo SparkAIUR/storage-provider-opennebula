@@ -334,7 +334,7 @@ func (ns *NodeServer) evaluateLocalDiskPath(volumeID, path string) (localDiskMou
 			return localDiskMountHealth{}, err
 		}
 		if session, exists, loadErr := ns.loadLocalDiskSession(volumeID); loadErr == nil && exists {
-			if session.DeviceSerial != "" && !deviceMatchesSerial(ns.mounter.Exec, mountPoint.Device, session.DeviceSerial, "") {
+			if session.DeviceSerial != "" && !deviceMatchesSerial(ns.mounter.Exec, mountPoint.Device, session.DeviceSerial) {
 				return localDiskMountHealth{Stale: true, Reason: "serial_mismatch", MountSource: mountPoint.Device, Message: "mount source serial does not match expected volume serial"}, nil
 			}
 			if session.Identity != nil {
@@ -479,7 +479,7 @@ func (ns *NodeServer) resolveLocalDiskRecoveryDevice(ctx context.Context, sessio
 	if err != nil {
 		return "", err
 	}
-	if session.DeviceSerial != "" && !deviceMatchesSerial(ns.mounter.Exec, devicePath, session.DeviceSerial, "") {
+	if session.DeviceSerial != "" && !deviceMatchesSerial(ns.mounter.Exec, devicePath, session.DeviceSerial) {
 		return "", fmt.Errorf("resolved device %s does not match expected serial %s", devicePath, session.DeviceSerial)
 	}
 	if ok, reason, observed := ns.verifyRecoveredDeviceIdentity(session, devicePath); !ok {

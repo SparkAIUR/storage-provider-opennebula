@@ -130,7 +130,7 @@ func (ns *NodeServer) recordLocalDeviceMissing(ctx context.Context, volumeID, vo
 		report.FailureClass = localDeviceFailureClassRuntimeAttachmentMissing
 		report.ExpectedTarget = strings.TrimSpace(volumeName)
 		report.DevicePath = ""
-		report.DeviceSerial = strings.TrimSpace(publishContext[publishContextDeviceSerial])
+		report.DeviceSerial = firstNonEmpty(report.DeviceSerial, strings.TrimSpace(publishContext[publishContextDeviceSerial]))
 		report.OpenNebulaImageID = strings.TrimSpace(publishContext[publishContextOpenNebulaImageID])
 		report.FsType = ""
 		report.ResolvedBy = ""
@@ -200,7 +200,7 @@ func (ns *NodeServer) recordLocalDeviceMountFailure(ctx context.Context, volumeI
 		report.FailureClass = localDeviceFailureClassMountFailed
 		report.ExpectedTarget = strings.TrimSpace(volumeName)
 		report.DevicePath = strings.TrimSpace(devicePath)
-		report.DeviceSerial = strings.TrimSpace(publishContext[publishContextDeviceSerial])
+		report.DeviceSerial = firstNonEmpty(report.DeviceSerial, strings.TrimSpace(publishContext[publishContextDeviceSerial]))
 		report.OpenNebulaImageID = strings.TrimSpace(publishContext[publishContextOpenNebulaImageID])
 		report.FsType = strings.TrimSpace(fsType)
 		report.ResolvedBy = strings.TrimSpace(resolution.ResolvedBy)
@@ -257,9 +257,9 @@ func (ns *NodeServer) recordWrongDeviceIdentityReport(ctx context.Context, sessi
 		report.VolumeID = volumeID
 		report.VolumeName = strings.TrimSpace(session.VolumeName)
 		report.FailureClass = localDeviceFailureClassWrongIdentity
-		report.ExpectedTarget = strings.TrimSpace(localDiskAssertedDiskTarget(session.Identity))
+		report.ExpectedTarget = firstNonEmpty(report.ExpectedTarget, strings.TrimSpace(localDiskAssertedDiskTarget(session.Identity)))
 		report.DevicePath = strings.TrimSpace(session.DevicePath)
-		report.DeviceSerial = strings.TrimSpace(session.DeviceSerial)
+		report.DeviceSerial = firstNonEmpty(report.DeviceSerial, strings.TrimSpace(session.DeviceSerial))
 		report.OpenNebulaImageID = strings.TrimSpace(session.OpenNebulaImageID)
 		report.FsType = strings.TrimSpace(session.FSType)
 		report.PVCNamespace = strings.TrimSpace(session.PVCNamespace)
@@ -270,10 +270,11 @@ func (ns *NodeServer) recordWrongDeviceIdentityReport(ctx context.Context, sessi
 		report.ObservedIdentity = observed
 		report.LastObservedAt = now
 		report.Attempts++
-		report.AttachmentState = localDeviceAttachmentStateRuntimeConfirmedByNode
-		report.ConfirmationState = localDeviceConfirmationStateConfirmed
-		report.ConfirmationDeadline = nil
-		report.RecoveryToken = ""
+		if report.RecoveryToken == "" && report.ConfirmationState != localDeviceConfirmationStateInProgress && report.ConfirmationState != localDeviceConfirmationStateRepairRequired {
+			report.AttachmentState = localDeviceAttachmentStateRuntimeConfirmedByNode
+			report.ConfirmationState = localDeviceConfirmationStateConfirmed
+			report.ConfirmationDeadline = nil
+		}
 		if cause != nil {
 			report.LastError = cause.Error()
 		}
@@ -346,7 +347,33 @@ func (ns *NodeServer) readLocalDeviceRecoveryAuthority(ctx context.Context, volu
 	return reportRef, repairRef, nil
 }
 
+func localDeviceReportSerials(report *LocalDeviceMissingReport) []string {
+	if report == nil {
+		return nil
+	}
+	normalizeLocalDiskIdentity(report.ExpectedIdentity)
+	return []string{report.DeviceSerial, localDiskObservedDeviceSerial(report.ExpectedIdentity), localDiskAssertedDeviceSerial(report.ExpectedIdentity)}
+}
+
+func verifyLocalDeviceReportIdentity(report *LocalDeviceMissingReport, observed *LocalDiskIdentity, publishContext map[string]string) error {
+	normalizeLocalDiskIdentity(observed)
+	for _, serial := range append(localDeviceReportSerials(report), publishContext[publishContextDeviceSerial]) {
+		if serial = strings.TrimSpace(serial); serial != "" && !strings.EqualFold(serial, localDiskObservedDeviceSerial(observed)) {
+			return status.Error(codes.FailedPrecondition, "observed device serial does not match expected volume identity")
+		}
+	}
+	if report != nil && ((report.ExpectedIdentity != nil && report.ExpectedIdentity.ObservedFromDevice != nil) || localDeviceFailureClass(*report) == localDeviceFailureClassWrongIdentity) {
+		if matches, _ := localDiskIdentityMatches(report.ExpectedIdentity, observed); report.ExpectedIdentity == nil || observed == nil || !matches {
+			return status.Error(codes.FailedPrecondition, "observed device does not match retained volume identity")
+		}
+	}
+	return nil
+}
+
 func (ns *NodeServer) confirmLocalDeviceRecovery(ctx context.Context, report *LocalDeviceMissingReport, volumeID, devicePath string, observed *LocalDiskIdentity, publishContext map[string]string) error {
+	if err := verifyLocalDeviceReportIdentity(report, observed, publishContext); err != nil {
+		return err
+	}
 	if ns == nil || ns.Driver == nil || ns.Driver.kubeRuntime == nil || !ns.Driver.kubeRuntime.enabled {
 		return nil
 	}
@@ -364,11 +391,6 @@ func (ns *NodeServer) confirmLocalDeviceRecovery(ctx context.Context, report *Lo
 	}
 	if report.ConfirmationState == localDeviceConfirmationStateInProgress || (report.RecoveryToken != "" && report.RecoveryMethod == "") {
 		return status.Error(codes.Unavailable, "local device recovery is still in progress; retry node verification")
-	}
-	if localDeviceFailureClass(*report) == localDeviceFailureClassWrongIdentity {
-		if matches, _ := localDiskIdentityMatches(report.ExpectedIdentity, observed); report.ExpectedIdentity == nil || observed == nil || !matches {
-			return status.Error(codes.FailedPrecondition, "verified device does not resolve the observed wrong-identity fault")
-		}
 	}
 	key := localDeviceReportKey(node, volumeID)
 	now := time.Now().UTC()

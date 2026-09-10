@@ -157,7 +157,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, reportErr
 	}
 	deviceTimeout := ns.deviceDiscoveryTimeout(volumeContext)
-	devicePath, resolution, err := ns.resolveDevicePathWithContext(volumeID, volName, volumeContext, deviceTimeout)
+	devicePath, resolution, err := ns.resolveDevicePathWithContext(volumeID, volName, volumeContext, deviceTimeout, reportRef)
 	if err != nil {
 		ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "timeout", time.Since(started))
 		ns.recordLocalDeviceMissing(ctx, volumeID, volName, stagingTargetPath, volumeContext, err)
@@ -196,10 +196,9 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 			return nil, err
 		}
 	}
-	if reportRef != nil && localDeviceFailureClass(*reportRef) == localDeviceFailureClassWrongIdentity {
-		observed := ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext)
-		if matches, _ := localDiskIdentityMatches(reportRef.ExpectedIdentity, observed); reportRef.ExpectedIdentity == nil || !matches {
-			return nil, status.Error(codes.FailedPrecondition, wrongDeviceIdentityMessage(volumeID, reportRef.ExpectedIdentity, observed))
+	if reportRef != nil {
+		if err := verifyLocalDeviceReportIdentity(reportRef, ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext), volumeContext); err != nil {
+			return nil, err
 		}
 	}
 	if session, exists, loadErr := ns.loadLocalDiskSession(volumeID); loadErr == nil && exists && session.Identity != nil {
@@ -436,7 +435,7 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			return nil, authorityErr
 		}
 		deviceTimeout := ns.deviceDiscoveryTimeout(volumeContext)
-		devicePath, resolution, resolveErr := ns.resolveDevicePathWithContext(volumeID, volName, volumeContext, deviceTimeout)
+		devicePath, resolution, resolveErr := ns.resolveDevicePathWithContext(volumeID, volName, volumeContext, deviceTimeout, reportRef)
 		if resolveErr != nil {
 			ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "timeout", deviceTimeout)
 			ns.recordLocalDeviceMissing(ctx, volumeID, volName, stagingTargetPath, volumeContext, resolveErr)
@@ -1035,56 +1034,14 @@ type deviceResolutionResult struct {
 }
 
 func (ns *NodeServer) resolveDevicePath(volumeName string, timeout time.Duration) (string, deviceResolutionResult, error) {
-	return ns.resolveDevicePathWithContext("", volumeName, nil, timeout)
+	return ns.resolveDevicePathWithContext("", volumeName, nil, timeout, nil)
 }
 
-func (ns *NodeServer) resolveDevicePathWithContext(volumeID, volumeName string, publishContext map[string]string, timeout time.Duration) (string, deviceResolutionResult, error) {
-	if ns.deviceResolver != nil {
-		return ns.deviceResolver.Resolve(context.Background(), volumeID, volumeName, publishContext, timeout)
+func (ns *NodeServer) resolveDevicePathWithContext(volumeID, volumeName string, publishContext map[string]string, timeout time.Duration, report *LocalDeviceMissingReport) (string, deviceResolutionResult, error) {
+	if ns.deviceResolver == nil {
+		return "", deviceResolutionResult{}, fmt.Errorf("node device resolver is unavailable")
 	}
-
-	started := time.Now()
-	candidates := ns.deviceCandidates(volumeName)
-	deadline := time.Now().Add(timeout)
-	var lastErr error
-	expected := ns.getDeviceName(volumeName)
-
-	for {
-		for _, candidate := range candidates {
-			if _, err := nodeVolumePathStat(candidate); err == nil {
-				result := deviceResolutionResult{
-					ResolvedBy: "exact",
-					Latency:    time.Since(started),
-				}
-				if candidate != expected {
-					result.ResolvedBy = "alias"
-					klog.V(2).InfoS("Resolved device path via alias",
-						"method", "resolveDevicePath", "volumeName", volumeName, "devicePath", candidate)
-				}
-				return candidate, result, nil
-			} else if !os.IsNotExist(err) {
-				lastErr = err
-			}
-		}
-
-		if time.Now().After(deadline) {
-			break
-		}
-
-		nodeDeviceSleep(defaultNodeDevicePollPeriod)
-	}
-
-	if lastErr != nil {
-		return "", deviceResolutionResult{}, fmt.Errorf(
-			"timed out after %s waiting for device path for volume %q (checked %s, last error: %v)",
-			timeout, volumeName, strings.Join(candidates, ", "), lastErr,
-		)
-	}
-
-	return "", deviceResolutionResult{}, fmt.Errorf(
-		"timed out after %s waiting for device path for volume %q (checked %s)",
-		timeout, volumeName, strings.Join(candidates, ", "),
-	)
+	return ns.deviceResolver.Resolve(context.Background(), volumeID, volumeName, publishContext, timeout, localDeviceReportSerials(report)...)
 }
 
 func (ns *NodeServer) deviceDiscoveryTimeout(publishContext map[string]string) time.Duration {

@@ -163,6 +163,8 @@ func TestReviewBlockPublishRepairAuthority(t *testing.T) {
 					report.FailureClass = localDeviceFailureClassWrongIdentity
 					report.ExpectedIdentity = identity
 					if scenario == "wrong-report-identity" {
+						reviewDeviceResolutionClock(t)
+						request.PublishContext[publishContextDeviceDiscoveryTimeoutSeconds] = "1"
 						report.ExpectedIdentity = &LocalDiskIdentity{LegacyDeviceSerial: "onecsi-wrong"}
 					}
 					require.NoError(t, updateLocalDeviceReport(ctx, ns.Driver.kubeRuntime, namespaceFromServiceAccount(), key, func(current *LocalDeviceMissingReport) { *current = report }))
@@ -218,7 +220,11 @@ func TestReviewBlockPublishRepairAuthority(t *testing.T) {
 					return
 				}
 				if strings.HasPrefix(scenario, "wrong-") {
-					require.Equal(t, codes.FailedPrecondition, status.Code(err))
+					if scenario == "wrong-report-identity" {
+						require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+					} else {
+						require.Equal(t, codes.FailedPrecondition, status.Code(err))
+					}
 					require.Error(t, controller.rejectIfActiveRepairState(ctx, report.VolumeID, nil))
 				} else {
 					require.Equal(t, codes.Unavailable, status.Code(err))
@@ -239,6 +245,93 @@ func TestReviewBlockPublishRepairAuthority(t *testing.T) {
 					require.True(t, exists)
 				}
 			})
+		}
+	}
+}
+
+func TestReviewBlockPublishRejectsRecycledAlias(t *testing.T) {
+	for _, bound := range []bool{false, true} {
+		for _, expectedSource := range []string{"publish-context", "report-serial", "report-observed-identity", "report-asserted-identity", "report-legacy-identity"} {
+			for _, observed := range []string{"onecsi-99", ""} {
+				name := expectedSource + "/serial=" + observed + "/new-bind"
+				if bound {
+					name = expectedSource + "/serial=" + observed + "/already-bound"
+				}
+				t.Run(name, func(t *testing.T) {
+					ctx := context.Background()
+					ns, controller, report, request := reviewBlockPublishFixture(t, bound)
+					reviewDeviceResolutionClock(t)
+					request.PublishContext[publishContextDeviceDiscoveryTimeoutSeconds] = "1"
+					device := filepath.Join(defaultDiskPath, report.VolumeName)
+					require.NoError(t, os.Remove(filepath.Join(defaultDiskPath, "disk", "by-id", "virtio-onecsi-42")))
+					serial := observed
+					exec := reviewDeviceSerialExec(func(string) string { return serial })
+					ns.mounter.Exec = exec
+					ns.deviceResolver.exec = exec
+					key := localDeviceReportKey(report.Node, report.VolumeID)
+					report.FailureClass = localDeviceFailureClassMissingDevice
+					report.RecoveryToken = "completed-episode"
+					report.RecoveryMethod = localDeviceRecoveryMethodRuntimeRepublish
+					report.ConfirmationState = localDeviceConfirmationStatePending
+					report.RecoveryAttempts = 1
+					deadline := time.Now().UTC().Add(time.Minute)
+					report.ConfirmationDeadline = &deadline
+					switch expectedSource {
+					case "publish-context":
+						request.PublishContext[publishContextDeviceSerial] = "onecsi-42"
+					case "report-serial":
+						report.DeviceSerial = "onecsi-42"
+					case "report-observed-identity":
+						report.ExpectedIdentity = &LocalDiskIdentity{ObservedFromDevice: &LocalDiskObservedIdentity{Block: &LocalDiskObservedBlockIdentity{DeviceSerial: "onecsi-42"}}}
+					case "report-asserted-identity":
+						report.ExpectedIdentity = &LocalDiskIdentity{AssertedByController: &LocalDiskControllerAssertion{DeviceSerial: "onecsi-42"}}
+					case "report-legacy-identity":
+						report.ExpectedIdentity = &LocalDiskIdentity{LegacyDeviceSerial: "onecsi-42"}
+					}
+					require.NoError(t, updateLocalDeviceReport(ctx, ns.Driver.kubeRuntime, namespaceFromServiceAccount(), key, func(current *LocalDeviceMissingReport) { *current = report }))
+					_, markerErr := ns.Driver.kubeRuntime.GetConfigMap(ctx, namespaceFromServiceAccount(), volumeRepairStateConfigMapName)
+					require.True(t, apierrors.IsNotFound(markerErr))
+					mounter := ns.mounter.Interface.(*mount.FakeMounter)
+					before, err := mounter.List()
+					require.NoError(t, err)
+					beforeLog := mounter.GetLog()
+					for i := 0; i < 2; i++ {
+						response, err := ns.NodePublishVolume(ctx, request)
+						require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+						require.Nil(t, response)
+						current, exists := ns.currentLocalDeviceReport(ctx, report.VolumeID)
+						require.True(t, exists)
+						require.Equal(t, report.RecoveryToken, current.RecoveryToken)
+						require.Equal(t, report.RecoveryMethod, current.RecoveryMethod)
+						require.Equal(t, report.ConfirmationState, current.ConfirmationState)
+						require.Equal(t, report.ConfirmationDeadline, current.ConfirmationDeadline)
+						if expectedSource == "report-serial" {
+							require.Equal(t, report.DeviceSerial, current.DeviceSerial)
+						}
+						require.Equal(t, report.ExpectedIdentity, current.ExpectedIdentity)
+						require.Empty(t, ns.deviceResolver.cache)
+						after, err := mounter.List()
+						require.NoError(t, err)
+						require.Equal(t, before, after)
+						require.Equal(t, beforeLog, mounter.GetLog())
+					}
+					serial = "onecsi-42"
+					response, err := ns.NodePublishVolume(ctx, request)
+					require.NoError(t, err)
+					require.NotNil(t, response)
+					_, exists := ns.currentLocalDeviceReport(ctx, report.VolumeID)
+					require.False(t, exists)
+					require.NoError(t, controller.rejectIfActiveRepairState(ctx, report.VolumeID, nil))
+					point, mounted, err := ns.mountPointForPath(request.TargetPath)
+					require.NoError(t, err)
+					require.True(t, mounted)
+					require.Equal(t, device, point.Device)
+					require.Equal(t, "onecsi-42", ns.deviceResolver.cache[report.VolumeID].Serial)
+					if bound {
+						require.Equal(t, beforeLog, mounter.GetLog())
+					}
+				})
+			}
 		}
 	}
 }

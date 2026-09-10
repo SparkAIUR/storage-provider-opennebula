@@ -214,6 +214,7 @@ func TestStageVolume(t *testing.T) {
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
 			ns := getTestNodeServer([]string{})
+			ns.localDiskSessions = newLocalDiskSessionStore(t.TempDir())
 			response, err := ns.NodeStageVolume(context.Background(), tc.request)
 			if tc.expectError {
 				assert.Error(t, err)
@@ -248,27 +249,12 @@ func TestStageVolumeKeepsLocalDeviceReportUntilMountSucceeds(t *testing.T) {
 		metrics:      NewDriverMetrics(driverVersion, "test"),
 		kubeRuntime:  &KubeRuntime{client: fake.NewSimpleClientset(), enabled: true},
 	}
-	commandScriptArray := []testingexec.FakeCommandAction{}
-	for i := 0; i < 10; i++ {
-		commandScriptArray = append(commandScriptArray, func(cmd string, args ...string) exec.Cmd {
-			return &testingexec.FakeCmd{
-				Argv:           append([]string{cmd}, args...),
-				Stdout:         nil,
-				Stderr:         nil,
-				DisableScripts: true,
-			}
-		})
-	}
 	mountErr := errors.New("can't read superblock")
 	ns := NewNodeServer(driver, mount.NewSafeFormatAndMount(
 		&failingMountInterface{FakeMounter: mount.NewFakeMounter(nil), err: mountErr},
-		&testingexec.FakeExec{
-			CommandScript: commandScriptArray,
-			LookPathFunc: func(path string) (string, error) {
-				return path, nil
-			},
-		},
+		reviewDeviceSerialExec(func(string) string { return "onecsi-439" }),
 	))
+	ns.localDiskSessions = newLocalDiskSessionStore(t.TempDir())
 	publishContext := map[string]string{
 		"volumeName":                    "sdd",
 		annotationBackend:               "local",
@@ -276,6 +262,7 @@ func TestStageVolumeKeepsLocalDeviceReportUntilMountSucceeds(t *testing.T) {
 		publishContextOpenNebulaImageID: "439",
 	}
 	ns.recordLocalDeviceMissing(context.Background(), "vol-1", "sdd", tempDir, publishContext, errors.New("device not found"))
+	delete(publishContext, publishContextDeviceSerial)
 
 	req := &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-1",
@@ -302,6 +289,7 @@ func TestStageVolumeKeepsLocalDeviceReportUntilMountSucceeds(t *testing.T) {
 	var report LocalDeviceMissingReport
 	assert.NoError(t, json.Unmarshal([]byte(raw), &report))
 	assert.Equal(t, localDeviceFailureClassMountFailed, report.FailureClass)
+	assert.Equal(t, "onecsi-439", report.DeviceSerial)
 	assert.Equal(t, 3, report.Attempts)
 	assert.Equal(t, filepath.Join(diskPath, "sdd"), report.DevicePath)
 }
