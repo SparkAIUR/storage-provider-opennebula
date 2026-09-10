@@ -446,7 +446,7 @@ func (m *VolumeRepairStateManager) GetCurrent(ctx context.Context, volumeID stri
 	}
 	cm, err = m.runtime.GetConfigMap(ctx, m.namespace, localDeviceStateConfigMapName)
 	if errors.IsNotFound(err) {
-		return VolumeRepairState{}, false, nil
+		return state, state.VolumeID != "", nil
 	}
 	if err != nil {
 		return VolumeRepairState{}, false, err
@@ -456,12 +456,17 @@ func (m *VolumeRepairStateManager) GetCurrent(ctx context.Context, volumeID stri
 		if err := json.Unmarshal([]byte(raw), &report); err != nil {
 			return VolumeRepairState{}, false, err
 		}
-		if report.VolumeID != volumeID || report.ConfirmationState != localDeviceConfirmationStateRepairRequired {
+		if report.VolumeID != volumeID || (report.ConfirmationState != localDeviceConfirmationStateRepairRequired && localDeviceFailureClass(report) != localDeviceFailureClassWrongIdentity) {
 			continue
 		}
+		classification := repairClassificationRuntimeAttachUnconfirmed
+		if localDeviceFailureClass(report) == localDeviceFailureClassWrongIdentity {
+			classification = repairClassificationWrongDeviceIdentity
+		}
 		return VolumeRepairState{
-			Version: stateObjectVersion, VolumeID: volumeID,
-			Classification: repairClassificationRuntimeAttachUnconfirmed,
+			LastHealthyIdentity: report.ExpectedIdentity,
+			Version:             stateObjectVersion, VolumeID: volumeID,
+			Classification: classification,
 			Reason:         localDeviceFailureClass(report), Message: report.LastRecoveryError,
 			RequestedNode: report.Node, LastKnownNodeName: report.Node,
 			LastKnownTarget:       firstNonEmpty(report.MetadataTarget, report.ExpectedTarget, report.VolumeName),
@@ -470,11 +475,11 @@ func (m *VolumeRepairStateManager) GetCurrent(ctx context.Context, volumeID stri
 			LastObservedAt: report.LastObservedAt, LastObservedIdentity: report.ObservedIdentity,
 		}, true, nil
 	}
-	return VolumeRepairState{}, false, nil
+	return state, state.VolumeID != "", nil
 }
 
 func (m *VolumeRepairStateManager) ClearObserved(ctx context.Context, expected VolumeRepairState) error {
-	if m == nil || expected.VolumeID == "" || expected.Classification == repairClassificationRuntimeAttachUnconfirmed {
+	if m == nil || expected.VolumeID == "" || expected.EvidenceSource == "local_device_report" {
 		return nil
 	}
 	if m.runtime == nil || !m.runtime.enabled {

@@ -152,7 +152,23 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	if len(volName) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "[volumeName] entry is required in volume context")
 	}
-	report, _ := ns.currentLocalDeviceReport(ctx, volumeID)
+	report, _, reportErr := ns.readLocalDeviceReport(ctx, volumeID)
+	if reportErr != nil {
+		return nil, status.Errorf(codes.Unavailable, "cannot read local recovery authority: %v", reportErr)
+	}
+	if report.ConfirmationState == localDeviceConfirmationStateInProgress {
+		return nil, status.Error(codes.Unavailable, "local device recovery is still in progress; retry staging")
+	}
+	var repairRef *VolumeRepairState
+	if ns.Driver.volumeRepairState != nil {
+		state, exists, err := ns.Driver.volumeRepairState.GetCurrent(ctx, volumeID)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "cannot read current repair authority: %v", err)
+		}
+		if exists {
+			repairRef = &state
+		}
+	}
 	var reportRef *LocalDeviceMissingReport
 	if strings.TrimSpace(report.VolumeID) != "" {
 		reportRef = &report
@@ -191,6 +207,11 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 
 	if accessMode.Mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY {
 		mountFlags = append(mountFlags, "ro")
+	}
+	if repairRef != nil {
+		if err := ns.verifyStageRepairObservation(repairRef, ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext)); err != nil {
+			return nil, err
+		}
 	}
 	if reportRef != nil && localDeviceFailureClass(report) == localDeviceFailureClassWrongIdentity {
 		observed := ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext)
@@ -273,7 +294,12 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		// to the volumeCapability provided in the request, then return 0 OK response
 		observedIdentity := ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext)
 		ns.recordLocalDiskStageSession(ctx, req, devicePath, fsType, mountFlags, observedIdentity, reportRef)
-		ns.confirmLocalDeviceRecovery(ctx, reportRef, volumeID, devicePath, observedIdentity, volumeContext)
+		if err := ns.confirmLocalDeviceRecovery(ctx, reportRef, volumeID, devicePath, observedIdentity, volumeContext); err != nil {
+			return nil, err
+		}
+		if err := ns.clearObservedStageRepair(ctx, volumeID, repairRef, observedIdentity); err != nil {
+			return nil, err
+		}
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
@@ -309,7 +335,12 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 
 	observedIdentity := ns.observeLocalDiskIdentity(devicePath, fsType, volumeContext)
 	ns.recordLocalDiskStageSession(ctx, req, devicePath, fsType, mountFlags, observedIdentity, reportRef)
-	ns.confirmLocalDeviceRecovery(ctx, reportRef, volumeID, devicePath, observedIdentity, volumeContext)
+	if err := ns.confirmLocalDeviceRecovery(ctx, reportRef, volumeID, devicePath, observedIdentity, volumeContext); err != nil {
+		return nil, err
+	}
+	if err := ns.clearObservedStageRepair(ctx, volumeID, repairRef, observedIdentity); err != nil {
+		return nil, err
+	}
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 

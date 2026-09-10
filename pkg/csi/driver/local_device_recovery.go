@@ -8,6 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	corev1 "k8s.io/api/core/v1"
@@ -304,44 +307,60 @@ func (ns *NodeServer) clearLocalDeviceMissing(ctx context.Context, volumeID stri
 }
 
 func (ns *NodeServer) currentLocalDeviceReport(ctx context.Context, volumeID string) (LocalDeviceMissingReport, bool) {
+	report, exists, _ := ns.readLocalDeviceReport(ctx, volumeID)
+	return report, exists
+}
+
+// Staging must distinguish absent authority from unreadable authority.
+func (ns *NodeServer) readLocalDeviceReport(ctx context.Context, volumeID string) (LocalDeviceMissingReport, bool, error) {
 	if ns == nil || ns.Driver == nil || ns.Driver.kubeRuntime == nil || !ns.Driver.kubeRuntime.enabled {
-		return LocalDeviceMissingReport{}, false
+		return LocalDeviceMissingReport{}, false, nil
 	}
 	node := strings.TrimSpace(ns.Driver.nodeID)
 	volumeID = strings.TrimSpace(volumeID)
-	if node == "" || volumeID == "" {
-		return LocalDeviceMissingReport{}, false
-	}
 	cm, err := ns.Driver.kubeRuntime.GetConfigMap(ctx, namespaceFromServiceAccount(), localDeviceStateConfigMapName)
+	if apierrors.IsNotFound(err) {
+		return LocalDeviceMissingReport{}, false, nil
+	}
 	if err != nil {
-		return LocalDeviceMissingReport{}, false
+		return LocalDeviceMissingReport{}, false, err
 	}
 	raw := strings.TrimSpace(cm.Data[localDeviceReportKey(node, volumeID)])
 	if raw == "" {
-		return LocalDeviceMissingReport{}, false
+		return LocalDeviceMissingReport{}, false, nil
 	}
 	var report LocalDeviceMissingReport
 	if err := json.Unmarshal([]byte(raw), &report); err != nil {
-		return LocalDeviceMissingReport{}, false
+		return report, false, err
 	}
-	return report, true
+	if report.Node != node || report.VolumeID != volumeID {
+		return report, false, fmt.Errorf("local device report identity mismatch")
+	}
+	return report, true, nil
 }
 
-func (ns *NodeServer) confirmLocalDeviceRecovery(ctx context.Context, report *LocalDeviceMissingReport, volumeID, devicePath string, observed *LocalDiskIdentity, publishContext map[string]string) {
+func (ns *NodeServer) confirmLocalDeviceRecovery(ctx context.Context, report *LocalDeviceMissingReport, volumeID, devicePath string, observed *LocalDiskIdentity, publishContext map[string]string) error {
 	if ns == nil || ns.Driver == nil || ns.Driver.kubeRuntime == nil || !ns.Driver.kubeRuntime.enabled {
-		return
+		return nil
 	}
 	volumeID = strings.TrimSpace(volumeID)
 	node := strings.TrimSpace(ns.Driver.nodeID)
 	if node == "" || volumeID == "" {
-		return
+		return nil
 	}
-	if report == nil || report.ConfirmationState == localDeviceConfirmationStateInProgress || (report.RecoveryToken != "" && report.RecoveryMethod == "") {
-		return
+	if report == nil {
+		_, exists, err := ns.readLocalDeviceReport(ctx, volumeID)
+		if err != nil || exists {
+			return status.Errorf(codes.Unavailable, "recovery authority changed during staging: %v", err)
+		}
+		return nil
+	}
+	if report.ConfirmationState == localDeviceConfirmationStateInProgress || (report.RecoveryToken != "" && report.RecoveryMethod == "") {
+		return status.Error(codes.Unavailable, "local device recovery is still in progress; retry staging")
 	}
 	if localDeviceFailureClass(*report) == localDeviceFailureClassWrongIdentity {
 		if matches, _ := localDiskIdentityMatches(report.ExpectedIdentity, observed); report.ExpectedIdentity == nil || observed == nil || !matches {
-			return
+			return status.Error(codes.FailedPrecondition, "staged device does not resolve the observed wrong-identity fault")
 		}
 	}
 	key := localDeviceReportKey(node, volumeID)
@@ -370,14 +389,18 @@ func (ns *NodeServer) confirmLocalDeviceRecovery(ctx context.Context, report *Lo
 		return true
 	})
 	if err != nil || !updated {
-		return
+		return status.Errorf(codes.Unavailable, "recovery authority changed during staging; retry: %v", err)
 	}
 	if report.RecoveryMethod != "" || report.ConfirmationState != "" {
 		ns.recordPVCEventFromPublishContext(ctx, publishContext, eventReasonLocalDeviceRecoverySucceeded, fmt.Sprintf("node confirmed local device visibility for volume %s on node %s", volumeID, node))
 	}
 	if err := clearLocalDeviceReportIf(ctx, ns.Driver.kubeRuntime, namespaceFromServiceAccount(), key, confirmed); err != nil {
-		klog.V(3).InfoS("Failed to clear confirmed local device report", "volumeID", volumeID, "err", err)
+		return status.Errorf(codes.Unavailable, "cannot retire confirmed recovery report: %v", err)
 	}
+	if _, exists, err := ns.readLocalDeviceReport(ctx, volumeID); err != nil || exists {
+		return status.Errorf(codes.Unavailable, "recovery authority changed during confirmation; retry: %v", err)
+	}
+	return nil
 }
 
 func (ns *NodeServer) localDeviceReportIdentity(ctx context.Context, volumeID string, publishContext map[string]string) localDeviceReportIdentity {
@@ -958,8 +981,7 @@ func updateLocalDeviceReportIf(ctx context.Context, runtime *KubeRuntime, namesp
 		}
 		if raw := strings.TrimSpace(current.Data[key]); raw != "" {
 			if err := json.Unmarshal([]byte(raw), &report); err != nil {
-				klog.V(3).InfoS("Replacing malformed local device report", "key", key, "err", err)
-				report = LocalDeviceMissingReport{}
+				return fmt.Errorf("cannot mutate malformed local device report %s: %w", key, err)
 			}
 		}
 		if !mutate(&report) {

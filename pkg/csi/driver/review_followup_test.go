@@ -226,10 +226,11 @@ func TestRepairSuccessUsesDurableStateAndConditionalClear(t *testing.T) {
 	ctx := context.Background()
 	controller := driver.volumeRepairState
 	ns.Driver.volumeRepairState = NewVolumeRepairStateManager(driver.kubeRuntime, namespaceFromServiceAccount())
-	old, err := controller.Mark(ctx, VolumeRepairState{VolumeID: report.VolumeID, Classification: repairClassificationWrongDeviceIdentity})
+	identity := &LocalDiskIdentity{LegacyFilesystemUUID: "verified-uuid"}
+	old, err := controller.Mark(ctx, VolumeRepairState{VolumeID: report.VolumeID, Classification: repairClassificationWrongDeviceIdentity, RequestedNode: ns.Driver.nodeID, LastHealthyIdentity: identity})
 	require.NoError(t, err)
 	require.Error(t, server.rejectIfActiveRepairState(ctx, report.VolumeID, nil))
-	ns.clearRepairStateOnSuccess(ctx, report.VolumeID)
+	require.NoError(t, ns.clearObservedStageRepair(ctx, report.VolumeID, &old, identity))
 	require.NoError(t, server.rejectIfActiveRepairState(ctx, report.VolumeID, nil))
 	newer, err := controller.Mark(ctx, VolumeRepairState{VolumeID: report.VolumeID, Classification: repairClassificationWrongDeviceIdentity, RequestedNode: "node-b"})
 	require.NoError(t, err)
@@ -334,4 +335,59 @@ func TestLocalDeviceRecoveryCannotDetachConcurrentSuccessfulStage(t *testing.T) 
 	provider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
 	provider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	provider.AssertExpectations(t)
+}
+
+func TestStageRepairRetirementCannotAdoptNewerFault(t *testing.T) {
+	for _, scenario := range []string{"before-clear-read", "no-initial-fault", "history-unavailable"} {
+		t.Run(scenario, func(t *testing.T) {
+			driver, ns, _, _, report := recoveryReviewFixture(t)
+			ctx := context.Background()
+			identity := &LocalDiskIdentity{LegacyFilesystemUUID: "verified"}
+			old, err := driver.volumeRepairState.Mark(ctx, VolumeRepairState{VolumeID: report.VolumeID, Classification: repairClassificationWrongDeviceIdentity, RequestedNode: ns.Driver.nodeID, LastHealthyIdentity: identity})
+			require.NoError(t, err)
+			if scenario == "history-unavailable" {
+				driver.volumeHistory = nil
+				require.NoError(t, ns.clearObservedStageRepair(ctx, report.VolumeID, &old, identity))
+				_, exists, err := driver.volumeRepairState.GetCurrent(ctx, report.VolumeID)
+				require.NoError(t, err)
+				require.False(t, exists)
+				return
+			}
+			newer, err := driver.volumeRepairState.Mark(ctx, VolumeRepairState{VolumeID: report.VolumeID, Classification: repairClassificationWrongDeviceIdentity, RequestedNode: ns.Driver.nodeID, LastHealthyIdentity: &LocalDiskIdentity{LegacyFilesystemUUID: "new-fault"}})
+			require.NoError(t, err)
+			expected := &old
+			if scenario == "no-initial-fault" {
+				expected = nil
+			}
+			require.Error(t, ns.clearObservedStageRepair(ctx, report.VolumeID, expected, identity))
+			current, exists, err := driver.volumeRepairState.GetCurrent(ctx, report.VolumeID)
+			require.NoError(t, err)
+			require.True(t, exists)
+			require.Equal(t, newer, current)
+		})
+	}
+}
+
+func TestRepairGuardsRetainLegacyRuntimeAndReportOnlyWrongIdentity(t *testing.T) {
+	for _, scenario := range []string{"legacy-runtime", "report-only-wrong-identity"} {
+		t.Run(scenario, func(t *testing.T) {
+			driver, _, server, _, report := recoveryReviewFixture(t)
+			ctx := context.Background()
+			if scenario == "legacy-runtime" {
+				state := VolumeRepairState{VolumeID: report.VolumeID, Classification: repairClassificationRuntimeAttachUnconfirmed, RequestedNode: report.Node}
+				payload, err := json.Marshal(state)
+				require.NoError(t, err)
+				require.NoError(t, driver.kubeRuntime.UpsertConfigMapData(ctx, namespaceFromServiceAccount(), volumeRepairStateConfigMapName, map[string]string{report.VolumeID: string(payload)}))
+			} else {
+				report.FailureClass = localDeviceFailureClassWrongIdentity
+				report.ExpectedIdentity = &LocalDiskIdentity{LegacyFilesystemUUID: "expected"}
+				require.NoError(t, updateLocalDeviceReport(ctx, driver.kubeRuntime, namespaceFromServiceAccount(), localDeviceReportKey(report.Node, report.VolumeID), func(current *LocalDeviceMissingReport) { *current = report }))
+			}
+			driver.volumeRepairState = NewVolumeRepairStateManager(driver.kubeRuntime, namespaceFromServiceAccount())
+			require.Error(t, server.rejectIfActiveRepairState(ctx, report.VolumeID, nil))
+			_, exists, err := server.repairStateForQueue(ctx, report.VolumeID)
+			require.NoError(t, err)
+			require.True(t, exists)
+		})
+	}
 }

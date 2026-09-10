@@ -291,6 +291,42 @@ func (r *KubeRuntime) UpsertConfigMapData(ctx context.Context, namespace, name s
 	return err
 }
 
+// Snapshot writes carry the fetched resourceVersion, including deletion. A delayed
+// request that outlives its timeout cannot overwrite a newer successful snapshot.
+func (r *KubeRuntime) setConfigMapSnapshot(ctx context.Context, namespace, name, key, payload string) error {
+	client := r.client.CoreV1().ConfigMaps(namespace)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		cm, err := client.Get(ctx, name, metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			data := map[string]string{}
+			if payload != "" {
+				data[key] = payload
+			}
+			_, err = client.Create(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}, Data: data}, metav1.CreateOptions{})
+			if errors.IsAlreadyExists(err) {
+				return errors.NewConflict(corev1.Resource("configmaps"), name, err)
+			}
+			return err
+		}
+		if err != nil {
+			return err
+		}
+		var value any
+		if payload != "" {
+			value = payload
+		}
+		patch, err := json.Marshal(map[string]any{"metadata": map[string]string{"resourceVersion": cm.ResourceVersion}, "data": map[string]any{key: value}})
+		if err != nil {
+			return err
+		}
+		_, err = client.Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{})
+		return err
+	})
+}
+
 func (r *KubeRuntime) DeleteConfigMapKey(ctx context.Context, namespace, name, key string) error {
 	if r == nil || !r.enabled {
 		return fmt.Errorf("kubernetes runtime is not enabled")

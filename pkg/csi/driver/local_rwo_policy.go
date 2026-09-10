@@ -408,26 +408,44 @@ func (s *ControllerServer) rejectIfActiveRepairState(ctx context.Context, volume
 	return status.Error(codes.FailedPrecondition, message)
 }
 
-func (s *ControllerServer) clearRepairStateOnSuccess(ctx context.Context, volumeID string) {
-	if s == nil || s.driver == nil || s.driver.volumeRepairState == nil || strings.TrimSpace(volumeID) == "" {
-		return
+func (ns *NodeServer) verifyStageRepairObservation(expected *VolumeRepairState, identity *LocalDiskIdentity) error {
+	if expected == nil {
+		return nil
 	}
-	if state, ok, err := s.driver.volumeRepairState.GetCurrent(ctx, volumeID); err == nil && ok {
-		if err := s.driver.volumeRepairState.ClearObserved(ctx, state); err == nil {
-			s.driver.metrics.RecordVolumeRepairState(state.Classification, "cleared")
+	if firstNonEmpty(expected.RequestedNode, expected.LastKnownNodeName) != ns.Driver.nodeID {
+		return status.Error(codes.FailedPrecondition, "repair authority requires verification on its affected node")
+	}
+	if expected.Classification == repairClassificationWrongDeviceIdentity {
+		matches, _ := localDiskIdentityMatches(expected.LastHealthyIdentity, identity)
+		if expected.LastHealthyIdentity == nil || identity == nil || !matches {
+			return status.Error(codes.FailedPrecondition, "device does not resolve the observed wrong-identity repair")
 		}
 	}
+	return nil
 }
 
-func (ns *NodeServer) clearRepairStateOnSuccess(ctx context.Context, volumeID string) {
-	if ns == nil || ns.Driver == nil || ns.Driver.volumeRepairState == nil || strings.TrimSpace(volumeID) == "" {
-		return
+// The record was read before device verification. Never adopt a newer fault here.
+func (ns *NodeServer) clearObservedStageRepair(ctx context.Context, volumeID string, expected *VolumeRepairState, identity *LocalDiskIdentity) error {
+	if ns.Driver.volumeRepairState == nil {
+		return nil
 	}
-	if state, ok, err := ns.Driver.volumeRepairState.GetCurrent(ctx, volumeID); err == nil && ok {
-		if err := ns.Driver.volumeRepairState.ClearObserved(ctx, state); err == nil {
-			ns.Driver.metrics.RecordVolumeRepairState(state.Classification, "cleared")
+	if expected == nil {
+		if _, exists, err := ns.Driver.volumeRepairState.GetCurrent(ctx, volumeID); err != nil || exists {
+			return status.Errorf(codes.Unavailable, "new repair authority appeared during staging; retry: %v", err)
 		}
+		return nil
 	}
+	if err := ns.verifyStageRepairObservation(expected, identity); err != nil {
+		return err
+	}
+	if err := ns.Driver.volumeRepairState.ClearObserved(ctx, *expected); err != nil {
+		return status.Errorf(codes.Unavailable, "cannot retire observed repair authority: %v", err)
+	}
+	if _, exists, err := ns.Driver.volumeRepairState.GetCurrent(ctx, expected.VolumeID); err != nil || exists {
+		return status.Errorf(codes.Unavailable, "repair authority changed during staging; retry: %v", err)
+	}
+	ns.Driver.metrics.RecordVolumeRepairState(expected.Classification, "cleared")
+	return nil
 }
 
 func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID, requestedNode, target string, sourceContext map[string]string, protection *LocalRWOProtectionDecision, metadata *opennebula.VolumeAttachmentMetadata) {
@@ -567,7 +585,6 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 	})
 	if err == nil {
 		ns.Driver.metrics.RecordVolumeHistory("stage", "persisted")
-		ns.clearRepairStateOnSuccess(ctx, volumeID)
 	}
 }
 

@@ -106,12 +106,19 @@ func (ns *NodeServer) verifySharedFilesystemTargetMode(volumeID, path string, al
 			return fmt.Errorf("ambiguous target mount at %s", path)
 		}
 		for _, other := range infos {
-			if other.MountPoint == path || filepath.Base(other.MountPoint) != "globalmount" || !sameSharedFilesystemMount(target, other) {
+			if other.MountPoint == path || !sameSharedFilesystemMount(target, other) {
 				continue
 			}
-			owner, err := sharedFilesystemStageVolumeID(other.MountPoint)
-			if err != nil || owner != volumeID {
-				return fmt.Errorf("target mount belongs to another volume")
+			if filepath.Base(other.MountPoint) == "globalmount" {
+				owner, err := sharedFilesystemStageVolumeID(other.MountPoint)
+				if err != nil || owner != volumeID {
+					return fmt.Errorf("target mount belongs to another volume")
+				}
+			} else if strings.Contains(other.MountPoint, "/volumes/kubernetes.io~csi/") {
+				owner, err := sharedFilesystemMetadata(other.MountPoint)
+				if err != nil || owner.VolumeHandle != volumeID {
+					return fmt.Errorf("target mount identity has conflicting sibling ownership")
+				}
 			}
 		}
 	}
@@ -221,7 +228,7 @@ func (ns *NodeServer) verifySharedFilesystemSessionMode(ctx context.Context, ses
 					return fmt.Errorf("target %s belongs to another staging mount", target.TargetPath)
 				}
 			}
-			if stage != nil && !sameSharedFilesystemMount(*stage, info) {
+			if stage == nil || !sameSharedFilesystemMount(*stage, info) {
 				if err := ns.sharedFS.probe(ctx, target.TargetPath); !isDisconnectedSharedFilesystemError(err) {
 					return fmt.Errorf("target mount identity mismatch at %s", target.TargetPath)
 				}

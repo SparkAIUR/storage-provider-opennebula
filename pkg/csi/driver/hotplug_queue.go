@@ -688,12 +688,7 @@ func (m *HotplugQueueManager) flushPendingSnapshot(node string) {
 		}
 		m.snapshotMu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), hotplugSnapshotTimeout)
-		var err error
-		if payload == "" {
-			err = m.runtime.DeleteConfigMapKey(ctx, m.namespace, hotplugQueueStateConfigMapName, node)
-		} else {
-			err = m.runtime.UpsertConfigMapData(ctx, m.namespace, hotplugQueueStateConfigMapName, map[string]string{node: payload})
-		}
+		err := m.runtime.setConfigMapSnapshot(ctx, m.namespace, hotplugQueueStateConfigMapName, node, payload)
 		cancel()
 		m.snapshotMu.Lock()
 		state.persisted = false

@@ -957,7 +957,6 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		if s.driver.volumeQuarantine != nil {
 			_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
 		}
-		s.clearRepairStateOnSuccess(ctx, req.VolumeId)
 		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
 		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
 		s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), &protection, lookup.AttachmentMetadata)
@@ -994,7 +993,6 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			if reuseErr != nil {
 				return reuseErr
 			}
-			s.clearRepairStateOnSuccess(queueCtx, req.VolumeId)
 			s.recordSuccessfulLocalVolumePublish(queueCtx, req.VolumeId, req.NodeId, reusedResponse.GetPublishContext()["volumeName"], req.GetVolumeContext(), &protection, lookup.AttachmentMetadata)
 			s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
 			response = reusedResponse
@@ -1038,7 +1036,6 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		if s.driver.volumeQuarantine != nil {
 			_ = s.driver.volumeQuarantine.Clear(queueCtx, req.VolumeId)
 		}
-		s.clearRepairStateOnSuccess(queueCtx, req.VolumeId)
 
 		klog.V(3).InfoS("Checking if volume is attached",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID)
@@ -1867,7 +1864,6 @@ func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.
 			if s.driver.volumeQuarantine != nil {
 				_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
 			}
-			s.clearRepairStateOnSuccess(ctx, req.VolumeId)
 			s.clearHostArtifactQuarantineForVolume(ctx, req.VolumeId)
 		} else if s.driver.volumeRecoveryControl != nil {
 			recoveryControl, _ := s.recoveryControlState(ctx, req.VolumeId, protection.RuntimeContext)
