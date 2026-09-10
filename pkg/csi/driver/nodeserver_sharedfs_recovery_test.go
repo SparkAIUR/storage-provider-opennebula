@@ -324,7 +324,7 @@ func TestSharedFilesystemGarbageCollectSkipsWhenPodLookupUnknown(t *testing.T) {
 
 	ns := getTestNodeServer(nil)
 	client := fake.NewSimpleClientset()
-	client.Fake.PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+	client.PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.New("api unavailable")
 	})
 	ns.Driver.kubeRuntime = &KubeRuntime{client: client, enabled: true}
@@ -337,7 +337,7 @@ func TestSharedFilesystemGarbageCollectSkipsWhenPodLookupUnknown(t *testing.T) {
 			{TargetPath: "/var/lib/kubelet/pods/test-pod-uid/volumes/kubernetes.io~csi/pvc-test/mount"},
 		},
 	}
-	ns.recordSharedFilesystemSession(session)
+	require.NoError(t, ns.recordSharedFilesystemSession(session))
 
 	collected, gcErr := ns.sharedFilesystemRecovery.garbageCollectOrphanedSession(context.Background(), session)
 	require.NoError(t, gcErr)

@@ -123,14 +123,14 @@ func getTestNodeServerWithMountPoints(mountPointList []mount.MountPoint) *NodeSe
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return mounter.Interface.Unmount(path)
+		return mounter.Unmount(path)
 	}
 	ns.sharedFS.bind = func(ctx context.Context, stage, target string, options []string) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		mp, _, _ := ns.mountPointForPath(stage)
-		return mounter.Interface.Mount(stage, target, mp.Type, options)
+		return mounter.Mount(stage, target, mp.Type, options)
 	}
 	ns.sharedFS.fuse = func(ctx context.Context, session sharedFilesystemSession, args []string) error {
 		_, err := ns.sharedFS.run(ctx, "ceph-fuse", args...)

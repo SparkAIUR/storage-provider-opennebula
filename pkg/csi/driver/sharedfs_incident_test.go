@@ -211,7 +211,7 @@ func TestSharedFilesystemSeedKeepsMissingPublishedTarget(t *testing.T) {
 	id, stage, target := stageSharedFilesystemFixture(t, ns, "seed-target")
 	_, err := ns.NodePublishVolume(context.Background(), newSharedFilesystemPublishRequest(id, stage, target))
 	require.NoError(t, err)
-	require.NoError(t, ns.mounter.Interface.Unmount(target))
+	require.NoError(t, ns.mounter.Unmount(target))
 	ns.sharedFilesystemRecovery.seedSessionsFromMounts(context.Background())
 	session, exists, err := ns.sharedFilesystemRecovery.store.Load(id)
 	require.NoError(t, err)

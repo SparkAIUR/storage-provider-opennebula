@@ -603,11 +603,7 @@ func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 
 	klog.V(1).InfoS("Volume successfully unpublished from target path",
 		"method", "NodeUnpublishVolume", "volumeID", volumeID, "targetPath", targetPath)
-	if opennebula.IsSharedFilesystemVolumeID(volumeID) {
-		ns.removeSharedFilesystemPublishedTarget(volumeID, targetPath)
-	} else {
-		ns.removeLocalDiskPublishedTarget(volumeID, targetPath)
-	}
+	ns.removeLocalDiskPublishedTarget(volumeID, targetPath)
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }

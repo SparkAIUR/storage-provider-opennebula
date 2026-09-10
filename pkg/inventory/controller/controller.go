@@ -1943,23 +1943,6 @@ func humanizeLatency(micros *int64) string {
 	}
 }
 
-func compatibleSystemDatastoresForInventory(ds datastoreSchema.Datastore) []int {
-	values := make([]int, 0)
-	compatibleRaw, _ := ds.Template.GetStr("COMPATIBLE_SYS_DS")
-	for _, candidate := range strings.Split(strings.TrimSpace(compatibleRaw), ",") {
-		trimmed := strings.TrimSpace(candidate)
-		if trimmed == "" {
-			continue
-		}
-		id, err := strconv.Atoi(trimmed)
-		if err != nil {
-			continue
-		}
-		values = append(values, id)
-	}
-	return values
-}
-
 func datastoreStateString(ds datastoreSchema.Datastore) string {
 	state, err := ds.State()
 	if err != nil {

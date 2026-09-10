@@ -178,15 +178,6 @@ func (ns *NodeServer) recordLocalDiskSession(session localDiskSession) {
 	}
 }
 
-func (ns *NodeServer) deleteLocalDiskSession(volumeID string) {
-	if ns == nil || ns.localDiskSessions == nil {
-		return
-	}
-	if err := ns.localDiskSessions.Delete(volumeID); err != nil {
-		klog.ErrorS(err, "Failed to delete local disk session", "volumeID", volumeID)
-	}
-}
-
 func cleanupLocalDiskStagePath(volumeID, stagingTargetPath string, mounter mount.Interface, sessions *localDiskSessionStore) error {
 	if strings.TrimSpace(stagingTargetPath) == "" {
 		return fmt.Errorf("staging target path is required")
