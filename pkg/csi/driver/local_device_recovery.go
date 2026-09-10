@@ -629,7 +629,7 @@ func (s *ControllerServer) recoverLocalDeviceReport(ctx context.Context, key str
 	if updated, err := s.markLocalDeviceRecoveryPendingConfirmation(ctx, key, report, attempt, deadline); err != nil || !updated {
 		return err
 	}
-	s.recordLocalDeviceRecoveryEvent(ctx, report, runtimeCtx, eventReasonLocalDeviceRecoveryPending, fmt.Sprintf("same-node device recovery for volume %s on node %s completed at the controller; waiting until %s for node runtime confirmation", volumeID, node, deadline.Format(time.RFC3339)))
+	s.recordLocalDeviceRecoveryEvent(ctx, report, runtimeCtx, eventReasonLocalDeviceRecoveryPending, fmt.Sprintf("same-node device recovery for volume %s on node %s completed at the controller; fresh node verification is required", volumeID, node))
 	return nil
 }
 
@@ -885,17 +885,29 @@ func (s *ControllerServer) markLocalDeviceRecoveryPendingConfirmation(ctx contex
 	if attempt == nil {
 		return false, fmt.Errorf("local device recovery attempt is required")
 	}
-	_, updated, err := s.updateLocalDeviceRecoveryReport(ctx, key, report, func(current *LocalDeviceMissingReport) {
-		current.ConfirmationState = localDeviceConfirmationStatePending
-		current.LastRecoveryOutcome = localDeviceConfirmationStatePending
-		current.ExpectedTarget = firstNonEmpty(strings.TrimSpace(attempt.ExpectedTarget), current.ExpectedTarget, strings.TrimSpace(current.VolumeName))
+	updated := false
+	err := updateLocalDeviceReportIf(ctx, s.driver.kubeRuntime, namespaceFromServiceAccount(), key, func(current *LocalDeviceMissingReport) bool {
+		updated = false
+		if report.RecoveryToken == "" || current.RecoveryToken != report.RecoveryToken ||
+			current.Node == "" || current.Node != report.Node || current.VolumeID == "" || current.VolumeID != report.VolumeID ||
+			!current.FirstObservedAt.Equal(report.FirstObservedAt) || current.RecoveryAttempts != report.RecoveryAttempts ||
+			current.LastRecoveryAt == nil || report.LastRecoveryAt == nil || !current.LastRecoveryAt.Equal(*report.LastRecoveryAt) {
+			return false
+		}
+		if current.ConfirmationState == localDeviceConfirmationStateInProgress {
+			current.ConfirmationState = localDeviceConfirmationStatePending
+			current.LastRecoveryOutcome = localDeviceConfirmationStatePending
+			current.ConfirmationDeadline = &deadline
+		}
+		current.ExpectedTarget = firstNonEmpty(current.ExpectedTarget, strings.TrimSpace(attempt.ExpectedTarget), strings.TrimSpace(current.VolumeName))
 		current.RecoveryMethod = strings.TrimSpace(attempt.Method)
-		current.ConfirmationDeadline = &deadline
 		current.MetadataAttachedToNode = attempt.MetadataAttached
 		current.MetadataNode = firstNonEmpty(strings.TrimSpace(attempt.MetadataNode), current.Node)
 		current.MetadataTarget = strings.TrimSpace(attempt.MetadataTarget)
+		updated = true
+		return true
 	})
-	return updated, err
+	return updated && err == nil, err
 }
 
 func (s *ControllerServer) updateLocalDeviceRecoveryReport(ctx context.Context, key string, expected LocalDeviceMissingReport, mutate func(*LocalDeviceMissingReport)) (LocalDeviceMissingReport, bool, error) {
