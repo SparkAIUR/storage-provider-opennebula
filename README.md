@@ -52,7 +52,7 @@ Features that remain gated by default:
 - Container images:
   `ghcr.io/sparkaiur/opennebula-csi:<tag>`
   `docker.io/nudevco/opennebula-csi:<tag>`
-- Latest release: [`v0.5.28`](https://github.com/SparkAIUR/storage-provider-opennebula/releases/tag/v0.5.28), published September 9, 2026.
+- Release candidate: `v0.5.29`. The last published release is [`v0.5.28`](https://github.com/SparkAIUR/storage-provider-opennebula/releases/tag/v0.5.28).
 - The hplmon failure test and Bravo canary passed. The staged production rollout is in progress, with 24-hour observation pending. See [CephFS recovery and rollout](docs/cephfs-recovery.md) for evidence and remaining checks.
 - Helm repo: `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
 - Chart name: `opennebula-csi`
@@ -439,7 +439,7 @@ The chart supports `allowVolumeExpansion`, and the controller deployment now inc
 Current behavior:
 
 - Controller expansion is supported for OpenNebula volumes that are attached to a VM.
-- Filesystem expansion on the node for mounted filesystem volumes enforces a post-condition: `NodeExpandVolume` returns success only after the mounted filesystem reaches requested size (within a configured tolerance).
+- Filesystem expansion on the node for mounted filesystem volumes enforces a post-condition: `NodeExpandVolume` returns success only after the block device reaches the full requested size and Kubernetes mount-utils confirms that filesystem geometry fills the device, within one filesystem block. Ext4 metadata overhead reported by `statfs` is not missing capacity.
 - If device or filesystem growth does not converge before timeout, `NodeExpandVolume` returns retriable `DeadlineExceeded` with requested/device/filesystem byte context.
 - Block volumes do not require node-side filesystem expansion.
 - CephFS shared-filesystem volumes support expansion for dynamic subvolumes by default.
@@ -451,7 +451,7 @@ Node resize convergence can be tuned with:
 
 - `driver.nodeExpand.verifyTimeoutSeconds` (`ONE_CSI_NODE_EXPAND_VERIFY_TIMEOUT_SECONDS`, default `120`)
 - `driver.nodeExpand.retryIntervalSeconds` (`ONE_CSI_NODE_EXPAND_RETRY_INTERVAL_SECONDS`, default `2`)
-- `driver.nodeExpand.sizeToleranceBytes` (`ONE_CSI_NODE_EXPAND_SIZE_TOLERANCE_BYTES`, default `134217728`)
+- `driver.nodeExpand.sizeToleranceBytes` / `ONE_CSI_NODE_EXPAND_SIZE_TOLERANCE_BYTES` is deprecated and ignored as of v0.5.29. Existing chart values remain accepted; they cannot relax device-capacity or filesystem-geometry verification.
 
 ## Snapshots and clones
 
@@ -862,7 +862,7 @@ At minimum, release validation should include:
 
 The legacy `hack/validate-release-lab.sh` assumes the retired lab and performs Helm ownership changes and broad smoke tests. It is not the hplmon recovery procedure. Use a bounded node canary and isolated test volumes; do not run that script against hplmon without adapting and reviewing its operations.
 
-Push the semantic tag for the release being cut, for example `v0.5.28`, only after that validation to trigger the release workflow.
+Push the semantic tag for the release being cut, for example `v0.5.28`, only after that validation to trigger the release workflow. For v0.5.29, validate a 10 GiB to 40 GiB ext4 PVC expansion with data checksum preservation on hplmon before tagging.
 
 The workflow will:
 
