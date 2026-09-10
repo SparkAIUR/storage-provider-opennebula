@@ -159,7 +159,7 @@ func TestLocalDeviceRecoveryRequiresProvenAttachmentAbsence(t *testing.T) {
 				}
 				provider.On("InspectVolumeAttachment", mock.Anything, report.VolumeID, report.Node).Run(func(mock.Arguments) {
 					if outcome == "confirmed-before-begin" {
-						ns.confirmLocalDeviceRecovery(ctx, &report, report.VolumeID, "/dev/sdd", nil, nil)
+						require.NoError(t, ns.confirmLocalDeviceRecovery(ctx, &report, report.VolumeID, "/dev/sdd", nil, nil))
 					}
 				}).Return(metadata, inspectErr).Once()
 			}
@@ -168,8 +168,8 @@ func TestLocalDeviceRecoveryRequiresProvenAttachmentAbsence(t *testing.T) {
 					inProgress, exists := ns.currentLocalDeviceReport(ctx, report.VolumeID)
 					require.True(t, exists)
 					require.Equal(t, localDeviceConfirmationStateInProgress, inProgress.ConfirmationState)
-					ns.confirmLocalDeviceRecovery(ctx, &report, report.VolumeID, "/dev/sdd", nil, nil)
-					ns.confirmLocalDeviceRecovery(ctx, &inProgress, report.VolumeID, "/dev/sdd", nil, nil)
+					require.Error(t, ns.confirmLocalDeviceRecovery(ctx, &report, report.VolumeID, "/dev/sdd", nil, nil))
+					require.Error(t, ns.confirmLocalDeviceRecovery(ctx, &inProgress, report.VolumeID, "/dev/sdd", nil, nil))
 					current, _ := ns.currentLocalDeviceReport(ctx, report.VolumeID)
 					require.Equal(t, inProgress, current)
 				}).Return(nil).Once()
@@ -177,22 +177,23 @@ func TestLocalDeviceRecoveryRequiresProvenAttachmentAbsence(t *testing.T) {
 			}
 			require.NoError(t, server.recoverLocalDeviceReport(ctx, key, report))
 			current, exists := ns.currentLocalDeviceReport(ctx, report.VolumeID)
-			if outcome == "confirmed-before-begin" {
+			switch outcome {
+			case "confirmed-before-begin":
 				require.False(t, exists)
-			} else if outcome == "metadata-attached" {
+			case "metadata-attached":
 				require.Equal(t, localDeviceConfirmationStateRepairRequired, current.ConfirmationState)
 				require.Contains(t, current.LastRecoveryError, "drain consumers")
 				require.Error(t, server.rejectIfActiveRepairState(ctx, report.VolumeID, nil))
-				ns.confirmLocalDeviceRecovery(ctx, &current, report.VolumeID, "/dev/sdd", nil, nil)
+				require.NoError(t, ns.confirmLocalDeviceRecovery(ctx, &current, report.VolumeID, "/dev/sdd", nil, nil))
 				require.NoError(t, server.rejectIfActiveRepairState(ctx, report.VolumeID, nil))
-			} else if outcome == "absent" {
+			case "absent":
 				require.Equal(t, localDeviceConfirmationStatePending, current.ConfirmationState)
 				require.Equal(t, localDeviceRecoveryMethodRuntimeRepublish, current.RecoveryMethod)
 				require.NotEmpty(t, current.RecoveryToken)
-				ns.confirmLocalDeviceRecovery(ctx, &current, report.VolumeID, "/dev/sdd", nil, nil)
+				require.NoError(t, ns.confirmLocalDeviceRecovery(ctx, &current, report.VolumeID, "/dev/sdd", nil, nil))
 				_, exists = ns.currentLocalDeviceReport(ctx, report.VolumeID)
 				require.False(t, exists)
-			} else {
+			default:
 				require.Equal(t, "failed", current.LastRecoveryOutcome)
 			}
 			provider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
@@ -446,7 +447,7 @@ func TestNodeRecordsNewMissingDeviceEpisodeAfterConfirmation(t *testing.T) {
 		}
 		return false, nil, nil
 	})
-	ns.confirmLocalDeviceRecovery(ctx, &report, "vol-1", "/dev/sdd", nil, publishContext)
+	require.Error(t, ns.confirmLocalDeviceRecovery(ctx, &report, "vol-1", "/dev/sdd", nil, publishContext))
 	confirmed, exists := ns.currentLocalDeviceReport(ctx, "vol-1")
 	require.True(t, exists)
 	require.Equal(t, localDeviceConfirmationStateConfirmed, confirmed.ConfirmationState)

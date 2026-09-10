@@ -34,11 +34,13 @@ func TestHotplugSnapshotTimeoutCannotOverwriteNewerClear(t *testing.T) {
 		if r.Method == http.MethodGet {
 			mu.Lock()
 			defer mu.Unlock()
-			json.NewEncoder(w).Encode(cm)
+			if err := json.NewEncoder(w).Encode(cm); err != nil {
+				t.Errorf("encode ConfigMap response: %v", err)
+			}
 			return
 		}
 		if r.Method != http.MethodPatch {
-			http.Error(w, "unexpected method", 405)
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
 			return
 		}
 		var patch struct {
@@ -49,7 +51,7 @@ func TestHotplugSnapshotTimeoutCannotOverwriteNewerClear(t *testing.T) {
 			Data map[string]*string `json:"data"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
-			http.Error(w, err.Error(), 400)
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		mu.Lock()
@@ -64,8 +66,10 @@ func TestHotplugSnapshotTimeoutCannotOverwriteNewerClear(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		if patch.Metadata.ResourceVersion != cm.ResourceVersion {
-			w.WriteHeader(409)
-			json.NewEncoder(w).Encode(metav1.Status{TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"}, Status: "Failure", Reason: metav1.StatusReasonConflict, Code: 409})
+			w.WriteHeader(http.StatusConflict)
+			if err := json.NewEncoder(w).Encode(metav1.Status{TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"}, Status: "Failure", Reason: metav1.StatusReasonConflict, Code: http.StatusConflict}); err != nil {
+				t.Errorf("encode conflict response: %v", err)
+			}
 			return
 		}
 		before := cm.DeepCopy()
@@ -86,7 +90,9 @@ func TestHotplugSnapshotTimeoutCannotOverwriteNewerClear(t *testing.T) {
 			revision++
 			cm.ResourceVersion = fmt.Sprint(revision)
 		}
-		json.NewEncoder(w).Encode(cm)
+		if err := json.NewEncoder(w).Encode(cm); err != nil {
+			t.Errorf("encode ConfigMap response: %v", err)
+		}
 	}))
 	defer func() { once.Do(func() { close(release) }); server.Close() }()
 	client, err := kubernetes.NewForConfig(&rest.Config{Host: server.URL})

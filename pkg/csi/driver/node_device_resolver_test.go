@@ -151,9 +151,10 @@ func TestNodeDeviceResolverRetainedSerialAndRecovery(t *testing.T) {
 			}), func(string) []string { return []string{device} })
 			publishContext := map[string]string{}
 			expected := "onecsi-42"
-			if scenario == "conflicting-context" {
+			switch scenario {
+			case "conflicting-context":
 				publishContext[publishContextDeviceSerial] = "onecsi-99"
-			} else if scenario == "identity-free-legacy" {
+			case "identity-free-legacy":
 				expected = ""
 			}
 			path, result, err := resolver.Resolve(context.Background(), "vol-1", "sdd", publishContext, 0, expected)

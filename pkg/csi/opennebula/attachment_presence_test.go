@@ -47,13 +47,14 @@ func TestAttachRetryRequiresConsistentAbsence(t *testing.T) {
 				attached, err := attachmentPresence(metadata, "volume", 7, 11)
 				return attached, true, err
 			}, func() error { attaches++; return nil }, "volume", "node")
-			if scenario == "absent" {
+			switch scenario {
+			case "absent":
 				require.NoError(t, err)
 				require.Equal(t, 1, attaches)
-			} else if scenario == "attached" {
+			case "attached":
 				require.NoError(t, err)
 				require.Zero(t, attaches)
-			} else {
+			default:
 				require.Error(t, err)
 				require.Zero(t, attaches)
 			}
