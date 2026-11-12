@@ -395,5 +395,19 @@ class ChartPromotionTest(unittest.TestCase):
         )
 
 
+class CandidateGuardTest(unittest.TestCase):
+    def test_only_structured_registry_absence_permits_new_candidate(self):
+        from guard_candidate_publication import assert_manifest_absent
+
+        for status in (200, 401, 403, 500):
+            with patch(
+                "guard_candidate_publication.fetch", return_value=(status, {}, b"")
+            ):
+                with self.assertRaises((ValueError, KeyError)):
+                    assert_manifest_absent("ghcr.io", "fixture", "v0.6.0-rc.1")
+        with patch("guard_candidate_publication.fetch", return_value=(404, {}, b"")):
+            assert_manifest_absent("ghcr.io", "fixture", "v0.6.0-rc.1")
+
+
 if __name__ == "__main__":
     unittest.main()
