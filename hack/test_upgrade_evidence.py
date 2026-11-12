@@ -3,6 +3,7 @@ import datetime as dt
 import hashlib
 import json
 import unittest
+import yaml
 from unittest.mock import patch
 import subprocess
 import sys
@@ -393,6 +394,167 @@ class ChartPromotionTest(unittest.TestCase):
             normalized(original),
             normalized(original.replace("sha256:abc", "sha256:other")),
         )
+
+
+class PromoteCLITest(unittest.TestCase):
+    setUp = EvidenceTest.setUp
+
+    def test_actual_cli_uses_one_sealed_lookup_fixture_and_packages_original_template(
+        self,
+    ):
+        import shutil
+        import tarfile
+        from upgrade_evidence import validate_receipt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shutil.copytree(Path(__file__).resolve().parents[1] / "helm", root / "helm")
+
+            def git(*args):
+                return subprocess.check_output(
+                    ["git", "-C", str(root), *args], text=True
+                ).strip()
+
+            git("init", "-q")
+            git(
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "add",
+                "helm",
+            )
+            git(
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "offline fixture",
+            )
+            candidate = copy.deepcopy(self.candidate)
+            candidate["sourceCommit"] = git("rev-parse", "HEAD")
+            candidate["sourceTree"] = git("rev-parse", "HEAD^{tree}")
+            for name in [
+                "opennebula-csi",
+                "csi-provisioner",
+                "csi-attacher",
+                "csi-resizer",
+                "csi-node-driver-registrar",
+                "liveness-probe",
+                "csi-snapshotter",
+            ]:
+                candidate["images"][name] = "registry/" + name + "@sha256:" + "a" * 64
+            binding = hashlib.sha256(
+                json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            receipt = {
+                "kind": "OpenNebulaNativeQualification/v1",
+                "sourceCommit": candidate["sourceCommit"],
+                "sourceTree": candidate["sourceTree"],
+                "images": candidate["images"],
+                "candidateSHA256": binding,
+                "providerVersion": "7.4.0",
+                "approval": {
+                    "operator": "OFFLINE FIXTURE",
+                    "changeReference": "TEST ONLY",
+                },
+                "clusters": {},
+            }
+            for i, (cluster, count, minor) in enumerate(
+                [("hpldb", 3, "1.36"), ("hplsvc", 10, "1.35"), ("bravo", 13, "1.35")]
+            ):
+                bundle = copy.deepcopy(self.bundle)
+                bundle["cluster"] = cluster
+                bundle["clusterUID"] = cluster
+                bundle["candidateSHA256"] = binding
+                bundle["kubernetesVersion"] = "v" + minor + ".2"
+                day = i * 2 + 1
+                bundle["capturedAt"] = f"2026-01-{day + 1:02d}T00:00:00+00:00"
+                for key in [
+                    "desiredNumberScheduled",
+                    "updatedNumberScheduled",
+                    "numberReady",
+                    "numberAvailable",
+                ]:
+                    bundle["daemonset"]["status"][key] = count
+                prototype = bundle["nodePods"]["items"][0]
+                bundle["nodePods"]["items"] = [
+                    copy.deepcopy(prototype) for _ in range(count)
+                ]
+                for n, pod in enumerate(bundle["nodePods"]["items"]):
+                    pod["spec"]["nodeName"] = str(n)
+                gates = [
+                    "createDelete",
+                    "attachDetach",
+                    "attachedExpandReattach",
+                    "cloneResponseLoss",
+                    "cephfsRecovery",
+                    "lookupFaults",
+                    "quarantinePreserved",
+                    "fuseDrain",
+                    "detachedGrowthRejected",
+                    "diskSnapshotsRejected",
+                ]
+                receipt["clusters"][cluster] = {
+                    "result": "passed",
+                    "observationStartedAt": f"2026-01-{day:02d}T00:00:00+00:00",
+                    "observationEndedAt": bundle["capturedAt"],
+                    "disposableVolumesOnly": True,
+                    "readback": bundle,
+                    "tests": {
+                        g: {
+                            "result": "passed",
+                            "commands": ["OFFLINE FIXTURE"],
+                            "backendReceiptsSHA256": "a" * 64,
+                            "artifactURI": "fixture:NOT-NATIVE",
+                        }
+                        for g in gates
+                    },
+                }
+            validate_receipt(receipt, candidate, True)
+            c = root / "candidate.json"
+            r = root / "native.json"
+            c.write_text(json.dumps(candidate))
+            r.write_text(json.dumps(receipt))
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("promote_chart.py").resolve()),
+                    "--candidate",
+                    str(c),
+                    "--receipt",
+                    str(r),
+                    "--version",
+                    "0.6.0",
+                    "--output",
+                    str(root / "out"),
+                ],
+                cwd=root,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with tarfile.open(root / "out/opennebula-csi-0.6.0.tgz") as archive:
+                template = (
+                    archive.extractfile(
+                        "opennebula-csi/templates/last-node-preference-webhook.yaml"
+                    )
+                    .read()
+                    .decode()
+                )
+                self.assertIn('lookup "v1" "Secret"', template)
+                self.assertNotIn("$existing := fromJson", template)
+                values = yaml.safe_load(
+                    archive.extractfile("opennebula-csi/values.yaml")
+                )
+                self.assertTrue(
+                    all(
+                        v["digest"].startswith("sha256:")
+                        for v in values["sidecarImages"].values()
+                    )
+                )
 
 
 class CandidateGuardTest(unittest.TestCase):

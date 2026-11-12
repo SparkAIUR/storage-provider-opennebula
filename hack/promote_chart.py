@@ -4,7 +4,6 @@ Requires PyYAML. Does not push or publish; binary VendorVersion remains its RC i
 """
 
 import argparse
-import copy
 import json
 import re
 import shutil
@@ -74,14 +73,16 @@ def main():
             "provisioner": "csi-provisioner",
             "attacher": "csi-attacher",
             "resizer": "csi-resizer",
-            "registrar": "node-driver-registrar",
+            "registrar": "csi-node-driver-registrar",
             "liveness": "liveness-probe",
             "snapshotter": "csi-snapshotter",
         }
         for key, name in mapping.items():
-            if name in candidate["images"]:
-                repo, digest = candidate["images"][name].split("@")
-                values["sidecarImages"][key].update(repository=repo, digest=digest)
+            require(
+                name in candidate["images"], "missing frozen sidecar image: " + name
+            )
+            repo, digest = candidate["images"][name].split("@")
+            values["sidecarImages"][key].update(repository=repo, digest=digest)
         (frozen / "values.yaml").write_text(yaml.safe_dump(values, sort_keys=False))
         shutil.copytree(frozen, stable)
         chart = yaml.safe_load((stable / "Chart.yaml").read_text())
@@ -104,10 +105,52 @@ def main():
                 text=True,
             )
 
+        # Render one fresh local TLS fixture, then give both renderers the same
+        # lookup response. This models the existing Secret branch without ignoring
+        # any Secret/CA bytes. Never package the fixture or contact a real cluster.
+        initial = list(yaml.safe_load_all(render(frozen)))
+        secrets = [
+            o
+            for o in initial
+            if o and o.get("kind") == "Secret" and o.get("type") == "kubernetes.io/tls"
+        ]
+        require(len(secrets) == 1, "expected exactly one generated webhook TLS fixture")
+        secret = secrets[0]
+        webhooks = [
+            o for o in initial if o and o.get("kind") == "MutatingWebhookConfiguration"
+        ]
+        require(
+            len(webhooks) == 1
+            and all(
+                w["clientConfig"]["caBundle"] == secret["data"]["ca.crt"]
+                for w in webhooks[0]["webhooks"]
+            ),
+            "fixture TLS CA binding differs",
+        )
+        lookup = '{{- $existing := lookup "v1" "Secret" $namespace $secretName -}}'
+        fixture = (
+            "{{- $existing := fromJson "
+            + json.dumps(json.dumps({"data": secret["data"]}))
+            + " -}}"
+        )
+        originals = {}
+        for path in (frozen, stable):
+            template = path / "templates/last-node-preference-webhook.yaml"
+            original = template.read_text()
+            require(
+                original.count(lookup) == 1,
+                "webhook lookup contract changed; review equivalence fixture",
+            )
+            originals[template] = original
+            template.write_text(original.replace(lookup, fixture))
         require(
             normalized(render(frozen)) == normalized(render(stable)),
             "stable chart changes rendered behavior",
         )
+        for template, original in originals.items():
+            template.write_text(
+                original
+            )  # never package the local test key/certificate
         a.output.mkdir(parents=True, exist_ok=True)
         subprocess.run(
             ["helm", "package", str(stable), "--destination", str(a.output)], check=True
