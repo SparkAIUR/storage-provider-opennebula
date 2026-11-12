@@ -17,11 +17,14 @@ jobs:
       - uses: actions/setup-go@v5
         with: {go-version-file: go.mod}
       - uses: azure/setup-helm@v4
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.13.8"
       - run: |
           go test -count=1 ./...
           go vet ./...
           go test -race ./pkg/csi/driver ./pkg/csi/opennebula ./pkg/inventory/...
-          python3 -m unittest discover -s hack -p 'test_*.py'
+          uv run --no-project --with PyYAML==6.0.3 python -m unittest discover -s hack -p 'test_*.py'
           helm lint helm/opennebula-csi
           bash hack/validate-chart-version-alignment.sh "$GITHUB_REF_NAME"
           bash hack/validate-storageclass-reconcile-render.sh

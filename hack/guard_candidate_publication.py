@@ -65,8 +65,14 @@ def assert_manifest_absent(registry, repository, tag, credentials=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tag", required=True)
+    parser.add_argument("--stable", action="store_true")
     a = parser.parse_args()
-    require(re.fullmatch(r"v\d+\.\d+\.\d+-rc\.\d+", a.tag), "RC tag required")
+    require(
+        re.fullmatch(
+            r"v\d+\.\d+\.\d+" if a.stable else r"v\d+\.\d+\.\d+-rc\.\d+", a.tag
+        ),
+        "valid release tag required",
+    )
     token = os.environ["GH_TOKEN"]
     repo = os.environ["GITHUB_REPOSITORY"]
     headers = {

@@ -9,6 +9,9 @@ on:
       stable_tag:
         description: Stable tag (for example v0.6.0); binary keeps its qualified RC VendorVersion
         required: true
+concurrency:
+  group: csi-stable-${{ inputs.stable_tag }}
+  cancel-in-progress: false
 permissions: {contents: write, packages: write, actions: read}
 jobs:
   promote:
@@ -43,7 +46,9 @@ jobs:
           gh run download "$RUN_ID" --name native-qualification --dir qualification
           python3 hack/upgrade_evidence.py qualify --stable --candidate qualification/candidate.json --evidence qualification/native.json
       - uses: azure/setup-helm@v4
-      - run: python3 -m pip install PyYAML==6.0.3
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.13.8"
       - uses: docker/login-action@v3
         with:
           registry: docker.io
@@ -57,7 +62,8 @@ jobs:
           [[ "$STABLE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$(python3 -c 'import json;print(json.load(open("qualification/candidate.json"))["sourceCommit"])')" = "$GITHUB_SHA"
           test "$(python3 -c 'import json;print(json.load(open("qualification/candidate.json"))["sourceTree"])')" = "$(git rev-parse HEAD^{tree})"
-          python3 hack/promote_chart.py --candidate qualification/candidate.json --receipt qualification/native.json --version "${STABLE_TAG#v}" --output _stable
+          uv run --no-project --with PyYAML==6.0.3 python hack/promote_chart.py --candidate qualification/candidate.json --receipt qualification/native.json --version "${STABLE_TAG#v}" --output _stable
+          python3 hack/guard_candidate_publication.py --stable --tag "$STABLE_TAG"
           IMAGE="$(python3 -c 'import json;print(json.load(open("qualification/candidate.json"))["images"]["opennebula-csi"])')"
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           docker buildx imagetools create --prefer-index=false --tag "ghcr.io/sparkaiur/opennebula-csi:$STABLE_TAG" --tag "nudevco/opennebula-csi:$STABLE_TAG" "$IMAGE"

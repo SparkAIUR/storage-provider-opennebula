@@ -43,6 +43,10 @@ def main():
         "stable semantic version required",
     )
     candidate = json.loads(a.candidate.read_text())
+    require(
+        a.version == candidate["chartVersion"].split("-rc.")[0],
+        "stable version does not match qualified candidate",
+    )
     validate_receipt(json.loads(a.receipt.read_text()), candidate, True)
     require(
         subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
