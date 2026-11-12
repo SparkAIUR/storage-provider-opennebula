@@ -33,14 +33,31 @@ def main():
     parser.add_argument("--gitops", type=Path, required=True)
     args = parser.parse_args()
     root = args.gitops
+    common = "infrastructure/opennebula-csi/kustomization.yaml"
+    require(
+        (root / common).read_bytes()
+        == subprocess.check_output(
+            ["git", "-C", str(root), "show", "origin/main:" + common]
+        ),
+        "shared resources changed outside target scope",
+    )
     base = yaml.safe_load(
         (root / "infrastructure/opennebula-csi/release.yaml").read_text()
     )
     for cluster, budget in [("hpldb", 150), ("hplsvc", 360), ("bravo", 450)]:
-        parent = yaml.safe_load(
-            (
-                root / "clusters" / cluster / "kube-system/opennebula-csi.yaml"
-            ).read_text()
+        documents = list(
+            yaml.safe_load_all(
+                (
+                    root / "clusters" / cluster / "kube-system/opennebula-csi.yaml"
+                ).read_text()
+            )
+        )
+        parent = next(o for o in documents if o["kind"] == "Kustomization")
+        repo = next(o for o in documents if o["kind"] == "HelmRepository")
+        require(
+            repo["metadata"]["name"] == "opennebula-csi-candidates"
+            and repo["spec"]["url"].endswith("/charts/candidates/"),
+            "scoped candidate source differs",
         )
         require(
             parent["spec"]["wait"] and parent["spec"]["timeout"] == f"{budget + 15}m",
@@ -63,6 +80,10 @@ def main():
             "candidate channel/version differs",
         )
         for action in ("install", "upgrade"):
+            require(
+                spec[action]["strategy"]["name"] == "RemediateOnFailure",
+                "strategy must be explicit",
+            )
             require(
                 spec[action]["disableWait"] is False
                 and spec[action]["disableWaitForJobs"] is False,
