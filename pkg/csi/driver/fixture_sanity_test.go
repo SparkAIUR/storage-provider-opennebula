@@ -2,6 +2,7 @@ package driver
 
 import (
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -19,6 +20,9 @@ import (
 // identity/capability/validation contract. Mutation and physical-device sanity
 // remain a distinct native gate; the original opt-in full suite is retained.
 func TestFixtureCSISanity(t *testing.T) {
+	if os.Getenv("RUN_CSI_SANITY_TESTS") == "1" {
+		t.Skip("native suite owns the single Ginkgo RunSpecs invocation")
+	}
 	socket := filepath.Join(t.TempDir(), "driver.sock")
 	listener, err := net.Listen("unix", socket)
 	require.NoError(t, err)
