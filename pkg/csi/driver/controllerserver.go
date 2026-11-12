@@ -349,6 +349,12 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 			result, err := s.volumeProvider.CloneVolume(ctx, name, source.Volume.GetVolumeId(), selection)
 			if err != nil {
 				switch {
+				case errors.Is(err, opennebula.ErrCloneCapacity):
+					s.driver.metrics.RecordOperation("create_volume", backend, "out_of_range", time.Since(started))
+					return nil, status.Error(codes.OutOfRange, err.Error())
+				case errors.Is(err, opennebula.ErrCloneConflict):
+					s.driver.metrics.RecordOperation("create_volume", backend, "already_exists", time.Since(started))
+					return nil, status.Error(codes.AlreadyExists, err.Error())
 				case opennebula.IsDatastoreTopologyError(err):
 					s.driver.metrics.RecordOperation("create_volume", backend, "resource_exhausted", time.Since(started))
 					return nil, status.Error(codes.ResourceExhausted, err.Error())
@@ -952,31 +958,6 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.Unavailable, message)
 	}
 
-	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
-	if err == nil {
-		if err := s.volumeProvider.RestoreVolumeCapacity(ctx, req.VolumeId, nodeID, volumeID); err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to restore volume capacity: %v", err)
-		}
-		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), runtimeCtx); localErr != nil {
-			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "unavailable", time.Since(started))
-			s.driver.metrics.RecordControllerPublishDuration("disk", "unavailable", time.Since(started))
-			return nil, localErr
-		}
-		if s.driver.volumeQuarantine != nil {
-			_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
-		}
-		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
-		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
-		s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), &protection, lookup.AttachmentMetadata)
-		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext())
-		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
-		s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
-		klog.V(1).InfoS("Volume already attached to node",
-			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
-		return &csi.ControllerPublishVolumeResponse{
-			PublishContext: publishContext,
-		}, nil
-	}
 	priority := hotplugQueuePriorityNormal
 	if _, ok := s.driver.stickyAttachments.Get(req.VolumeId); ok {
 		priority = hotplugQueuePriorityCritical
@@ -988,6 +969,31 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 		release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
 		defer release()
+
+		target, err := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
+		if err == nil {
+			if err := s.volumeProvider.RestoreVolumeCapacity(queueCtx, req.VolumeId, nodeID, volumeID); err != nil {
+				return status.Errorf(codes.Internal, "failed to restore volume capacity: %v", err)
+			}
+			if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(queueCtx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), runtimeCtx); localErr != nil {
+				s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "unavailable", time.Since(started))
+				s.driver.metrics.RecordControllerPublishDuration("disk", "unavailable", time.Since(started))
+				return localErr
+			}
+			if s.driver.volumeQuarantine != nil {
+				_ = s.driver.volumeQuarantine.Clear(queueCtx, req.VolumeId)
+			}
+			s.clearStickyReuseState(queueCtx, req.VolumeId, req.NodeId, "disk")
+			s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
+			s.recordSuccessfulLocalVolumePublish(queueCtx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), &protection, lookup.AttachmentMetadata)
+			publishContext := s.publishContextForVolume(queueCtx, req.VolumeId, target, 0, req.GetVolumeContext())
+			klog.V(1).InfoS("Volume already attached to node",
+				"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
+			response = &csi.ControllerPublishVolumeResponse{
+				PublishContext: publishContext,
+			}
+			return nil
+		}
 
 		if handled, freshResponse, freshErr := s.precheckPublishHotplug(queueCtx, req, volumeID, nodeID, &protection, lookup.AttachmentMetadata); handled {
 			if freshErr != nil {
@@ -1103,6 +1109,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, queueErr
 	}
 
+	if response == nil {
+		return nil, status.Error(codes.Aborted, "publish completion requires capacity verification; retry the request")
+	}
 	s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
 	s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
 	return response, nil
@@ -1862,14 +1871,18 @@ func (s *ControllerServer) withQueuedHotplug(ctx context.Context, node, operatio
 }
 
 func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node, operation, volume string) HotplugQueueValidation {
-	return s.evaluateVolumeReconcile(ctx, node, operation, volume).HotplugQueueValidation()
+	validation := s.evaluateVolumeReconcile(ctx, node, operation, volume).HotplugQueueValidation()
+	if operation == "attach" && validation.Decision == HotplugQueueValidationCompleted {
+		validation.Decision = HotplugQueueValidationValid
+	}
+	return validation
 }
 
 func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.ControllerPublishVolumeRequest, volumeID, nodeID int, protection *LocalRWOProtectionDecision, metadata *opennebula.VolumeAttachmentMetadata) (bool, *csi.ControllerPublishVolumeResponse, error) {
 	if s == nil || req == nil {
 		return false, nil, nil
 	}
-	validation := s.validateHotplugQueueRequest(ctx, req.NodeId, "attach", req.VolumeId)
+	validation := s.evaluateVolumeReconcile(ctx, req.NodeId, "attach", req.VolumeId).HotplugQueueValidation()
 	switch validation.Decision {
 	case HotplugQueueValidationCompleted:
 		target := strings.TrimSpace(validation.AttachmentTarget)
