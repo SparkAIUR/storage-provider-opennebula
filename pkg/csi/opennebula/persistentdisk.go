@@ -508,6 +508,10 @@ func (p *PersistentDiskVolumeProvider) ExpandVolume(ctx context.Context, volume 
 		}
 		return 0, &datastoreConfigError{message: "detached disk growth is unsupported; attach the volume and retry"}
 	}
+	return p.expandAttachedDisk(ctx, vmID, diskID, id, size)
+}
+
+func (p *PersistentDiskVolumeProvider) expandAttachedDisk(ctx context.Context, vmID, diskID, id int, size int64) (int64, error) {
 	actual, err := p.completedDiskSize(ctx, vmID, diskID, id)
 	if err != nil {
 		return 0, err
@@ -974,7 +978,7 @@ func (p *PersistentDiskVolumeProvider) DetachVolume(ctx context.Context, volume,
 	if err != nil || volumeID == -1 {
 		return fmt.Errorf("failed to check if volume exists: %w", err)
 	}
-	sizeBytes, err := p.resolveDetachVolumeSizeBytes(ctx, volumeID)
+	sizeBytes, err := p.resolveDetachVolumeSizeBytes(ctx, volumeID, nodeID)
 	if err != nil {
 		return fmt.Errorf("failed to resolve volume size for detach of %s: %w", volume, err)
 	}
@@ -1163,27 +1167,43 @@ func (p *PersistentDiskVolumeProvider) findAttachedVolumeDisk(ctx context.Contex
 	return attachedVMID, attachedDiskID, true, attachedSizeBytes, nil
 }
 
-func (p *PersistentDiskVolumeProvider) attachedDiskSizeBytes(ctx context.Context, vmID, diskID, volumeID int) (int64, error) {
-	vmInfo, err := p.ctrl.VM(vmID).InfoContext(ctx, true)
+func (p *PersistentDiskVolumeProvider) volumeDiskInVM(ctx context.Context, imageID, vmID int) (int, int64, error) {
+	info, err := p.ctrl.VM(vmID).InfoContext(ctx, true)
 	if err != nil {
-		return 0, fmt.Errorf("failed to inspect vm %d while checking attached volume %d size: %w", vmID, volumeID, err)
+		return 0, 0, err
 	}
-
-	for _, disk := range vmInfo.Template.GetDisks() {
-		diskImageID, diskErr := disk.GetI(shared.ImageID)
-		if diskErr != nil || diskImageID != volumeID {
+	if info.ID != vmID {
+		return 0, 0, fmt.Errorf("requested VM identity changed")
+	}
+	selected := -1
+	var size int64
+	for _, disk := range info.Template.GetDisks() {
+		id, err := disk.GetI(shared.ImageID)
+		if err != nil {
+			if raw, e := disk.Get(shared.ImageID); e == nil && strings.TrimSpace(raw) != "" {
+				return 0, 0, fmt.Errorf("malformed VM disk image identity: %w", err)
+			}
 			continue
 		}
-
-		currentDiskID, idErr := disk.GetI(shared.DiskID)
-		if idErr != nil || currentDiskID != diskID {
+		if id != imageID {
 			continue
 		}
-
-		return diskSizeBytesFromTemplate(disk)
+		if selected >= 0 {
+			return 0, 0, fmt.Errorf("image %d has multiple disks on VM %d", imageID, vmID)
+		}
+		selected, err = disk.GetI(shared.DiskID)
+		if err != nil || selected < 0 {
+			return 0, 0, fmt.Errorf("invalid disk identity for image %d on VM %d", imageID, vmID)
+		}
+		size, err = diskSizeBytesFromTemplate(disk)
+		if err != nil {
+			return 0, 0, err
+		}
 	}
-
-	return 0, fmt.Errorf("failed to locate attached disk %d for volume %d on vm %d", diskID, volumeID, vmID)
+	if selected < 0 {
+		return 0, 0, fmt.Errorf("%w: image %d VM %d", ErrAttachmentNotFound, imageID, vmID)
+	}
+	return selected, size, nil
 }
 
 func diskSizeBytesFromTemplate(disk shared.Disk) (int64, error) {
@@ -1539,29 +1559,26 @@ func (p *PersistentDiskVolumeProvider) waitForDetachState(ctx context.Context, t
 	}
 }
 
-func (p *PersistentDiskVolumeProvider) resolveDetachVolumeSizeBytes(ctx context.Context, volumeID int) (int64, error) {
-	vmID, diskID, attached, attachedSizeBytes, err := p.findAttachedVolumeDisk(ctx, volumeID)
-	if err != nil {
+func (p *PersistentDiskVolumeProvider) resolveDetachVolumeSizeBytes(ctx context.Context, volumeID, vmID int) (int64, error) {
+	_, size, err := p.volumeDiskInVM(ctx, volumeID, vmID)
+	if err == nil && size > 0 {
+		return size, nil
+	}
+	if err != nil && !errors.Is(err, ErrAttachmentNotFound) {
 		return 0, err
 	}
-	if attached && attachedSizeBytes > 0 {
-		return attachedSizeBytes, nil
-	}
-	if attached {
-		sizeBytes, sizeErr := p.attachedDiskSizeBytes(ctx, vmID, diskID, volumeID)
-		if sizeErr == nil && sizeBytes > 0 {
-			return sizeBytes, nil
-		}
-	}
-
 	image, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
 	if err != nil {
 		return 0, err
 	}
-	if image.Size <= 0 {
+	size, err = effectiveImageSize(image)
+	if err != nil {
+		return 0, err
+	}
+	if size <= 0 {
 		return 0, fmt.Errorf("volume %d size is unavailable", volumeID)
 	}
-	return int64(image.Size * sizeConversion), nil
+	return size, nil
 }
 
 func (p *PersistentDiskVolumeProvider) waitForResourceStatus(volumeID int, timeout time.Duration, check func(int) (bool, error)) error {
@@ -1608,8 +1625,23 @@ func attachmentPresence(metadata *VolumeAttachmentMetadata, volume string, image
 			return true, nil
 		}
 	}
-	if metadata.AttachedToRequestedNode || len(metadata.DiskRecords) != 0 || metadata.ImageRunningVMs != 0 || len(metadata.ImageVMIDs) != 0 {
-		return false, fmt.Errorf("attachment absence is contradicted by image or VM usage")
+	if metadata.AttachedToRequestedNode {
+		return false, fmt.Errorf("requested-node attachment observations contradict one another")
+	}
+	owners := make(map[int]bool)
+	for _, record := range metadata.DiskRecords {
+		if record.NodeID <= 0 || strings.TrimSpace(record.Target) == "" {
+			return false, fmt.Errorf("attachment ownership could not be verified")
+		}
+		owners[record.NodeID] = true
+	}
+	for _, id := range metadata.ImageVMIDs {
+		if id == nodeID || !owners[id] {
+			return false, fmt.Errorf("image usage contradicts observed VM attachments")
+		}
+	}
+	if metadata.ImageRunningVMs > len(owners) {
+		return false, fmt.Errorf("image usage exceeds observed VM attachments")
 	}
 	return false, nil
 }

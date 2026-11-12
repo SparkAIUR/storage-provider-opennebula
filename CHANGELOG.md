@@ -2,6 +2,8 @@
 
 ## v0.6.0-rc.1, unreleased
 
+- Separate requested-VM attachment and capacity checks from global ownership, preserving approved moves and shared readers; distinguish disabled datastores from unknown prerequisites.
+
 - Pause attachment reconciliation on unknown provider observations and retain sticky holds; only typed absence can authorize absence handling.
 
 - Target OpenNebula7.4.x with the7.4 GoCA SDK, Go1.27.4, Kubernetes0.36.6 libraries, CSI1.13 and current storage sidecars.

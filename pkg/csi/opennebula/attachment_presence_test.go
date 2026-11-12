@@ -25,6 +25,8 @@ func TestAttachRetryRequiresConsistentAbsence(t *testing.T) {
 				metadata.DiskRecords = []VolumeDiskRecord{{NodeID: 11}}
 			case "another-vm":
 				metadata.DiskRecords = []VolumeDiskRecord{{NodeID: 12, Target: "sdd"}}
+				metadata.ImageVMIDs = []int{12}
+				metadata.ImageRunningVMs = 1
 			case "image-usage":
 				metadata.ImageRunningVMs = 1
 			case "image-vm-ids":
@@ -48,7 +50,7 @@ func TestAttachRetryRequiresConsistentAbsence(t *testing.T) {
 				return attached, true, err
 			}, func() error { attaches++; return nil }, "volume", "node")
 			switch scenario {
-			case "absent":
+			case "absent", "another-vm":
 				require.NoError(t, err)
 				require.Equal(t, 1, attaches)
 			case "attached":

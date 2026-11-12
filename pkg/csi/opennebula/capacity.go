@@ -97,6 +97,9 @@ func (p *PersistentDiskVolumeProvider) RestoreVolumeCapacity(ctx context.Context
 	if err != nil {
 		return err
 	}
+	if info.ID != imageID || info.Name != volume {
+		return fmt.Errorf("image identity changed before capacity verification")
+	}
 	raw, err := info.Template.GetStr(requestedSizeTag)
 	if err != nil || raw == "" {
 		return nil
@@ -105,19 +108,16 @@ func (p *PersistentDiskVolumeProvider) RestoreVolumeCapacity(ctx context.Context
 	if err != nil {
 		return err
 	}
-	foundVM, disk, attached, _, err := p.findAttachedVolumeDisk(ctx, imageID)
+	disk, _, err := p.volumeDiskInVM(ctx, imageID, vmID)
 	if err != nil {
 		return err
-	}
-	if !attached || foundVM != vmID {
-		return fmt.Errorf("attachment changed before capacity verification")
 	}
 	actual, err := p.completedDiskSize(ctx, vmID, disk, imageID)
 	if err != nil {
 		return err
 	}
 	if actual < desired {
-		_, err = p.ExpandVolume(ctx, volume, desired, false)
+		_, err = p.expandAttachedDisk(ctx, vmID, disk, imageID, desired)
 		return err
 	}
 	return nil

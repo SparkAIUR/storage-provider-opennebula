@@ -315,14 +315,16 @@ func (s *Syncer) syncDatastores(ctx context.Context) error {
 			continue
 		}
 		nextStatus := s.buildDatastoreStatusWithPool(item, ds, dsPool.Datastores, pvs.Items, pvcByNSName, scs.Items, vas.Items, latestBenchmarks[ds.ID])
-		if err := opennebula.ProvisioningFeasible(ctx, s.ctrl, normalizeDatastore(ds, dsPool.Datastores)); err != nil {
-			nextStatus.Health = inventoryv1alpha1.DatastoreHealthLookupFailed
-			nextStatus.Phase = inventoryv1alpha1.DatastorePhaseUnavailable
-			for i := range nextStatus.Conditions {
-				if nextStatus.Conditions[i].Type == "ProvisioningFeasible" {
-					nextStatus.Conditions[i].Status = metav1.ConditionFalse
-					nextStatus.Conditions[i].Reason = "ProviderPrerequisiteUnknown"
-					nextStatus.Conditions[i].Message = err.Error()
+		if normalized := normalizeDatastore(ds, dsPool.Datastores); normalized.Enabled && item.Spec.Enabled && item.Spec.Discovery.Allowed && !item.Spec.MaintenanceMode {
+			if err := opennebula.ProvisioningFeasible(ctx, s.ctrl, normalized); err != nil {
+				nextStatus.Health = inventoryv1alpha1.DatastoreHealthLookupFailed
+				nextStatus.Phase = inventoryv1alpha1.DatastorePhaseUnavailable
+				for i := range nextStatus.Conditions {
+					if nextStatus.Conditions[i].Type == "ProvisioningFeasible" {
+						nextStatus.Conditions[i].Status = metav1.ConditionFalse
+						nextStatus.Conditions[i].Reason = "ProviderPrerequisiteUnknown"
+						nextStatus.Conditions[i].Message = err.Error()
+					}
 				}
 			}
 		}
@@ -2181,6 +2183,9 @@ func datastoreConditions(item inventoryv1alpha1.OpenNebulaDatastore, normalized 
 	case !item.Spec.Enabled:
 		provisioningReason = "ProvisioningDisabled"
 		provisioningMessage = "Datastore provisioning is disabled"
+	case !normalized.Enabled:
+		provisioningReason = "ProviderDisabled"
+		provisioningMessage = "Datastore is disabled in OpenNebula"
 	case !item.Spec.Discovery.Allowed:
 		provisioningReason = "DiscoveryDisallowed"
 		provisioningMessage = "Datastore is excluded from CSI provisioning"
