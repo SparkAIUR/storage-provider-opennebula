@@ -162,13 +162,15 @@ func TestPersistentDiskDetachedExpansion(t *testing.T) {
 		_ = volumeProvider.DeleteVolume(ctx, volumeTestName)
 	})
 
+	// The legacy allowDetached flag cannot re-enable unqualified backend growth.
 	newSize, err := volumeProvider.ExpandVolume(ctx, volumeTestName, expandedSize, true)
-	require.NoError(t, err)
-	assert.GreaterOrEqual(t, newSize, expandedSize)
-
+	require.Error(t, err)
+	require.True(t, IsDatastoreConfigError(err))
+	require.ErrorContains(t, err, "detached disk growth is unsupported")
+	require.Zero(t, newSize)
 	_, resolvedSize, err := volumeProvider.VolumeExists(ctx, volumeTestName)
 	require.NoError(t, err)
-	assert.GreaterOrEqual(t, int64(resolvedSize), expandedSize)
+	assert.Equal(t, initialSize, int64(resolvedSize))
 }
 
 func getIntegrationTestDatastores() []string {
