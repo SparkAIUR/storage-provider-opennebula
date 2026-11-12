@@ -284,8 +284,13 @@ func resolveDatastoreIdentifier(identifier string, poolByID map[int]datastoreSch
 	return candidate, nil
 }
 
+// NormalizeDatastore exposes the same provider state and backend attributes to inventory.
+func NormalizeDatastore(source datastoreSchema.Datastore) Datastore {
+	return datastoreFromSchema(source)
+}
+
 func datastoreFromSchema(source datastoreSchema.Datastore) Datastore {
-	enabled := true
+	enabled := false
 	if state, err := source.State(); err == nil {
 		enabled = state == datastoreSchema.Ready
 	}

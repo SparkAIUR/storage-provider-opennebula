@@ -33,6 +33,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 )
@@ -580,6 +581,22 @@ func (s *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 		return &csi.DeleteVolumeResponse{}, nil
 	}
 
+	var identityErr error
+	ctx, identityErr = s.pinKnownVolumeIdentity(ctx, req.VolumeId)
+	if identityErr != nil {
+		return nil, status.Error(codes.Unavailable, identityErr.Error())
+	}
+	if manager := s.driver.volumeQuarantine; manager != nil && manager.runtime != nil && manager.runtime.enabled {
+		cm, e := manager.runtime.GetConfigMap(ctx, manager.namespace, volumeQuarantineStateConfigMapName)
+		if e != nil && !apierrors.IsNotFound(e) {
+			return nil, status.Error(codes.Unavailable, "cannot inspect cleanup quarantine")
+		}
+		if e == nil {
+			if _, exists := cm.Data[req.VolumeId]; exists {
+				return nil, status.Error(codes.FailedPrecondition, "volume has unresolved cleanup quarantine; external verification required")
+			}
+		}
+	}
 	err := s.volumeProvider.DeleteVolume(ctx, req.VolumeId)
 	if err != nil {
 		s.driver.metrics.RecordOperation("delete_volume", "disk", "failed_precondition", time.Since(started))
@@ -1102,8 +1119,13 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 
+	var identityErr error
+	ctx, identityErr = s.pinKnownVolumeIdentity(ctx, req.VolumeId)
+	if identityErr != nil {
+		return nil, status.Error(codes.Unavailable, identityErr.Error())
+	}
 	volumeID, _, err := s.volumeProvider.VolumeExists(ctx, req.VolumeId)
-	if err != nil && !errors.Is(err, opennebula.ErrVolumeNotFound) {
+	if err != nil && !opennebula.IsAuthoritativeVolumeAbsence(err) {
 		return nil, status.Errorf(codes.Unavailable, "volume lookup is unknown: %v", err)
 	}
 	if volumeID == -1 {
@@ -2817,4 +2839,17 @@ func hasSingleWriterAccessMode(modes []corev1.PersistentVolumeAccessMode) bool {
 		}
 	}
 	return false
+}
+
+func (s *ControllerServer) pinKnownVolumeIdentity(ctx context.Context, volume string) (context.Context, error) {
+	if s.driver.volumeHistory == nil {
+		return ctx, nil
+	}
+	if err := s.driver.volumeHistory.RefreshEntry(ctx, volume); err != nil {
+		return ctx, err
+	}
+	if record, ok := s.driver.volumeHistory.Get(volume); ok && record.LastSuccessfulImageID > 0 {
+		return opennebula.WithExpectedImageID(ctx, record.LastSuccessfulImageID), nil
+	}
+	return ctx, nil
 }

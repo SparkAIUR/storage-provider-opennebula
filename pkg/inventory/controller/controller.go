@@ -315,6 +315,17 @@ func (s *Syncer) syncDatastores(ctx context.Context) error {
 			continue
 		}
 		nextStatus := s.buildDatastoreStatusWithPool(item, ds, dsPool.Datastores, pvs.Items, pvcByNSName, scs.Items, vas.Items, latestBenchmarks[ds.ID])
+		if err := opennebula.ProvisioningFeasible(ctx, s.ctrl, normalizeDatastore(ds, dsPool.Datastores)); err != nil {
+			nextStatus.Health = inventoryv1alpha1.DatastoreHealthLookupFailed
+			nextStatus.Phase = inventoryv1alpha1.DatastorePhaseUnavailable
+			for i := range nextStatus.Conditions {
+				if nextStatus.Conditions[i].Type == "ProvisioningFeasible" {
+					nextStatus.Conditions[i].Status = metav1.ConditionFalse
+					nextStatus.Conditions[i].Reason = "ProviderPrerequisiteUnknown"
+					nextStatus.Conditions[i].Message = err.Error()
+				}
+			}
+		}
 		status.Status = nextStatus
 		log.Info("patching datastore status",
 			"datastoreObject", item.Name,
@@ -566,6 +577,9 @@ func (s *Syncer) buildDatastoreStatusWithPool(item inventoryv1alpha1.OpenNebulaD
 		}
 	}
 	status.Health = datastoreHealthForDisplay(status.Capacity.TotalBytes, item.Spec.Discovery.ExpectedBackend, normalized.Backend)
+	if !normalized.Enabled {
+		status.Health = inventoryv1alpha1.DatastoreHealthInvalid
+	}
 	status.Phase = datastorePhaseForDisplay(status.Health, item.Spec.Enabled, item.Spec.Discovery.Allowed, item.Spec.MaintenanceMode, referencedByStorageClass)
 	status.ValidationEligible = validationEligible(item, normalized.Backend)
 	status.ValidationLastOutcome = validationLastOutcome(status.Validation)
@@ -1685,17 +1699,11 @@ func validationResourceName(prefix, name, nonce string) string {
 }
 
 func normalizeDatastore(ds datastoreSchema.Datastore, pool []datastoreSchema.Datastore) opennebula.Datastore {
-	return opennebula.Datastore{
-		ID:                         ds.ID,
-		Name:                       ds.Name,
-		Type:                       normalizeDatastoreType(ds),
-		Backend:                    normalizeDatastoreBackend(ds),
-		DSMad:                      strings.ToLower(strings.TrimSpace(ds.DSMad)),
-		TMMad:                      strings.ToLower(strings.TrimSpace(ds.TMMad)),
-		FreeBytes:                  int64(ds.FreeMB) * 1024 * 1024,
-		TotalBytes:                 int64(ds.TotalMB) * 1024 * 1024,
-		CompatibleSystemDatastores: opennebula.EffectiveCompatibleSystemDatastores(ds, pool),
-	}
+	result := opennebula.NormalizeDatastore(ds)
+	result.Type = normalizeDatastoreType(ds)
+	result.Backend = normalizeDatastoreBackend(ds)
+	result.CompatibleSystemDatastores = opennebula.EffectiveCompatibleSystemDatastores(ds, pool)
+	return result
 }
 
 func normalizeDatastoreBackend(ds datastoreSchema.Datastore) string {
@@ -2163,7 +2171,7 @@ func benchmarkNodeDeviceReportBlocks(report benchmarkNodeDeviceReport) bool {
 }
 
 func datastoreConditions(item inventoryv1alpha1.OpenNebulaDatastore, normalized opennebula.Datastore, status inventoryv1alpha1.OpenNebulaDatastoreStatus, benchmark *latestBenchmarkResult) []metav1.Condition {
-	provisioningAllowed := item.Spec.Enabled && item.Spec.Discovery.Allowed && !item.Spec.MaintenanceMode
+	provisioningAllowed := item.Spec.Enabled && item.Spec.Discovery.Allowed && !item.Spec.MaintenanceMode && normalized.Enabled
 	provisioningReason := "ProvisioningEnabled"
 	provisioningMessage := "Datastore accepts new provisioning requests"
 	switch {

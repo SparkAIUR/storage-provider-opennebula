@@ -886,6 +886,9 @@ func (p *CephFSVolumeProvider) getCloneStatus(ctx context.Context, datastore Dat
 }
 
 func (p *CephFSVolumeProvider) runCephCommand(ctx context.Context, datastore Datastore, secrets map[string]string, args ...string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if datastore.CephFS == nil {
 		return nil, &datastoreConfigError{message: fmt.Sprintf("datastore %d does not expose CephFS metadata", datastore.ID)}
 	}
@@ -935,6 +938,9 @@ func (p *CephFSVolumeProvider) runCephCommand(ctx context.Context, datastore Dat
 	defer cancel()
 	cmd := p.exec.CommandContext(commandCtx, cephFsCommandBin, commandArgs...)
 	output, err := cmd.CombinedOutput()
+	if commandCtx.Err() != nil {
+		return output, commandCtx.Err()
+	}
 	if err != nil {
 		trimmedOutput := strings.TrimSpace(string(output))
 		if trimmedOutput != "" {

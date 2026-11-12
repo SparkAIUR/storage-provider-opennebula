@@ -118,6 +118,9 @@ func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name st
 			continue
 		}
 
+		if err := ProvisioningFeasible(ctx, p.ctrl, datastore); err != nil {
+			return nil, err
+		}
 		if selection.Authorize != nil {
 			if err := selection.Authorize(ctx, datastore.ID); err != nil {
 				return nil, err
@@ -157,7 +160,7 @@ func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name st
 
 func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume string) error {
 	volumeID, _, err := p.VolumeExists(ctx, volume)
-	if errors.Is(err, ErrVolumeNotFound) {
+	if IsAuthoritativeVolumeAbsence(err) {
 		return nil
 	}
 	if err != nil {
@@ -232,20 +235,27 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 	if name == sourceVolume {
 		return nil, fmt.Errorf("%w: clone target equals source", ErrCloneConflict)
 	}
+	sourceImage, err = p.normalizeImageIdentity(ctx, sourceImage)
+	if err != nil {
+		return nil, err
+	}
 	if existing, lookupErr := p.lookupImageID(ctx, name); lookupErr == nil {
 		target, e := p.ctrl.Image(existing).InfoContext(ctx, true)
 		if e != nil {
 			return nil, e
 		}
-		provenance, e := target.Template.GetStr("CSI_CLONE_SOURCE_IMAGE_ID")
-		if e != nil || provenance != strconv.Itoa(sourceVolumeID) {
-			return nil, fmt.Errorf("%w: target %q has unproven source identity; do not replay an uncertain clone", ErrCloneConflict, name)
+		target, e = p.verifiedCloneTarget(ctx, target, sourceVolumeID)
+		if e != nil {
+			return nil, e
 		}
 		if target.DatastoreID == nil {
 			return nil, fmt.Errorf("clone target datastore unavailable")
 		}
 		for _, candidate := range candidates {
 			if candidate.ID == *target.DatastoreID {
+				if err := ProvisioningFeasible(ctx, p.ctrl, candidate); err != nil {
+					return nil, err
+				}
 				if selection.Authorize != nil {
 					if e := selection.Authorize(ctx, candidate.ID); e != nil {
 						return nil, e
@@ -278,6 +288,9 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 			continue
 		}
 
+		if err := ProvisioningFeasible(ctx, p.ctrl, datastore); err != nil {
+			return nil, err
+		}
 		if selection.Authorize != nil {
 			if err := selection.Authorize(ctx, datastore.ID); err != nil {
 				return nil, err
@@ -301,18 +314,9 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 		if target.ID == sourceVolumeID || target.Name != name {
 			return nil, fmt.Errorf("clone target identity differs from request")
 		}
-		provenance := img.NewTemplate()
-		provenance.AddPair("CSI_CLONE_SOURCE_IMAGE_ID", strconv.Itoa(sourceVolumeID))
-		if err := p.ctrl.Image(cloneID).UpdateContext(ctx, provenance.String(), parameters.Merge); err != nil {
-			return nil, fmt.Errorf("clone provenance unresolved: %w", err)
-		}
-		target, e = p.ctrl.Image(cloneID).InfoContext(ctx, true)
+		target, e = p.verifiedCloneTarget(ctx, target, sourceVolumeID)
 		if e != nil {
 			return nil, e
-		}
-		recorded, e := target.Template.GetStr("CSI_CLONE_SOURCE_IMAGE_ID")
-		if e != nil || recorded != strconv.Itoa(sourceVolumeID) {
-			return nil, fmt.Errorf("clone provenance readback failed")
 		}
 		recordDatastoreProvisioningResult(datastore.ID, true)
 
@@ -354,17 +358,50 @@ func (p *PersistentDiskVolumeProvider) CreateSnapshot(ctx context.Context, sourc
 	return nil, fmt.Errorf("new OpenNebula disk snapshots are unavailable until the complete backend snapshot lifecycle is qualified")
 }
 
-func (p *PersistentDiskVolumeProvider) DeleteSnapshot(ctx context.Context, snapshotID string) error {
-	imageID, imageSnapshotID, err := DecodeVolumeSnapshotID(snapshotID)
+func (p *PersistentDiskVolumeProvider) DeleteSnapshot(ctx context.Context, handle string) error {
+	imageID, snapshotID, err := DecodeVolumeSnapshotID(handle)
 	if err != nil {
 		return err
 	}
-
-	err = p.ctrl.Image(imageID).Snapshot(imageSnapshotID).DeleteContext(ctx)
-	if err != nil && strings.Contains(strings.ToLower(err.Error()), "not found") {
+	info, err := p.ctrl.Image(imageID).InfoContext(ctx, true)
+	if err != nil {
+		return err
+	}
+	state, err := info.State()
+	if err != nil {
+		return err
+	}
+	if state != img.Ready {
+		return &datastoreConfigError{message: "source image is attached or not ready; existing snapshot deletion requires verified VM-side lifecycle and is not available in this mode"}
+	}
+	metadata, err := p.InspectVolumeAttachment(ctx, info.Name, "")
+	if err != nil {
+		return err
+	}
+	if metadata.ImageID != imageID || metadata.ImageRunningVMs != 0 || len(metadata.ImageVMIDs) != 0 || len(metadata.DiskRecords) != 0 {
+		return &datastoreConfigError{message: "snapshot source ownership is inconsistent; no deletion performed"}
+	}
+	if _, err := imageSnapshotByID(info, snapshotID); err != nil {
 		return nil
 	}
-	return err
+	if err := p.ctrl.Image(imageID).Snapshot(snapshotID).DeleteContext(ctx); err != nil {
+		return err
+	}
+	return p.waitForResourceStatusContext(ctx, imageID, p.hotplugPolicy.BaseTimeout, func(ctx context.Context, id int) (bool, error) {
+		current, e := p.ctrl.Image(id).InfoContext(ctx, true)
+		if e != nil {
+			return false, e
+		}
+		state, e := current.State()
+		if e != nil {
+			return false, e
+		}
+		if state == img.Error {
+			return false, fmt.Errorf("backend snapshot deletion failed")
+		}
+		_, e = imageSnapshotByID(current, snapshotID)
+		return e != nil, nil
+	})
 }
 
 func (p *PersistentDiskVolumeProvider) ListSnapshots(ctx context.Context, snapshotID string, sourceVolumeID string, maxEntries int32, startingToken string) ([]VolumeSnapshot, string, error) {
@@ -1140,6 +1177,16 @@ func diskSizeBytesFromTemplate(disk shared.Disk) (int64, error) {
 	return int64(sizeMB) * sizeConversion, nil
 }
 
+type expectedImageIdentity struct{}
+
+func WithExpectedImageID(ctx context.Context, id int) context.Context {
+	return context.WithValue(ctx, expectedImageIdentity{}, id)
+}
+func IsAuthoritativeVolumeAbsence(err error) bool {
+	var response *gocaerrors.ResponseError
+	return errors.As(err, &response) && response.Code == gocaerrors.OneNoExistsError
+}
+
 // These errors mean absence observed through a successful provider response, never transport failure.
 var ErrCloneCapacity = errors.New("unsupported clone capacity")
 var ErrCloneConflict = errors.New("incompatible or uncertain clone target")
@@ -1167,13 +1214,20 @@ func (p *PersistentDiskVolumeProvider) lookupImageID(ctx context.Context, name s
 }
 
 func (p *PersistentDiskVolumeProvider) VolumeExists(ctx context.Context, volume string) (int, int, error) {
-	id, err := p.lookupImageID(ctx, volume)
+	id, known := ctx.Value(expectedImageIdentity{}).(int)
+	var err error
+	if !known {
+		id, err = p.lookupImageID(ctx, volume)
+	}
 	if err != nil {
 		return -1, -1, err
 	}
 	info, err := p.ctrl.Image(id).InfoContext(ctx, true)
 	if err != nil {
 		return -1, -1, err
+	}
+	if info.Name != volume {
+		return -1, -1, fmt.Errorf("pinned image %d name differs from volume handle", id)
 	}
 	size, err := effectiveImageSize(info)
 	if err != nil {
@@ -1552,11 +1606,15 @@ func (p *PersistentDiskVolumeProvider) GetVolumeInNode(ctx context.Context, volu
 	for _, disk := range vmInfo.Template.GetDisks() {
 		diskImageID, err := disk.GetI(shared.ImageID)
 		if err != nil {
-			continue
+			// A malformed image reference must not become evidence of absence.
+			if raw, e := disk.Get(shared.ImageID); e == nil && strings.TrimSpace(raw) != "" {
+				return "", fmt.Errorf("malformed VM disk image identity: %w", err)
+			}
+			continue // CDROM and volatile disks legitimately have no IMAGE_ID.
 		}
 		if diskImageID == volumeID {
 			target, err := disk.Get("TARGET")
-			if err != nil {
+			if err != nil || strings.TrimSpace(target) == "" {
 				return "", fmt.Errorf(
 					"failed to get target for volume %d on node %d: %w",
 					volumeID, nodeID, err)
@@ -1828,7 +1886,7 @@ func convertImageSnapshot(imageInfo *img.Image, snapshot shared.Snapshot) Volume
 		SnapshotID:     EncodeVolumeSnapshotID(imageInfo.ID, snapshot.ID),
 		SourceVolumeID: imageInfo.Name,
 		CreationTime:   time.Unix(int64(snapshot.Date), 0).UTC(),
-		SizeBytes:      int64(imageInfo.Size * sizeConversion),
+		SizeBytes:      int64(snapshot.Size) * sizeConversion,
 		ReadyToUse:     true,
 	}
 }

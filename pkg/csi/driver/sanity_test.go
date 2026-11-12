@@ -55,8 +55,7 @@ func TestDriver(t *testing.T) {
 		t.Skip("set RUN_CSI_SANITY_TESTS=1 to run CSI sanity tests")
 	}
 
-	tmpDir := os.TempDir()
-	defer os.Remove(tmpDir)
+	tmpDir := t.TempDir()
 
 	socket := path.Join(tmpDir, "csi.sock")
 	grpcEndpoint := "unix://" + socket

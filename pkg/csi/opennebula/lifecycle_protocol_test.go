@@ -36,6 +36,10 @@ func lifecycleFixture(t *testing.T, reply func(string) (bool, string, int), insp
 			b = 1
 		}
 		w.Header().Set("Content-Type", "text/xml")
+		if ok && call.Method == "one.image.clone" {
+			fmt.Fprintf(w, `<?xml version="1.0"?><methodResponse><params><param><value><array><data><value><boolean>1</boolean></value><value><int>%s</int></value><value><int>0</int></value></data></array></value></param></params></methodResponse>`, body)
+			return
+		}
 		fmt.Fprintf(w, `<?xml version="1.0"?><methodResponse><params><param><value><array><data><value><boolean>%d</boolean></value><value><string>%s</string></value><value><int>%d</int></value></data></array></value></param></params></methodResponse>`, b, escaped.String(), code)
 	}))
 	t.Cleanup(server.Close)
