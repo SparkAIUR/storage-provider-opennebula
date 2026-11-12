@@ -70,6 +70,7 @@ def main():
         stable = Path(tmp) / "stable"
         shutil.copytree(source, frozen)
         values = yaml.safe_load((frozen / "values.yaml").read_text())
+        values["snapshotter"]["image"] = ""
         repo, digest = candidate["images"]["opennebula-csi"].split("@")
         values["image"]["repository"] = repo
         values["image"]["digest"] = digest

@@ -231,7 +231,7 @@ spec:
               mountPath: /csi
         {{- if .Values.snapshotter.enabled }}
         - name: csi-snapshotter
-          image: {{ .Values.snapshotter.image | quote }}
+          image: {{ default (include "opennebula-csi.image" .Values.sidecarImages.snapshotter) .Values.snapshotter.image | quote }}
           imagePullPolicy: IfNotPresent
           args:
             - "--feature-gates=ReleaseLeaderElectionOnExit=false,CSIVolumeGroupSnapshot=false"

@@ -62,6 +62,13 @@ jobs:
           [[ "$STABLE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$(python3 -c 'import json;print(json.load(open("qualification/candidate.json"))["sourceCommit"])')" = "$GITHUB_SHA"
           test "$(python3 -c 'import json;print(json.load(open("qualification/candidate.json"))["sourceTree"])')" = "$(git rev-parse HEAD^{tree})"
+          if git ls-remote --exit-code --refs origin "refs/tags/$STABLE_TAG" > stable-tag.ref; then
+            git fetch --no-tags origin "refs/tags/$STABLE_TAG"
+            test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA"
+          else
+            tag_status=$?
+            test "$tag_status" -eq 2
+          fi
           uv run --no-project --with PyYAML==6.0.3 python hack/promote_chart.py --candidate qualification/candidate.json --receipt qualification/native.json --version "${STABLE_TAG#v}" --output _stable
           python3 hack/guard_candidate_publication.py --stable --tag "$STABLE_TAG"
           IMAGE="$(python3 -c 'import json;print(json.load(open("qualification/candidate.json"))["images"]["opennebula-csi"])')"
@@ -69,7 +76,7 @@ jobs:
           docker buildx imagetools create --prefer-index=false --tag "ghcr.io/sparkaiur/opennebula-csi:$STABLE_TAG" --tag "nudevco/opennebula-csi:$STABLE_TAG" "$IMAGE"
           test "$(docker buildx imagetools inspect "ghcr.io/sparkaiur/opennebula-csi:$STABLE_TAG" --format '{{.Manifest.Digest}}')" = "${IMAGE##*@}"
           test "$(docker buildx imagetools inspect "nudevco/opennebula-csi:$STABLE_TAG" --format '{{.Manifest.Digest}}')" = "${IMAGE##*@}"
-          gh release create "$STABLE_TAG" --title "$STABLE_TAG" --notes 'Promoted qualified image without rebuilding; binary VendorVersion retains the qualified RC identity. Stable chart rendering was compared with the frozen candidate; only chart metadata differs.' qualification/candidate.json qualification/native.json _stable/*.tgz
+          gh release create "$STABLE_TAG" --target "$GITHUB_SHA" --title "$STABLE_TAG" --notes 'Promoted qualified image without rebuilding; binary VendorVersion retains the qualified RC identity. Stable chart rendering was compared with the frozen candidate; only chart metadata differs.' qualification/candidate.json qualification/native.json _stable/*.tgz
       - name: Checkout isolated qualified stable chart channel
         uses: actions/checkout@v4
         with:

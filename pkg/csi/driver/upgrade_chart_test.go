@@ -65,7 +65,7 @@ func TestUpgradeChartHonorsSafetyBooleans(t *testing.T) {
 
 func TestUpgradeChartCustodyStrategyAndProbes(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("a", 64)
-	output, err := renderUpgradeChart(t, map[string]interface{}{"image": map[string]interface{}{"digest": digest}, "node": map[string]interface{}{"updateStrategy": map[string]interface{}{"type": "OnDelete"}}, "preflight": map[string]interface{}{"enabled": true, "failReleaseOnError": true}, "storageClassReconcile": map[string]interface{}{"enabled": true}, "storageClasses": []interface{}{map[string]interface{}{"name": "fixture", "parameters": map[string]interface{}{"datastoreIDs": "100"}}}, "sidecarImages": map[string]interface{}{"registrar": map[string]interface{}{"digest": digest}}, "probes": map[string]interface{}{"startup": map[string]interface{}{"failureThreshold": 100}}})
+	output, err := renderUpgradeChart(t, map[string]interface{}{"image": map[string]interface{}{"digest": digest}, "preflight": map[string]interface{}{"enabled": true, "failReleaseOnError": true}, "storageClassReconcile": map[string]interface{}{"enabled": true}, "storageClasses": []interface{}{map[string]interface{}{"name": "fixture", "parameters": map[string]interface{}{"datastoreIDs": "100"}}}, "sidecarImages": map[string]interface{}{"registrar": map[string]interface{}{"digest": digest}}, "probes": map[string]interface{}{"startup": map[string]interface{}{"failureThreshold": 100}}})
 	require.NoError(t, err)
 	var node appsv1.DaemonSet
 	require.NoError(t, yaml.Unmarshal([]byte(output["opennebula-csi/templates/csi-node-server.yaml"]), &node))
@@ -134,4 +134,29 @@ func TestUpgradeWebhookExcludesOwnInfrastructure(t *testing.T) {
 		})
 	}
 
+}
+
+func TestUpgradeChartSnapshotterImageSelection(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("b", 64)
+	for _, tc := range []struct {
+		name   string
+		values map[string]interface{}
+		image  string
+	}{
+		{"default", map[string]interface{}{}, "registry.k8s.io/sig-storage/csi-snapshotter:v8.7.0"},
+		{"digest", map[string]interface{}{"sidecarImages": map[string]interface{}{"snapshotter": map[string]interface{}{"digest": digest}}}, "registry.k8s.io/sig-storage/csi-snapshotter@" + digest},
+		{"legacy", map[string]interface{}{"snapshotter": map[string]interface{}{"image": "registry.example/snapshotter:custom"}, "sidecarImages": map[string]interface{}{"snapshotter": map[string]interface{}{"digest": digest}}}, "registry.example/snapshotter:custom"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			output, err := renderUpgradeChart(t, tc.values)
+			require.NoError(t, err)
+			var controller appsv1.StatefulSet
+			require.NoError(t, yaml.Unmarshal([]byte(output["opennebula-csi/templates/csi-controller-server.yaml"]), &controller))
+			images := map[string]string{}
+			for _, container := range controller.Spec.Template.Spec.Containers {
+				images[container.Name] = container.Image
+			}
+			require.Equal(t, tc.image, images["csi-snapshotter"])
+		})
+	}
 }

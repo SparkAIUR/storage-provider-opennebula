@@ -195,7 +195,7 @@ func TestLifecycleReattachRestoresVerifiedCapacityAndWaitsPending(t *testing.T) 
 					return false, "unexpected", 0x800
 				}
 			})
-			require.NoError(t, p.restoreVerifiedSize(context.Background(), "volume-test", 11, 7, time.Second))
+			require.NoError(t, p.RestoreVolumeCapacity(context.Background(), "volume-test", 11, 7))
 			require.GreaterOrEqual(t, reads, 3)
 			if pending {
 				require.Zero(t, resized)

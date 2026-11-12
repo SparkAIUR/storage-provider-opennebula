@@ -6,11 +6,7 @@ metadata:
   namespace: {{ include "opennebula-csi.namespace" . }}
 spec:
   updateStrategy:
-    type: {{ .Values.node.updateStrategy.type }}
-    {{- if eq .Values.node.updateStrategy.type "RollingUpdate" }}
-    rollingUpdate:
-      maxUnavailable: {{ .Values.node.updateStrategy.maxUnavailable }}
-    {{- end }}
+    type: OnDelete
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "opennebula-csi.name" . }}

@@ -216,9 +216,6 @@ inventoryController:
     burst: 40
 
 node:
-  updateStrategy:
-    type: OnDelete
-    maxUnavailable: 1
   podAnnotations: {}
   resources: {}
   nodeSelector: {}
@@ -286,7 +283,7 @@ storageClassReconcile:
 
 snapshotter:
   enabled: true
-  image: registry.k8s.io/sig-storage/csi-snapshotter:v8.2.1
+  image: ""
   extraArgs: []
 
 storageClasses: []

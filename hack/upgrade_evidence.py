@@ -273,6 +273,7 @@ def validate_receipt(receipt, candidate, stable=False):
             begin <= captured <= end and (end - captured).total_seconds() <= 300,
             "final readback is outside observation end",
         )
+        require(result["readback"]["cluster"] == cluster, "readback cluster differs")
         evaluate(result["readback"], candidate, max_age=None)
         for gate in (
             "createDelete",

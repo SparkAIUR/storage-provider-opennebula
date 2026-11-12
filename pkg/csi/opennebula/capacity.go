@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/OpenNebula/one/src/oca/go/src/goca/parameters"
 	img "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/image"
@@ -93,7 +92,7 @@ func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, 
 	return nil
 }
 
-func (p *PersistentDiskVolumeProvider) restoreVerifiedSize(ctx context.Context, volume string, vmID, imageID int, timeout time.Duration) error {
+func (p *PersistentDiskVolumeProvider) RestoreVolumeCapacity(ctx context.Context, volume string, vmID, imageID int) error {
 	info, err := p.ctrl.Image(imageID).InfoContext(ctx, true)
 	if err != nil {
 		return err

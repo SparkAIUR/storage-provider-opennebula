@@ -195,6 +195,7 @@ type OpenNebulaVolumeProvider interface {
 	DeleteVolume(ctx context.Context, volume string) error
 	ExpandVolume(ctx context.Context, volume string, size int64, allowDetached bool) (int64, error)
 	AttachVolume(ctx context.Context, volume string, node string, immutable bool, params map[string]string) error
+	RestoreVolumeCapacity(ctx context.Context, volume string, vmID, imageID int) error
 	DetachVolume(ctx context.Context, volume string, node string) error
 	ResolveVolumeSizeBytes(ctx context.Context, volume string) (int64, error)
 	ComputeHotplugTimeout(sizeBytes int64) time.Duration

@@ -672,7 +672,7 @@ For local-backed classes, preflight now checks `volumeBindingMode` and warns by 
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `snapshotter.enabled` | Deploy the `csi-snapshotter` sidecar in the controller pod. | `true` | No |
-| `snapshotter.image` | Snapshotter image reference. | `"registry.k8s.io/sig-storage/csi-snapshotter:v8.2.1"` | No |
+| `snapshotter.image` | Legacy image override; empty selects `sidecarImages.snapshotter` with default v8.7.0 or its configured digest. Stable promotion clears this override. | `""` | No |
 | `snapshotter.extraArgs` | Additional args for the snapshotter sidecar. | `[]` | No |
 
 ### StorageClasses

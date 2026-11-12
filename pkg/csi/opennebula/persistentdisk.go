@@ -225,19 +225,8 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 		return nil, err
 	}
 
-	sourceSizeBytes, err := effectiveImageSize(sourceImage)
-	if err != nil {
-		return nil, err
-	}
-	if selection.CloneRequiredBytes > sourceSizeBytes || (selection.CloneLimitBytes > 0 && sourceSizeBytes > selection.CloneLimitBytes) {
-		return nil, fmt.Errorf("%w: source capacity %d is outside requested clone range", ErrCloneCapacity, sourceSizeBytes)
-	}
 	if name == sourceVolume {
 		return nil, fmt.Errorf("%w: clone target equals source", ErrCloneConflict)
-	}
-	sourceImage, err = p.normalizeImageIdentity(ctx, sourceImage)
-	if err != nil {
-		return nil, err
 	}
 	if existing, lookupErr := p.lookupImageID(ctx, name); lookupErr == nil {
 		target, e := p.ctrl.Image(existing).InfoContext(ctx, true)
@@ -264,6 +253,10 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 				if err := p.waitForResourceStatusContext(ctx, existing, p.hotplugPolicy.BaseTimeout, p.volumeReadyContext); err != nil {
 					return nil, err
 				}
+				target, e = p.ctrl.Image(existing).InfoContext(ctx, true)
+				if e != nil {
+					return nil, e
+				}
 				targetSize, e := effectiveImageSize(target)
 				if e != nil {
 					return nil, e
@@ -277,6 +270,16 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 		return nil, fmt.Errorf("%w: existing clone is outside selected datastores", ErrCloneConflict)
 	} else if !errors.Is(lookupErr, ErrVolumeNotFound) {
 		return nil, lookupErr
+	}
+	sourceSizeBytes, err := effectiveImageSize(sourceImage)
+	if err != nil {
+		return nil, err
+	}
+	if selection.CloneRequiredBytes > sourceSizeBytes || (selection.CloneLimitBytes > 0 && sourceSizeBytes > selection.CloneLimitBytes) {
+		return nil, fmt.Errorf("%w: source capacity %d is outside requested clone range", ErrCloneCapacity, sourceSizeBytes)
+	}
+	if _, err = p.normalizeImageIdentity(ctx, sourceImage); err != nil {
+		return nil, err
 	}
 	attemptedDatastores := make([]int, 0, len(candidates))
 	insufficientCapacity := make([]string, 0)
@@ -323,10 +326,21 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 		if err := p.waitForResourceStatusContext(ctx, cloneID, p.hotplugPolicy.BaseTimeout, p.volumeReadyContext); err != nil {
 			return nil, fmt.Errorf("failed waiting for clone %d to become ready: %w", cloneID, err)
 		}
+		target, e = p.ctrl.Image(cloneID).InfoContext(ctx, true)
+		if e != nil {
+			return nil, e
+		}
+		targetSize, e := effectiveImageSize(target)
+		if e != nil {
+			return nil, e
+		}
+		if targetSize < selection.CloneRequiredBytes || (selection.CloneLimitBytes > 0 && targetSize > selection.CloneLimitBytes) {
+			return nil, ErrCloneCapacity
+		}
 
 		return &VolumeCreateResult{
 			Datastore:             datastore,
-			CapacityBytes:         sourceSizeBytes,
+			CapacityBytes:         targetSize,
 			FallbackUsed:          len(attemptedDatastores) > 1,
 			AttemptedDatastoreIDs: append([]int(nil), attemptedDatastores...),
 		}, nil
@@ -630,7 +644,7 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		}
 		return err
 	}
-	return p.restoreVerifiedSize(ctx, volume, nodeID, volumeID, hotplugTimeout)
+	return p.RestoreVolumeCapacity(ctx, volume, nodeID, volumeID)
 }
 
 func (p *PersistentDiskVolumeProvider) InspectHostArtifactAttachmentTarget(ctx context.Context, volume string, node string, params map[string]string) (*HostArtifactAttachmentTarget, error) {

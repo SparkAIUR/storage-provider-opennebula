@@ -409,6 +409,10 @@ class PromoteCLITest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             shutil.copytree(Path(__file__).resolve().parents[1] / "helm", root / "helm")
+            chart_values = root / "helm/opennebula-csi/values.yaml"
+            legacy_values = yaml.safe_load(chart_values.read_text())
+            legacy_values["snapshotter"]["image"] = "registry.example/snapshotter:legacy"
+            chart_values.write_text(yaml.safe_dump(legacy_values, sort_keys=False))
 
             def git(*args):
                 return subprocess.check_output(
@@ -514,6 +518,14 @@ class PromoteCLITest(unittest.TestCase):
                     },
                 }
             validate_receipt(receipt, candidate, True)
+            for cluster in ("hpldb", "hplsvc", "bravo"):
+                substituted = copy.deepcopy(receipt)
+                foreign = "hplsvc" if cluster == "hpldb" else "hpldb"
+                readback = copy.deepcopy(receipt["clusters"][foreign]["readback"])
+                readback["capturedAt"] = receipt["clusters"][cluster]["readback"]["capturedAt"]
+                substituted["clusters"][cluster]["readback"] = readback
+                with self.assertRaisesRegex(ValueError, "readback cluster differs"):
+                    validate_receipt(substituted, candidate, True)
             c = root / "candidate.json"
             r = root / "native.json"
             c.write_text(json.dumps(candidate))
@@ -555,6 +567,15 @@ class PromoteCLITest(unittest.TestCase):
                         for v in values["sidecarImages"].values()
                     )
                 )
+                self.assertEqual(values["snapshotter"]["image"], "")
+            rendered = subprocess.check_output(
+                ["helm", "template", "fixture", str(root / "out/opennebula-csi-0.6.0.tgz"),
+                 "--set", "credentials.existingSecret.name=fixture"], text=True
+            )
+            controller = next(o for o in yaml.safe_load_all(rendered) if o and o.get("kind") == "StatefulSet")
+            containers = controller["spec"]["template"]["spec"]["containers"]
+            images = {c["name"]: c["image"] for c in containers}
+            self.assertEqual(images["csi-snapshotter"], candidate["images"]["csi-snapshotter"])
 
 
 class CandidateGuardTest(unittest.TestCase):

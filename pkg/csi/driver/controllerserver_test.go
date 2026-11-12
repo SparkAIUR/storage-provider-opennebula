@@ -2808,6 +2808,13 @@ func (m *MockOpenNebulaVolumeProviderTestify) GetVolumeInNode(ctx context.Contex
 	return args.Get(0).(string), args.Error(1)
 }
 
+func (m *MockOpenNebulaVolumeProviderTestify) RestoreVolumeCapacity(ctx context.Context, volume string, vmID, imageID int) error {
+	if !m.hasExpectation("RestoreVolumeCapacity") {
+		return nil
+	}
+	return m.Called(ctx, volume, vmID, imageID).Error(0)
+}
+
 func (m *MockOpenNebulaVolumeProviderTestify) ResolveVolumeSizeBytes(ctx context.Context, volume string) (int64, error) {
 	if !m.hasExpectation("ResolveVolumeSizeBytes") {
 		return int64(10 * 1024 * 1024 * 1024), nil

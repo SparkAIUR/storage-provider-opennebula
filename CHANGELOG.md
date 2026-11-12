@@ -7,6 +7,8 @@
 - Reconcile clone retries through atomically inherited durable origin metadata. Reject new disk snapshots and detached growth until lifecycle qualification.
 - Revalidate datastore authority at allocation and report disabled/unknown Ceph bridge feasibility.
 - Add digest images, configurable probes, webhook readiness/self-exclusion, retained mandatory preflight failures, supervised OnDelete rollout and release qualification gates.
+- Verify capacity on publish retries, reconcile clone targets before source growth limits, bind qualification readbacks to each cluster, and pin stable release tags to the qualified source.
+- Render snapshotter v8.7.0 or its frozen digest while preserving ordinary legacy overrides; keep node replacement OnDelete.
 - Native qualification and ordered24h cluster observation remain pending. See [upgrade runbook](docs/opennebula-74-upgrade.md). Inventory batching/write reduction is a separate follow-up.
 
 ## v0.5.29, unreleased

@@ -954,6 +954,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err == nil {
+		if err := s.volumeProvider.RestoreVolumeCapacity(ctx, req.VolumeId, nodeID, volumeID); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to restore volume capacity: %v", err)
+		}
 		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), runtimeCtx); localErr != nil {
 			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "unavailable", time.Since(started))
 			s.driver.metrics.RecordControllerPublishDuration("disk", "unavailable", time.Since(started))
@@ -1047,6 +1050,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		target, err = s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
 		if err != nil {
 			return status.Error(codes.Internal, "failed to get volume in node")
+		}
+		if err := s.volumeProvider.RestoreVolumeCapacity(queueCtx, req.VolumeId, nodeID, volumeID); err != nil {
+			return status.Errorf(codes.Internal, "failed to restore volume capacity: %v", err)
 		}
 		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(queueCtx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), runtimeCtx); localErr != nil {
 			return localErr
@@ -1870,6 +1876,11 @@ func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.
 		if target == "" {
 			return false, nil, nil
 		}
+		if validation.Reason != queueReasonManualRecoveryAdopted {
+			if err := s.volumeProvider.RestoreVolumeCapacity(ctx, req.VolumeId, nodeID, volumeID); err != nil {
+				return true, nil, status.Errorf(codes.Internal, "failed to restore volume capacity: %v", err)
+			}
+		}
 		if protection == nil {
 			protection = &LocalRWOProtectionDecision{}
 		}
@@ -2484,6 +2495,9 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 		if err != nil {
 			_ = s.driver.stickyAttachments.Clear(req.VolumeId)
 			return false, nil, nil
+		}
+		if err := s.volumeProvider.RestoreVolumeCapacity(ctx, req.VolumeId, nodeID, volumeID); err != nil {
+			return true, nil, status.Errorf(codes.Internal, "failed to restore volume capacity: %v", err)
 		}
 		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), nil); localErr != nil {
 			return true, nil, localErr
