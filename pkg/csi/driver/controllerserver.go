@@ -994,6 +994,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			}
 			return nil
 		}
+		if !errors.Is(err, opennebula.ErrAttachmentNotFound) {
+			return status.Errorf(codes.Unavailable, "attachment state is unknown: %v", err)
+		}
 
 		if handled, freshResponse, freshErr := s.precheckPublishHotplug(queueCtx, req, volumeID, nodeID, &protection, lookup.AttachmentMetadata); handled {
 			if freshErr != nil {
@@ -1055,7 +1058,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID)
 		target, err = s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
 		if err != nil {
-			return status.Error(codes.Internal, "failed to get volume in node")
+			return status.Errorf(codes.Unavailable, "failed to verify attached volume: %v", err)
 		}
 		if err := s.volumeProvider.RestoreVolumeCapacity(queueCtx, req.VolumeId, nodeID, volumeID); err != nil {
 			return status.Errorf(codes.Internal, "failed to restore volume capacity: %v", err)
@@ -2405,6 +2408,9 @@ func (s *ControllerServer) rescueSameNodeUnpublish(ctx context.Context, req *csi
 	}
 	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err != nil {
+		if !errors.Is(err, opennebula.ErrAttachmentNotFound) {
+			return true, nil, status.Errorf(codes.Unavailable, "attachment state is unknown: %v", err)
+		}
 		return false, nil, nil
 	}
 	if s.driver.stickyAttachments != nil {
@@ -2506,6 +2512,9 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 	if strings.TrimSpace(state.NodeID) == strings.TrimSpace(req.NodeId) {
 		target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 		if err != nil {
+			if !errors.Is(err, opennebula.ErrAttachmentNotFound) {
+				return true, nil, status.Errorf(codes.Unavailable, "attachment state is unknown: %v", err)
+			}
 			_ = s.driver.stickyAttachments.Clear(req.VolumeId)
 			return false, nil, nil
 		}
@@ -2545,20 +2554,21 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 	}
 
 	oldNodeID, oldNodeErr := s.volumeProvider.NodeExists(ctx, state.NodeID)
-	if oldNodeErr == nil && oldNodeID != -1 {
-		if _, oldAttachErr := s.volumeProvider.GetVolumeInNode(ctx, volumeID, oldNodeID); oldAttachErr != nil {
-			if !errors.Is(oldAttachErr, opennebula.ErrAttachmentNotFound) {
-				return true, nil, status.Errorf(codes.Unavailable, "old attachment is unknown: %v", oldAttachErr)
-			}
-			if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
-				return true, nil, status.Errorf(codes.Internal, "failed to clear sticky attachment state: %v", err)
-			}
-			s.recordSafeDetach(ctx, req.VolumeId, state.NodeID)
-			s.driver.metrics.RecordStickyDetach("already_absent", state.Reason)
-			s.driver.metrics.RecordStickyDetachResidency("already_absent", time.Since(state.StartedAt))
-			s.recordPVCEventFromStickyState(ctx, state, eventReasonDetachGraceCancelled, fmt.Sprintf("cleared stale attachment state for volume %s because it is already absent from node %s", req.VolumeId, state.NodeID))
-			return false, nil, nil
+	if oldNodeErr != nil || oldNodeID <= 0 {
+		return true, nil, status.Errorf(codes.Unavailable, "old attachment node is unknown: %v", oldNodeErr)
+	}
+	if _, oldAttachErr := s.volumeProvider.GetVolumeInNode(ctx, volumeID, oldNodeID); oldAttachErr != nil {
+		if !errors.Is(oldAttachErr, opennebula.ErrAttachmentNotFound) {
+			return true, nil, status.Errorf(codes.Unavailable, "old attachment is unknown: %v", oldAttachErr)
 		}
+		if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
+			return true, nil, status.Errorf(codes.Internal, "failed to clear sticky attachment state: %v", err)
+		}
+		s.recordSafeDetach(ctx, req.VolumeId, state.NodeID)
+		s.driver.metrics.RecordStickyDetach("already_absent", state.Reason)
+		s.driver.metrics.RecordStickyDetachResidency("already_absent", time.Since(state.StartedAt))
+		s.recordPVCEventFromStickyState(ctx, state, eventReasonDetachGraceCancelled, fmt.Sprintf("cleared stale attachment state for volume %s because it is already absent from node %s", req.VolumeId, state.NodeID))
+		return false, nil, nil
 	}
 
 	if err := s.volumeProvider.DetachVolume(ctx, req.VolumeId, state.NodeID); err != nil {
@@ -2612,43 +2622,37 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 			return nil
 		}
 
-		if desired, reason, desiredErr := s.driver.kubeRuntime.VolumeDesiredOnNode(queueCtx, confirmed.VolumeID, confirmed.NodeID); desiredErr == nil && desired {
-			volumeID, _, volumeErr := s.volumeProvider.VolumeExists(queueCtx, confirmed.VolumeID)
-			nodeID, nodeErr := s.volumeProvider.NodeExists(queueCtx, confirmed.NodeID)
-			if volumeErr == nil && nodeErr == nil && volumeID != -1 && nodeID != -1 {
-				if _, attachedErr := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID); attachedErr == nil {
-					if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
-						klog.V(2).InfoS("Failed to clear sticky attachment state after same-node desired validation", "volumeID", confirmed.VolumeID, "err", err)
-						return err
-					}
-					s.driver.metrics.RecordStickyDetach("reused", confirmed.Reason)
-					s.driver.metrics.RecordStickyDetachResidency("reused", time.Since(confirmed.StartedAt))
-					s.recordPVCEventFromStickyState(queueCtx, confirmed, eventReasonSameNodeDetachRescued, fmt.Sprintf("kept expired sticky volume %s attached to node %s because Kubernetes still desires it there (%s)", confirmed.VolumeID, confirmed.NodeID, reason))
-					return nil
-				}
-			}
-		}
-
 		volumeID, _, volumeErr := s.volumeProvider.VolumeExists(queueCtx, confirmed.VolumeID)
 		nodeID, nodeErr := s.volumeProvider.NodeExists(queueCtx, confirmed.NodeID)
-		if volumeErr == nil && nodeErr == nil && volumeID != -1 && nodeID != -1 {
-			if _, attachedErr := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID); attachedErr != nil {
-				if !errors.Is(attachedErr, opennebula.ErrAttachmentNotFound) {
-					return status.Errorf(codes.Unavailable, "attachment is unknown: %v", attachedErr)
-				}
-				if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
-					klog.V(2).InfoS("Failed to clear already-absent sticky attachment state", "volumeID", confirmed.VolumeID, "err", err)
-					return err
-				}
-				s.recordSafeDetach(queueCtx, confirmed.VolumeID, confirmed.NodeID)
-				if s.driver.volumeQuarantine != nil {
-					_ = s.driver.volumeQuarantine.Clear(queueCtx, confirmed.VolumeID)
-				}
-				s.driver.metrics.RecordStickyDetach("already_absent", confirmed.Reason)
-				s.driver.metrics.RecordStickyDetachResidency("already_absent", time.Since(confirmed.StartedAt))
-				s.recordPVCEventFromStickyState(queueCtx, confirmed, eventReasonDetachGraceExpired, fmt.Sprintf("cleared expired sticky state for volume %s because it is already absent from node %s", confirmed.VolumeID, confirmed.NodeID))
-				return nil
+		if volumeErr != nil || nodeErr != nil || volumeID <= 0 || nodeID <= 0 {
+			return status.Errorf(codes.Unavailable, "attachment identity is unknown: volume lookup: %v; node lookup: %v", volumeErr, nodeErr)
+		}
+		if _, attachedErr := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID); attachedErr != nil {
+			if !errors.Is(attachedErr, opennebula.ErrAttachmentNotFound) {
+				return status.Errorf(codes.Unavailable, "attachment is unknown: %v", attachedErr)
 			}
+			if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
+				klog.V(2).InfoS("Failed to clear already-absent sticky attachment state", "volumeID", confirmed.VolumeID, "err", err)
+				return err
+			}
+			s.recordSafeDetach(queueCtx, confirmed.VolumeID, confirmed.NodeID)
+			if s.driver.volumeQuarantine != nil {
+				_ = s.driver.volumeQuarantine.Clear(queueCtx, confirmed.VolumeID)
+			}
+			s.driver.metrics.RecordStickyDetach("already_absent", confirmed.Reason)
+			s.driver.metrics.RecordStickyDetachResidency("already_absent", time.Since(confirmed.StartedAt))
+			s.recordPVCEventFromStickyState(queueCtx, confirmed, eventReasonDetachGraceExpired, fmt.Sprintf("cleared expired sticky state for volume %s because it is already absent from node %s", confirmed.VolumeID, confirmed.NodeID))
+			return nil
+		}
+		if desired, reason, desiredErr := s.driver.kubeRuntime.VolumeDesiredOnNode(queueCtx, confirmed.VolumeID, confirmed.NodeID); desiredErr == nil && desired {
+			if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
+				klog.V(2).InfoS("Failed to clear sticky attachment state after same-node desired validation", "volumeID", confirmed.VolumeID, "err", err)
+				return err
+			}
+			s.driver.metrics.RecordStickyDetach("reused", confirmed.Reason)
+			s.driver.metrics.RecordStickyDetachResidency("reused", time.Since(confirmed.StartedAt))
+			s.recordPVCEventFromStickyState(queueCtx, confirmed, eventReasonSameNodeDetachRescued, fmt.Sprintf("kept expired sticky volume %s attached to node %s because Kubernetes still desires it there (%s)", confirmed.VolumeID, confirmed.NodeID, reason))
+			return nil
 		}
 
 		detachStarted := time.Now()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -58,7 +59,7 @@ func TestReviewNodeStagePreservesFailedProviderRecoveryAuthority(t *testing.T) {
 			provider.On("NodeReady", mock.Anything, report.Node).Return(true, nil).Once()
 			provider.On("VolumeExists", mock.Anything, report.VolumeID).Return(394, 1, nil).Once()
 			provider.On("NodeExists", mock.Anything, report.Node).Return(208, nil).Once()
-			provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("", errors.New("not attached")).Once()
+			provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Once()
 			provider.On("InspectVolumeAttachment", mock.Anything, report.VolumeID, report.Node).Return(&opennebula.VolumeAttachmentMetadata{VolumeHandle: report.VolumeID, ImageID: 394, RequestedNodeID: 208}, nil).Once()
 			var attachErr error
 			switch failure {

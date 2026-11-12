@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -89,7 +90,7 @@ func TestReviewNodeStageProviderCompletionAfterConcurrentWrongIdentity(t *testin
 				provider.On("NodeReady", mock.Anything, report.Node).Return(true, nil).Once()
 				provider.On("VolumeExists", mock.Anything, report.VolumeID).Return(394, 1, nil).Once()
 				provider.On("NodeExists", mock.Anything, report.Node).Return(208, nil).Once()
-				provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("", errors.New("not attached")).Once()
+				provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Once()
 				provider.On("InspectVolumeAttachment", mock.Anything, report.VolumeID, report.Node).Return(&opennebula.VolumeAttachmentMetadata{VolumeHandle: report.VolumeID, ImageID: 394, RequestedNodeID: 208}, nil).Once()
 				attachEntered := make(chan LocalDeviceMissingReport, 1)
 				finishAttach := make(chan struct{})
@@ -258,7 +259,7 @@ func TestReviewNodeStageProviderCompletionWriteFailure(t *testing.T) {
 				provider.On("NodeReady", mock.Anything, report.Node).Return(true, nil).Once()
 				provider.On("VolumeExists", mock.Anything, report.VolumeID).Return(394, 1, nil).Once()
 				provider.On("NodeExists", mock.Anything, report.Node).Return(208, nil).Once()
-				provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("", errors.New("not attached")).Once()
+				provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Once()
 				provider.On("InspectVolumeAttachment", mock.Anything, report.VolumeID, report.Node).Return(&opennebula.VolumeAttachmentMetadata{VolumeHandle: report.VolumeID, ImageID: 394, RequestedNodeID: 208}, nil).Once()
 				var unfinished LocalDeviceMissingReport
 				provider.On("AttachVolume", mock.Anything, report.VolumeID, report.Node, false, mock.Anything).Run(func(mock.Arguments) {

@@ -135,7 +135,7 @@ func TestNodeRecordsLocalDeviceMountFailureReport(t *testing.T) {
 }
 
 func TestLocalDeviceRecoveryRequiresProvenAttachmentAbsence(t *testing.T) {
-	for _, outcome := range []string{"metadata-attached", "unknown", "inspection-error", "other-owner", "absent", "confirmed-before-begin"} {
+	for _, outcome := range []string{"metadata-attached", "lookup-error", "unknown", "inspection-error", "other-owner", "absent", "confirmed-before-begin"} {
 		t.Run(outcome, func(t *testing.T) {
 			_, ns, server, provider, report := recoveryReviewFixture(t)
 			ctx := context.Background()
@@ -145,8 +145,10 @@ func TestLocalDeviceRecoveryRequiresProvenAttachmentAbsence(t *testing.T) {
 			provider.On("NodeExists", mock.Anything, report.Node).Return(208, nil).Once()
 			if outcome == "metadata-attached" {
 				provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("sdd", nil).Once()
-			} else {
+			} else if outcome == "lookup-error" {
 				provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("", errors.New("lookup failed")).Once()
+			} else {
+				provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Once()
 				var metadata *opennebula.VolumeAttachmentMetadata
 				var inspectErr error
 				if outcome == "inspection-error" {
@@ -195,6 +197,9 @@ func TestLocalDeviceRecoveryRequiresProvenAttachmentAbsence(t *testing.T) {
 				require.False(t, exists)
 			default:
 				require.Equal(t, "failed", current.LastRecoveryOutcome)
+			}
+			if outcome != "absent" {
+				provider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 			}
 			provider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
 			provider.AssertExpectations(t)

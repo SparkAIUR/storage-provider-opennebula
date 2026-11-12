@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -685,6 +686,9 @@ func (s *ControllerServer) executeLocalDeviceRecovery(ctx context.Context, repor
 			})
 			return err
 		}
+		if !errors.Is(attachedErr, opennebula.ErrAttachmentNotFound) {
+			return status.Errorf(codes.Unavailable, "attachment state is unknown: %v", attachedErr)
+		}
 		inspector, ok := s.volumeProvider.(opennebula.VolumeAttachmentInspector)
 		if !ok {
 			return fmt.Errorf("cannot verify attachment absence: %w", attachedErr)
@@ -713,7 +717,7 @@ func (s *ControllerServer) executeLocalDeviceRecovery(ctx context.Context, repor
 		}
 		target, err = s.volumeProvider.GetVolumeInNode(queueCtx, volumeNumericID, nodeNumericID)
 		if err != nil {
-			return fmt.Errorf("failed to confirm recovered same-node attachment: %w", err)
+			return status.Errorf(codes.Unavailable, "failed to confirm recovered same-node attachment: %v", err)
 		}
 		attempt.AttachmentState = localDeviceAttachmentStateRuntimeUnconfirmed
 		attempt.MetadataAttached = true

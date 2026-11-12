@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -138,7 +139,7 @@ func (s *ControllerServer) evaluateVolumeReconcile(ctx context.Context, node, op
 		case codes.FailedPrecondition:
 			return decision.with(VolumeReconcileReject, queueReasonRepairRequired, codes.FailedPrecondition, lookupErr.Error())
 		default:
-			return decision
+			return decision.with(VolumeReconcilePause, "volume_lookup_unknown", codes.Unavailable, lookupErr.Error())
 		}
 	}
 	if lookup != nil {
@@ -150,7 +151,7 @@ func (s *ControllerServer) evaluateVolumeReconcile(ctx context.Context, node, op
 	evidence.NodeLookupErr = nodeErr
 	if nodeErr != nil {
 		decision.Evidence = evidence
-		return decision
+		return decision.with(VolumeReconcilePause, "node_lookup_unknown", codes.Unavailable, nodeErr.Error())
 	}
 	if nodeID == -1 {
 		decision.Evidence = evidence
@@ -179,6 +180,13 @@ func (s *ControllerServer) evaluateVolumeReconcile(ctx context.Context, node, op
 		evidence.AttachedTarget = strings.TrimSpace(target)
 		evidence.AttachedErr = attachedErr
 		evidence.Attached = attachedErr == nil
+		if attachedErr != nil && !errors.Is(attachedErr, opennebula.ErrAttachmentNotFound) {
+			return decision.withEvidence(evidence).with(VolumeReconcilePause, "attachment_unknown", codes.Unavailable,
+				fmt.Sprintf("attachment state is unknown for volume %s on node %s: %v", evidence.VolumeID, evidence.NodeID, attachedErr))
+		}
+	} else {
+		return decision.withEvidence(evidence).with(VolumeReconcilePause, "attachment_unknown", codes.Unavailable,
+			"attachment identity could not be established")
 	}
 
 	switch evidence.Operation {
