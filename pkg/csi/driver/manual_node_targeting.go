@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"k8s.io/klog/v2"
 	"sort"
 	"strconv"
 	"strings"
@@ -531,7 +532,7 @@ func podToleratesTaint(pod *corev1.Pod, taint corev1.Taint) bool {
 		return false
 	}
 	for _, toleration := range pod.Spec.Tolerations {
-		if toleration.ToleratesTaint(&taint) {
+		if toleration.ToleratesTaint(klog.Background(), &taint, false) {
 			return true
 		}
 	}

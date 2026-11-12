@@ -18,7 +18,9 @@ package opennebula
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	gocaerrors "github.com/OpenNebula/one/src/oca/go/src/goca/errors"
 	"math"
 	"strconv"
 	"strings"
@@ -116,6 +118,11 @@ func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name st
 			continue
 		}
 
+		if selection.Authorize != nil {
+			if err := selection.Authorize(ctx, datastore.ID); err != nil {
+				return nil, err
+			}
+		}
 		finishAttempt := beginDatastoreAttempt(datastore.ID)
 		imageID, err := p.ctrl.Images().CreateContext(ctx, tpl.String(), uint(datastore.ID))
 		finishAttempt()
@@ -130,7 +137,7 @@ func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name st
 		}
 		recordDatastoreProvisioningResult(datastore.ID, true)
 
-		err = p.waitForResourceStatus(imageID, p.hotplugPolicy.BaseTimeout, p.volumeReady)
+		err = p.waitForResourceStatusContext(ctx, imageID, p.hotplugPolicy.BaseTimeout, p.volumeReadyContext)
 		if err != nil {
 			return nil, fmt.Errorf("failed to wait for volume readiness: %w", err)
 		}
@@ -150,26 +157,43 @@ func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name st
 
 func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume string) error {
 	volumeID, _, err := p.VolumeExists(ctx, volume)
-	if err != nil || volumeID == -1 {
+	if errors.Is(err, ErrVolumeNotFound) {
 		return nil
 	}
-
-	image, err := p.ctrl.Image(volumeID).Info(true)
-	if err == nil {
-		state, err := image.State()
-		if err == nil && state == img.Used {
-			return fmt.Errorf("cannot delete volume %s, it is currently in use",
-				volume)
-		}
-	}
-
-	// Force delete
-	p.ctrl.Client.CallContext(ctx, "one.image.delete", volumeID, true)
-	err = p.waitForResourceStatus(volumeID, p.hotplugPolicy.BaseTimeout, p.volumeDeleted)
 	if err != nil {
-		return fmt.Errorf("failed to wait for volume deletion: %w", err)
+		return err
 	}
-	return nil
+	info, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
+	if err != nil {
+		return fmt.Errorf("cannot establish deletion authority for image %d: %w", volumeID, err)
+	}
+	state, err := info.State()
+	if err != nil {
+		return err
+	}
+	if state != img.Ready && state != img.Error {
+		return fmt.Errorf("image %d is not in a deletable state: %v", volumeID, state)
+	}
+	if flag, _ := info.Template.GetStr("FORCE_DELETE"); strings.EqualFold(flag, "YES") || strings.EqualFold(flag, "true") || flag == "1" {
+		return fmt.Errorf("image %d carries historical FORCE_DELETE; external cleanup verification required", volumeID)
+	}
+	if len(info.Snapshots.Snapshots) > 0 {
+		return fmt.Errorf("image %d has dependent snapshots; source deletion is blocked", volumeID)
+	}
+	metadata, err := p.InspectVolumeAttachment(ctx, volume, "")
+	if err != nil {
+		return err
+	}
+	if metadata.ImageID != volumeID || len(metadata.DiskRecords) != 0 || metadata.ImageRunningVMs != 0 || len(metadata.ImageVMIDs) != 0 {
+		return fmt.Errorf("image %d ownership is not consistently absent", volumeID)
+	}
+	if strings.TrimSpace(info.Source) == "" {
+		return fmt.Errorf("image %d has no backend SOURCE; cleanup cannot be established", volumeID)
+	}
+	if err := p.ctrl.Image(volumeID).DeleteContext(ctx); err != nil {
+		return fmt.Errorf("delete image %d: %w", volumeID, err)
+	}
+	return p.waitForResourceStatusContext(ctx, volumeID, p.hotplugPolicy.BaseTimeout, p.volumeDeletedContext)
 }
 
 func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name string, sourceVolume string, selection DatastoreSelectionConfig) (*VolumeCreateResult, error) {
@@ -198,7 +222,52 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 		return nil, err
 	}
 
-	sourceSizeBytes := int64(sourceImage.Size * sizeConversion)
+	sourceSizeBytes, err := effectiveImageSize(sourceImage)
+	if err != nil {
+		return nil, err
+	}
+	if selection.CloneRequiredBytes > sourceSizeBytes || (selection.CloneLimitBytes > 0 && sourceSizeBytes > selection.CloneLimitBytes) {
+		return nil, fmt.Errorf("%w: source capacity %d is outside requested clone range", ErrCloneCapacity, sourceSizeBytes)
+	}
+	if name == sourceVolume {
+		return nil, fmt.Errorf("%w: clone target equals source", ErrCloneConflict)
+	}
+	if existing, lookupErr := p.lookupImageID(ctx, name); lookupErr == nil {
+		target, e := p.ctrl.Image(existing).InfoContext(ctx, true)
+		if e != nil {
+			return nil, e
+		}
+		provenance, e := target.Template.GetStr("CSI_CLONE_SOURCE_IMAGE_ID")
+		if e != nil || provenance != strconv.Itoa(sourceVolumeID) {
+			return nil, fmt.Errorf("%w: target %q has unproven source identity; do not replay an uncertain clone", ErrCloneConflict, name)
+		}
+		if target.DatastoreID == nil {
+			return nil, fmt.Errorf("clone target datastore unavailable")
+		}
+		for _, candidate := range candidates {
+			if candidate.ID == *target.DatastoreID {
+				if selection.Authorize != nil {
+					if e := selection.Authorize(ctx, candidate.ID); e != nil {
+						return nil, e
+					}
+				}
+				if err := p.waitForResourceStatusContext(ctx, existing, p.hotplugPolicy.BaseTimeout, p.volumeReadyContext); err != nil {
+					return nil, err
+				}
+				targetSize, e := effectiveImageSize(target)
+				if e != nil {
+					return nil, e
+				}
+				if targetSize < selection.CloneRequiredBytes || (selection.CloneLimitBytes > 0 && targetSize > selection.CloneLimitBytes) {
+					return nil, ErrCloneCapacity
+				}
+				return &VolumeCreateResult{Datastore: candidate, CapacityBytes: targetSize, AttemptedDatastoreIDs: []int{candidate.ID}}, nil
+			}
+		}
+		return nil, fmt.Errorf("%w: existing clone is outside selected datastores", ErrCloneConflict)
+	} else if !errors.Is(lookupErr, ErrVolumeNotFound) {
+		return nil, lookupErr
+	}
 	attemptedDatastores := make([]int, 0, len(candidates))
 	insufficientCapacity := make([]string, 0)
 	for _, datastore := range candidates {
@@ -209,6 +278,11 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 			continue
 		}
 
+		if selection.Authorize != nil {
+			if err := selection.Authorize(ctx, datastore.ID); err != nil {
+				return nil, err
+			}
+		}
 		finishAttempt := beginDatastoreAttempt(datastore.ID)
 		cloneID, err := p.ctrl.Image(sourceVolumeID).CloneContext(ctx, name, datastore.ID)
 		finishAttempt()
@@ -220,9 +294,29 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 			}
 			return nil, fmt.Errorf("failed to clone volume %q into datastore %d: %w", sourceVolume, datastore.ID, err)
 		}
+		target, e := p.ctrl.Image(cloneID).InfoContext(ctx, true)
+		if e != nil {
+			return nil, fmt.Errorf("clone outcome unresolved for image %d: %w", cloneID, e)
+		}
+		if target.ID == sourceVolumeID || target.Name != name {
+			return nil, fmt.Errorf("clone target identity differs from request")
+		}
+		provenance := img.NewTemplate()
+		provenance.AddPair("CSI_CLONE_SOURCE_IMAGE_ID", strconv.Itoa(sourceVolumeID))
+		if err := p.ctrl.Image(cloneID).UpdateContext(ctx, provenance.String(), parameters.Merge); err != nil {
+			return nil, fmt.Errorf("clone provenance unresolved: %w", err)
+		}
+		target, e = p.ctrl.Image(cloneID).InfoContext(ctx, true)
+		if e != nil {
+			return nil, e
+		}
+		recorded, e := target.Template.GetStr("CSI_CLONE_SOURCE_IMAGE_ID")
+		if e != nil || recorded != strconv.Itoa(sourceVolumeID) {
+			return nil, fmt.Errorf("clone provenance readback failed")
+		}
 		recordDatastoreProvisioningResult(datastore.ID, true)
 
-		if err := p.waitForResourceStatus(cloneID, p.hotplugPolicy.BaseTimeout, p.volumeReady); err != nil {
+		if err := p.waitForResourceStatusContext(ctx, cloneID, p.hotplugPolicy.BaseTimeout, p.volumeReadyContext); err != nil {
 			return nil, fmt.Errorf("failed waiting for clone %d to become ready: %w", cloneID, err)
 		}
 
@@ -256,29 +350,8 @@ func (p *PersistentDiskVolumeProvider) CreateSnapshot(ctx context.Context, sourc
 		snapshotName = fmt.Sprintf("%s-snapshot", sourceVolume)
 	}
 
-	response, err := p.ctrl.Client.CallContext(ctx, "one.image.snapshotcreate", sourceVolumeID, snapshotName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create snapshot for volume %q: %w", sourceVolume, err)
-	}
-
-	snapshotID := response.BodyInt()
-	imageInfo, err := p.ctrl.Image(sourceVolumeID).InfoContext(ctx, true)
-	if err != nil {
-		return nil, fmt.Errorf("failed to inspect snapshot metadata for volume %q: %w", sourceVolume, err)
-	}
-
-	snapshot, err := imageSnapshotByID(imageInfo, snapshotID)
-	if err != nil {
-		return nil, err
-	}
-
-	return &VolumeSnapshot{
-		SnapshotID:     EncodeVolumeSnapshotID(sourceVolumeID, snapshotID),
-		SourceVolumeID: sourceVolume,
-		CreationTime:   time.Unix(int64(snapshot.Date), 0).UTC(),
-		SizeBytes:      int64(sourceSize),
-		ReadyToUse:     true,
-	}, nil
+	_ = sourceSize
+	return nil, fmt.Errorf("new OpenNebula disk snapshots are unavailable until the complete backend snapshot lifecycle is qualified")
 }
 
 func (p *PersistentDiskVolumeProvider) DeleteSnapshot(ctx context.Context, snapshotID string) error {
@@ -362,99 +435,54 @@ func (p *PersistentDiskVolumeProvider) ListSnapshots(ctx context.Context, snapsh
 
 func (p *PersistentDiskVolumeProvider) ExpandVolume(ctx context.Context, volume string, size int64, allowDetached bool) (int64, error) {
 	if size <= 0 {
-		return 0, fmt.Errorf("invalid requested volume size: must be greater than 0")
+		return 0, fmt.Errorf("requested capacity must be positive")
 	}
-
-	volumeID, currentSize, err := p.VolumeExists(ctx, volume)
-	if err != nil {
-		return 0, fmt.Errorf("failed to check if volume exists: %w", err)
-	}
-	if volumeID == -1 {
-		return 0, fmt.Errorf("volume %s was not found", volume)
-	}
-
-	if size < int64(currentSize) {
-		return 0, &datastoreConfigError{
-			message: fmt.Sprintf("shrinking volumes is not supported: requested %d bytes but current size is %d bytes", size, currentSize),
-		}
-	}
-
-	if size == int64(currentSize) {
-		return int64(currentSize), nil
-	}
-
-	vmID, diskID, attached, attachedSizeBytes, err := p.findAttachedVolumeDisk(ctx, volumeID)
+	id, current, err := p.VolumeExists(ctx, volume)
 	if err != nil {
 		return 0, err
 	}
-
-	sizeMB := size / sizeConversion
-	if size%sizeConversion != 0 {
-		sizeMB++
+	if size < int64(current) {
+		return 0, &datastoreConfigError{message: "shrinking volumes is unsupported"}
 	}
-
-	if attached {
-		if attachedSizeBytes >= size {
-			return attachedSizeBytes, nil
-		}
-
-		err = p.ctrl.VM(vmID).Disk(diskID).ResizeContext(ctx, strconv.FormatInt(sizeMB, 10))
-		if err != nil {
-			if attachedSizeBytes, sizeErr := p.attachedDiskSizeBytes(ctx, vmID, diskID, volumeID); sizeErr == nil && attachedSizeBytes >= size {
-				return attachedSizeBytes, nil
-			}
-			return 0, fmt.Errorf("failed to expand volume %s on vm %d disk %d: %w", volume, vmID, diskID, err)
-		}
-	} else {
-		if !allowDetached {
-			return 0, &datastoreConfigError{
-				message: "expanding detached OpenNebula persistent disks is disabled; attach the volume or enable the detachedDiskExpansion feature gate and retry expansion",
-			}
-		}
-
-		tpl := img.NewTemplate()
-		tpl.Add(imk.Size, int(sizeMB))
-		if err := p.ctrl.Image(volumeID).UpdateContext(ctx, tpl.String(), parameters.Merge); err != nil {
-			return 0, fmt.Errorf("failed to expand detached volume %s via image update: %w", volume, err)
-		}
-	}
-
-	var completedSizeBytes int64
-	if attached {
-		err = p.waitForResourceStatus(volumeID, volumeUsedTimeout, func(resourceID int) (bool, error) {
-			currentSizeBytes, sizeErr := p.attachedDiskSizeBytes(ctx, vmID, diskID, resourceID)
-			if sizeErr != nil {
-				return false, sizeErr
-			}
-			if currentSizeBytes >= size {
-				completedSizeBytes = currentSizeBytes
-				return true, nil
-			}
-			return false, nil
-		})
-	} else {
-		err = p.waitForResourceStatus(volumeID, volumeUsedTimeout, func(resourceID int) (bool, error) {
-			imageInfo, infoErr := p.ctrl.Image(resourceID).Info(true)
-			if infoErr != nil {
-				return false, fmt.Errorf("failed to get volume info after resize: %w", infoErr)
-			}
-			currentSizeBytes := int64(imageInfo.Size * sizeConversion)
-			if currentSizeBytes >= size {
-				completedSizeBytes = currentSizeBytes
-				return true, nil
-			}
-			return false, nil
-		})
-	}
+	vmID, diskID, attached, _, err := p.findAttachedVolumeDisk(ctx, id)
 	if err != nil {
-		return 0, fmt.Errorf("failed waiting for volume resize to complete: %w", err)
+		return 0, err
 	}
-
-	if completedSizeBytes == 0 {
-		completedSizeBytes = sizeMB * sizeConversion
+	if !attached {
+		if size == int64(current) {
+			return int64(current), nil
+		}
+		return 0, &datastoreConfigError{message: "detached disk growth is unsupported; attach the volume and retry"}
 	}
-
-	return completedSizeBytes, nil
+	actual, err := p.completedDiskSize(ctx, vmID, diskID, id)
+	if err != nil {
+		return 0, err
+	}
+	if actual < size && actual > 0 {
+		mb := size / sizeConversion
+		if size%sizeConversion != 0 {
+			mb++
+		}
+		if err := p.ctrl.VM(vmID).Disk(diskID).ResizeContext(ctx, strconv.FormatInt(mb, 10)); err != nil {
+			return 0, fmt.Errorf("resize outcome uncertain; retry after observing completion: %w", err)
+		}
+	}
+	var completed int64
+	err = p.waitForResourceStatusContext(ctx, id, p.hotplugPolicy.MaxTimeout, func(ctx context.Context, _ int) (bool, error) {
+		observed, e := p.completedDiskSize(ctx, vmID, diskID, id)
+		if e != nil {
+			return false, e
+		}
+		completed = observed
+		return observed >= size, nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	if err := p.persistVerifiedSize(ctx, id, completed); err != nil {
+		return 0, err
+	}
+	return completed, nil
 }
 
 func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume string, node string, immutable bool, params map[string]string) error {
@@ -519,7 +547,7 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		"timeout", hotplugTimeout)
 
 	attachDisk := func() error {
-		return p.ctrl.VM(nodeID).DiskAttach(disk.String())
+		return p.ctrl.VM(nodeID).DiskAttachContext(ctx, disk.String())
 	}
 
 	attachErr := attachDisk()
@@ -545,7 +573,7 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		if inspectErr != nil {
 			return false, false, inspectErr
 		}
-		ready, readyErr := p.nodeReady(nodeID)
+		ready, readyErr := p.nodeReadyContext(ctx, nodeID)
 		if readyErr != nil {
 			return attached, false, readyErr
 		}
@@ -562,7 +590,7 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		}
 		return err
 	}
-	return nil
+	return p.restoreVerifiedSize(ctx, volume, nodeID, volumeID, hotplugTimeout)
 }
 
 func (p *PersistentDiskVolumeProvider) InspectHostArtifactAttachmentTarget(ctx context.Context, volume string, node string, params map[string]string) (*HostArtifactAttachmentTarget, error) {
@@ -745,7 +773,7 @@ func linuxDiskLetters(index int) string {
 }
 
 func (p *PersistentDiskVolumeProvider) inspectAttachmentEnvironment(ctx context.Context, volumeID, nodeID int) (*DatastoreEnvironmentReport, error) {
-	imageInfo, err := p.ctrl.Image(volumeID).Info(true)
+	imageInfo, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to inspect image %d before attach: %w", volumeID, err)
 	}
@@ -754,7 +782,7 @@ func (p *PersistentDiskVolumeProvider) inspectAttachmentEnvironment(ctx context.
 		return nil, &datastoreConfigError{message: fmt.Sprintf("volume %d does not expose a source datastore ID", volumeID)}
 	}
 
-	datastorePool, err := p.ctrl.Datastores().Info()
+	datastorePool, err := p.ctrl.Datastores().InfoContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to inspect datastores before attach: %w", err)
 	}
@@ -769,7 +797,7 @@ func (p *PersistentDiskVolumeProvider) inspectAttachmentEnvironment(ctx context.
 		DeploymentMode: DeploymentModeUnknown,
 	}
 
-	vmInfo, err := p.ctrl.VM(nodeID).Info(true)
+	vmInfo, err := p.ctrl.VM(nodeID).InfoContext(ctx, true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to inspect node %d before attach: %w", nodeID, err)
 	}
@@ -904,7 +932,7 @@ func (p *PersistentDiskVolumeProvider) DetachVolume(ctx context.Context, volume,
 		"timeout", hotplugTimeout)
 
 	vmController := p.ctrl.VM(nodeID)
-	vmInfo, err := vmController.Info(true)
+	vmInfo, err := vmController.InfoContext(ctx, true)
 	if err != nil {
 		return fmt.Errorf("failed to get VM info: %w", err)
 	}
@@ -923,7 +951,7 @@ func (p *PersistentDiskVolumeProvider) DetachVolume(ctx context.Context, volume,
 				return fmt.Errorf("invalid disk ID format: %w", err)
 			}
 			detachDisk := func() error {
-				return vmController.Disk(diskIDInt).Detach()
+				return vmController.Disk(diskIDInt).DetachContext(ctx)
 			}
 			detachErr := detachDisk()
 			if detachErr != nil && !isHotplugStateError(detachErr) {
@@ -940,8 +968,10 @@ func (p *PersistentDiskVolumeProvider) DetachVolume(ctx context.Context, volume,
 				attached := false
 				if _, infoErr := p.GetVolumeInNode(ctx, volumeID, nodeID); infoErr == nil {
 					attached = true
+				} else if !errors.Is(infoErr, ErrAttachmentNotFound) {
+					return false, false, infoErr
 				}
-				ready, readyErr := p.nodeReady(nodeID)
+				ready, readyErr := p.nodeReadyContext(ctx, nodeID)
 				if readyErr != nil {
 					return attached, false, readyErr
 				}
@@ -980,7 +1010,7 @@ func (p *PersistentDiskVolumeProvider) ListVolumes(ctx context.Context, owner st
 		listingParams[2] = int(maxEntries) // page size
 	}
 
-	images, err := p.ctrl.Images().Info(listingParams...)
+	images, err := p.ctrl.Images().InfoContext(ctx, listingParams...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list volumes: %w", err)
 	}
@@ -1010,7 +1040,7 @@ func (p *PersistentDiskVolumeProvider) ResolveProvisioningDatastores(ctx context
 }
 
 func (p *PersistentDiskVolumeProvider) resolveProvisioningDatastores(ctx context.Context, selection DatastoreSelectionConfig) ([]Datastore, error) {
-	datastores, err := p.ctrl.Datastores().Info()
+	datastores, err := p.ctrl.Datastores().InfoContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get datastores info: %w", err)
 	}
@@ -1110,24 +1140,51 @@ func diskSizeBytesFromTemplate(disk shared.Disk) (int64, error) {
 	return int64(sizeMB) * sizeConversion, nil
 }
 
+// These errors mean absence observed through a successful provider response, never transport failure.
+var ErrCloneCapacity = errors.New("unsupported clone capacity")
+var ErrCloneConflict = errors.New("incompatible or uncertain clone target")
+var ErrVolumeNotFound = errors.New("volume not found")
+var ErrAttachmentNotFound = errors.New("volume attachment not found")
+
+func (p *PersistentDiskVolumeProvider) lookupImageID(ctx context.Context, name string) (int, error) {
+	pool, err := p.ctrl.Images().InfoContext(ctx)
+	if err != nil {
+		return -1, err
+	}
+	found := -1
+	for _, v := range pool.Images {
+		if v.Name == name {
+			if found != -1 {
+				return -1, fmt.Errorf("duplicate image name %q", name)
+			}
+			found = v.ID
+		}
+	}
+	if found < 0 {
+		return -1, fmt.Errorf("%w: %s", ErrVolumeNotFound, name)
+	}
+	return found, nil
+}
+
 func (p *PersistentDiskVolumeProvider) VolumeExists(ctx context.Context, volume string) (int, int, error) {
-	imgID, err := p.ctrl.Images().ByName(volume)
+	id, err := p.lookupImageID(ctx, volume)
 	if err != nil {
-		return -1, -1, fmt.Errorf("failed to get volume by name: %w", err)
+		return -1, -1, err
 	}
-	img, err := p.ctrl.Image(imgID).Info(true)
+	info, err := p.ctrl.Image(id).InfoContext(ctx, true)
 	if err != nil {
-		return -1, -1, fmt.Errorf("failed to get volume info: %w", err)
+		return -1, -1, err
 	}
-	return imgID, (img.Size * sizeConversion), nil
+	size, err := effectiveImageSize(info)
+	if err != nil {
+		return -1, -1, err
+	}
+	return id, int(size), nil
 }
 
 func openNebulaLookupNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(strings.TrimSpace(err.Error()))
-	return strings.Contains(message, "not found") || strings.Contains(message, "does not exist") || strings.Contains(message, "no such")
+	var response *gocaerrors.ResponseError
+	return errors.Is(err, ErrVolumeNotFound) || errors.Is(err, ErrAttachmentNotFound) || (errors.As(err, &response) && response.Code == gocaerrors.OneNoExistsError)
 }
 
 func isInsufficientCapacityError(err error) bool {
@@ -1226,11 +1283,14 @@ func (p *PersistentDiskVolumeProvider) NodeReady(ctx context.Context, node strin
 	if err != nil {
 		return false, err
 	}
-	return p.nodeReady(nodeID)
+	return p.nodeReadyContext(ctx, nodeID)
 }
 
 func (p *PersistentDiskVolumeProvider) volumeReady(volumeID int) (bool, error) {
-	image, err := p.ctrl.Image(volumeID).Info(true)
+	return p.volumeReadyContext(context.Background(), volumeID)
+}
+func (p *PersistentDiskVolumeProvider) volumeReadyContext(ctx context.Context, volumeID int) (bool, error) {
+	image, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
 	if err != nil {
 		return false, fmt.Errorf("failed to get Disk info: %w", err)
 	}
@@ -1244,15 +1304,31 @@ func (p *PersistentDiskVolumeProvider) volumeReady(volumeID int) (bool, error) {
 }
 
 func (p *PersistentDiskVolumeProvider) volumeDeleted(volumeID int) (bool, error) {
-	_, err := p.ctrl.Image(volumeID).Info(true)
+	return p.volumeDeletedContext(context.Background(), volumeID)
+}
+func (p *PersistentDiskVolumeProvider) volumeDeletedContext(ctx context.Context, volumeID int) (bool, error) {
+	info, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
 	if err != nil {
-		return true, nil
+		if openNebulaLookupNotFound(err) {
+			return true, nil
+		}
+		return false, err
 	}
-	return false, fmt.Errorf("volume %d still exists: %w", volumeID, err)
+	state, err := info.State()
+	if err != nil {
+		return false, err
+	}
+	if state == img.Error {
+		return false, fmt.Errorf("backend deletion failed for image %d", volumeID)
+	}
+	return false, nil
 }
 
 func (p *PersistentDiskVolumeProvider) nodeReady(nodeID int) (bool, error) {
-	vmInfo, err := p.ctrl.VM(nodeID).Info(true)
+	return p.nodeReadyContext(context.Background(), nodeID)
+}
+func (p *PersistentDiskVolumeProvider) nodeReadyContext(ctx context.Context, nodeID int) (bool, error) {
+	vmInfo, err := p.ctrl.VM(nodeID).InfoContext(ctx, true)
 	if err != nil {
 		return false, fmt.Errorf("failed to get VM info: %w", err)
 	}
@@ -1407,7 +1483,7 @@ func (p *PersistentDiskVolumeProvider) resolveDetachVolumeSizeBytes(ctx context.
 		}
 	}
 
-	image, err := p.ctrl.Image(volumeID).Info(true)
+	image, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
 	if err != nil {
 		return 0, err
 	}
@@ -1417,25 +1493,33 @@ func (p *PersistentDiskVolumeProvider) resolveDetachVolumeSizeBytes(ctx context.
 	return int64(image.Size * sizeConversion), nil
 }
 
-func (p *PersistentDiskVolumeProvider) waitForResourceStatus(volumeID int, timeout time.Duration, checkFunc func(int) (bool, error)) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func (p *PersistentDiskVolumeProvider) waitForResourceStatus(volumeID int, timeout time.Duration, check func(int) (bool, error)) error {
+	return p.waitForResourceStatusContext(context.Background(), volumeID, timeout, func(_ context.Context, id int) (bool, error) { return check(id) })
+}
+func (p *PersistentDiskVolumeProvider) waitForResourceStatusContext(parent context.Context, volumeID int, timeout time.Duration, check func(context.Context, int) (bool, error)) error {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-
-	ticker := time.NewTicker(1 * time.Second)
+	interval := p.hotplugPollWait
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		ready, err := check(ctx, volumeID)
+		if err != nil {
+			return err
+		}
+		if ready {
+			return nil
+		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for volume %d to be ready", volumeID)
+			return ctx.Err()
 		case <-ticker.C:
-			ready, err := checkFunc(volumeID)
-			if err != nil {
-				return fmt.Errorf("error checking volume readiness: %w", err)
-			}
-			if ready {
-				return nil
-			}
 		}
 	}
 }
@@ -1460,7 +1544,7 @@ func attachmentPresence(metadata *VolumeAttachmentMetadata, volume string, image
 }
 
 func (p *PersistentDiskVolumeProvider) GetVolumeInNode(ctx context.Context, volumeID int, nodeID int) (string, error) {
-	vmInfo, err := p.ctrl.VM(nodeID).Info(true)
+	vmInfo, err := p.ctrl.VM(nodeID).InfoContext(ctx, true)
 	if err != nil {
 		return "", fmt.Errorf("failed to get VM info: %w", err)
 	}
@@ -1480,7 +1564,22 @@ func (p *PersistentDiskVolumeProvider) GetVolumeInNode(ctx context.Context, volu
 			return target, nil
 		}
 	}
-	return "", fmt.Errorf("volume %d not found on node %d", volumeID, nodeID)
+	info, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
+	if err != nil {
+		return "", err
+	}
+	metadata, err := p.InspectVolumeAttachment(ctx, info.Name, vmInfo.Name)
+	if err != nil {
+		return "", err
+	}
+	present, err := attachmentPresence(metadata, info.Name, volumeID, nodeID)
+	if err != nil {
+		return "", err
+	}
+	if present {
+		return "", fmt.Errorf("contradictory VM observations")
+	}
+	return "", fmt.Errorf("%w: image %d node %d", ErrAttachmentNotFound, volumeID, nodeID)
 }
 
 func (p *PersistentDiskVolumeProvider) InspectVolumeLookup(ctx context.Context, volume string, requestedNode string) (*VolumeLookupResult, error) {
@@ -1498,7 +1597,7 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeLookup(ctx context.Context, 
 		}
 	}
 
-	imgID, err := p.ctrl.Images().ByName(volume)
+	imgID, err := p.lookupImageID(ctx, volume)
 	if err != nil {
 		if openNebulaLookupNotFound(err) {
 			result.Status = VolumeLookupImageRecordMissing
@@ -1631,7 +1730,7 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 			}
 			imageMeta, ok := imageCache[diskImageID]
 			if !ok {
-				imageInfo, imageErr := p.ctrl.Image(diskImageID).Info(true)
+				imageInfo, imageErr := p.ctrl.Image(diskImageID).InfoContext(ctx, true)
 				if imageErr != nil {
 					return nil, fmt.Errorf("failed to inspect image %d while listing attachments: %w", diskImageID, imageErr)
 				}

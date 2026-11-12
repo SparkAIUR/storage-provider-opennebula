@@ -18,7 +18,9 @@ package opennebula
 
 import (
 	"context"
+	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/OpenNebula/one/src/oca/go/src/goca"
@@ -234,9 +236,12 @@ func NewClient(config OpenNebulaConfig) *OpenNebulaClient {
 }
 
 func (c *OpenNebulaClient) Probe(ctx context.Context) error {
-	_, err := c.Client.CallContext(ctx, "one.system.version")
+	response, err := goca.NewController(c.Client).SystemVersionContext(ctx)
 	if err != nil {
 		return err
+	}
+	if !strings.HasPrefix(strings.TrimSpace(response), "7.4.") {
+		return fmt.Errorf("unsupported OpenNebula server version %q; require 7.4.x", response)
 	}
 	return nil
 }

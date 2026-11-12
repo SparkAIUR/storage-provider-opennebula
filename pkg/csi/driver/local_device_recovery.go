@@ -993,7 +993,7 @@ func updateLocalDeviceReportIf(ctx context.Context, runtime *KubeRuntime, namesp
 		namespace = namespaceFromServiceAccount()
 	}
 	cmClient := runtime.client.CoreV1().ConfigMaps(namespace)
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	return retryOnConflict(retry.DefaultRetry, func() error {
 		current, err := cmClient.Get(ctx, localDeviceStateConfigMapName, metav1.GetOptions{})
 		report := LocalDeviceMissingReport{}
 		if err != nil {

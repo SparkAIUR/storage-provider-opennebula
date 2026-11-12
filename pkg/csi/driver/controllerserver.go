@@ -341,6 +341,10 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	if contentSource != nil {
 		switch source := contentSource.Type.(type) {
 		case *csi.VolumeContentSource_Volume:
+			selection.CloneRequiredBytes = requiredBytes
+			if req.GetCapacityRange() != nil {
+				selection.CloneLimitBytes = req.GetCapacityRange().GetLimitBytes()
+			}
 			result, err := s.volumeProvider.CloneVolume(ctx, name, source.Volume.GetVolumeId(), selection)
 			if err != nil {
 				switch {
@@ -628,24 +632,8 @@ func (s *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 		}, nil
 	}
 
-	snapshot, err := s.volumeProvider.CreateSnapshot(ctx, req.GetSourceVolumeId(), req.GetName())
-	if err != nil {
-		s.driver.metrics.RecordSnapshot("disk", "create", "internal")
-		return nil, status.Error(codes.Internal, err.Error())
-	}
+	return nil, status.Error(codes.Unimplemented, "new disk snapshot creation is unavailable until backend lifecycle qualification")
 
-	s.driver.metrics.RecordSnapshot("disk", "create", "success")
-	s.driver.metrics.RecordOperation("create_snapshot", "disk", "success", time.Since(started))
-
-	return &csi.CreateSnapshotResponse{
-		Snapshot: &csi.Snapshot{
-			SizeBytes:      snapshot.SizeBytes,
-			SnapshotId:     snapshot.SnapshotID,
-			SourceVolumeId: snapshot.SourceVolumeID,
-			CreationTime:   timestamppb.New(snapshot.CreationTime),
-			ReadyToUse:     snapshot.ReadyToUse,
-		},
-	}, nil
 }
 
 func (s *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
@@ -1115,7 +1103,10 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	}
 
 	volumeID, _, err := s.volumeProvider.VolumeExists(ctx, req.VolumeId)
-	if err != nil || volumeID == -1 {
+	if err != nil && !errors.Is(err, opennebula.ErrVolumeNotFound) {
+		return nil, status.Errorf(codes.Unavailable, "volume lookup is unknown: %v", err)
+	}
+	if volumeID == -1 {
 		klog.V(1).InfoS("Volume not found, skipping volume unpublish",
 			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId)
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
@@ -1142,6 +1133,9 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 
 	_, err = s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err != nil {
+		if !errors.Is(err, opennebula.ErrAttachmentNotFound) {
+			return nil, status.Errorf(codes.Unavailable, "attachment state is unknown: %v", err)
+		}
 		s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
 		klog.V(1).InfoS("Volume does not exist in node, skipping unpublish",
 			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
@@ -2504,6 +2498,9 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 	oldNodeID, oldNodeErr := s.volumeProvider.NodeExists(ctx, state.NodeID)
 	if oldNodeErr == nil && oldNodeID != -1 {
 		if _, oldAttachErr := s.volumeProvider.GetVolumeInNode(ctx, volumeID, oldNodeID); oldAttachErr != nil {
+			if !errors.Is(oldAttachErr, opennebula.ErrAttachmentNotFound) {
+				return true, nil, status.Errorf(codes.Unavailable, "old attachment is unknown: %v", oldAttachErr)
+			}
 			if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
 				return true, nil, status.Errorf(codes.Internal, "failed to clear sticky attachment state: %v", err)
 			}
@@ -2587,6 +2584,9 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 		nodeID, nodeErr := s.volumeProvider.NodeExists(queueCtx, confirmed.NodeID)
 		if volumeErr == nil && nodeErr == nil && volumeID != -1 && nodeID != -1 {
 			if _, attachedErr := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID); attachedErr != nil {
+				if !errors.Is(attachedErr, opennebula.ErrAttachmentNotFound) {
+					return status.Errorf(codes.Unavailable, "attachment is unknown: %v", attachedErr)
+				}
 				if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
 					klog.V(2).InfoS("Failed to clear already-absent sticky attachment state", "volumeID", confirmed.VolumeID, "err", err)
 					return err

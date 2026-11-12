@@ -108,6 +108,11 @@ func (p *CephFSVolumeProvider) CreateSharedVolume(ctx context.Context, req Share
 		metadata.Mode = SharedVolumeModeDynamic
 		metadata.SubvolumeName = sanitizeSubvolumeName(req.Name)
 
+		if req.Selection.Authorize != nil {
+			if err := req.Selection.Authorize(ctx, datastore.ID); err != nil {
+				return nil, err
+			}
+		}
 		finishAttempt := beginDatastoreAttempt(datastore.ID)
 		if err := p.ensureSubvolume(ctx, datastore, metadata, req.SizeBytes, req.Secrets); err != nil {
 			finishAttempt()
@@ -277,6 +282,11 @@ func (p *CephFSVolumeProvider) CloneSharedVolume(ctx context.Context, req Shared
 			return nil, &datastoreConfigError{message: fmt.Sprintf("datastore %d is missing a CephFS subvolume group", datastore.ID)}
 		}
 
+		if req.Selection.Authorize != nil {
+			if err := req.Selection.Authorize(ctx, datastore.ID); err != nil {
+				return nil, err
+			}
+		}
 		finishAttempt := beginDatastoreAttempt(datastore.ID)
 		err := p.cloneFromSnapshot(ctx, datastore, sourceSnapshot, metadata, req.Secrets)
 		finishAttempt()
@@ -875,7 +885,7 @@ func (p *CephFSVolumeProvider) getCloneStatus(ctx context.Context, datastore Dat
 	}, nil
 }
 
-func (p *CephFSVolumeProvider) runCephCommand(_ context.Context, datastore Datastore, secrets map[string]string, args ...string) ([]byte, error) {
+func (p *CephFSVolumeProvider) runCephCommand(ctx context.Context, datastore Datastore, secrets map[string]string, args ...string) ([]byte, error) {
 	if datastore.CephFS == nil {
 		return nil, &datastoreConfigError{message: fmt.Sprintf("datastore %d does not expose CephFS metadata", datastore.ID)}
 	}
@@ -921,7 +931,9 @@ func (p *CephFSVolumeProvider) runCephCommand(_ context.Context, datastore Datas
 	commandArgs = append(commandArgs, "-m", strings.Join(datastore.CephFS.Monitors, ","), "--id", adminID, "--keyfile", keyFilePath)
 	commandArgs = append(commandArgs, args...)
 
-	cmd := p.exec.Command(cephFsCommandBin, commandArgs...)
+	commandCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	cmd := p.exec.CommandContext(commandCtx, cephFsCommandBin, commandArgs...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		trimmedOutput := strings.TrimSpace(string(output))

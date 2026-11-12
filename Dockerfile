@@ -17,7 +17,7 @@
 ##
 ARG BUILDPLATFORM=linux/amd64
 # Build the manager binary
-FROM --platform=${BUILDPLATFORM} golang:1.24 AS builder
+FROM --platform=${BUILDPLATFORM} golang:1.27.4@sha256:5e8afd493a7124a8586e134d9b532731161d4b9becf9dee5a5956b107426f93d AS builder
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev

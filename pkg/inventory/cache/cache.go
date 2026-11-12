@@ -146,7 +146,7 @@ func (p *Provider) refresh(ctx context.Context) error {
 	for _, item := range list.Items {
 		entries[item.Spec.Discovery.OpenNebulaDatastoreID] = DatastoreEligibility{
 			ID:      item.Spec.Discovery.OpenNebulaDatastoreID,
-			Enabled: item.Spec.Enabled,
+			Enabled: item.Spec.Enabled && !item.Spec.MaintenanceMode,
 			Allowed: item.Spec.Discovery.Allowed,
 			Phase:   item.Status.Phase,
 		}
@@ -155,4 +155,13 @@ func (p *Provider) refresh(ctx context.Context) error {
 	p.entries = entries
 	p.mu.Unlock()
 	return nil
+}
+
+// AuthorizeDatastore always refreshes mutation authority; cached observations never authorize allocation.
+func (p *Provider) AuthorizeDatastore(ctx context.Context, id int) error {
+	if err := p.refresh(ctx); err != nil {
+		return fmt.Errorf("inventory authority unavailable: %w", err)
+	}
+	_, err := p.FilterIdentifiers([]string{strconv.Itoa(id)})
+	return err
 }

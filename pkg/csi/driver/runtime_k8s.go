@@ -299,7 +299,7 @@ func (r *KubeRuntime) setConfigMapSnapshot(ctx context.Context, namespace, name,
 	client := r.client.CoreV1().ConfigMaps(namespace)
 	keyHash := sha256.Sum256([]byte(key))
 	annotations := map[string]string{fmt.Sprintf("storage-provider.opennebula.sparkaiur.io/snapshot-%x", keyHash[:16]): uuid.NewString()}
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	result := retryOnConflict(retry.DefaultRetry, func() error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -329,6 +329,10 @@ func (r *KubeRuntime) setConfigMapSnapshot(ctx context.Context, namespace, name,
 		_, err = client.Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{})
 		return err
 	})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return result
 }
 
 func (r *KubeRuntime) DeleteConfigMapKey(ctx context.Context, namespace, name, key string) error {
@@ -359,7 +363,7 @@ func (r *KubeRuntime) DeletePVAnnotation(ctx context.Context, pvName, key string
 	if strings.TrimSpace(pvName) == "" || strings.TrimSpace(key) == "" {
 		return nil
 	}
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	return retryOnConflict(retry.DefaultRetry, func() error {
 		pv, err := r.client.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
 		if err != nil {
 			if errors.IsNotFound(err) {

@@ -1,6 +1,7 @@
 package opennebula
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -20,6 +21,9 @@ const (
 )
 
 type DatastoreSelectionConfig struct {
+	Authorize                func(context.Context, int) error
+	CloneRequiredBytes       int64
+	CloneLimitBytes          int64
 	Identifiers              []string
 	Policy                   DatastoreSelectionPolicy
 	AllowedTypes             []string
