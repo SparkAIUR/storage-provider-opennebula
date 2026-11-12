@@ -916,3 +916,6 @@ go run ./cmd/opennebula-csi \
 ## Upstream
 
 This project is derived from the OpenNebula storage provider. The fork keeps the Apache 2.0 license and focuses on SparkAI-specific OpenNebula and Omni requirements.
+
+
+OpenNebula7.4 upgrade: see [candidate support and supervised qualification](docs/opennebula-74-upgrade.md). The0.6.0 RC requires native hpldb qualification before production progression; local tests do not establish deployment acceptance.

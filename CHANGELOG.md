@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.6.0-rc.1, unreleased
+
+- Target OpenNebula7.4.x with the7.4 GoCA SDK, Go1.27.4, Kubernetes0.36.6 libraries, CSI1.13 and current storage sidecars.
+- Preserve holds on uncertain provider evidence; pin known IDs, observe nonforced deletion, verify attached resize completion and restore verified capacity on reattach.
+- Reconcile clone retries through atomically inherited durable origin metadata. Reject new disk snapshots and detached growth until lifecycle qualification.
+- Revalidate datastore authority at allocation and report disabled/unknown Ceph bridge feasibility.
+- Add digest images, configurable probes, webhook readiness/self-exclusion, retained mandatory preflight failures, supervised OnDelete rollout and release qualification gates.
+- Native qualification and ordered24h cluster observation remain pending. See [upgrade runbook](docs/opennebula-74-upgrade.md). Inventory batching/write reduction is a separate follow-up.
+
 ## v0.5.29, unreleased
 
 - Apply recovery authority and identity verification to raw-block publishing, including already-bound targets, before confirming recovery or exposing the device.

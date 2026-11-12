@@ -16,7 +16,11 @@ require() {
   fi
 }
 
+[[ "${ISOLATED_DISPOSABLE_CLUSTER_APPROVAL:-}" == "run invasive isolated lab suite" ]] || { echo "This legacy installer is restricted to an approved isolated cluster; use the 7.4 qualification runbook on hpldb." >&2; exit 1; }
+require LAB_CLUSTER_UID
+require CSI_IMAGE_DIGEST
 require KUBECONFIG
+[[ "$(kubectl get ns kube-system -o jsonpath='{.metadata.uid}')" == "$LAB_CLUSTER_UID" ]] || { echo "wrong cluster UID" >&2; exit 1; }
 require ONE_XMLRPC
 require ONE_AUTH
 require CEPHFS_ADMIN_ID
@@ -50,6 +54,10 @@ helm_args=(
   upgrade --install "${RELEASE_NAME}" helm/opennebula-csi
   --namespace "${NAMESPACE}"
   --create-namespace
+  --wait
+  --wait-for-jobs
+  --timeout 150m
+  --set "image.digest=${CSI_IMAGE_DIGEST}"
   --set "oneApiEndpoint=${ONE_XMLRPC}"
   --values "${VALUES_FILE}"
 )

@@ -1,0 +1,44 @@
+---
+name: Record native qualification
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_json:
+        description: Frozen exact-commit/tree, all-container digest, cluster UID/revision candidate JSON
+        required: true
+      qualification_json:
+        description: Native receipts with ordered 24h observations and API readback; never local fixtures
+        required: true
+permissions: {contents: read}
+jobs:
+  record:
+    environment: csi-native-qualification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require configured protected publication environment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/environments/csi-native-qualification" > environment.json
+          python3 - <<'PYCODE'
+          import json
+          rules=json.load(open('environment.json'))['protection_rules']
+          assert any(r['type']=='required_reviewers' and r.get('reviewers') for r in rules), 'Configure required reviewers before publication/qualification'
+          PYCODE
+      - name: Validate reviewed receipts
+        env:
+          CANDIDATE: ${{ inputs.candidate_json }}
+          RECEIPT: ${{ inputs.qualification_json }}
+        run: |
+          mkdir -p qualification
+          printf '%s' "$CANDIDATE" > qualification/candidate.json
+          printf '%s' "$RECEIPT" > qualification/native.json
+          python3 hack/upgrade_evidence.py qualify --stable --candidate qualification/candidate.json --evidence qualification/native.json
+          test "$(python3 -c 'import json;print(json.load(open("qualification/candidate.json"))["sourceCommit"])')" = "$GITHUB_SHA"
+          test "$(python3 -c 'import json;print(json.load(open("qualification/candidate.json"))["sourceTree"])')" = "$(git rev-parse HEAD^{tree})"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-qualification
+          path: qualification/
+          retention-days: 90

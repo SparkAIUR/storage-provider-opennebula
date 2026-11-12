@@ -37,3 +37,7 @@ go.work.sum
 
 refs/*
 AGENTS.md
+__pycache__/
+*.pyc
+_candidate/
+_stable/

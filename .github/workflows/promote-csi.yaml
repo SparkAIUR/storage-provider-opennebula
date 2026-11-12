@@ -1,0 +1,60 @@
+---
+name: Promote qualified CSI image
+on:
+  workflow_dispatch:
+    inputs:
+      qualification_run:
+        description: Successful protected native-qualification workflow run ID at this exact RC source commit
+        required: true
+      stable_tag:
+        description: Stable tag (for example v0.6.0); binary keeps its qualified RC VendorVersion
+        required: true
+permissions: {contents: write, packages: write, actions: read}
+jobs:
+  promote:
+    environment: csi-stable-promotion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require configured protected publication environment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/environments/csi-stable-promotion" > environment.json
+          python3 - <<'PYCODE'
+          import json
+          rules=json.load(open('environment.json'))['protection_rules']
+          assert any(r['type']=='required_reviewers' and r.get('reviewers') for r in rules), 'Configure required reviewers before publication/qualification'
+          PYCODE
+      - name: Download trusted qualification artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ inputs.qualification_run }}
+        run: |
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > run.json
+          python3 - <<'PY'
+          import json,os
+          run=json.load(open('run.json'))
+          assert run['path']=='.github/workflows/native-qualification.yaml'
+          assert run['head_sha']==os.environ['GITHUB_SHA'] and run['conclusion']=='success'
+          assert run['event']=='workflow_dispatch'
+          PY
+          gh run download "$RUN_ID" --name native-qualification --dir qualification
+          python3 hack/upgrade_evidence.py qualify --stable --candidate qualification/candidate.json --evidence qualification/native.json
+      - uses: azure/setup-helm@v4
+      - run: python3 -m pip install PyYAML==6.0.3
+      - name: Verify exact source and promote image without rebuilding
+        env:
+          STABLE_TAG: ${{ inputs.stable_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          [[ "$STABLE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(python3 -c 'import json;print(json.load(open("qualification/candidate.json"))["sourceCommit"])')" = "$GITHUB_SHA"
+          test "$(python3 -c 'import json;print(json.load(open("qualification/candidate.json"))["sourceTree"])')" = "$(git rev-parse HEAD^{tree})"
+          python3 hack/promote_chart.py --candidate qualification/candidate.json --receipt qualification/native.json --version "${STABLE_TAG#v}" --output _stable
+          IMAGE="$(python3 -c 'import json;print(json.load(open("qualification/candidate.json"))["images"]["opennebula-csi"])')"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx imagetools create --prefer-index=false --tag "ghcr.io/sparkaiur/opennebula-csi:$STABLE_TAG" "$IMAGE"
+          test "$(docker buildx imagetools inspect "ghcr.io/sparkaiur/opennebula-csi:$STABLE_TAG" --format '{{.Manifest.Digest}}')" = "${IMAGE##*@}"
+          gh release create "$STABLE_TAG" --title "$STABLE_TAG" --notes 'Promoted qualified image without rebuilding; binary VendorVersion retains the qualified RC identity. Stable chart rendering was compared with the frozen candidate; only chart metadata differs.' qualification/candidate.json qualification/native.json _stable/*.tgz
