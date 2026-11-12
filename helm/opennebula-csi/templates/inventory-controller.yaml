@@ -54,7 +54,7 @@ spec:
       {{- end }}
       containers:
         - name: inventory-controller
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ include "opennebula-csi.image" .Values.image }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "--mode=inventory-controller"

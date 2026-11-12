@@ -13,8 +13,9 @@ credentials:
   inlineAuth: ""
 
 image:
+  digest: ""
   repository: "nudevco/opennebula-csi"
-  tag: "v0.5.29"
+  tag: "v0.6.0-rc.1"
   pullPolicy: "IfNotPresent"
 
 imagePullSecrets: []
@@ -116,7 +117,7 @@ driver:
 
 featureGates:
   compatibilityAwareSelection: true
-  detachedDiskExpansion: true
+  detachedDiskExpansion: false
   cephfsExpansion: true
   cephfsSnapshots: false
   cephfsClones: false
@@ -215,6 +216,9 @@ inventoryController:
     burst: 40
 
 node:
+  updateStrategy:
+    type: OnDelete
+    maxUnavailable: 1
   podAnnotations: {}
   resources: {}
   nodeSelector: {}
@@ -286,3 +290,35 @@ snapshotter:
   extraArgs: []
 
 storageClasses: []
+
+sidecarImages:
+  provisioner:
+    repository: registry.k8s.io/sig-storage/csi-provisioner
+    tag: v6.4.0
+    digest: ""
+  attacher:
+    repository: registry.k8s.io/sig-storage/csi-attacher
+    tag: v4.13.0
+    digest: ""
+  resizer:
+    repository: registry.k8s.io/sig-storage/csi-resizer
+    tag: v2.3.0
+    digest: ""
+  snapshotter:
+    repository: registry.k8s.io/sig-storage/csi-snapshotter
+    tag: v8.7.0
+    digest: ""
+  registrar:
+    repository: registry.k8s.io/sig-storage/csi-node-driver-registrar
+    tag: v2.18.0
+    digest: ""
+  liveness:
+    repository: registry.k8s.io/sig-storage/livenessprobe
+    tag: v2.20.0
+    digest: ""
+
+probes:
+  enabled: true
+  startup: {periodSeconds: 5, timeoutSeconds: 5, failureThreshold: 60}
+  liveness: {periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 6}
+  readiness: {periodSeconds: 5, timeoutSeconds: 5, failureThreshold: 3}

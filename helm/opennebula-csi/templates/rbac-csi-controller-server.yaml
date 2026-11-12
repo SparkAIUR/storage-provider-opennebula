@@ -11,6 +11,9 @@ apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: {{ printf "%s-provisioner-role" (include "opennebula-csi.fullname" .) }}
 rules:
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattributesclasses"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["get", "list", "watch", "create", "delete"]

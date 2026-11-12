@@ -35,7 +35,7 @@ spec:
       {{- end }}
       containers:
         - name: storageclass-reconcile
-          image: "{{ include "opennebula-csi.storageClassReconcileImageRepository" . }}:{{ include "opennebula-csi.storageClassReconcileImageTag" . }}"
+          image: "{{ include "opennebula-csi.reconcileImage" . }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "--mode=storageclass-reconcile"

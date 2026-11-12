@@ -1,4 +1,7 @@
 {{- if .Values.preflight.enabled }}
+{{- if and .Values.preflight.failReleaseOnError (not .Values.credentials.existingSecret.name) }}
+{{- fail "mandatory preflight requires credentials.existingSecret.name available before installation" }}
+{{- end }}
 {{- $nodeStageRefs := list -}}
 {{- range .Values.preflight.nodeStageSecretRefs }}
 {{- $nodeStageRefs = append $nodeStageRefs (printf "%s/%s" .namespace .name) -}}
@@ -23,8 +26,11 @@ metadata:
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
   {{- end }}
 spec:
+  activeDeadlineSeconds: 300
   backoffLimit: 0
+  {{- if not .Values.preflight.failReleaseOnError }}
   ttlSecondsAfterFinished: 300
+  {{- end }}
   template:
     metadata:
       labels:
@@ -33,14 +39,14 @@ spec:
         app.kubernetes.io/component: preflight
     spec:
       restartPolicy: Never
-      serviceAccountName: {{ include "opennebula-csi.controllerServiceAccountName" . }}
+      serviceAccountName: {{ include "opennebula-csi.fullname" . }}-preflight
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}
       {{- end }}
       containers:
         - name: preflight
-          image: "{{ include "opennebula-csi.preflightImageRepository" . }}:{{ include "opennebula-csi.preflightImageTag" . }}"
+          image: "{{ include "opennebula-csi.preflightImage" . }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "--mode=preflight"

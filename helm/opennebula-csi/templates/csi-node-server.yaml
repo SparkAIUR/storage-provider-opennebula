@@ -6,9 +6,11 @@ metadata:
   namespace: {{ include "opennebula-csi.namespace" . }}
 spec:
   updateStrategy:
+    type: {{ .Values.node.updateStrategy.type }}
+    {{- if eq .Values.node.updateStrategy.type "RollingUpdate" }}
     rollingUpdate:
-      maxUnavailable: 1
-    type: RollingUpdate
+      maxUnavailable: {{ .Values.node.updateStrategy.maxUnavailable }}
+    {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "opennebula-csi.name" . }}
@@ -46,8 +48,19 @@ spec:
       {{- end }}
       containers:
         - name: opennebula-csi
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ include "opennebula-csi.image" .Values.image }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.probes.enabled }}
+          startupProbe:
+            httpGet: {path: /healthz, port: 9808}
+{{ toYaml .Values.probes.startup | nindent 12 }}
+          livenessProbe:
+            httpGet: {path: /healthz, port: 9808}
+{{ toYaml .Values.probes.liveness | nindent 12 }}
+          readinessProbe:
+            httpGet: {path: /healthz, port: 9808}
+{{ toYaml .Values.probes.readiness | nindent 12 }}
+          {{- end }}
           {{- if or .Values.debugPort .Values.metrics.driver.enabled }}
           ports:
             {{- if .Values.debugPort }}
@@ -102,7 +115,7 @@ spec:
             - name: device-dir
               mountPath: /dev
         - name: csi-node-driver-registrar
-          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.14.0
+          image: "{{ include "opennebula-csi.image" .Values.sidecarImages.registrar }}"
           {{- if .Values.metrics.enabled }}
           ports:
             - containerPort: {{ .Values.metrics.ports.registrar }}
@@ -133,11 +146,11 @@ spec:
               mountPath: /registration
         - name: liveness-probe
           imagePullPolicy: IfNotPresent
-          image: registry.k8s.io/sig-storage/livenessprobe:v2.16.0
+          image: "{{ include "opennebula-csi.image" .Values.sidecarImages.liveness }}"
           args:
             - --csi-address=/csi/csi.sock
             - --probe-timeout=3s
-            - --health-port=9808
+            - --http-endpoint=:9808
           volumeMounts:
             - name: csi-socket-dir
               mountPath: /csi
