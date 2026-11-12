@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"github.com/google/cel-go/cel"
 	"github.com/stretchr/testify/require"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/chartutil"
@@ -106,4 +107,31 @@ func TestUpgradeWebhookExcludesOwnInfrastructure(t *testing.T) {
 	require.Len(t, webhook.Webhooks, 1)
 	require.NotEmpty(t, webhook.Webhooks[0].MatchConditions)
 	require.Equal(t, "exclude-driver-infrastructure", webhook.Webhooks[0].MatchConditions[0].Name)
+	env, err := cel.NewEnv(cel.Variable("object", cel.DynType))
+	require.NoError(t, err)
+	ast, issues := env.Compile(webhook.Webhooks[0].MatchConditions[0].Expression)
+	require.NoError(t, issues.Err())
+	program, err := env.Program(ast)
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name, namespace string
+		labels          map[string]interface{}
+		admit           bool
+	}{
+		{"own infrastructure", "kube-system", map[string]interface{}{"app.kubernetes.io/instance": "test", "app.kubernetes.io/name": "opennebula-csi"}, false},
+		{"protected workload", "kube-system", map[string]interface{}{"app.kubernetes.io/instance": "database"}, true},
+		{"missing labels", "kube-system", nil, true},
+		{"other namespace", "default", map[string]interface{}{"app.kubernetes.io/instance": "test", "app.kubernetes.io/name": "opennebula-csi"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			metadata := map[string]interface{}{"namespace": tc.namespace}
+			if tc.labels != nil {
+				metadata["labels"] = tc.labels
+			}
+			value, _, err := program.Eval(map[string]interface{}{"object": map[string]interface{}{"metadata": metadata}})
+			require.NoError(t, err)
+			require.Equal(t, tc.admit, value.Value())
+		})
+	}
+
 }

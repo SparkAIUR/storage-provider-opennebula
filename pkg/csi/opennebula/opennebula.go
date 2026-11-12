@@ -208,7 +208,7 @@ type OpenNebulaVolumeProvider interface {
 	ListSnapshots(ctx context.Context, snapshotID string, sourceVolumeID string, maxEntries int32, startingToken string) ([]VolumeSnapshot, string, error)
 	NodeExists(ctx context.Context, node string) (int, error)
 	GetVolumeInNode(ctx context.Context, volumeID int, nodeID int) (string, error)
-	VolumeReadyWithTimeout(volumeID int) (bool, error)
+	VolumeReadyWithTimeout(ctx context.Context, volumeID int) (bool, error)
 	ListCurrentAttachments(ctx context.Context) ([]ObservedAttachment, error)
 }
 

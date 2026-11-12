@@ -2848,7 +2848,7 @@ func (m *MockOpenNebulaVolumeProviderTestify) NodeReady(ctx context.Context, nod
 	return args.Bool(0), args.Error(1)
 }
 
-func (m *MockOpenNebulaVolumeProviderTestify) VolumeReadyWithTimeout(volumeID int) (bool, error) {
+func (m *MockOpenNebulaVolumeProviderTestify) VolumeReadyWithTimeout(ctx context.Context, volumeID int) (bool, error) {
 	if !m.hasExpectation("VolumeReadyWithTimeout") {
 		return true, nil
 	}

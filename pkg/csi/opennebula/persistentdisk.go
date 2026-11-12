@@ -400,7 +400,7 @@ func (p *PersistentDiskVolumeProvider) DeleteSnapshot(ctx context.Context, handl
 			return false, fmt.Errorf("backend snapshot deletion failed")
 		}
 		_, e = imageSnapshotByID(current, snapshotID)
-		return e != nil, nil
+		return e != nil && state == img.Ready, nil
 	})
 }
 
@@ -435,6 +435,9 @@ func (p *PersistentDiskVolumeProvider) ListSnapshots(ctx context.Context, snapsh
 		imageInfo, err := p.ctrl.Image(imageID).InfoContext(ctx, true)
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to inspect source volume %q: %w", sourceVolumeID, err)
+		}
+		if state, e := imageInfo.State(); e != nil || state != img.Ready {
+			return nil, "", &datastoreConfigError{message: "attached or transitional source snapshot inventory is incomplete; VM-side lifecycle inspection requires operator reconciliation"}
 		}
 		snapshots = append(snapshots, convertImageSnapshots(imageInfo)...)
 	default:
@@ -1272,12 +1275,12 @@ func isHotplugStateError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "wrong state hotplug")
 }
 
-func (p *PersistentDiskVolumeProvider) VolumeReadyWithTimeout(volumeID int) (bool, error) {
-	err := p.waitForResourceStatus(volumeID, volumeUsedTimeout, p.volumeReady)
+func (p *PersistentDiskVolumeProvider) VolumeReadyWithTimeout(ctx context.Context, volumeID int) (bool, error) {
+	err := p.waitForResourceStatusContext(ctx, volumeID, volumeUsedTimeout, p.volumeReadyContext)
 	if err != nil {
 		return false, fmt.Errorf("failed to wait for volume ready: %w", err)
 	}
-	return p.volumeReady(volumeID)
+	return p.volumeReadyContext(ctx, volumeID)
 }
 
 func (p *PersistentDiskVolumeProvider) HotplugPolicy() HotplugTimeoutPolicy {

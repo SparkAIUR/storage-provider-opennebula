@@ -157,3 +157,101 @@ func TestLifecycleResizeRejectsWrongStateOrIdentity(t *testing.T) {
 		require.Zero(t, size)
 	}
 }
+
+func TestLifecycleReattachRestoresVerifiedCapacityAndWaitsPending(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		t.Run(fmt.Sprint(pending), func(t *testing.T) {
+			desired := int64(256 * sizeConversion)
+			resized := 0
+			reads := 0
+			image := fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, desired)
+			vmXML := func(marker string, size int) string {
+				return fmt.Sprintf(`<VM><ID>11</ID><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><SIZE>%d</SIZE>%s</DISK></TEMPLATE></VM>`, size, marker)
+			}
+			p := lifecycleFixture(t, func(method string) (bool, string, int) {
+				switch method {
+				case "one.image.info":
+					return true, image, 0
+				case "one.imagepool.info":
+					return true, "<IMAGE_POOL>" + image + "</IMAGE_POOL>", 0
+				case "one.vmpool.info":
+					return true, "<VM_POOL>" + vmXML("", 128) + "</VM_POOL>", 0
+				case "one.vm.info":
+					reads++
+					if pending && reads <= 3 {
+						return true, vmXML("<RESIZE>YES</RESIZE><SIZE_PREV>128</SIZE_PREV>", 256), 0
+					}
+					if resized > 0 || pending {
+						return true, vmXML("", 256), 0
+					}
+					return true, vmXML("", 128), 0
+				case "one.vm.diskresize":
+					resized++
+					return true, "11", 0
+				case "one.image.update":
+					return true, "7", 0
+				default:
+					t.Errorf("unexpected %s", method)
+					return false, "unexpected", 0x800
+				}
+			})
+			require.NoError(t, p.restoreVerifiedSize(context.Background(), "volume-test", 11, 7, time.Second))
+			require.GreaterOrEqual(t, reads, 3)
+			if pending {
+				require.Zero(t, resized)
+			} else {
+				require.Equal(t, 1, resized)
+			}
+		})
+	}
+}
+
+func TestLifecycleMalformedVMImageCannotEstablishAbsence(t *testing.T) {
+	p := lifecycleFixture(t, func(string) (bool, string, int) {
+		return true, `<VM><ID>11</ID><TEMPLATE><DISK><IMAGE_ID>broken</IMAGE_ID></DISK></TEMPLATE></VM>`, 0
+	})
+	_, err := p.GetVolumeInNode(context.Background(), 7, 11)
+	require.ErrorContains(t, err, "malformed")
+	require.NotErrorIs(t, err, ErrAttachmentNotFound)
+}
+
+func TestLifecycleExistingSnapshotDeleteWaitsAndUsesSnapshotCapacity(t *testing.T) {
+	deleted := false
+	polls := 0
+	mutations := 0
+	snapshot := `<SNAPSHOTS><SNAPSHOT><ID>3</ID><NAME>old</NAME><SIZE>64</SIZE><DATE>1</DATE></SNAPSHOT></SNAPSHOTS>`
+	image := func(snap string) string {
+		return `<IMAGE><ID>7</ID><NAME>source</NAME><STATE>1</STATE><SIZE>256</SIZE><RUNNING_VMS>0</RUNNING_VMS>` + snap + `</IMAGE>`
+	}
+	p := lifecycleFixture(t, func(method string) (bool, string, int) {
+		switch method {
+		case "one.image.info":
+			if deleted {
+				polls++
+				if polls > 1 {
+					return true, image(""), 0
+				}
+			}
+			return true, image(snapshot), 0
+		case "one.imagepool.info":
+			return true, "<IMAGE_POOL>" + image(snapshot) + "</IMAGE_POOL>", 0
+		case "one.vmpool.info":
+			return true, "<VM_POOL/>", 0
+		case "one.image.snapshotdelete":
+			deleted = true
+			mutations++
+			return true, "7", 0
+		default:
+			t.Errorf("unexpected %s", method)
+			return false, "unexpected", 0x800
+		}
+	})
+	handle := EncodeVolumeSnapshotID(7, 3)
+	snapshots, _, err := p.ListSnapshots(context.Background(), handle, "", 0, "")
+	require.NoError(t, err)
+	require.Len(t, snapshots, 1)
+	require.EqualValues(t, 64*sizeConversion, snapshots[0].SizeBytes)
+	require.NoError(t, p.DeleteSnapshot(context.Background(), handle))
+	require.GreaterOrEqual(t, polls, 2)
+	require.Equal(t, 1, mutations)
+}

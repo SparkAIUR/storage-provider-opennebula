@@ -405,7 +405,7 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		return nil, status.Errorf(codes.Internal, "failed to verify whether volume %q already exists: %v", name, volumeExistsErr)
 	}
 	if volumeID != -1 {
-		ready, readyErr := s.volumeProvider.VolumeReadyWithTimeout(volumeID)
+		ready, readyErr := s.volumeProvider.VolumeReadyWithTimeout(ctx, volumeID)
 		if readyErr != nil {
 			s.driver.metrics.RecordOperation("create_volume", backend, "already_exists", time.Since(started))
 			klog.V(0).ErrorS(readyErr, "Volume with same name already exists but readiness check failed",
@@ -1136,7 +1136,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 
 	nodeID, err := s.volumeProvider.NodeExists(ctx, req.NodeId)
 	if err != nil || nodeID == -1 {
-		volumeReady, err := s.volumeProvider.VolumeReadyWithTimeout(volumeID)
+		volumeReady, err := s.volumeProvider.VolumeReadyWithTimeout(ctx, volumeID)
 		if err != nil {
 			klog.V(0).ErrorS(err, "Failed to check if volume is used",
 				"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId)
