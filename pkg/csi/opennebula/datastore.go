@@ -2,6 +2,7 @@ package opennebula
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -83,18 +84,18 @@ func (e *datastoreTopologyError) Error() string {
 }
 
 func IsDatastoreConfigError(err error) bool {
-	_, ok := err.(*datastoreConfigError)
-	return ok
+	var target *datastoreConfigError
+	return errors.As(err, &target)
 }
 
 func IsDatastoreCapacityError(err error) bool {
-	_, ok := err.(*datastoreCapacityError)
-	return ok
+	var target *datastoreCapacityError
+	return errors.As(err, &target)
 }
 
 func IsDatastoreTopologyError(err error) bool {
-	_, ok := err.(*datastoreTopologyError)
-	return ok
+	var target *datastoreTopologyError
+	return errors.As(err, &target)
 }
 
 func NewDatastoreConfigError(message string) error {

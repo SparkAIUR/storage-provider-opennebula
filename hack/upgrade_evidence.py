@@ -96,7 +96,7 @@ def evaluate(bundle, candidate, max_age=300):
     revision = revisions[ds["metadata"]["name"] + "-" + expected_revision]
     require(
         any(
-            o.get("uid") == ds["metadata"]["uid"] and o.get("controller")
+            o.get("uid") == ds["metadata"]["uid"] and o.get("controller") is True
             for o in revision["metadata"].get("ownerReferences", [])
         ),
         "revision not owned by daemonset",
@@ -107,7 +107,7 @@ def evaluate(bundle, candidate, max_age=300):
             raise ValueError("node pod terminating")
         require(
             any(
-                o.get("uid") == ds["metadata"]["uid"] and o.get("controller")
+                o.get("uid") == ds["metadata"]["uid"] and o.get("controller") is True
                 for o in pod["metadata"].get("ownerReferences", [])
             ),
             "unowned node pod",
@@ -142,7 +142,7 @@ def evaluate(bundle, candidate, max_age=300):
         owners = [
             o["uid"]
             for o in pod["metadata"].get("ownerReferences", [])
-            if o.get("controller")
+            if o.get("controller") is True
         ]
         require(len(owners) == 1, "control pod owner ambiguous")
         uid = owners[0]
@@ -150,7 +150,7 @@ def evaluate(bundle, candidate, max_age=300):
             owners = [
                 o["uid"]
                 for o in replicasets[uid]["metadata"].get("ownerReferences", [])
-                if o.get("controller")
+                if o.get("controller") is True
             ]
             require(len(owners) == 1, "replicaset owner ambiguous")
             uid = owners[0]
@@ -189,7 +189,7 @@ def evaluate(bundle, candidate, max_age=300):
         "Flux chart version differs",
     )
     require(
-        bundle["registrationVerified"] and bundle["readWriteVerified"],
+        bundle["registrationVerified"] is True and bundle["readWriteVerified"] is True,
         "registration/read-write receipts missing",
     )
     require(
@@ -215,7 +215,7 @@ def check_pod(pod, images, resolved):
         )
         actual = statuses.get(name, {})
         require(
-            actual.get("ready")
+            actual.get("ready") is True
             and any(
                 d in actual.get("imageID", "")
                 for d in [images[name].split("@", 1)[1]]

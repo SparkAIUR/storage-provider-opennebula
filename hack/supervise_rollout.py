@@ -55,7 +55,7 @@ def validate_drain(receipt, candidate, context, node, uid, now):
             "mount/process inspection missing",
         )
     require(
-        receipt["kernelMountsPreserved"] and receipt["vmAttachmentsPreserved"],
+        receipt["kernelMountsPreserved"] is True and receipt["vmAttachmentsPreserved"] is True,
         "kernel mounts/VM attachments not preserved",
     )
     require(
@@ -76,7 +76,7 @@ def pod_ready(pod):
             for c in pod["status"].get("conditions", [])
         )
         and {c["name"] for c in containers} == {c["name"] for c in statuses}
-        and all(c.get("ready") for c in statuses)
+        and all(c.get("ready") is True for c in statuses)
     )
 
 
@@ -127,7 +127,7 @@ def validate_live(ds, pods, node, receipt, candidate, context):
         )
         require(
             any(
-                o.get("uid") == ds["metadata"]["uid"] and o.get("controller")
+                o.get("uid") == ds["metadata"]["uid"] and o.get("controller") is True
                 for o in pod["metadata"].get("ownerReferences", [])
             ),
             "unowned node pod",
@@ -151,7 +151,7 @@ def replacement_ready(pods, old_uid, ds_uid, node, revision, candidate):
     pod = matching[0]
     require(
         any(
-            o.get("uid") == ds_uid and o.get("controller")
+            o.get("uid") == ds_uid and o.get("controller") is True
             for o in pod["metadata"].get("ownerReferences", [])
         ),
         "replacement unowned",

@@ -100,6 +100,9 @@ func (s *ControllerServer) rejectIfOpenNebulaMetadataDrift(ctx context.Context, 
 }
 
 func (s *ControllerServer) detachMetadataDriftError(ctx context.Context, volumeID, nodeID string, cause error) error {
+	if opennebula.IsDatastoreConfigError(cause) {
+		return status.Error(codes.FailedPrecondition, cause.Error())
+	}
 	if s == nil || s.driver == nil || !s.metadataDriftQuarantineEnabled() {
 		return nil
 	}

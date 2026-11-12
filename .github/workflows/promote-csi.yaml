@@ -46,6 +46,8 @@ jobs:
           gh run download "$RUN_ID" --name native-qualification --dir qualification
           python3 hack/upgrade_evidence.py qualify --stable --candidate qualification/candidate.json --evidence qualification/native.json
       - uses: azure/setup-helm@v4
+        with:
+          version: v3.21.4
       - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
         with:
           version: "0.13.8"

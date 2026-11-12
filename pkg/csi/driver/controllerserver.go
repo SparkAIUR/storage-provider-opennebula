@@ -1143,7 +1143,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return nil, status.Error(codes.Unavailable, identityErr.Error())
 	}
 	volumeID, _, err := s.volumeProvider.VolumeExists(ctx, req.VolumeId)
-	if err != nil && !opennebula.IsAuthoritativeVolumeAbsence(err) {
+	if err != nil && !errors.Is(err, opennebula.ErrVolumeNotFound) && !opennebula.IsAuthoritativeVolumeAbsence(err) {
 		return nil, status.Errorf(codes.Unavailable, "volume lookup is unknown: %v", err)
 	}
 	if volumeID == -1 {
@@ -1153,22 +1153,8 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	}
 
 	nodeID, err := s.volumeProvider.NodeExists(ctx, req.NodeId)
-	if err != nil || nodeID == -1 {
-		volumeReady, err := s.volumeProvider.VolumeReadyWithTimeout(ctx, volumeID)
-		if err != nil {
-			klog.V(0).ErrorS(err, "Failed to check if volume is used",
-				"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId)
-			return nil, status.Error(codes.Internal, "failed to check if volume is used")
-		}
-
-		if !volumeReady {
-			klog.V(0).ErrorS(err, "Node not found and volume is still in use",
-				"method", "ControllerUnpublishVolume", "nodeID", req.NodeId)
-			return nil, status.Error(codes.NotFound, "node not found and volume is still in use")
-		}
-		klog.V(1).InfoS("Node not found and volume not in use, skipping volume unpublish",
-			"method", "ControllerUnpublishVolume", "nodeID", req.NodeId)
-		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	if err != nil || nodeID <= 0 {
+		return nil, status.Errorf(codes.Unavailable, "attachment node lookup is unknown: %v", err)
 	}
 
 	_, err = s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
@@ -1958,22 +1944,27 @@ func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *cs
 	if s == nil || req == nil {
 		return false, nil, nil
 	}
-	validation := s.validateHotplugQueueRequest(ctx, req.NodeId, "detach", req.VolumeId)
-	switch validation.Decision {
-	case HotplugQueueValidationCompleted, HotplugQueueValidationStale:
+	decision := s.evaluateVolumeReconcile(ctx, req.NodeId, "detach", req.VolumeId)
+	switch decision.Action {
+	case VolumeReconcileComplete:
+		if !errors.Is(decision.Evidence.AttachedErr, opennebula.ErrAttachmentNotFound) {
+			return true, nil, status.Error(codes.Unavailable, "attachment absence is unverified")
+		}
 		s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
 		return true, &csi.ControllerUnpublishVolumeResponse{}, nil
-	case HotplugQueueValidationPaused:
-		if detachPauseCanReturnSuccess(validation.Reason) {
+	case VolumeReconcileReject, VolumeReconcileStale:
+		return true, nil, decision.Err()
+	case VolumeReconcilePause:
+		if detachPauseCanReturnSuccess(decision.Reason) {
 			s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
 			return true, &csi.ControllerUnpublishVolumeResponse{}, nil
 		}
 		eventReason := eventReasonHotplugCooldown
-		if validation.Reason == queueReasonRecoveryModeManual || validation.Reason == queueReasonRecoveryModeObserve {
+		if decision.Reason == queueReasonRecoveryModeManual || decision.Reason == queueReasonRecoveryModeObserve {
 			eventReason = eventReasonRecoveryModeActive
 		}
-		s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReason, validation.Message)
-		return true, nil, status.Error(codes.Unavailable, validation.Message)
+		s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReason, decision.Message)
+		return true, nil, decision.Err()
 	default:
 		return false, nil, nil
 	}

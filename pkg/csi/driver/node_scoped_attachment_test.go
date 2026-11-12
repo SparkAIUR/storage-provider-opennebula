@@ -20,14 +20,16 @@ import (
 )
 
 type nodeAttachmentProtocol struct {
-	mu         sync.Mutex
-	disks      map[int]int
-	marker     int64
-	mutations  []string
-	failMethod string
-	claimNew   bool
-	ready      bool
-	pending    bool
+	hideDiskInfo      bool
+	ignoreMarkerWrite bool
+	mu                sync.Mutex
+	disks             map[int]int
+	marker            int64
+	mutations         []string
+	failMethod        string
+	claimNew          bool
+	ready             bool
+	pending           bool
 }
 
 func nodeAttachmentProvider(t *testing.T) (*opennebula.PersistentDiskVolumeProvider, *nodeAttachmentProtocol) {
@@ -49,15 +51,15 @@ func nodeAttachmentProvider(t *testing.T) (*opennebula.PersistentDiskVolumeProvi
 		number := func(i int) int { v := call.Params[i].Value; return v.Int + v.I4 + v.I8 }
 		state.mu.Lock()
 		defer state.mu.Unlock()
-		vmXML := func(id int) string {
+		vmXML := func(id int, direct bool) string {
 			name := "node-old"
 			if id == 42 {
 				name = "node-new"
 			}
 			disk := ""
-			if size, ok := state.disks[id]; ok {
+			if size, ok := state.disks[id]; ok && !(direct && state.hideDiskInfo) {
 				marker := ""
-				if state.pending && id == 42 {
+				if state.pending {
 					marker = "<RESIZE>YES</RESIZE><SIZE_PREV>128</SIZE_PREV>"
 				}
 				disk = fmt.Sprintf(`<DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE><SERIAL>onecsi-7</SERIAL>%s</DISK>`, size, marker)
@@ -77,7 +79,11 @@ func nodeAttachmentProvider(t *testing.T) (*opennebula.PersistentDiskVolumeProvi
 			if count > 0 && !state.ready {
 				imageState = 8
 			}
-			return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>%d</STATE><SIZE>128</SIZE><DATASTORE_ID>100</DATASTORE_ID><SOURCE>/fixture/disk</SOURCE><PERSISTENT>0</PERSISTENT><RUNNING_VMS>%d</RUNNING_VMS><VMS>%s</VMS><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, imageState, count, ids, state.marker)
+			tag := ""
+			if state.marker > 0 {
+				tag = fmt.Sprintf("<CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES>", state.marker)
+			}
+			return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>%d</STATE><SIZE>128</SIZE><DATASTORE_ID>100</DATASTORE_ID><SOURCE>/fixture/disk</SOURCE><PERSISTENT>0</PERSISTENT><RUNNING_VMS>%d</RUNNING_VMS><VMS>%s</VMS><TEMPLATE>%s</TEMPLATE></IMAGE>`, imageState, count, ids, tag)
 		}
 		ok, body, code := 1, "", 0
 		if call.Method == state.failMethod {
@@ -89,9 +95,9 @@ func nodeAttachmentProvider(t *testing.T) (*opennebula.PersistentDiskVolumeProvi
 			case "one.image.info":
 				body = imageXML()
 			case "one.vmpool.info":
-				body = "<VM_POOL>" + vmXML(41) + vmXML(42) + "</VM_POOL>"
+				body = "<VM_POOL>" + vmXML(41, false) + vmXML(42, false) + "</VM_POOL>"
 			case "one.vm.info":
-				body = vmXML(number(1))
+				body = vmXML(number(1), true)
 			case "one.datastorepool.info":
 				body = `<DATASTORE_POOL><DATASTORE><ID>100</ID><NAME>images</NAME><TYPE>IMAGE</TYPE><DS_MAD>fs</DS_MAD><TM_MAD>ssh</TM_MAD><STATE>0</STATE><TOTAL_MB>20000</TOTAL_MB><FREE_MB>10000</FREE_MB></DATASTORE><DATASTORE><ID>200</ID><NAME>system</NAME><TYPE>SYSTEM</TYPE><TM_MAD>ssh</TM_MAD><STATE>0</STATE></DATASTORE></DATASTORE_POOL>`
 			case "one.vm.attach":
@@ -121,8 +127,11 @@ func nodeAttachmentProvider(t *testing.T) (*opennebula.PersistentDiskVolumeProvi
 				require.Equal(t, "CSI_REQUESTED_SIZE_BYTES", key)
 				value, err := strconv.Unquote(strings.TrimSpace(raw))
 				require.NoError(t, err)
-				state.marker, err = strconv.ParseInt(value, 10, 64)
+				verified, err := strconv.ParseInt(value, 10, 64)
 				require.NoError(t, err)
+				if !state.ignoreMarkerWrite {
+					state.marker = verified
+				}
 				state.mutations = append(state.mutations, "marker:"+value)
 				body = "7"
 			default:

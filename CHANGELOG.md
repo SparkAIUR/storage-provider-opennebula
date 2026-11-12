@@ -2,6 +2,8 @@
 
 ## v0.6.0-rc.1, unreleased
 
+- Reject unrecorded or pending expanded-disk detach, retain lookup rejections through queue prechecks, require literal evidence booleans, and pin workflow Helm installers to v3.21.4.
+
 - Separate requested-VM attachment and capacity checks from global ownership, preserving approved moves and shared readers; distinguish disabled datastores from unknown prerequisites.
 
 - Pause attachment reconciliation on unknown provider observations and retain sticky holds; only typed absence can authorize absence handling.

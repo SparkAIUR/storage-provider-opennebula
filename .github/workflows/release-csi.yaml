@@ -17,6 +17,8 @@ jobs:
       - uses: actions/setup-go@v5
         with: {go-version-file: go.mod}
       - uses: azure/setup-helm@v4
+        with:
+          version: v3.21.4
       - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
         with:
           version: "0.13.8"
@@ -72,6 +74,8 @@ jobs:
             VERSION=${{ github.ref_name }}
             COMMIT=${{ github.sha }}
       - uses: azure/setup-helm@v4
+        with:
+          version: v3.21.4
       - name: Package candidate; never promote stable here
         env:
           IMAGE: ghcr.io/sparkaiur/opennebula-csi@${{ steps.image.outputs.digest }}

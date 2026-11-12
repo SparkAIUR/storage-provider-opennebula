@@ -2889,7 +2889,10 @@ func (m *MockOpenNebulaVolumeProviderTestify) InspectVolumeLookup(ctx context.Co
 	if !m.hasExpectation("InspectVolumeLookup") {
 		if m.hasExpectation("VolumeExists") {
 			imageID, sizeBytes, err := m.VolumeExists(ctx, volume)
-			if err != nil || imageID == -1 {
+			if err != nil {
+				return nil, err
+			}
+			if imageID == -1 {
 				return &opennebula.VolumeLookupResult{
 					Status:        opennebula.VolumeLookupNotFound,
 					VolumeHandle:  volume,

@@ -1009,6 +1009,9 @@ func (p *PersistentDiskVolumeProvider) DetachVolume(ctx context.Context, volume,
 				return fmt.Errorf("invalid disk ID format: %w", err)
 			}
 			detachDisk := func() error {
+				if _, err := p.resolveDetachVolumeSizeBytes(ctx, volumeID, nodeID); err != nil {
+					return err
+				}
 				return vmController.Disk(diskIDInt).DetachContext(ctx)
 			}
 			detachErr := detachDisk()
@@ -1042,6 +1045,9 @@ func (p *PersistentDiskVolumeProvider) DetachVolume(ctx context.Context, volume,
 			}
 			return nil
 		}
+	}
+	if _, err := p.GetVolumeInNode(ctx, volumeID, nodeID); !errors.Is(err, ErrAttachmentNotFound) {
+		return fmt.Errorf("attachment absence could not be verified before detach completion: %v", err)
 	}
 	klog.V(1).InfoS("Volume already absent from node, treating detach as successful",
 		"method", "DetachVolume", "volumeID", volumeID, "volumeHandle", volume, "nodeID", nodeID, "node", node)
@@ -1560,23 +1566,29 @@ func (p *PersistentDiskVolumeProvider) waitForDetachState(ctx context.Context, t
 }
 
 func (p *PersistentDiskVolumeProvider) resolveDetachVolumeSizeBytes(ctx context.Context, volumeID, vmID int) (int64, error) {
-	_, size, err := p.volumeDiskInVM(ctx, volumeID, vmID)
-	if err == nil && size > 0 {
-		return size, nil
-	}
-	if err != nil && !errors.Is(err, ErrAttachmentNotFound) {
-		return 0, err
+	disk, _, diskErr := p.volumeDiskInVM(ctx, volumeID, vmID)
+	if diskErr != nil && !errors.Is(diskErr, ErrAttachmentNotFound) {
+		return 0, diskErr
 	}
 	image, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
 	if err != nil {
 		return 0, err
 	}
-	size, err = effectiveImageSize(image)
+	size, err := effectiveImageSize(image)
 	if err != nil {
 		return 0, err
 	}
 	if size <= 0 {
 		return 0, fmt.Errorf("volume %d size is unavailable", volumeID)
+	}
+	if diskErr == nil {
+		completed, err := p.completedDiskSize(ctx, vmID, disk, volumeID)
+		if err != nil || completed <= 0 {
+			return 0, &datastoreConfigError{message: fmt.Sprintf("completed capacity is not verified for image %d on VM %d: %v", volumeID, vmID, err)}
+		}
+		if completed != size {
+			return 0, &datastoreConfigError{message: fmt.Sprintf("disk capacity %d differs from durable image capacity %d; verify expansion and persist capacity before detaching", completed, size)}
+		}
 	}
 	return size, nil
 }
@@ -1706,8 +1718,8 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeLookup(ctx context.Context, 
 
 	imgID, err := p.lookupImageID(ctx, volume)
 	if err != nil {
-		if openNebulaLookupNotFound(err) {
-			result.Status = VolumeLookupImageRecordMissing
+		if errors.Is(err, ErrVolumeNotFound) {
+			result.Status = VolumeLookupNotFound
 			result.Message = fmt.Sprintf("OpenNebula image record for volume %s is missing", volume)
 			return result, nil
 		}
