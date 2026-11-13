@@ -30,7 +30,7 @@ import (
 // Real mount-utils must not acknowledge XFS's successful no-op on device B
 // using device A's larger capacity. Device nodes are external-boundary fixtures.
 func TestNodeExpandMountUtilsBinding(t *testing.T) {
-	for _, scenario := range []string{"different devices", "valid alias", "kernel block aliases", "kernel btrfs anonymous identity", "kernel btrfs mount mismatch", "kernel published mount mismatch", "kernel staging mount mismatch", "kernel mount identity unavailable", "kernel mount changes during capacity read", "mount changes during capacity read", "alias changes during capacity read"} {
+	for _, scenario := range []string{"different devices", "valid alias", "kernel block aliases", "kernel btrfs anonymous identity", "kernel btrfs mount mismatch", "kernel btrfs both stale aliases", "kernel btrfs stale no staging", "kernel btrfs filesystem changes during read", "kernel btrfs filesystem changes during wait", "kernel btrfs missing membership", "kernel btrfs extra membership", "kernel btrfs malformed membership", "kernel btrfs maxid mismatch", "kernel btrfs observation error", "kernel btrfs canceled observation", "kernel btrfs deadline observation", "kernel published mount mismatch", "kernel staging mount mismatch", "kernel mount identity unavailable", "kernel mount changes during capacity read", "mount changes during capacity read", "alias changes during capacity read"} {
 		t.Run(scenario, func(t *testing.T) {
 			root := t.TempDir()
 			alias := filepath.Join(root, "alias")
@@ -42,10 +42,18 @@ func TestNodeExpandMountUtilsBinding(t *testing.T) {
 			stageDevice := "/dev/null"
 			publishedDevice := alias
 			mountChanged := false
+			btrfsFSChanged := false
+			capacityReads := 0
+			_ = btrfsFSChanged
 			if strings.HasPrefix(scenario, "kernel ") {
 				stageDevice, publishedDevice = filepath.Join(root, "block-a"), filepath.Join(root, "block-b")
 				for _, device := range []string{stageDevice, publishedDevice} {
-					if err := unix.Mknod(device, unix.S_IFBLK|0600, int(unix.Mkdev(7, 253))); err != nil {
+					if err := unix.Mknod(device, unix.S_IFBLK|0600, int(unix.Mkdev(7, func() uint32 {
+						if scenario == "kernel btrfs both stale aliases" || scenario == "kernel btrfs stale no staging" {
+							return 252
+						}
+						return 253
+					}()))); err != nil {
 						if err == unix.EPERM {
 							t.Skip("block-node alias fixture requires mknod permission")
 						}
@@ -84,6 +92,17 @@ func TestNodeExpandMountUtilsBinding(t *testing.T) {
 			if scenario == "different devices" {
 				publishedDevice = "/dev/zero"
 			}
+			oldSleep, oldNow := nodeExpandSleep, nodeNow
+			t.Cleanup(func() { nodeExpandSleep, nodeNow = oldSleep, oldNow })
+			now := time.Unix(0, 0)
+			nodeNow = func() time.Time { return now }
+			nodeExpandSleep = func(_ context.Context, d time.Duration) error {
+				now = now.Add(d)
+				if scenario == "kernel btrfs filesystem changes during wait" {
+					btrfsFSChanged = true
+				}
+				return nil
+			}
 			ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Path: stage, Device: stageDevice}, {Path: publish, Device: publishedDevice}})
 			mounter := ns.mounter.Interface.(*mount.FakeMounter)
 			if strings.Contains(scenario, "btrfs") {
@@ -97,6 +116,13 @@ func TestNodeExpandMountUtilsBinding(t *testing.T) {
 				return testingexec.InitFakeCmd(&testingexec.FakeCmd{CombinedOutputScript: []testingexec.FakeAction{func() ([]byte, []byte, error) {
 					switch cmd {
 					case "blockdev":
+						capacityReads++
+						if scenario == "kernel btrfs filesystem changes during read" {
+							btrfsFSChanged = true
+						}
+						if scenario == "kernel btrfs filesystem changes during wait" && capacityReads == 1 {
+							return []byte("1073741824\n"), nil, nil
+						}
 						if scenario == "kernel mount changes during capacity read" {
 							mountChanged = true
 						}
@@ -134,6 +160,9 @@ func TestNodeExpandMountUtilsBinding(t *testing.T) {
 				commands.CommandScript = append(commands.CommandScript, action)
 			}
 			ns.mounter.Exec = commands
+			if scenario == "kernel btrfs stale no staging" {
+				stage = ""
+			}
 			response, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{VolumeId: "binding-fixture", VolumePath: publish, StagingTargetPath: stage, CapacityRange: &csi.CapacityRange{RequiredBytes: 2147483648}})
 			if scenario == "valid alias" || scenario == "kernel block aliases" || scenario == "kernel btrfs anonymous identity" {
 				require.NoError(t, err)
