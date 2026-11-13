@@ -44,3 +44,8 @@ The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI i
 - AI: Treat bindings as durable operator inventory without a renewal TTL. Do not infer identity through DNS or SSH in the service. IP reassignment outside OpenNebula remains the operator's inventory responsibility.
 - AI: Scope preflight and reconciliation Jobs, bootstrap RBAC and reconciliation input ConfigMaps to the release revision. Retain failed Jobs and their inputs across later revisions, preserve finite deadlines and existing hook order, and do not replay a failed revision.
 - AI: Prepare v0.6.0-rc.2 as a new immutable candidate. Preserve RC1 artifacts and receipts. Local protocol, chart and lifecycle fixtures are offline evidence; publication, production bindings, native lifecycle qualification and ordered cluster observations remain separate gates owned by the root operator.
+
+## 2026-11-13, RC2 review corrections
+
+- AI: Preserve BRIDGE_LIST exactly at provider extraction so fingerprinting and prerequisite checks reject unsupported whitespace across runtime, preflight and inventory. Only Bash default IFS separators may be normalized by tokenization.
+- AI: Check selected datastore prerequisites and authorization before writing clone identity metadata on either a new source or an existing retry target. Retain ownership, durable origin, capacity checks and idempotent normalization. Synthetic XML-RPC regressions cover denied writes and successful normalization; native acceptance remains outside this review phase.

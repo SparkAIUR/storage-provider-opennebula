@@ -235,10 +235,6 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 		if e != nil {
 			return nil, e
 		}
-		target, e = p.verifiedCloneTarget(ctx, target, sourceVolumeID)
-		if e != nil {
-			return nil, e
-		}
 		if target.DatastoreID == nil {
 			return nil, fmt.Errorf("clone target datastore unavailable")
 		}
@@ -251,6 +247,9 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 					if e := selection.Authorize(ctx, candidate.ID); e != nil {
 						return nil, e
 					}
+				}
+				if _, e = p.verifiedCloneTarget(ctx, target, sourceVolumeID); e != nil {
+					return nil, e
 				}
 				if err := p.waitForResourceStatusContext(ctx, existing, p.hotplugPolicy.BaseTimeout, p.volumeReadyContext); err != nil {
 					return nil, err
@@ -280,9 +279,6 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 	if selection.CloneRequiredBytes > sourceSizeBytes || (selection.CloneLimitBytes > 0 && sourceSizeBytes > selection.CloneLimitBytes) {
 		return nil, fmt.Errorf("%w: source capacity %d is outside requested clone range", ErrCloneCapacity, sourceSizeBytes)
 	}
-	if _, err = p.normalizeImageIdentity(ctx, sourceImage); err != nil {
-		return nil, err
-	}
 	attemptedDatastores := make([]int, 0, len(candidates))
 	insufficientCapacity := make([]string, 0)
 	for _, datastore := range candidates {
@@ -300,6 +296,10 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 			if err := selection.Authorize(ctx, datastore.ID); err != nil {
 				return nil, err
 			}
+		}
+		sourceImage, err = p.normalizeImageIdentity(ctx, sourceImage)
+		if err != nil {
+			return nil, err
 		}
 		finishAttempt := beginDatastoreAttempt(datastore.ID)
 		cloneID, err := p.ctrl.Image(sourceVolumeID).CloneContext(ctx, name, datastore.ID)

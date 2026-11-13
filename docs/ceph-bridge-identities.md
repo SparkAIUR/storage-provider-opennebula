@@ -43,6 +43,8 @@ OpenNebula 7.4.0 and the pinned 7.4.1 code try to remove literal registered NAME
 
 The remaining endpoints can be selected by image ID modulo count or randomly. No filtering exemption is used. A canceled or failed host observation blocks allocation. The success diagnostic says "bridge identities and current registered-host eligibility verified". That is not proof of Ceph authentication, pool permissions or a successful allocation. Native lifecycle tests remain required.
 
+Provider extraction preserves the raw BRIDGE_LIST before token validation, including leading and trailing non-IFS whitespace. Preflight fingerprinting, inventory eligibility and runtime provisioning therefore reject the same malformed provider values. New clones check bridge prerequisites and datastore authorization before normalizing legacy source metadata. Retries check the selected target datastore before normalizing inherited target metadata, while retaining durable origin and ownership validation. Rejected prerequisites or authorization cannot trigger these identity writes.
+
 
 ## Failed hook retention
 

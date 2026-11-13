@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,6 +21,47 @@ func bridgeFixtureDatastore() Datastore {
 }
 func bridgeFixtureBinding(fingerprint string, id int, name string) string {
 	return fmt.Sprintf(`{"version":1,"datastores":[{"datastoreID":42,"configFingerprint":%q,"endpoints":[{"endpoint":"192.0.2.10","hostID":%d,"hostName":%q}]}]}`, fingerprint, id, name)
+}
+
+func bridgeFixtureDatastoreXML(t *testing.T, bridges string) string {
+	t.Helper()
+	var escaped strings.Builder
+	require.NoError(t, xml.EscapeText(&escaped, []byte(bridges)))
+	return `<DATASTORE_POOL><DATASTORE><ID>42</ID><NAME>fixture</NAME><TYPE>IMAGE</TYPE><STATE>0</STATE><DS_MAD>ceph</DS_MAD><TM_MAD>ceph</TM_MAD><FREE_MB>1024</FREE_MB><TOTAL_MB>2048</TOTAL_MB><TEMPLATE><DISK_TYPE>RBD</DISK_TYPE><BRIDGE_LIST>` + escaped.String() + `</BRIDGE_LIST><CEPH_HOST>monitor.example.invalid:6789</CEPH_HOST><POOL_NAME>volumes</POOL_NAME><CEPH_USER>csi</CEPH_USER><CEPH_SECRET>fixture-secret-reference</CEPH_SECRET></TEMPLATE></DATASTORE></DATASTORE_POOL>`
+}
+
+func TestBridgeIdentityProviderPreservesRawEndpointGrammar(t *testing.T) {
+	for _, raw := range []string{"bridge-a.example.invalid", " \tbridge-a.example.invalid\n", "bridge-a.example.invalid\u00a0", "\u00a0bridge-a.example.invalid", "bridge-a.example.invalid\r", "\u2003bridge-a.example.invalid"} {
+		t.Run(fmt.Sprintf("%q", raw), func(t *testing.T) {
+			p := lifecycleFixture(t, func(method string) (bool, string, int) {
+				switch method {
+				case "one.datastorepool.info":
+					return true, bridgeFixtureDatastoreXML(t, raw), 0
+				case "one.hostpool.info":
+					return true, `<HOST_POOL><HOST><ID>7</ID><NAME>bridge-a.example.invalid</NAME><STATE>2</STATE></HOST></HOST_POOL>`, 0
+				default:
+					t.Errorf("unexpected API %s", method)
+					return false, "unexpected mutation", 0x800
+				}
+			})
+			resolved, err := p.ResolveProvisioningDatastores(context.Background(), DatastoreSelectionConfig{Identifiers: []string{"42"}, AllowedTypes: []string{"ceph"}})
+			require.NoError(t, err)
+			require.Len(t, resolved, 1)
+			require.Equal(t, raw, resolved[0].Ceph.BridgeList)
+			fingerprint, fingerprintErr := CephBridgeConfigFingerprint(resolved[0])
+			prerequisiteErr := ProvisioningFeasible(context.Background(), p.ctrl, resolved[0], CephBridgeIdentities{})
+			if raw == "bridge-a.example.invalid" || raw == " \tbridge-a.example.invalid\n" {
+				require.NoError(t, fingerprintErr)
+				require.NoError(t, prerequisiteErr)
+				canonical := `{"version":1,"datastoreID":42,"category":"IMAGE","backend":"ceph-rbd","dsMad":"ceph","tmMad":"ceph","diskType":"RBD","bridges":["bridge-a.example.invalid"],"monitors":["monitor.example.invalid:6789"],"pool":"volumes","user":"csi","rbdFormat":"","ecPool":""}`
+				require.Equal(t, fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(canonical))), fingerprint)
+			} else {
+				require.Empty(t, fingerprint)
+				require.ErrorContains(t, fingerprintErr, "unsupported Ceph bridge endpoint")
+				require.ErrorContains(t, prerequisiteErr, "unsupported Ceph bridge endpoint")
+			}
+		})
+	}
 }
 func TestCephBridgeConfigFingerprintContract(t *testing.T) {
 	ds := bridgeFixtureDatastore()
@@ -206,7 +249,7 @@ func TestCephBridgeAuthorizationDoesNotCacheProviderEligibility(t *testing.T) {
 
 func TestBridgeIdentityRejectsAllocationAndCloneBeforeMutation(t *testing.T) {
 	for _, operation := range []string{"create", "clone"} {
-		for _, scenario := range []string{"verified", "unmapped", "mapped-disabled", "hash-drift", "observation-failed", "canceled-observation", "literal-disabled-mixed", "literal-monitoring-disabled-mixed", "literal-monitoring-error-mixed"} {
+		for _, scenario := range []string{"verified", "unmapped", "mapped-disabled", "hash-drift", "observation-failed", "canceled-observation", "literal-disabled-mixed", "literal-monitoring-disabled-mixed", "literal-monitoring-error-mixed", "unsupported-whitespace"} {
 			t.Run(operation+"/"+scenario, func(t *testing.T) {
 				ds := bridgeFixtureDatastore()
 				if strings.HasPrefix(scenario, "literal-") {
@@ -216,6 +259,10 @@ func TestBridgeIdentityRejectsAllocationAndCloneBeforeMutation(t *testing.T) {
 				require.NoError(t, err)
 				raw := bridgeFixtureBinding(fingerprint, 7, "bridge-a.example.invalid")
 				if scenario == "unmapped" || strings.HasPrefix(scenario, "literal-") {
+					raw = ""
+				}
+				if scenario == "unsupported-whitespace" {
+					ds.Ceph.BridgeList = "bridge-a.example.invalid\u00a0"
 					raw = ""
 				}
 				if scenario == "hash-drift" {
@@ -281,6 +328,9 @@ func TestBridgeIdentityRejectsAllocationAndCloneBeforeMutation(t *testing.T) {
 				if strings.HasPrefix(scenario, "literal-") {
 					require.ErrorContains(t, err, "not currently MONITORED")
 				}
+				if scenario == "unsupported-whitespace" {
+					require.ErrorContains(t, err, "unsupported Ceph bridge endpoint")
+				}
 				expected := int32(0)
 				if scenario == "verified" {
 					expected = 1
@@ -288,6 +338,185 @@ func TestBridgeIdentityRejectsAllocationAndCloneBeforeMutation(t *testing.T) {
 				}
 				require.Equal(t, expected, allocate.Load()+clone.Load())
 				require.Zero(t, otherMutation.Load())
+			})
+		}
+	}
+}
+
+func TestBridgeIdentityCloneMetadataRequiresPrerequisitesAndAuthority(t *testing.T) {
+	for _, operation := range []string{"new-legacy", "new-inherited", "new-normalized", "retry-inherited", "retry-normalized"} {
+		scenarios := []string{"accepted", "unmapped", "disabled", "unsupported-whitespace", "authorization-denied"}
+		if strings.HasPrefix(operation, "retry-") {
+			scenarios = append(scenarios, "outside-selection", "invalid-origin", "foreign-owner")
+		}
+		for _, scenario := range scenarios {
+			t.Run(operation+"/"+scenario, func(t *testing.T) {
+				retry := strings.HasPrefix(operation, "retry-")
+				self := map[int]int{7: 7, 8: 7}
+				parent := map[int]int{}
+				if operation == "new-legacy" {
+					delete(self, 7)
+				}
+				if operation == "new-inherited" {
+					self[7] = 6
+				}
+				if operation == "retry-normalized" {
+					self[8], parent[8] = 8, 7
+				}
+				if scenario == "invalid-origin" {
+					self[8], parent[8] = 8, 6
+				}
+				targetPresent := retry
+				imageXML := func(id int) string {
+					name, owner, datastore := "source", "csi.opennebula.io", 42
+					if id == 8 {
+						name = "child"
+						if scenario == "outside-selection" {
+							datastore = 43
+						}
+						if scenario == "foreign-owner" {
+							owner = "foreign"
+						}
+					}
+					markers := ""
+					if self[id] > 0 {
+						markers += fmt.Sprintf(`<CSI_IMAGE_ID>%d</CSI_IMAGE_ID>`, self[id])
+					}
+					if parent[id] > 0 {
+						markers += fmt.Sprintf(`<CSI_CLONE_SOURCE_IMAGE_ID>%d</CSI_CLONE_SOURCE_IMAGE_ID>`, parent[id])
+					}
+					return fmt.Sprintf(`<IMAGE><ID>%d</ID><NAME>%s</NAME><STATE>1</STATE><SIZE>128</SIZE><DATASTORE_ID>%d</DATASTORE_ID><TEMPLATE><OWNER>%s</OWNER>%s</TEMPLATE></IMAGE>`, id, name, datastore, owner, markers)
+				}
+				var args []fixtureParam
+				var updates, clones, allocations, hostReads, authorizations atomic.Int32
+				p := lifecycleFixture(t, func(method string) (bool, string, int) {
+					switch method {
+					case "one.datastorepool.info":
+						bridge := "bridge-a.example.invalid"
+						if scenario == "unmapped" {
+							bridge = "192.0.2.10"
+						}
+						if scenario == "unsupported-whitespace" {
+							bridge += "\u00a0"
+						}
+						return true, bridgeFixtureDatastoreXML(t, bridge), 0
+					case "one.hostpool.info":
+						hostReads.Add(1)
+						state := 2
+						if scenario == "disabled" {
+							state = 4
+						}
+						return true, fmt.Sprintf(`<HOST_POOL><HOST><ID>7</ID><NAME>bridge-a.example.invalid</NAME><STATE>%d</STATE></HOST></HOST_POOL>`, state), 0
+					case "one.imagepool.info":
+						body := imageXML(7)
+						if targetPresent {
+							body += imageXML(8)
+						}
+						return true, "<IMAGE_POOL>" + body + "</IMAGE_POOL>", 0
+					case "one.image.info":
+						return true, imageXML(args[1].number()), 0
+					case "one.image.update":
+						updates.Add(1)
+						require.Positive(t, hostReads.Load())
+						require.Positive(t, authorizations.Load())
+						id := args[1].number()
+						require.Equal(t, 1, args[3].number())
+						for _, line := range strings.Split(strings.TrimSpace(args[2].String), "\n") {
+							key, raw, ok := strings.Cut(line, "=")
+							require.True(t, ok)
+							value, err := strconv.Unquote(strings.TrimSpace(raw))
+							require.NoError(t, err)
+							number, err := strconv.Atoi(value)
+							require.NoError(t, err)
+							switch strings.TrimSpace(key) {
+							case imageSelfTag:
+								self[id] = number
+							case cloneParentTag:
+								parent[id] = number
+							default:
+								t.Errorf("unexpected identity field %q", key)
+							}
+						}
+						return true, strconv.Itoa(id), 0
+					case "one.image.clone":
+						clones.Add(1)
+						require.Positive(t, hostReads.Load())
+						require.Positive(t, authorizations.Load())
+						require.Equal(t, 7, args[1].number())
+						require.Equal(t, "child", args[2].String)
+						require.Equal(t, 42, args[3].number())
+						targetPresent = true
+						self[8], parent[8] = self[7], parent[7]
+						return true, "8", 0
+					case "one.image.allocate":
+						allocations.Add(1)
+						return false, "unexpected allocation", 0x800
+					default:
+						t.Errorf("unexpected API %s", method)
+						return false, "unexpected mutation", 0x800
+					}
+				}, func(_ string, raw []byte) { args = fixtureArgs(t, raw) })
+				selection := DatastoreSelectionConfig{Identifiers: []string{"42"}, AllowedTypes: []string{"ceph"}, CloneRequiredBytes: 128 * sizeConversion, CloneLimitBytes: 128 * sizeConversion,
+					Authorize: func(_ context.Context, id int) error {
+						require.Equal(t, 42, id)
+						authorizations.Add(1)
+						if scenario == "authorization-denied" {
+							return fmt.Errorf("datastore authorization denied")
+						}
+						return nil
+					}}
+				result, err := p.CloneVolume(context.Background(), "child", "source", selection)
+				require.Zero(t, allocations.Load())
+				if scenario != "accepted" {
+					require.Error(t, err)
+					require.Nil(t, result)
+					require.Zero(t, updates.Load())
+					require.Zero(t, clones.Load())
+					switch scenario {
+					case "unmapped":
+						require.ErrorContains(t, err, "no verified registered identity")
+					case "disabled":
+						require.ErrorContains(t, err, "not currently MONITORED")
+					case "unsupported-whitespace":
+						require.ErrorContains(t, err, "unsupported Ceph bridge endpoint")
+					case "outside-selection":
+						require.ErrorIs(t, err, ErrCloneConflict)
+					case "invalid-origin":
+						require.ErrorIs(t, err, ErrCloneConflict)
+					case "foreign-owner":
+						require.ErrorContains(t, err, "not owned by this CSI driver")
+					}
+					if scenario == "authorization-denied" {
+						require.ErrorContains(t, err, "datastore authorization denied")
+						require.EqualValues(t, 1, authorizations.Load())
+					}
+					return
+				}
+				require.NoError(t, err)
+				require.EqualValues(t, 128*sizeConversion, result.CapacityBytes)
+				require.Equal(t, 8, self[8])
+				require.Equal(t, 7, parent[8])
+				require.EqualValues(t, 1, hostReads.Load())
+				require.EqualValues(t, 1, authorizations.Load())
+				if retry {
+					require.Zero(t, clones.Load())
+					expectedUpdates := int32(1)
+					if operation == "retry-normalized" {
+						expectedUpdates = 0
+					}
+					require.Equal(t, expectedUpdates, updates.Load())
+				} else {
+					require.EqualValues(t, 1, clones.Load())
+					require.Equal(t, 7, self[7])
+					expectedUpdates := int32(2)
+					if operation == "new-normalized" {
+						expectedUpdates = 1
+					}
+					require.Equal(t, expectedUpdates, updates.Load())
+					if operation == "new-inherited" {
+						require.Equal(t, 6, parent[7])
+					}
+				}
 			})
 		}
 	}

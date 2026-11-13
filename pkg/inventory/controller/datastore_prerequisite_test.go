@@ -23,7 +23,7 @@ import (
 )
 
 func TestDatastoreSyncDistinguishesDisabledAndUnknownPrerequisites(t *testing.T) {
-	for _, scenario := range []string{"provider-disabled", "spec-disabled", "observation-failed", "ready", "bound-IP", "unbound-IP", "bound-disabled-IP"} {
+	for _, scenario := range []string{"provider-disabled", "spec-disabled", "observation-failed", "ready", "bound-IP", "unbound-IP", "bound-disabled-IP", "trailing-non-IFS", "leading-non-IFS", "trailing-CR"} {
 		t.Run(scenario, func(t *testing.T) {
 			var hostReads atomic.Int32
 			endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -43,10 +43,20 @@ func TestDatastoreSyncDistinguishesDisabledAndUnknownPrerequisites(t *testing.T)
 						bridge = "192.0.2.10"
 						attributes = `<DISK_TYPE>RBD</DISK_TYPE><CEPH_HOST>monitor.example.invalid:6789</CEPH_HOST><POOL_NAME>volumes</POOL_NAME><CEPH_USER>csi</CEPH_USER>`
 					}
-					body = fmt.Sprintf(`<DATASTORE_POOL><DATASTORE><ID>100</ID><NAME>ceph</NAME><TYPE>IMAGE</TYPE><DS_MAD>ceph</DS_MAD><TM_MAD>ceph</TM_MAD><STATE>%d</STATE><TOTAL_MB>20000</TOTAL_MB><FREE_MB>10000</FREE_MB><TEMPLATE><BRIDGE_LIST>%s</BRIDGE_LIST>%s</TEMPLATE></DATASTORE></DATASTORE_POOL>`, state, bridge, attributes)
+					switch scenario {
+					case "trailing-non-IFS":
+						bridge += "\u00a0"
+					case "leading-non-IFS":
+						bridge = "\u00a0" + bridge
+					case "trailing-CR":
+						bridge += "\r"
+					}
+					var bridgeXML strings.Builder
+					require.NoError(t, xml.EscapeText(&bridgeXML, []byte(bridge)))
+					body = fmt.Sprintf(`<DATASTORE_POOL><DATASTORE><ID>100</ID><NAME>ceph</NAME><TYPE>IMAGE</TYPE><DS_MAD>ceph</DS_MAD><TM_MAD>ceph</TM_MAD><STATE>%d</STATE><TOTAL_MB>20000</TOTAL_MB><FREE_MB>10000</FREE_MB><TEMPLATE><BRIDGE_LIST>%s</BRIDGE_LIST>%s</TEMPLATE></DATASTORE></DATASTORE_POOL>`, state, bridgeXML.String(), attributes)
 				case "one.hostpool.info":
 					hostReads.Add(1)
-					if scenario != "ready" && !strings.Contains(scenario, "IP") {
+					if scenario == "observation-failed" {
 						ok, body, code = 0, "host observation unavailable", 0x800
 					} else {
 						body = `<HOST_POOL><HOST><ID>1</ID><NAME>bridge</NAME><STATE>2</STATE></HOST></HOST_POOL>`
@@ -114,11 +124,14 @@ func TestDatastoreSyncDistinguishesDisabledAndUnknownPrerequisites(t *testing.T)
 				require.Equal(t, metav1.ConditionFalse, conditions["ProvisioningFeasible"].Status)
 				require.Contains(t, conditions["ProvisioningFeasible"].Message, "host observation unavailable")
 				require.EqualValues(t, 1, hostReads.Load())
-			case "unbound-IP", "bound-disabled-IP":
+			case "unbound-IP", "bound-disabled-IP", "trailing-non-IFS", "leading-non-IFS", "trailing-CR":
 				require.Equal(t, inventoryv1alpha1.DatastoreHealthLookupFailed, current.Status.Health)
 				require.Equal(t, inventoryv1alpha1.DatastorePhaseUnavailable, current.Status.Phase)
 				require.Equal(t, metav1.ConditionFalse, conditions["ProvisioningFeasible"].Status)
 				require.EqualValues(t, 1, hostReads.Load())
+				if strings.Contains(scenario, "non-IFS") || scenario == "trailing-CR" {
+					require.Contains(t, conditions["ProvisioningFeasible"].Message, "unsupported Ceph bridge endpoint")
+				}
 
 			case "ready", "bound-IP":
 				require.Equal(t, inventoryv1alpha1.DatastoreHealthHealthy, current.Status.Health)
