@@ -56,3 +56,9 @@ The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI i
 - AI: Gate real persistent disk growth, including restoration growth, on fresh provider identity and canonical version observations. Persistent SYSTEM/SELF transfer targets require 7.4.1 or a later canonical patch within 7.4. Unknown persistence, clone mode, transfer target or provider version cannot authorize growth.
 - AI: Preserve basic 7.4.0 Probe/readiness and already-satisfied retries. A positively identified persistent NONE target may grow on canonical 7.4.0 because upstream updates its image size on growth completion. Do not infer safety from a datastore display name or apply a persistent attach SIZE override.
 - AI: Keep terminal-state, capacity, attachment identity and detach protections unchanged. This guard does not repair existing expanded volumes, qualify native lifecycle cases or start the 24-hour observation. Preserve published RC2 and the separately reviewed node completion correction.
+
+## 2026-11-13, current 7.4.0 target supersedes upgrade preparation
+
+- HUMAN: "do not perform any action on OpenNebula hosts directly. We're on 7.4.0 so maintain work with that." This supersedes the earlier HUMAN choice to require 7.4.1+ and prepare a provider upgrade. Preserve that earlier entry as historical context; provider upgrade preparation is no longer the current direction.
+- AI: Keep basic 7.4.0 support, Probe/readiness, already-satisfied retries and positively identified NONE-target growth. Retain the operation-specific denial of known-unsafe persistent SYSTEM/SELF growth pending a qualified 7.4.0 API-only path. Do not raise the global provider minimum or infer approval for a feature waiver.
+- AI: Keep work implementation-only, with no direct host actions or assumed backend upgrade. This restriction does not establish positive affected-LVM expansion/reattach qualification on 7.4.0, complete native acceptance or start the 24-hour observation.

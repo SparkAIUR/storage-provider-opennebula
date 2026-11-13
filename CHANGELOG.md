@@ -2,6 +2,8 @@
 
 ## Unreleased provider growth prerequisite
 
+- Current user direction supersedes provider upgrade preparation: remain on OpenNebula 7.4.0 and take no direct OpenNebula host actions. Basic support and positively identified NONE-target growth remain available; known-unsafe SYSTEM/SELF growth stays denied pending a qualified 7.4.0 API-only path. This is a technical safety restriction, not a native acceptance waiver.
+
 - Require canonical OpenNebula 7.4.1+ before persistent SYSTEM/SELF-target disk growth, including capacity-restoration growth. Fail closed on unknown identity, version or observation failure before any mutation.
 - Preserve basic 7.4.0 readiness, satisfied-capacity retries and positively identified NONE-target growth. Native lifecycle acceptance and provider upgrade approval remain separate gates.
 
