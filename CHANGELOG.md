@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased Btrfs mounted-device binding
+
+- Associate the actual mounted Btrfs filesystem with its capacity device using read-only kernel FS_INFO and sysfs block membership. Pin its FSID and mounted device identity through capacity reads and waits.
+- Reject missing, changed or ambiguous membership before resize; preserve single-device Btrfs with default device ID 1 and existing ext4/XFS checks. Local fixtures do not establish native Btrfs qualification.
+
 ## Unreleased node expansion correction
 
 - Correct node expansion completion for the pinned mount-utils dependency. This supersedes the v0.5.29 geometry check; see the [node expansion contract](docs/node-expansion.md#verification-contract).

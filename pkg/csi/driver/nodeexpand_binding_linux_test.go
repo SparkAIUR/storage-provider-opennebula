@@ -4,6 +4,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -30,7 +31,7 @@ import (
 // Real mount-utils must not acknowledge XFS's successful no-op on device B
 // using device A's larger capacity. Device nodes are external-boundary fixtures.
 func TestNodeExpandMountUtilsBinding(t *testing.T) {
-	for _, scenario := range []string{"different devices", "valid alias", "kernel block aliases", "kernel btrfs anonymous identity", "kernel btrfs mount mismatch", "kernel btrfs both stale aliases", "kernel btrfs stale no staging", "kernel btrfs filesystem changes during read", "kernel btrfs filesystem changes during wait", "kernel btrfs missing membership", "kernel btrfs extra membership", "kernel btrfs malformed membership", "kernel btrfs maxid mismatch", "kernel btrfs observation error", "kernel btrfs canceled observation", "kernel btrfs deadline observation", "kernel published mount mismatch", "kernel staging mount mismatch", "kernel mount identity unavailable", "kernel mount changes during capacity read", "mount changes during capacity read", "alias changes during capacity read"} {
+	for _, scenario := range []string{"different devices", "valid alias", "kernel block aliases", "kernel btrfs anonymous identity", "kernel btrfs valid no staging", "kernel btrfs valid symlink alias", "kernel btrfs device count mismatch", "kernel btrfs zero fsid", "kernel btrfs missing dev", "kernel btrfs nonblock member", "kernel btrfs mount device changes during read", "kernel btrfs mount mismatch", "kernel btrfs both stale aliases", "kernel btrfs stale no staging", "kernel btrfs filesystem changes during read", "kernel btrfs filesystem changes during wait", "kernel btrfs missing membership", "kernel btrfs extra membership", "kernel btrfs malformed membership", "kernel btrfs maxid mismatch", "kernel btrfs observation error", "kernel btrfs canceled observation", "kernel btrfs deadline observation", "kernel published mount mismatch", "kernel staging mount mismatch", "kernel mount identity unavailable", "kernel mount changes during capacity read", "mount changes during capacity read", "alias changes during capacity read"} {
 		t.Run(scenario, func(t *testing.T) {
 			root := t.TempDir()
 			alias := filepath.Join(root, "alias")
@@ -44,7 +45,6 @@ func TestNodeExpandMountUtilsBinding(t *testing.T) {
 			mountChanged := false
 			btrfsFSChanged := false
 			capacityReads := 0
-			_ = btrfsFSChanged
 			if strings.HasPrefix(scenario, "kernel ") {
 				stageDevice, publishedDevice = filepath.Join(root, "block-a"), filepath.Join(root, "block-b")
 				for _, device := range []string{stageDevice, publishedDevice} {
@@ -84,10 +84,18 @@ func TestNodeExpandMountUtilsBinding(t *testing.T) {
 					}
 					if (scenario == "kernel published mount mismatch" && target == publish) || (scenario == "kernel staging mount mismatch" && target == stage) || mountChanged || (scenario == "kernel btrfs mount mismatch" && target == publish) {
 						st.Dev = unix.Mkdev(7, 252)
+						if scenario == "kernel btrfs mount device changes during read" {
+							st.Dev = unix.Mkdev(0, 252)
+						}
 					}
 					return nodeExpandMountFileInfo{FileInfo: info, state: &st}, nil
 				}
 
+			}
+			if scenario == "kernel btrfs valid symlink alias" {
+				require.NoError(t, os.Remove(alias))
+				require.NoError(t, os.Symlink(stageDevice, alias))
+				publishedDevice = alias
 			}
 			if scenario == "different devices" {
 				publishedDevice = "/dev/zero"
@@ -116,6 +124,70 @@ func TestNodeExpandMountUtilsBinding(t *testing.T) {
 				ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
 			}
 			defer cancel()
+			if strings.Contains(scenario, "btrfs") {
+				oldInfo, oldDirectory := nodeBtrfsFilesystemInfo, nodeBtrfsDevicesDirectory
+				t.Cleanup(func() { nodeBtrfsFilesystemInfo, nodeBtrfsDevicesDirectory = oldInfo, oldDirectory })
+				sysfs := filepath.Join(root, "sysfs")
+				require.NoError(t, os.Mkdir(sysfs, 0700))
+				member := filepath.Join(root, "kernel-block")
+				require.NoError(t, os.Mkdir(member, 0700))
+				subsystem := "/sys/class/block"
+				if scenario == "kernel btrfs nonblock member" {
+					subsystem = root
+				}
+				require.NoError(t, os.Symlink(subsystem, filepath.Join(member, "subsystem")))
+				text := "7:253\n"
+				if scenario == "kernel btrfs malformed membership" {
+					text = "07:253\n"
+				}
+				if scenario != "kernel btrfs missing dev" {
+					require.NoError(t, os.WriteFile(filepath.Join(member, "dev"), []byte(text), 0600))
+				}
+				if scenario != "kernel btrfs missing membership" {
+					require.NoError(t, os.Symlink(member, filepath.Join(sysfs, "block-a")))
+				}
+				if scenario == "kernel btrfs extra membership" {
+					require.NoError(t, os.Symlink(member, filepath.Join(sysfs, "block-b")))
+				}
+				nodeBtrfsDevicesDirectory = func(string) string { return sysfs }
+				// Synthetic kernel FS_INFO and sysfs observations; the capacity
+				// source nodes and major/minor stats are real OS block nodes.
+				nodeBtrfsFilesystemInfo = func(observationCtx context.Context, target string) (nodeBtrfsKernelInfo, error) {
+					require.Contains(t, []string{publish, stage}, target)
+					_, bounded := observationCtx.Deadline()
+					require.True(t, bounded)
+					if scenario == "kernel btrfs observation error" {
+						return nodeBtrfsKernelInfo{}, errors.New("ioctl observation failed")
+					}
+					if scenario == "kernel btrfs canceled observation" {
+						cancel()
+					}
+					if scenario == "kernel btrfs deadline observation" {
+						<-observationCtx.Done()
+						return nodeBtrfsKernelInfo{}, observationCtx.Err()
+					}
+					fsid := [16]byte{1}
+					if btrfsFSChanged {
+						fsid[0] = 2
+					}
+					if scenario == "kernel btrfs zero fsid" {
+						fsid = [16]byte{}
+					}
+					devices := uint64(1)
+					if scenario == "kernel btrfs device count mismatch" {
+						devices = 2
+					}
+					filesystemDevice := unix.Mkdev(0, 253)
+					if scenario == "kernel btrfs mount device changes during read" && mountChanged {
+						filesystemDevice = unix.Mkdev(0, 252)
+					}
+					maxID := uint64(1)
+					if scenario == "kernel btrfs maxid mismatch" {
+						maxID = 2
+					}
+					return nodeBtrfsKernelInfo{filesystemDevice: filesystemDevice, filesystem: fsid, maxID: maxID, devices: devices}, nil
+				}
+			}
 			commands := &testingexec.FakeExec{}
 			resizeCalls := 0
 			action := func(cmd string, args ...string) utilexec.Cmd {
@@ -123,6 +195,9 @@ func TestNodeExpandMountUtilsBinding(t *testing.T) {
 					switch cmd {
 					case "blockdev":
 						capacityReads++
+						if scenario == "kernel btrfs mount device changes during read" {
+							mountChanged = true
+						}
 						if scenario == "kernel btrfs filesystem changes during read" {
 							btrfsFSChanged = true
 						}
@@ -166,11 +241,11 @@ func TestNodeExpandMountUtilsBinding(t *testing.T) {
 				commands.CommandScript = append(commands.CommandScript, action)
 			}
 			ns.mounter.Exec = commands
-			if scenario == "kernel btrfs stale no staging" {
+			if scenario == "kernel btrfs stale no staging" || scenario == "kernel btrfs valid no staging" {
 				stage = ""
 			}
 			response, err := ns.NodeExpandVolume(ctx, &csi.NodeExpandVolumeRequest{VolumeId: "binding-fixture", VolumePath: publish, StagingTargetPath: stage, CapacityRange: &csi.CapacityRange{RequiredBytes: 2147483648}})
-			if scenario == "valid alias" || scenario == "kernel block aliases" || scenario == "kernel btrfs anonymous identity" {
+			if scenario == "valid alias" || scenario == "kernel block aliases" || scenario == "kernel btrfs anonymous identity" || scenario == "kernel btrfs valid no staging" || scenario == "kernel btrfs valid symlink alias" {
 				require.NoError(t, err)
 				require.Equal(t, int64(2147483648), response.GetCapacityBytes())
 				require.Equal(t, 1, resizeCalls)
@@ -315,3 +390,14 @@ type nodeExpandMountFileInfo struct {
 }
 
 func (f nodeExpandMountFileInfo) Sys() any { return f.state }
+
+// This is a real read-only ioctl failure against a non-Btrfs local kernel
+// filesystem. Positive mounted Btrfs observations remain boundary fixtures.
+func TestNodeExpandBtrfsKernelObservation(t *testing.T) {
+	_, err := readNodeBtrfsFilesystemInfo(context.Background(), "/proc/self")
+	require.Error(t, err, "a procfs directory cannot provide Btrfs FS_INFO")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = readNodeBtrfsFilesystemInfo(ctx, "/proc/self")
+	require.ErrorIs(t, err, context.Canceled)
+}

@@ -14,6 +14,18 @@ A successful statfs read is a required availability check, not a growth measurem
 
 `driver.nodeExpand.sizeToleranceBytes` and `ONE_CSI_NODE_EXPAND_SIZE_TOLERANCE_BYTES` are deprecated and ignored as of v0.5.29. Existing configuration remains accepted but cannot relax the device-capacity or resize-result checks. The implementation is in [NodeExpandVolume](../pkg/csi/driver/nodeserver.go). Raw-block and CephFS behavior is unchanged.
 
+## Btrfs association
+
+Btrfs subvolumes use an [anonymous mounted device number](https://btrfs.readthedocs.io/en/stable/btrfs-subvolume.html#mount-options), so mounted st_dev cannot be equated with block st_rdev. Agreement between staging and published mounts is insufficient: both may still refer to filesystem A after their shared source alias points at device B.
+
+For a block-backed Btrfs mount, the driver opens the mounted directory read-only and issues the fixed-size [BTRFS_IOC_FS_INFO](https://github.com/torvalds/linux/blob/v6.17/fs/btrfs/ioctl.c#L2764). The kernel result supplies the actual mounted FSID, device count and maximum device ID. The driver requires one device and maximum ID 1, then reads `/sys/fs/btrfs/<FSID>/devices`. That directory must contain exactly one symlink to a kernel block-class member whose canonical `dev` major/minor matches the capacity source's st_rdev. [Kernel sysfs code](https://github.com/torvalds/linux/blob/v6.17/fs/btrfs/sysfs.c#L2188) creates those links from actual block-device objects. No identity is inferred from the current `/dev` alias or a block superblock UUID.
+
+The association uses bounded directory and attribute reads and checks cancellation before and after kernel observations. It pins both FSID and mounted st_dev, together with the backing device, across the request. Staging and published paths must agree. The driver reobserves the binding after capacity reads and waits immediately before the resizer. Missing sysfs, failed ioctl, zero FSID, extra/missing devices, malformed attributes, changed identity and cancellation cannot authorize resizing. Linux metadata syscalls are read-only observations; these checks do not claim to interrupt a stuck kernel syscall.
+
+The single-device/default-ID requirement matches the existing mount-utils `btrfs filesystem resize max` call, which [implicitly targets device ID 1](https://btrfs.readthedocs.io/en/stable/btrfs-filesystem.html#subcommand). Multiple-device or other-ID layouts are ambiguous for that command and fail closed. This preserves the driver's single-device Btrfs behavior without asserting a qualified multi-device resize contract or a human feature waiver. Ext4/XFS mounted-device equality and regular-image test behavior remain intact.
+
+The new observer needs no binary or image/mount change. Existing local runtime inspection found `/sys` and `/sys/class/block`, but no `btrfs` binary; visibility of actual mounted Btrfs sysfs records and real Btrfs resize remains a qualification gate. No cluster or host was inspected to establish that visibility. Unknown runtime availability fails closed.
+
 ## Validation
 
 Current regression coverage in [node_expand_validation_test.go](../pkg/csi/driver/node_expand_validation_test.go), [nodeserver_test.go](../pkg/csi/driver/nodeserver_test.go) and the [Linux mount-utils fixtures](../pkg/csi/driver/nodeexpand_mountutils_linux_test.go) covers the exact 40 GiB/statfs case, devices one byte or 512 MiB short despite configured tolerance, delayed device growth, failed format observations and resize commands, unsupported and unformatted devices, false resize results, fatal statfs errors, cancellation and deadlines. Linux fixtures exercise the actual pinned dependency with synthetic command output, not real volumes. Earlier synthetic post-resize geometry-progress and geometry-error assumptions were replaced with these dependency-contract checks.
@@ -31,3 +43,7 @@ A Linux AMD64 candidate built from source 9f0f12d1c454ed351f2c7d2b917a065b94e60a
 The test uses a compatible local datastore because hplmonw03's system datastore 105 cannot attach datastore 124. This proves the node filesystem path on a real attached disk; Bravo's Ceph-backed PVCs require separate live recovery evidence.
 
 See [the sanitized hplmon evidence](node-expansion-hplmon-validation.json). Rerun with `python3 hack/validate-node-expansion.py --cluster hplmon --node hplmonw03 --storage-class one --expected-image-digest sha256:<digest> --output /tmp/node-expansion.json` after installing the candidate on that lab node. On failure the unique test resources remain for inspection.
+
+### Btrfs follow-up evidence boundary
+
+Linux binding regressions create disposable local block-device nodes to exercise actual st_rdev identity while modeling mounted stat, FS_INFO and sysfs records at explicit external boundaries. They cover valid aliases and anonymous identities, both stale sources, no staging path, FSID or mounted-device changes during reads/waits, unavailable or ambiguous membership and cancellation/deadline. The real FS_INFO call rejects a local procfs directory. These are not actual mounted Btrfs positives. Existing real local ext4 image/gRPC/tool tests remain separate from synthetic mount observations, and all native/provider/rollout gates remain open.

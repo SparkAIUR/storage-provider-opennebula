@@ -51,6 +51,9 @@ var (
 	nodeResizeFS       = func(exec utilexec.Interface, devicePath, deviceMountPath string) (bool, error) {
 		return mount.NewResizeFs(exec).Resize(devicePath, deviceMountPath)
 	}
+	nodeExpandBtrfsIdentity = func(context.Context, string) (nodeExpandBtrfsID, error) {
+		return nodeExpandBtrfsID{}, fmt.Errorf("btrfs mounted identity is unavailable on this platform")
+	}
 	nodeExpandSleep = func(ctx context.Context, interval time.Duration) error {
 		timer := time.NewTimer(interval)
 		defer timer.Stop()
@@ -780,7 +783,7 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 	policy := ns.nodeExpandPolicy()
 	ctx, cancel := context.WithTimeout(ctx, policy.verifyTimeout)
 	defer cancel()
-	_, deviceID, err := ns.nodeExpandMountedDevice(volumePath, req.GetStagingTargetPath())
+	_, deviceID, err := ns.nodeExpandMountedDevice(ctx, volumePath, req.GetStagingTargetPath())
 	if contextErr := ctx.Err(); contextErr != nil {
 		return nil, status.FromContextError(contextErr).Err()
 	}
@@ -808,7 +811,7 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		attempts++
 
 		// A wait may outlive a mount or device alias. Never reuse its old binding.
-		devicePath, err := ns.nodeExpandBoundDevice(volumePath, req.GetStagingTargetPath(), deviceID)
+		devicePath, err := ns.nodeExpandBoundDevice(ctx, volumePath, req.GetStagingTargetPath(), deviceID)
 		if contextErr := ctx.Err(); contextErr != nil {
 			return nil, status.FromContextError(contextErr).Err()
 		}
@@ -829,10 +832,10 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		if contextErr := ctx.Err(); contextErr != nil {
 			return nil, status.FromContextError(contextErr).Err()
 		}
-		if err != nil || observedID != deviceID {
+		if err != nil || observedID != deviceID.backing {
 			return nil, status.Errorf(codes.FailedPrecondition, "capacity device identity changed at %s: %v", devicePath, err)
 		}
-		devicePath, err = ns.nodeExpandBoundDevice(volumePath, req.GetStagingTargetPath(), deviceID)
+		devicePath, err = ns.nodeExpandBoundDevice(ctx, volumePath, req.GetStagingTargetPath(), deviceID)
 		if contextErr := ctx.Err(); contextErr != nil {
 			return nil, status.FromContextError(contextErr).Err()
 		}
@@ -941,10 +944,22 @@ func nodeExpandBackingIdentity(devicePath string) (nodeExpandDeviceID, error) {
 	}
 }
 
-func (ns *NodeServer) nodeExpandMountedDevice(volumePath, stagingPath string) (string, nodeExpandDeviceID, error) {
+type nodeExpandBtrfsID struct {
+	filesystemDevice uint64
+	filesystem       [16]byte
+	device           uint64
+}
+
+type nodeExpandBindingID struct {
+	backing          nodeExpandDeviceID
+	filesystemDevice uint64
+	btrfsFilesystem  [16]byte
+}
+
+func (ns *NodeServer) nodeExpandMountedDevice(ctx context.Context, volumePath, stagingPath string) (string, nodeExpandBindingID, error) {
 	mountPoints, err := ns.mounter.List()
 	if err != nil {
-		return "", nodeExpandDeviceID{}, err
+		return "", nodeExpandBindingID{}, err
 	}
 	// Read both mount bindings from one observation. A supplied staging path
 	// must be observable too; failure there cannot authorize a publish fallback.
@@ -965,25 +980,26 @@ func (ns *NodeServer) nodeExpandMountedDevice(volumePath, stagingPath string) (s
 	}
 	devicePath, err := deviceAt(volumePath)
 	if err != nil {
-		return "", nodeExpandDeviceID{}, err
+		return "", nodeExpandBindingID{}, err
 	}
 	id, err := nodeExpandBackingIdentity(devicePath)
 	if err != nil {
-		return "", nodeExpandDeviceID{}, err
+		return "", nodeExpandBindingID{}, err
 	}
 	if stagingPath != "" && stagingPath != volumePath {
 		stagingDevice, err := deviceAt(stagingPath)
 		if err != nil {
-			return "", nodeExpandDeviceID{}, err
+			return "", nodeExpandBindingID{}, err
 		}
 		stagingID, err := nodeExpandBackingIdentity(stagingDevice)
 		if err != nil {
-			return "", nodeExpandDeviceID{}, err
+			return "", nodeExpandBindingID{}, err
 		}
 		if stagingID != id {
-			return "", nodeExpandDeviceID{}, fmt.Errorf("staging and published mounts have different backing devices")
+			return "", nodeExpandBindingID{}, fmt.Errorf("staging and published mounts have different backing devices")
 		}
 	}
+	binding := nodeExpandBindingID{backing: id}
 	if id.kind == unix.S_IFBLK {
 		// A mount source alias can be retargeted without changing the mounted
 		// filesystem. Verify the kernel filesystem identity as well as the node.
@@ -994,17 +1010,18 @@ func (ns *NodeServer) nodeExpandMountedDevice(volumePath, stagingPath string) (s
 			}
 			info, err := nodeVolumePathStat(target)
 			if err != nil {
-				return "", nodeExpandDeviceID{}, err
+				return "", nodeExpandBindingID{}, err
 			}
 			st, ok := info.Sys().(*syscall.Stat_t)
 			if !ok {
-				return "", nodeExpandDeviceID{}, fmt.Errorf("mount %s filesystem identity is unavailable", target)
+				return "", nodeExpandBindingID{}, fmt.Errorf("mount %s filesystem identity is unavailable", target)
 			}
 			if i == 0 {
 				filesystemDevice = uint64(st.Dev)
+				binding.filesystemDevice = filesystemDevice
 			}
-			// Btrfs subvolumes use anonymous filesystem device numbers rather
-			// than the backing block number. Both binds must still agree.
+			// Btrfs st_dev is anonymous. Require kernel filesystem membership
+			// instead of treating mount agreement as device association.
 			btrfs := false
 			for _, mp := range mountPoints {
 				if mp.Path == target {
@@ -1012,16 +1029,30 @@ func (ns *NodeServer) nodeExpandMountedDevice(volumePath, stagingPath string) (s
 					break
 				}
 			}
+			if btrfs {
+				witness, e := nodeExpandBtrfsIdentity(ctx, target)
+				if e != nil {
+					return "", nodeExpandBindingID{}, fmt.Errorf("mount %s Btrfs association is unknown: %w", target, e)
+				}
+				if witness.device != id.device || witness.filesystemDevice != uint64(st.Dev) || witness.filesystem == ([16]byte{}) {
+					return "", nodeExpandBindingID{}, fmt.Errorf("mount %s Btrfs membership does not match capacity device", target)
+				}
+				if i == 0 {
+					binding.btrfsFilesystem = witness.filesystem
+				} else if binding.btrfsFilesystem != witness.filesystem {
+					return "", nodeExpandBindingID{}, fmt.Errorf("staging and published Btrfs filesystem identities differ")
+				}
+			}
 			if uint64(st.Dev) != filesystemDevice || (!btrfs && uint64(st.Dev) != id.device) {
-				return "", nodeExpandDeviceID{}, fmt.Errorf("mount %s filesystem identity does not match backing device", target)
+				return "", nodeExpandBindingID{}, fmt.Errorf("mount %s filesystem identity does not match backing device", target)
 			}
 		}
 	}
-	return devicePath, id, nil
+	return devicePath, binding, nil
 }
 
-func (ns *NodeServer) nodeExpandBoundDevice(volumePath, stagingPath string, expected nodeExpandDeviceID) (string, error) {
-	devicePath, id, err := ns.nodeExpandMountedDevice(volumePath, stagingPath)
+func (ns *NodeServer) nodeExpandBoundDevice(ctx context.Context, volumePath, stagingPath string, expected nodeExpandBindingID) (string, error) {
+	devicePath, id, err := ns.nodeExpandMountedDevice(ctx, volumePath, stagingPath)
 	if err != nil {
 		return "", err
 	}
