@@ -429,8 +429,8 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.vmHotplugTimeoutMaxSeconds` | Maximum timeout cap for a single VM hotplug operation. | `900` | No |
 | `driver.vmHotplugStuckVmCooldownSeconds` | Cooldown period applied after a VM stays stuck in hotplug through the full timeout. | `300` | No |
 | `driver.nodeDeviceDiscoveryTimeoutSeconds` | Dedicated node-side device discovery timeout. This stays shorter than the controller hotplug budget so healthy fast-path retries happen quickly. | `30` | No |
-| `driver.nodeExpand.verifyTimeoutSeconds` | Maximum time for node-side resize convergence before returning `DeadlineExceeded`. | `120` | No |
-| `driver.nodeExpand.retryIntervalSeconds` | Retry interval for node-side checks between device visibility, growfs execution, and filesystem size validation. | `2` | No |
+| `driver.nodeExpand.verifyTimeoutSeconds` | Verification timeout; see the [node expansion contract](../../docs/node-expansion.md#verification-contract). | `120` | No |
+| `driver.nodeExpand.retryIntervalSeconds` | Retry interval; see the [node expansion contract](../../docs/node-expansion.md#verification-contract). | `2` | No |
 | `driver.nodeExpand.sizeToleranceBytes` | Legacy compatibility setting; see the [node expansion contract](../../docs/node-expansion.md#verification-contract). | See [values.yaml](./values.yaml). | No |
 | `driver.nodeDeviceCache.enabled` | Enable node-local device cache and stable serial/by-id resolution. | `true` | No |
 | `driver.nodeDeviceCache.ttlSeconds` | Cache TTL for confirmed device paths. | `600` | No |

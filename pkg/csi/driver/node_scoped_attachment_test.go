@@ -30,9 +30,14 @@ type nodeAttachmentProtocol struct {
 	claimNew          bool
 	ready             bool
 	pending           bool
+	version           string
 }
 
-func nodeAttachmentProvider(t *testing.T) (*opennebula.PersistentDiskVolumeProvider, *nodeAttachmentProtocol) {
+// This fixture models durable shareable storage, not ephemeral cloned disks.
+// Image.cc emits PERSISTENT=YES/CLONE=NO/SAVE=YES and SHAREABLE=YES for a
+// persistent raw image with PERSISTENT_TYPE=SHAREABLE. The former PERSISTENT=0
+// contradicted both that intent and its USED_PERS state.
+func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Context)) (*opennebula.PersistentDiskVolumeProvider, *nodeAttachmentProtocol) {
 	t.Helper()
 	state := &nodeAttachmentProtocol{disks: map[int]int{41: 256}, marker: 256 * 1024 * 1024}
 	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -48,6 +53,9 @@ func nodeAttachmentProvider(t *testing.T) (*opennebula.PersistentDiskVolumeProvi
 			} `xml:"params>param"`
 		}
 		require.NoError(t, xml.NewDecoder(r.Body).Decode(&call))
+		for _, observer := range observe {
+			observer(call.Method, r.Context())
+		}
 		number := func(i int) int { v := call.Params[i].Value; return v.Int + v.I4 + v.I8 }
 		state.mu.Lock()
 		defer state.mu.Unlock()
@@ -62,7 +70,7 @@ func nodeAttachmentProvider(t *testing.T) (*opennebula.PersistentDiskVolumeProvi
 				if state.pending {
 					marker = "<RESIZE>YES</RESIZE><SIZE_PREV>128</SIZE_PREV>"
 				}
-				disk = fmt.Sprintf(`<DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE><SERIAL>onecsi-7</SERIAL>%s</DISK>`, size, marker)
+				disk = fmt.Sprintf(`<DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><SAVE>YES</SAVE><SHAREABLE>YES</SHAREABLE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>ssh</TM_MAD><TM_MAD_SYSTEM>ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE><SERIAL>onecsi-7</SERIAL>%s</DISK>`, size, marker)
 			}
 			return fmt.Sprintf(`<VM><ID>%d</ID><NAME>%s</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE>%s</TEMPLATE><HISTORY_RECORDS><HISTORY><SEQ>0</SEQ><DS_ID>200</DS_ID></HISTORY></HISTORY_RECORDS></VM>`, id, name, disk)
 		}
@@ -83,7 +91,7 @@ func nodeAttachmentProvider(t *testing.T) (*opennebula.PersistentDiskVolumeProvi
 			if state.marker > 0 {
 				tag = fmt.Sprintf("<CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES>", state.marker)
 			}
-			return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>%d</STATE><SIZE>128</SIZE><DATASTORE_ID>100</DATASTORE_ID><SOURCE>/fixture/disk</SOURCE><PERSISTENT>0</PERSISTENT><RUNNING_VMS>%d</RUNNING_VMS><VMS>%s</VMS><TEMPLATE>%s</TEMPLATE></IMAGE>`, imageState, count, ids, tag)
+			return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>%d</STATE><SIZE>128</SIZE><DATASTORE_ID>100</DATASTORE_ID><SOURCE>/fixture/disk</SOURCE><PERSISTENT>1</PERSISTENT><FORMAT>raw</FORMAT><RUNNING_VMS>%d</RUNNING_VMS><VMS>%s</VMS><TEMPLATE><PERSISTENT_TYPE>SHAREABLE</PERSISTENT_TYPE>%s</TEMPLATE></IMAGE>`, imageState, count, ids, tag)
 		}
 		ok, body, code := 1, "", 0
 		if call.Method == state.failMethod {
@@ -112,6 +120,11 @@ func nodeAttachmentProvider(t *testing.T) (*opennebula.PersistentDiskVolumeProvi
 				delete(state.disks, id)
 				state.mutations = append(state.mutations, fmt.Sprintf("detach:%d", id))
 				body = strconv.Itoa(id)
+			case "one.system.version":
+				body = state.version
+				if body == "" {
+					body = "7.4.1"
+				}
 			case "one.vm.diskresize":
 				id := number(1)
 				require.Equal(t, 2, number(2))

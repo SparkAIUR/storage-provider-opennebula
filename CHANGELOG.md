@@ -1,5 +1,29 @@
 # Changelog
 
+Current source target is OpenNebula 7.4.0, with no direct OpenNebula host actions. This integration grants no native acceptance or feature waiver; affected persistent growth/reattach and the 24-hour observation remain open.
+
+## Unreleased test reliability
+
+- Synchronize node expansion deadline injection with the actual RPC command context. Preserve deadline status and mutation assertions without relying on parent-to-child cancellation scheduling. Production behavior and native qualification gates are unchanged.
+
+## Unreleased provider growth prerequisite
+
+- Add an operation-specific [persistent growth prerequisite](docs/opennebula-74-upgrade.md#provider-growth-metadata-prerequisite-2026-11-13), including restoration, while retaining basic OpenNebula 7.4.0 support. See that contract for allowed growth, mutation limits and open native gates.
+- Preserve actionable FailedPrecondition for publish restoration prerequisites and context error identity through queued direct and embedded post-attach restoration.
+
+## Unreleased Btrfs mounted-device binding
+
+- Require a block source for every nonempty observed mount type before local-image shortcuts. See [mounted-filesystem source requirements](docs/node-expansion.md#real-mounted-filesystem-sources).
+- Associate the actual mounted Btrfs filesystem with its capacity device using read-only kernel FS_INFO and sysfs block membership. Pin its FSID and mounted device identity through capacity reads and waits.
+- Reject missing, changed or ambiguous membership before resize; preserve single-device Btrfs with default device ID 1 and existing ext4/XFS checks. Local fixtures do not establish native Btrfs qualification.
+
+## Unreleased node expansion correction
+
+- Revalidate pinned mount and captured source identities at filesystem child execution, after resize and after statfs. Reject observed binding changes without mutation or false success, preserving cancellation through mount-utils errors.
+- Correct node expansion completion for the pinned mount-utils dependency. This supersedes the v0.5.29 geometry check; see the [node expansion contract](docs/node-expansion.md#verification-contract).
+- Honor cancellation during filesystem commands and device-capacity waits, and recheck it before acknowledging success. Native expansion and ordinary reattach acceptance remain pending.
+- Bind node expansion capacity and filesystem resize to the same observable backing device. Accept device aliases, reject missing or mismatched staging/published bindings, and refresh identity after capacity waits and reads.
+
 ## v0.6.0-rc.2, unreleased
 
 - Accept explicitly bound Ceph bridge IP/name aliases using versioned operator configuration tied to a non-secret datastore fingerprint and current registered host IDs/names. Verify every upstream-selectable bridge before allocation; a healthy member cannot mask an unknown or ineligible endpoint.
