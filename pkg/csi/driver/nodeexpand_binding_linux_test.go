@@ -388,6 +388,201 @@ func (c nodeExpandAfterProbeCmd) CombinedOutput() ([]byte, error) {
 	return output, err
 }
 
+func TestNodeExpandMountUtilsBindingAcrossCommands(t *testing.T) {
+	for _, format := range []string{"ext3", "ext4", "xfs", "btrfs"} {
+		for _, boundary := range []string{"probe", "command creation", "resize", "statfs"} {
+			for _, change := range []string{"stable no-op", "valid source alias", "valid mount alias", "source retargeted", "captured source retargeted", "source missing", "published source", "staging source", "published filesystem", "staging filesystem", "unknown observation", "canceled observation", "expired observation", "btrfs fsid"} {
+				if change == "btrfs fsid" && format != "btrfs" {
+					continue
+				}
+				t.Run(format+"/"+boundary+"/"+change, func(t *testing.T) {
+					root := t.TempDir()
+					device, equivalent, other := filepath.Join(root, "device"), filepath.Join(root, "equivalent"), filepath.Join(root, "other")
+					for i, name := range []string{device, equivalent, other} {
+						minor := uint32(253)
+						if i == 2 {
+							minor = 252
+						}
+						if err := unix.Mknod(name, unix.S_IFBLK|0600, int(unix.Mkdev(7, minor))); err != nil {
+							if err == unix.EPERM {
+								t.Skip("block-source boundary fixture requires mknod permission")
+							}
+							require.NoError(t, err)
+						}
+					}
+					alias := filepath.Join(root, "alias")
+					require.NoError(t, os.Symlink(device, alias))
+					publish, stage := filepath.Join(root, "publish"), filepath.Join(root, "stage")
+					require.NoError(t, os.Mkdir(publish, 0700))
+					require.NoError(t, os.Mkdir(stage, 0700))
+					ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Path: publish, Device: alias, Type: format}, {Path: stage, Device: device, Type: format}})
+					mounter := ns.mounter.Interface.(*mount.FakeMounter)
+					ctx, cancel := context.WithCancel(context.Background())
+					if change == "expired observation" {
+						cancel()
+						ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
+					}
+					defer cancel()
+					oldStat, oldFS := nodeVolumePathStat, nodeVolumePathFS
+					oldInfo, oldDirectory := nodeBtrfsFilesystemInfo, nodeBtrfsDevicesDirectory
+					t.Cleanup(func() {
+						nodeVolumePathStat, nodeVolumePathFS = oldStat, oldFS
+						nodeBtrfsFilesystemInfo, nodeBtrfsDevicesDirectory = oldInfo, oldDirectory
+					})
+					changed := false
+					filesystemDevice := func(target string) uint64 {
+						major, minor := uint32(7), uint32(253)
+						if format == "btrfs" {
+							major = 0
+						}
+						if changed && ((change == "published filesystem" && target == publish) || (change == "staging filesystem" && target == stage)) {
+							minor = 252
+						}
+						return unix.Mkdev(major, minor)
+					}
+					nodeVolumePathStat = func(target string) (os.FileInfo, error) {
+						if changed {
+							switch change {
+							case "unknown observation":
+								return nil, os.ErrNotExist
+							case "canceled observation":
+								cancel()
+								return nil, os.ErrNotExist
+							case "expired observation":
+								<-ctx.Done()
+								return nil, os.ErrNotExist
+							}
+						}
+						info, err := os.Stat(target)
+						if err != nil {
+							return nil, err
+						}
+						st := *info.Sys().(*syscall.Stat_t)
+						st.Dev = filesystemDevice(target)
+						return nodeExpandMountFileInfo{FileInfo: info, state: &st}, nil
+					}
+					if format == "btrfs" {
+						sysfs, member := filepath.Join(root, "sysfs"), filepath.Join(root, "member")
+						require.NoError(t, os.Mkdir(sysfs, 0700))
+						require.NoError(t, os.Mkdir(member, 0700))
+						require.NoError(t, os.Symlink("/sys/class/block", filepath.Join(member, "subsystem")))
+						require.NoError(t, os.WriteFile(filepath.Join(member, "dev"), []byte("7:253\n"), 0600))
+						require.NoError(t, os.Symlink(member, filepath.Join(sysfs, "device")))
+						nodeBtrfsDevicesDirectory = func(string) string { return sysfs }
+						nodeBtrfsFilesystemInfo = func(_ context.Context, target string) (nodeBtrfsKernelInfo, error) {
+							fsid := [16]byte{1}
+							if changed && change == "btrfs fsid" {
+								fsid[0] = 2
+							}
+							return nodeBtrfsKernelInfo{filesystemDevice: filesystemDevice(target), filesystem: fsid, maxID: 1, devices: 1}, nil
+						}
+					}
+					transition := func(at string) {
+						if boundary != at {
+							return
+						}
+						require.False(t, changed, "the external boundary must be exercised once")
+						changed = true
+						switch change {
+						case "valid source alias", "source retargeted", "captured source retargeted", "source missing":
+							require.NoError(t, os.Remove(alias))
+							target := other
+							if change == "valid source alias" {
+								target = equivalent
+							}
+							if change != "source missing" {
+								require.NoError(t, os.Symlink(target, alias))
+							}
+							if change == "captured source retargeted" {
+								mounter.MountPoints[0].Device = equivalent
+							}
+						case "valid mount alias":
+							mounter.MountPoints[0].Device, mounter.MountPoints[1].Device = equivalent, equivalent
+						case "published source":
+							mounter.MountPoints[0].Device = other
+						case "staging source":
+							mounter.MountPoints[1].Device = other
+						}
+					}
+					statfsCalls, resizeCalls, probeCalls := 0, 0, 0
+					nodeVolumePathFS = func(_ string, st *unix.Statfs_t) error {
+						statfsCalls++
+						transition("statfs")
+						st.Bsize, st.Blocks = 4096, 1
+						return nil
+					}
+					commands := &testingexec.FakeExec{}
+					action := func(cmd string, args ...string) utilexec.Cmd {
+						if cmd == "resize2fs" || cmd == "xfs_growfs" || cmd == "btrfs" {
+							transition("command creation")
+						}
+						return testingexec.InitFakeCmd(&testingexec.FakeCmd{CombinedOutputScript: []testingexec.FakeAction{func() ([]byte, []byte, error) {
+							switch cmd {
+							case "blockdev":
+								require.Equal(t, []string{"--getsize64", alias}, args)
+								return []byte("2147483648\n"), nil, nil
+							case "blkid":
+								require.Equal(t, alias, args[len(args)-1])
+								probeCalls++
+								transition("probe")
+								return []byte("TYPE=" + format + "\n"), nil, nil
+							case "resize2fs":
+								require.Contains(t, []string{"ext3", "ext4"}, format)
+								require.Equal(t, []string{alias}, args)
+							case "xfs_growfs":
+								require.Equal(t, "xfs", format)
+								require.Equal(t, []string{"-d", publish}, args)
+							case "btrfs":
+								require.Equal(t, "btrfs", format)
+								require.Equal(t, []string{"filesystem", "resize", "max", publish}, args)
+							default:
+								t.Fatalf("unexpected command %s %v", cmd, args)
+							}
+							resizeCalls++
+							transition("resize")
+							return []byte("Nothing to do!\n"), nil, nil
+						}}}, cmd, args...)
+					}
+					for range 4 {
+						commands.CommandScript = append(commands.CommandScript, action)
+					}
+					ns.mounter.Exec = commands
+					response, err := ns.NodeExpandVolume(ctx, &csi.NodeExpandVolumeRequest{VolumeId: "command-boundary-fixture", VolumePath: publish, StagingTargetPath: stage, CapacityRange: &csi.CapacityRange{RequiredBytes: 2147483648}})
+					require.True(t, changed, "exercise the selected external boundary")
+					require.Equal(t, 1, probeCalls)
+					valid := change == "stable no-op" || change == "valid source alias" || change == "valid mount alias"
+					if valid {
+						require.NoError(t, err)
+						require.Equal(t, int64(2147483648), response.GetCapacityBytes())
+					} else {
+						want := codes.FailedPrecondition
+						if change == "canceled observation" {
+							want = codes.Canceled
+						}
+						if change == "expired observation" {
+							want = codes.DeadlineExceeded
+						}
+						require.Equal(t, want, status.Code(err), "%v", err)
+						require.Nil(t, response)
+						if change == "captured source retargeted" {
+							require.Contains(t, err.Error(), "resize source identity changed")
+						}
+					}
+					wantResize, wantStatfs := 1, 1
+					if !valid && boundary != "statfs" {
+						wantStatfs = 0
+						if boundary != "resize" {
+							wantResize = 0
+						}
+					}
+					require.Equal(t, wantResize, resizeCalls, "no mutating child may run after an invalid observation")
+					require.Equal(t, wantStatfs, statfsCalls, "reject changed bindings immediately after resize")
+				})
+			}
+		}
+	}
+}
+
 // Override only the mount-stat external boundary; device-node identity is real.
 type nodeExpandMountFileInfo struct {
 	os.FileInfo

@@ -78,3 +78,8 @@ The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI i
 
 - AI: Root reproduced the same source-kind bypass for XFS after the Btrfs-only correction. Apply block-source admission to every nonempty observed mount type before regular-file or character-device shortcuts. Real file-backed mounts expose loop block devices; blank mount types remain an explicit synthetic local-image contract. Preserve the Btrfs association witness and ext4/XFS device checks.
 - AI: Keep the earlier Btrfs tests and receipts, add full-handler ext3/ext4/XFS/Btrfs regressions, and rerun root's unchanged XFS overlay. This is the final scoped review revision, with no new filesystem feature, provider policy or non-Linux shortcut change. No native qualification is claimed.
+
+## 2026-11-13, binding checks across filesystem commands
+
+- AI: The pre-Resize observation cannot authorize a later filesystem command because mount-utils first awaits a format probe. Check the pinned published/staging association and exact captured source at child execution, after the resizer and after statfs. Keep checks synchronous and local to the RPC; preserve binding failures across mount-utils error formatting and give cancellation precedence after each observation.
+- AI: Exercise actual pinned mount-utils with block-source and kernel-boundary fixtures for ext3/ext4/XFS/Btrfs across probing, command construction, resize and statfs. Valid aliases and successful no-ops retain requested capacity. These fixtures do not qualify mounted Btrfs or native OpenNebula 7.4.0 expansion; provider, rollout and 24-hour gates remain held.

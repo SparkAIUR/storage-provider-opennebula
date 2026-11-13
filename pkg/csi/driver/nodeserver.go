@@ -881,9 +881,39 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		if err := ctx.Err(); err != nil {
 			return nil, status.FromContextError(err).Err()
 		}
-		resized, err = nodeResizeFS(nodeExpandExec{Interface: ns.mounter.Exec, ctx: ctx}, devicePath, volumePath)
+		checkBinding := func() error {
+			if err := ctx.Err(); err != nil {
+				return status.FromContextError(err).Err()
+			}
+			_, err := ns.nodeExpandBoundDevice(ctx, volumePath, req.GetStagingTargetPath(), deviceID)
+			if contextErr := ctx.Err(); contextErr != nil {
+				return status.FromContextError(contextErr).Err()
+			}
+			if err != nil {
+				return status.Errorf(codes.FailedPrecondition, "volume expansion binding changed: %v", err)
+			}
+			observedID, err := nodeExpandBackingIdentity(devicePath)
+			if contextErr := ctx.Err(); contextErr != nil {
+				return status.FromContextError(contextErr).Err()
+			}
+			if err != nil || observedID != deviceID.backing {
+				return status.Errorf(codes.FailedPrecondition, "resize source identity changed at %s: %v", devicePath, err)
+			}
+			return nil
+		}
+		var bindingErr error
+		resized, err = nodeResizeFS(nodeExpandExec{Interface: ns.mounter.Exec, ctx: ctx, before: func() error {
+			bindingErr = checkBinding()
+			return bindingErr
+		}}, devicePath, volumePath)
 		if contextErr := ctx.Err(); contextErr != nil {
 			return nil, status.FromContextError(contextErr).Err()
+		}
+		if bindingErr != nil {
+			return nil, bindingErr
+		}
+		if bindingErr := checkBinding(); bindingErr != nil {
+			return nil, bindingErr
 		}
 		if err != nil {
 			ns.recordNodeExpandOperation(started, "disk", "internal")
@@ -893,6 +923,9 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		lastFSBytes, err = ns.filesystemSizeBytes(volumePath)
 		if contextErr := ctx.Err(); contextErr != nil {
 			return nil, status.FromContextError(contextErr).Err()
+		}
+		if bindingErr := checkBinding(); bindingErr != nil {
+			return nil, bindingErr
 		}
 		if err != nil {
 			ns.recordNodeExpandOperation(started, "disk", "internal")
@@ -957,7 +990,13 @@ type nodeExpandBindingID struct {
 }
 
 func (ns *NodeServer) nodeExpandMountedDevice(ctx context.Context, volumePath, stagingPath string) (string, nodeExpandBindingID, error) {
+	if err := ctx.Err(); err != nil {
+		return "", nodeExpandBindingID{}, err
+	}
 	mountPoints, err := ns.mounter.List()
+	if contextErr := ctx.Err(); contextErr != nil {
+		return "", nodeExpandBindingID{}, contextErr
+	}
 	if err != nil {
 		return "", nodeExpandBindingID{}, err
 	}
@@ -983,6 +1022,9 @@ func (ns *NodeServer) nodeExpandMountedDevice(ctx context.Context, volumePath, s
 		return "", nodeExpandBindingID{}, err
 	}
 	id, err := nodeExpandBackingIdentity(devicePath)
+	if contextErr := ctx.Err(); contextErr != nil {
+		return "", nodeExpandBindingID{}, contextErr
+	}
 	if err != nil {
 		return "", nodeExpandBindingID{}, err
 	}
@@ -999,6 +1041,9 @@ func (ns *NodeServer) nodeExpandMountedDevice(ctx context.Context, volumePath, s
 			return "", nodeExpandBindingID{}, err
 		}
 		stagingID, err := nodeExpandBackingIdentity(stagingDevice)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return "", nodeExpandBindingID{}, contextErr
+		}
 		if err != nil {
 			return "", nodeExpandBindingID{}, err
 		}
@@ -1016,6 +1061,9 @@ func (ns *NodeServer) nodeExpandMountedDevice(ctx context.Context, volumePath, s
 				continue
 			}
 			info, err := nodeVolumePathStat(target)
+			if contextErr := ctx.Err(); contextErr != nil {
+				return "", nodeExpandBindingID{}, contextErr
+			}
 			if err != nil {
 				return "", nodeExpandBindingID{}, err
 			}
@@ -1038,6 +1086,9 @@ func (ns *NodeServer) nodeExpandMountedDevice(ctx context.Context, volumePath, s
 			}
 			if btrfs {
 				witness, e := nodeExpandBtrfsIdentity(ctx, target)
+				if contextErr := ctx.Err(); contextErr != nil {
+					return "", nodeExpandBindingID{}, contextErr
+				}
 				if e != nil {
 					return "", nodeExpandBindingID{}, fmt.Errorf("mount %s Btrfs association is unknown: %w", target, e)
 				}
@@ -1072,11 +1123,53 @@ func (ns *NodeServer) nodeExpandBoundDevice(ctx context.Context, volumePath, sta
 // mount-utils calls Command; bind those external calls to this RPC's deadline.
 type nodeExpandExec struct {
 	utilexec.Interface
-	ctx context.Context
+	ctx    context.Context
+	before func() error
 }
 
 func (e nodeExpandExec) Command(cmd string, args ...string) utilexec.Cmd {
 	return e.CommandContext(e.ctx, cmd, args...)
+}
+
+func (e nodeExpandExec) CommandContext(ctx context.Context, cmd string, args ...string) utilexec.Cmd {
+	command := e.Interface.CommandContext(ctx, cmd, args...)
+	if e.before == nil {
+		return command
+	}
+	return nodeExpandBoundCommand{Cmd: command, before: e.before}
+}
+
+type nodeExpandBoundCommand struct {
+	utilexec.Cmd
+	before func() error
+}
+
+func (c nodeExpandBoundCommand) CombinedOutput() ([]byte, error) {
+	if err := c.before(); err != nil {
+		return nil, err
+	}
+	return c.Cmd.CombinedOutput()
+}
+
+func (c nodeExpandBoundCommand) Output() ([]byte, error) {
+	if err := c.before(); err != nil {
+		return nil, err
+	}
+	return c.Cmd.Output()
+}
+
+func (c nodeExpandBoundCommand) Run() error {
+	if err := c.before(); err != nil {
+		return err
+	}
+	return c.Cmd.Run()
+}
+
+func (c nodeExpandBoundCommand) Start() error {
+	if err := c.before(); err != nil {
+		return err
+	}
+	return c.Cmd.Start()
 }
 
 type nodeExpandPolicy struct {
