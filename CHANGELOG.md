@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased provider growth prerequisite
+
+- Add an operation-specific [persistent growth prerequisite](docs/opennebula-74-upgrade.md#provider-growth-metadata-prerequisite-2026-11-13), including restoration, while retaining basic OpenNebula 7.4.0 support. See that contract for allowed growth, mutation limits and open native gates.
+- Preserve actionable FailedPrecondition for publish restoration prerequisites and context error identity through queued direct and embedded post-attach restoration.
+
 ## v0.6.0-rc.2, unreleased
 
 - Accept explicitly bound Ceph bridge IP/name aliases using versioned operator configuration tied to a non-secret datastore fingerprint and current registered host IDs/names. Verify every upstream-selectable bridge before allocation; a healthy member cannot mask an unknown or ineligible endpoint.

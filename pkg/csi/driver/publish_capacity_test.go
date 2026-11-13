@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	corev1 "k8s.io/api/core/v1"
 )
 
 type capacityProtocolProvider struct {
@@ -36,6 +37,18 @@ func (p *capacityProtocolProvider) RestoreVolumeCapacity(ctx context.Context, vo
 
 func (p *capacityProtocolProvider) ExpandVolume(ctx context.Context, volume string, size int64, allowDetached bool) (int64, error) {
 	return p.capacity.ExpandVolume(ctx, volume, size, allowDetached)
+}
+
+type cancelableCapacityAttachProvider struct {
+	*opennebula.PersistentDiskVolumeProvider
+	cancelReady chan context.CancelFunc
+}
+
+func (p *cancelableCapacityAttachProvider) AttachVolume(ctx context.Context, volume, node string, immutable bool, params map[string]string) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	p.cancelReady <- cancel
+	return p.PersistentDiskVolumeProvider.AttachVolume(ctx, volume, node, immutable, params)
 }
 
 func reviewControllerClient(t *testing.T, controller *ControllerServer) csi.ControllerClient {
@@ -56,7 +69,7 @@ func reviewControllerClient(t *testing.T, controller *ControllerServer) csi.Cont
 }
 
 func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
-	for _, path := range []string{"already_attached", "queued_completion", "post_attach"} {
+	for _, path := range []string{"already_attached", "queued_completion", "post_attach", "sticky_reuse"} {
 		t.Run(path, func(t *testing.T) {
 			const desired = 256 * 1024 * 1024
 			var size atomic.Int64
@@ -64,9 +77,9 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 			var reject atomic.Bool
 			reject.Store(true)
 			var resizes atomic.Int32
-			image := fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, desired)
+			image := fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, desired)
 			vmXML := func() string {
-				return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE></DISK></TEMPLATE></VM>`, size.Load())
+				return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE></DISK></TEMPLATE></VM>`, size.Load())
 			}
 			endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var call struct {
@@ -91,6 +104,8 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 					body = "<VM_POOL>" + vmXML() + "</VM_POOL>"
 				case "one.vm.info":
 					body = vmXML()
+				case "one.system.version":
+					body = "7.4.1"
 				case "one.vm.diskresize":
 					require.Len(t, call.Params, 4)
 					number := func(i int) int { v := call.Params[i].Value; return v.Int + v.I4 + v.I8 }
@@ -121,22 +136,30 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 			provider := &MockOpenNebulaVolumeProviderTestify{}
 			provider.On("VolumeExists", mock.Anything, "volume-test").Return(7, desired, nil)
 			provider.On("NodeExists", mock.Anything, "node-test").Return(11, nil)
-			if path == "queued_completion" || path == "post_attach" {
+			if path != "already_attached" {
 				count := 1
-				if path == "post_attach" {
+				if path == "post_attach" || path == "sticky_reuse" {
 					count = 2
+				}
+				if path == "post_attach" {
 					provider.On("AttachVolume", mock.Anything, "volume-test", "node-test", false, mock.Anything).Return(nil).Once()
 				}
 				provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("", opennebula.ErrAttachmentNotFound).Times(count)
 			}
 			provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("vdb", nil)
-			controller := NewControllerServer(newTestDriver(), &capacityProtocolProvider{provider, capacity}, &MockSharedFilesystemProviderTestify{})
+			driver := newTestDriver()
+			if path == "sticky_reuse" {
+				pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+				driver = newStickyTestDriver(t, pv, pvc, newReadyNode("node-test", true), activePodForPVC("capacity-pod", pvc.Name, "node-test"))
+				require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{VolumeID: "volume-test", NodeID: "node-test", Backend: "local", StartedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute), GraceSeconds: 60}))
+			}
+			controller := NewControllerServer(driver, &capacityProtocolProvider{provider, capacity}, &MockSharedFilesystemProviderTestify{})
 			client := reviewControllerClient(t, controller)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			req := newPublishReq("volume-test", "node-test")
 			response, err := client.ControllerPublishVolume(ctx, req)
-			require.Error(t, err)
+			require.Equal(t, codes.Internal, status.Code(err))
 			require.Nil(t, response)
 			require.EqualValues(t, 128, size.Load())
 			require.EqualValues(t, 1, resizes.Load())
@@ -193,10 +216,10 @@ func TestControllerPublishAndExpandSerializeVerifiedCapacity(t *testing.T) {
 				defer resume()
 				var paused atomic.Bool
 				imageXML := func() string {
-					return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, marker.Load())
+					return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, marker.Load())
 				}
 				vmXML := func() string {
-					return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE></DISK></TEMPLATE></VM>`, size.Load())
+					return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE></DISK></TEMPLATE></VM>`, size.Load())
 				}
 				endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					var call struct {
@@ -222,6 +245,8 @@ func TestControllerPublishAndExpandSerializeVerifiedCapacity(t *testing.T) {
 						body = "<VM_POOL>" + vmXML() + "</VM_POOL>"
 					case "one.vm.info":
 						body = vmXML()
+					case "one.system.version":
+						body = "7.4.1"
 					case "one.vm.diskresize":
 						require.Len(t, call.Params, 4)
 						require.Equal(t, 11, number(1))
@@ -346,6 +371,231 @@ func TestControllerPublishAndExpandSerializeVerifiedCapacity(t *testing.T) {
 				require.EqualValues(t, 512, size.Load())
 				require.Equal(t, 512*mib, marker.Load())
 				provider.AssertExpectations(t)
+			})
+		}
+	}
+}
+
+func TestControllerProviderGrowthCompatibilityFailedPrecondition(t *testing.T) {
+	for _, path := range []string{"expand", "already_attached", "queued_completion", "post_attach", "sticky_reuse"} {
+		for _, target := range []string{"SYSTEM", "SELF"} {
+			t.Run(path+"/"+target, func(t *testing.T) {
+				var mutations, versions atomic.Int32
+				imageCapacity := "134217728"
+				if path != "expand" {
+					imageCapacity = "268435456"
+				}
+				image := `<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>` + imageCapacity + `</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`
+				vmXML := `<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>128</SIZE><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>` + target + `</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM></DISK></TEMPLATE></VM>`
+				endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					var call struct {
+						Method string `xml:"methodName"`
+					}
+					require.NoError(t, xml.NewDecoder(r.Body).Decode(&call))
+					body := ""
+					ok, code := 1, 0
+					switch call.Method {
+					case "one.imagepool.info":
+						body = "<IMAGE_POOL>" + image + "</IMAGE_POOL>"
+					case "one.image.info":
+						body = image
+					case "one.vmpool.info":
+						body = "<VM_POOL>" + vmXML + "</VM_POOL>"
+					case "one.vm.info":
+						body = vmXML
+					case "one.system.version":
+						versions.Add(1)
+						body = "7.4.0"
+					default:
+						mutations.Add(1)
+						ok, code = 0, 0x800
+						body = "forbidden mutation"
+					}
+					var escaped strings.Builder
+					require.NoError(t, xml.EscapeText(&escaped, []byte(body)))
+					_, err := fmt.Fprintf(w, `<methodResponse><params><param><value><array><data><value><boolean>%d</boolean></value><value><string>%s</string></value><value><int>%d</int></value></data></array></value></param></params></methodResponse>`, ok, escaped.String(), code)
+					require.NoError(t, err)
+				}))
+				defer endpoint.Close()
+				provider, err := opennebula.NewPersistentDiskVolumeProvider(opennebula.NewClient(opennebula.OpenNebulaConfig{Endpoint: endpoint.URL, Credentials: "fixture:fixture"}), opennebula.HotplugTimeoutPolicy{BaseTimeout: time.Second, MaxTimeout: time.Second, PollInterval: time.Millisecond}, opennebula.CephBridgeIdentities{})
+				require.NoError(t, err)
+				mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+				driver := newTestDriver()
+				if path != "expand" {
+					mockProvider.On("VolumeExists", mock.Anything, "volume-test").Return(7, 256*1024*1024, nil)
+					mockProvider.On("NodeExists", mock.Anything, "node-test").Return(11, nil)
+					if path != "already_attached" {
+						count := 1
+						if path == "post_attach" || path == "sticky_reuse" {
+							count = 2
+						}
+						mockProvider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("", opennebula.ErrAttachmentNotFound).Times(count)
+					}
+					mockProvider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("vdb", nil).Once()
+					if path == "post_attach" {
+						mockProvider.On("AttachVolume", mock.Anything, "volume-test", "node-test", false, mock.Anything).Return(nil).Once()
+					}
+					if path == "sticky_reuse" {
+						pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+						driver = newStickyTestDriver(t, pv, pvc, newReadyNode("node-test", true), activePodForPVC("capacity-pod", pvc.Name, "node-test"))
+						require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{VolumeID: "volume-test", NodeID: "node-test", Backend: "local", StartedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute), GraceSeconds: 60}))
+					}
+				}
+				controller := NewControllerServer(driver, &capacityProtocolProvider{mockProvider, provider}, &MockSharedFilesystemProviderTestify{})
+				client := reviewControllerClient(t, controller)
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if path == "expand" {
+					response, expandErr := client.ControllerExpandVolume(ctx, &csi.ControllerExpandVolumeRequest{VolumeId: "volume-test", CapacityRange: &csi.CapacityRange{RequiredBytes: 256 * 1024 * 1024}})
+					require.Nil(t, response)
+					err = expandErr
+				} else {
+					response, publishErr := client.ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-test"))
+					require.Nil(t, response)
+					err = publishErr
+				}
+				if path == "sticky_reuse" {
+					_, exists := driver.stickyAttachments.Get("volume-test")
+					require.True(t, exists)
+				}
+				mockProvider.AssertExpectations(t)
+				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				require.ErrorContains(t, err, "7.4.1+")
+				require.ErrorContains(t, err, "7.4.0")
+				require.EqualValues(t, 1, versions.Load())
+				require.Zero(t, mutations.Load())
+			})
+		}
+	}
+}
+
+func TestControllerPublishCapacityRestorationContextErrors(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, path := range []string{"already_attached", "queued_completion", "post_attach", "sticky_reuse"} {
+			for _, failure := range []struct {
+				name string
+				err  error
+				code codes.Code
+			}{
+				{"canceled", fmt.Errorf("restore interrupted: %w", context.Canceled), codes.Canceled},
+				{"deadline", fmt.Errorf("restore interrupted: %w", context.DeadlineExceeded), codes.DeadlineExceeded},
+				{"unknown", fmt.Errorf("resize outcome uncertain"), codes.Internal},
+			} {
+				t.Run(fmt.Sprintf("queued=%t/%s/%s", queued, path, failure.name), func(t *testing.T) {
+					provider := &MockOpenNebulaVolumeProviderTestify{}
+					provider.On("VolumeExists", mock.Anything, "volume-test").Return(7, 256*1024*1024, nil)
+					provider.On("NodeExists", mock.Anything, "node-test").Return(11, nil)
+					if path != "already_attached" {
+						count := 1
+						if path == "post_attach" || path == "sticky_reuse" {
+							count = 2
+						}
+						provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("", opennebula.ErrAttachmentNotFound).Times(count)
+					}
+					provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("vdb", nil).Once()
+					provider.On("RestoreVolumeCapacity", mock.Anything, "volume-test", 11, 7).Return(failure.err).Once()
+					if path == "post_attach" {
+						provider.On("AttachVolume", mock.Anything, "volume-test", "node-test", false, mock.Anything).Return(nil).Once()
+					}
+					driver := newTestDriver()
+					if path == "sticky_reuse" {
+						pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+						driver = newStickyTestDriver(t, pv, pvc, newReadyNode("node-test", true), activePodForPVC("capacity-pod", pvc.Name, "node-test"))
+						require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{VolumeID: "volume-test", NodeID: "node-test", Backend: "local", StartedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute), GraceSeconds: 60}))
+					}
+					controller := NewControllerServer(driver, provider, &MockSharedFilesystemProviderTestify{})
+					if queued {
+						driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+						driver.hotplugQueue.Configure(true, 0, 0, time.Second, nil)
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					response, err := reviewControllerClient(t, controller).ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-test"))
+					require.Nil(t, response)
+					require.Equal(t, failure.code, status.Code(err))
+					if queued && failure.code == codes.DeadlineExceeded {
+						require.ErrorContains(t, err, "executing hotplug queue request")
+					} else {
+						require.ErrorContains(t, err, failure.err.Error())
+					}
+					if path == "sticky_reuse" {
+						_, exists := driver.stickyAttachments.Get("volume-test")
+						require.True(t, exists)
+					}
+					provider.AssertExpectations(t)
+				})
+			}
+		}
+	}
+}
+
+func TestControllerPublishRealAttachRestorationContext(t *testing.T) {
+	for _, observation := range []struct {
+		method string
+		read   int32
+		modes  []string
+	}{
+		{"one.vm.info", 3, []string{"deadline"}}, // Queue deadline during the earlier capacity read.
+		{"one.vm.info", 5, []string{"deadline", "cancel", "denied"}},
+		{"one.image.info", 4, []string{"deadline", "cancel", "denied"}},
+		{"one.system.version", 1, []string{"deadline", "cancel", "denied"}},
+	} {
+		for _, mode := range observation.modes {
+			t.Run(fmt.Sprintf("%s/read=%d/%s", observation.method, observation.read, mode), func(t *testing.T) {
+				var attached, interrupted atomic.Bool
+				var reads atomic.Int32
+				cancelReady := make(chan context.CancelFunc, 1)
+				provider, state := nodeAttachmentProvider(t, func(method string, requestCtx context.Context) {
+					if method == "one.vm.attach" {
+						attached.Store(true)
+						return
+					}
+					if !attached.Load() || method != observation.method || reads.Add(1) != observation.read {
+						return
+					}
+					interrupted.Store(true)
+					if mode == "denied" {
+						return
+					}
+					if mode == "cancel" {
+						cancel := <-cancelReady
+						cancel()
+					}
+					<-requestCtx.Done()
+				})
+				state.mu.Lock()
+				delete(state.disks, 41)
+				state.version = "7.4.0"
+				state.mu.Unlock()
+				var volumeProvider opennebula.OpenNebulaVolumeProvider = provider
+				if mode == "cancel" {
+					volumeProvider = &cancelableCapacityAttachProvider{provider, cancelReady}
+				}
+				driver := newTestDriver()
+				controller := NewControllerServer(driver, volumeProvider, &MockSharedFilesystemProviderTestify{})
+				driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+				driver.hotplugQueue.Configure(true, 0, 0, 500*time.Millisecond, nil)
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				response, err := reviewControllerClient(t, controller).ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-new"))
+				require.Nil(t, response)
+				require.NoError(t, ctx.Err(), "the parent CSI caller must remain connected")
+				require.True(t, interrupted.Load(), "must reach the growth prerequisite observation inside real AttachVolume")
+				switch mode {
+				case "deadline":
+					require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+					require.ErrorContains(t, err, "executing hotplug queue request")
+				case "cancel":
+					require.Equal(t, codes.Canceled, status.Code(err))
+				case "denied":
+					require.Equal(t, codes.FailedPrecondition, status.Code(err))
+					require.ErrorContains(t, err, "7.4.0")
+				}
+				state.mu.Lock()
+				defer state.mu.Unlock()
+				require.Equal(t, []string{"attach:42:false"}, state.mutations)
+				require.Equal(t, 128, state.disks[42])
+				require.EqualValues(t, 256*1024*1024, state.marker)
 			})
 		}
 	}

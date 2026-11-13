@@ -514,6 +514,9 @@ func (p *PersistentDiskVolumeProvider) expandAttachedDisk(ctx context.Context, v
 		return 0, err
 	}
 	if actual < size && actual > 0 {
+		if err := p.authorizePersistentDiskGrowth(ctx, vmID, diskID, id); err != nil {
+			return 0, err
+		}
 		mb := size / sizeConversion
 		if size%sizeConversion != 0 {
 			mb++
