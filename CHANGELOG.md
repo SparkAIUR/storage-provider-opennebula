@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased provider growth prerequisite
+
+- Require canonical OpenNebula 7.4.1+ before persistent SYSTEM/SELF-target disk growth, including capacity-restoration growth. Fail closed on unknown identity, version or observation failure before any mutation.
+- Preserve basic 7.4.0 readiness, satisfied-capacity retries and positively identified NONE-target growth. Native lifecycle acceptance and provider upgrade approval remain separate gates.
+
 ## v0.6.0-rc.2, unreleased
 
 - Accept explicitly bound Ceph bridge IP/name aliases using versioned operator configuration tied to a non-secret datastore fingerprint and current registered host IDs/names. Verify every upstream-selectable bridge before allocation; a healthy member cannot mask an unknown or ineligible endpoint.

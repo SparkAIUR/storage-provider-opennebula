@@ -166,9 +166,9 @@ func TestLifecycleReattachRestoresVerifiedCapacityAndWaitsPending(t *testing.T) 
 			desired := int64(256 * sizeConversion)
 			resized := 0
 			reads := 0
-			image := fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, desired)
+			image := fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, desired)
 			vmXML := func(marker string, size int) string {
-				return fmt.Sprintf(`<VM><ID>11</ID><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><SIZE>%d</SIZE>%s</DISK></TEMPLATE></VM>`, size, marker)
+				return fmt.Sprintf(`<VM><ID>11</ID><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><SIZE>%d</SIZE>%s</DISK></TEMPLATE></VM>`, size, marker)
 			}
 			p := lifecycleFixture(t, func(method string) (bool, string, int) {
 				switch method {
@@ -187,6 +187,8 @@ func TestLifecycleReattachRestoresVerifiedCapacityAndWaitsPending(t *testing.T) 
 						return true, vmXML("", 256), 0
 					}
 					return true, vmXML("", 128), 0
+				case "one.system.version":
+					return true, "7.4.1", 0
 				case "one.vm.diskresize":
 					resized++
 					return true, "11", 0

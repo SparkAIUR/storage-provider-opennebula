@@ -49,3 +49,10 @@ The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI i
 
 - AI: Preserve BRIDGE_LIST exactly at provider extraction so fingerprinting and prerequisite checks reject unsupported whitespace across runtime, preflight and inventory. Only Bash default IFS separators may be normalized by tokenization.
 - AI: Check selected datastore prerequisites and authorization before writing clone identity metadata on either a new source or an existing retry target. Retain ownership, durable origin, capacity checks and idempotent normalization. Synthetic XML-RPC regressions cover denied writes and successful normalization; native acceptance remains outside this review phase.
+
+## 2026-11-13, provider growth metadata prerequisite
+
+- HUMAN: Require 7.4.1+ and prepare the provider upgrade. Provider package installation, host remotes synchronization and service restarts remain a separate operational review. Existing hpldb-only authorization and the required review after its completed 24-hour observation remain unchanged.
+- AI: Gate real persistent disk growth, including restoration growth, on fresh provider identity and canonical version observations. Persistent SYSTEM/SELF transfer targets require 7.4.1 or a later canonical patch within 7.4. Unknown persistence, clone mode, transfer target or provider version cannot authorize growth.
+- AI: Preserve basic 7.4.0 Probe/readiness and already-satisfied retries. A positively identified persistent NONE target may grow on canonical 7.4.0 because upstream updates its image size on growth completion. Do not infer safety from a datastore display name or apply a persistent attach SIZE override.
+- AI: Keep terminal-state, capacity, attachment identity and detach protections unchanged. This guard does not repair existing expanded volumes, qualify native lifecycle cases or start the 24-hour observation. Preserve published RC2 and the separately reviewed node completion correction.

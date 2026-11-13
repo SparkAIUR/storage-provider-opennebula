@@ -64,9 +64,9 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 			var reject atomic.Bool
 			reject.Store(true)
 			var resizes atomic.Int32
-			image := fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, desired)
+			image := fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, desired)
 			vmXML := func() string {
-				return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE></DISK></TEMPLATE></VM>`, size.Load())
+				return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE></DISK></TEMPLATE></VM>`, size.Load())
 			}
 			endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var call struct {
@@ -91,6 +91,8 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 					body = "<VM_POOL>" + vmXML() + "</VM_POOL>"
 				case "one.vm.info":
 					body = vmXML()
+				case "one.system.version":
+					body = "7.4.1"
 				case "one.vm.diskresize":
 					require.Len(t, call.Params, 4)
 					number := func(i int) int { v := call.Params[i].Value; return v.Int + v.I4 + v.I8 }
@@ -193,10 +195,10 @@ func TestControllerPublishAndExpandSerializeVerifiedCapacity(t *testing.T) {
 				defer resume()
 				var paused atomic.Bool
 				imageXML := func() string {
-					return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, marker.Load())
+					return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, marker.Load())
 				}
 				vmXML := func() string {
-					return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE></DISK></TEMPLATE></VM>`, size.Load())
+					return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE></DISK></TEMPLATE></VM>`, size.Load())
 				}
 				endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					var call struct {
@@ -222,6 +224,8 @@ func TestControllerPublishAndExpandSerializeVerifiedCapacity(t *testing.T) {
 						body = "<VM_POOL>" + vmXML() + "</VM_POOL>"
 					case "one.vm.info":
 						body = vmXML()
+					case "one.system.version":
+						body = "7.4.1"
 					case "one.vm.diskresize":
 						require.Len(t, call.Params, 4)
 						require.Equal(t, 11, number(1))
@@ -349,4 +353,49 @@ func TestControllerPublishAndExpandSerializeVerifiedCapacity(t *testing.T) {
 			})
 		}
 	}
+}
+
+// The public CSI status must retain the real provider compatibility denial.
+func TestControllerExpandProviderGrowthCompatibilityFailedPrecondition(t *testing.T) {
+	var mutations atomic.Int32
+	image := `<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>134217728</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`
+	vmXML := `<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>128</SIZE><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM></DISK></TEMPLATE></VM>`
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var call struct {
+			Method string `xml:"methodName"`
+		}
+		require.NoError(t, xml.NewDecoder(r.Body).Decode(&call))
+		body := ""
+		ok, code := 1, 0
+		switch call.Method {
+		case "one.imagepool.info":
+			body = "<IMAGE_POOL>" + image + "</IMAGE_POOL>"
+		case "one.image.info":
+			body = image
+		case "one.vmpool.info":
+			body = "<VM_POOL>" + vmXML + "</VM_POOL>"
+		case "one.vm.info":
+			body = vmXML
+		case "one.system.version":
+			body = "7.4.0"
+		default:
+			mutations.Add(1)
+			ok, code = 0, 0x800
+			body = "forbidden mutation"
+		}
+		var escaped strings.Builder
+		require.NoError(t, xml.EscapeText(&escaped, []byte(body)))
+		_, err := fmt.Fprintf(w, `<methodResponse><params><param><value><array><data><value><boolean>%d</boolean></value><value><string>%s</string></value><value><int>%d</int></value></data></array></value></param></params></methodResponse>`, ok, escaped.String(), code)
+		require.NoError(t, err)
+	}))
+	defer endpoint.Close()
+	provider, err := opennebula.NewPersistentDiskVolumeProvider(opennebula.NewClient(opennebula.OpenNebulaConfig{Endpoint: endpoint.URL, Credentials: "fixture:fixture"}), opennebula.HotplugTimeoutPolicy{BaseTimeout: time.Second, MaxTimeout: time.Second, PollInterval: time.Millisecond}, opennebula.CephBridgeIdentities{})
+	require.NoError(t, err)
+	controller := NewControllerServer(newTestDriver(), &capacityProtocolProvider{&MockOpenNebulaVolumeProviderTestify{}, provider}, &MockSharedFilesystemProviderTestify{})
+	response, err := reviewControllerClient(t, controller).ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{VolumeId: "volume-test", CapacityRange: &csi.CapacityRange{RequiredBytes: 256 * 1024 * 1024}})
+	require.Nil(t, response)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.ErrorContains(t, err, "7.4.1+")
+	require.ErrorContains(t, err, "7.4.0")
+	require.Zero(t, mutations.Load())
 }
