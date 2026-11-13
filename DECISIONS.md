@@ -38,7 +38,7 @@ The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI i
 
 ## 2026-11-13, RC2 Ceph bridge identity and failed hook retention
 
-- HUMAN: Existing rollout authorization starts with hpldb only and requires a completed 24-hour observation before advancing to hplsvc, then Bravo. This record preserves that boundary and does not establish native qualification or authorize publication or further live actions.
+- HUMAN: Existing authorization covers a live rollout to hpldb only. The user will request a review after its completed 24-hour observation before considering hplsvc; later clusters remain gated. This record does not claim completed native qualification or authorize progression to another cluster.
 - AI: Configure reviewed, versioned endpoint-to-host bindings through `driver.cephBridgeIdentities` and `ONE_CSI_CEPH_BRIDGE_IDENTITIES`. Bind each datastore to the deterministic non-secret `CephBridgeConfigFingerprint`; configuration order, host ID or exact name drift invalidates authorization.
 - AI: Fetch fresh provider observations for every prerequisite check and require every configured bridge to resolve uniquely to a currently Monitored registered host. The upstream host-filter failure path can select the original list, so one healthy endpoint cannot excuse an unknown or disabled member. This verifies identity and registered-host eligibility, not Ceph authentication or allocation permissions.
 - AI: Treat bindings as durable operator inventory without a renewal TTL. Do not infer identity through DNS or SSH in the service. IP reassignment outside OpenNebula remains the operator's inventory responsibility.
