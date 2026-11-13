@@ -115,3 +115,8 @@ The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI i
 
 - AI: Combine reviewed provider source PR7 at 2eb6e4a and node source PR8 at 641d317 through ordinary local merges. Resolve only the three overlapping documentation files by retaining both contracts and their decision history. All code, test and Helm blobs remain exact component versions.
 - AI: Preserve the current HUMAN 7.4.0/no-direct-host instruction and the superseded status of earlier upgrade preparation. This source integration neither changes the operation-specific growth prerequisite nor grants a native acceptance or feature waiver. Native qualification and the 24-hour observation remain open.
+
+## 2026-11-13, node expansion deadline fixture synchronization
+
+- AI: Capture the actual operation context at the first capacity command and await its cancellation before injecting the deadline observation error. Waiting for the caller context alone does not synchronize child cancellation. Retain all filesystem formats, command boundaries, deadline status and mutation assertions; production context handling is unchanged.
+- AI: Preserve the independent Plan007 runtime failure receipt alongside the corrected fixture results. Local validation does not qualify native expansion or reattach, waive acceptance, or start the 24-hour observation. The current OpenNebula 7.4.0/no-direct-host instruction remains in force.

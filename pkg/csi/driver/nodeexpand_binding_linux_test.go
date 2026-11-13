@@ -388,6 +388,16 @@ func (c nodeExpandAfterProbeCmd) CombinedOutput() ([]byte, error) {
 	return output, err
 }
 
+type nodeExpandContextExec struct {
+	utilexec.Interface
+	observe func(context.Context, string)
+}
+
+func (e nodeExpandContextExec) CommandContext(ctx context.Context, cmd string, args ...string) utilexec.Cmd {
+	e.observe(ctx, cmd)
+	return e.Interface.CommandContext(ctx, cmd, args...)
+}
+
 func TestNodeExpandMountUtilsBindingAcrossCommands(t *testing.T) {
 	for _, format := range []string{"ext3", "ext4", "xfs", "btrfs"} {
 		for _, boundary := range []string{"probe", "command creation", "resize", "statfs"} {
@@ -423,6 +433,7 @@ func TestNodeExpandMountUtilsBindingAcrossCommands(t *testing.T) {
 						ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
 					}
 					defer cancel()
+					var operationCtx context.Context
 					oldStat, oldFS := nodeVolumePathStat, nodeVolumePathFS
 					oldInfo, oldDirectory := nodeBtrfsFilesystemInfo, nodeBtrfsDevicesDirectory
 					t.Cleanup(func() {
@@ -449,7 +460,12 @@ func TestNodeExpandMountUtilsBindingAcrossCommands(t *testing.T) {
 								cancel()
 								return nil, os.ErrNotExist
 							case "expired observation":
-								<-ctx.Done()
+								require.NotNil(t, operationCtx, "capture the RPC context before injecting expiry")
+								require.NotSame(t, ctx, operationCtx)
+								// Parent Done can close before cancellation reaches its child.
+								// Synchronize with the context checked by the actual RPC.
+								<-operationCtx.Done()
+								require.ErrorIs(t, operationCtx.Err(), context.DeadlineExceeded)
 								return nil, os.ErrNotExist
 							}
 						}
@@ -546,7 +562,16 @@ func TestNodeExpandMountUtilsBindingAcrossCommands(t *testing.T) {
 					for range 4 {
 						commands.CommandScript = append(commands.CommandScript, action)
 					}
-					ns.mounter.Exec = commands
+					ns.mounter.Exec = nodeExpandContextExec{Interface: commands, observe: func(commandCtx context.Context, cmd string) {
+						require.NotNil(t, commandCtx)
+						if operationCtx == nil {
+							require.Equal(t, "blockdev", cmd, "capture the first capacity command")
+							require.False(t, changed, "capture the context before any external transition")
+							operationCtx = commandCtx
+						} else {
+							require.Same(t, operationCtx, commandCtx, "all commands must use the same RPC context")
+						}
+					}}
 					response, err := ns.NodeExpandVolume(ctx, &csi.NodeExpandVolumeRequest{VolumeId: "command-boundary-fixture", VolumePath: publish, StagingTargetPath: stage, CapacityRange: &csi.CapacityRange{RequiredBytes: 2147483648}})
 					require.True(t, changed, "exercise the selected external boundary")
 					require.Equal(t, 1, probeCalls)

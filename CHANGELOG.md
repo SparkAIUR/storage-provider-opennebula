@@ -2,6 +2,10 @@
 
 Current source target is OpenNebula 7.4.0, with no direct OpenNebula host actions. This integration grants no native acceptance or feature waiver; affected persistent growth/reattach and the 24-hour observation remain open.
 
+## Unreleased test reliability
+
+- Synchronize node expansion deadline injection with the actual RPC command context. Preserve deadline status and mutation assertions without relying on parent-to-child cancellation scheduling. Production behavior and native qualification gates are unchanged.
+
 ## Unreleased provider growth prerequisite
 
 - Add an operation-specific [persistent growth prerequisite](docs/opennebula-74-upgrade.md#provider-growth-metadata-prerequisite-2026-11-13), including restoration, while retaining basic OpenNebula 7.4.0 support. See that contract for allowed growth, mutation limits and open native gates.
