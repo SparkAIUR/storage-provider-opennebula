@@ -33,6 +33,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 )
@@ -341,9 +342,19 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	if contentSource != nil {
 		switch source := contentSource.Type.(type) {
 		case *csi.VolumeContentSource_Volume:
+			selection.CloneRequiredBytes = requiredBytes
+			if req.GetCapacityRange() != nil {
+				selection.CloneLimitBytes = req.GetCapacityRange().GetLimitBytes()
+			}
 			result, err := s.volumeProvider.CloneVolume(ctx, name, source.Volume.GetVolumeId(), selection)
 			if err != nil {
 				switch {
+				case errors.Is(err, opennebula.ErrCloneCapacity):
+					s.driver.metrics.RecordOperation("create_volume", backend, "out_of_range", time.Since(started))
+					return nil, status.Error(codes.OutOfRange, err.Error())
+				case errors.Is(err, opennebula.ErrCloneConflict):
+					s.driver.metrics.RecordOperation("create_volume", backend, "already_exists", time.Since(started))
+					return nil, status.Error(codes.AlreadyExists, err.Error())
 				case opennebula.IsDatastoreTopologyError(err):
 					s.driver.metrics.RecordOperation("create_volume", backend, "resource_exhausted", time.Since(started))
 					return nil, status.Error(codes.ResourceExhausted, err.Error())
@@ -400,7 +411,7 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		return nil, status.Errorf(codes.Internal, "failed to verify whether volume %q already exists: %v", name, volumeExistsErr)
 	}
 	if volumeID != -1 {
-		ready, readyErr := s.volumeProvider.VolumeReadyWithTimeout(volumeID)
+		ready, readyErr := s.volumeProvider.VolumeReadyWithTimeout(ctx, volumeID)
 		if readyErr != nil {
 			s.driver.metrics.RecordOperation("create_volume", backend, "already_exists", time.Since(started))
 			klog.V(0).ErrorS(readyErr, "Volume with same name already exists but readiness check failed",
@@ -576,6 +587,22 @@ func (s *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 		return &csi.DeleteVolumeResponse{}, nil
 	}
 
+	var identityErr error
+	ctx, identityErr = s.pinKnownVolumeIdentity(ctx, req.VolumeId)
+	if identityErr != nil {
+		return nil, status.Error(codes.Unavailable, identityErr.Error())
+	}
+	if manager := s.driver.volumeQuarantine; manager != nil && manager.runtime != nil && manager.runtime.enabled {
+		cm, e := manager.runtime.GetConfigMap(ctx, manager.namespace, volumeQuarantineStateConfigMapName)
+		if e != nil && !apierrors.IsNotFound(e) {
+			return nil, status.Error(codes.Unavailable, "cannot inspect cleanup quarantine")
+		}
+		if e == nil {
+			if _, exists := cm.Data[req.VolumeId]; exists {
+				return nil, status.Error(codes.FailedPrecondition, "volume has unresolved cleanup quarantine; external verification required")
+			}
+		}
+	}
 	err := s.volumeProvider.DeleteVolume(ctx, req.VolumeId)
 	if err != nil {
 		s.driver.metrics.RecordOperation("delete_volume", "disk", "failed_precondition", time.Since(started))
@@ -628,24 +655,8 @@ func (s *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 		}, nil
 	}
 
-	snapshot, err := s.volumeProvider.CreateSnapshot(ctx, req.GetSourceVolumeId(), req.GetName())
-	if err != nil {
-		s.driver.metrics.RecordSnapshot("disk", "create", "internal")
-		return nil, status.Error(codes.Internal, err.Error())
-	}
+	return nil, status.Error(codes.Unimplemented, "new disk snapshot creation is unavailable until backend lifecycle qualification")
 
-	s.driver.metrics.RecordSnapshot("disk", "create", "success")
-	s.driver.metrics.RecordOperation("create_snapshot", "disk", "success", time.Since(started))
-
-	return &csi.CreateSnapshotResponse{
-		Snapshot: &csi.Snapshot{
-			SizeBytes:      snapshot.SizeBytes,
-			SnapshotId:     snapshot.SnapshotID,
-			SourceVolumeId: snapshot.SourceVolumeID,
-			CreationTime:   timestamppb.New(snapshot.CreationTime),
-			ReadyToUse:     snapshot.ReadyToUse,
-		},
-	}, nil
 }
 
 func (s *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
@@ -947,28 +958,6 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.Unavailable, message)
 	}
 
-	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
-	if err == nil {
-		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), runtimeCtx); localErr != nil {
-			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "unavailable", time.Since(started))
-			s.driver.metrics.RecordControllerPublishDuration("disk", "unavailable", time.Since(started))
-			return nil, localErr
-		}
-		if s.driver.volumeQuarantine != nil {
-			_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
-		}
-		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
-		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
-		s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), &protection, lookup.AttachmentMetadata)
-		publishContext := s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext())
-		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
-		s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
-		klog.V(1).InfoS("Volume already attached to node",
-			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
-		return &csi.ControllerPublishVolumeResponse{
-			PublishContext: publishContext,
-		}, nil
-	}
 	priority := hotplugQueuePriorityNormal
 	if _, ok := s.driver.stickyAttachments.Get(req.VolumeId); ok {
 		priority = hotplugQueuePriorityCritical
@@ -980,6 +969,34 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 		release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
 		defer release()
+
+		target, err := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
+		if err == nil {
+			if err := s.volumeProvider.RestoreVolumeCapacity(queueCtx, req.VolumeId, nodeID, volumeID); err != nil {
+				return status.Errorf(codes.Internal, "failed to restore volume capacity: %v", err)
+			}
+			if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(queueCtx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), runtimeCtx); localErr != nil {
+				s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "unavailable", time.Since(started))
+				s.driver.metrics.RecordControllerPublishDuration("disk", "unavailable", time.Since(started))
+				return localErr
+			}
+			if s.driver.volumeQuarantine != nil {
+				_ = s.driver.volumeQuarantine.Clear(queueCtx, req.VolumeId)
+			}
+			s.clearStickyReuseState(queueCtx, req.VolumeId, req.NodeId, "disk")
+			s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
+			s.recordSuccessfulLocalVolumePublish(queueCtx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), &protection, lookup.AttachmentMetadata)
+			publishContext := s.publishContextForVolume(queueCtx, req.VolumeId, target, 0, req.GetVolumeContext())
+			klog.V(1).InfoS("Volume already attached to node",
+				"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
+			response = &csi.ControllerPublishVolumeResponse{
+				PublishContext: publishContext,
+			}
+			return nil
+		}
+		if !errors.Is(err, opennebula.ErrAttachmentNotFound) {
+			return status.Errorf(codes.Unavailable, "attachment state is unknown: %v", err)
+		}
 
 		if handled, freshResponse, freshErr := s.precheckPublishHotplug(queueCtx, req, volumeID, nodeID, &protection, lookup.AttachmentMetadata); handled {
 			if freshErr != nil {
@@ -1041,7 +1058,10 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID)
 		target, err = s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
 		if err != nil {
-			return status.Error(codes.Internal, "failed to get volume in node")
+			return status.Errorf(codes.Unavailable, "failed to verify attached volume: %v", err)
+		}
+		if err := s.volumeProvider.RestoreVolumeCapacity(queueCtx, req.VolumeId, nodeID, volumeID); err != nil {
+			return status.Errorf(codes.Internal, "failed to restore volume capacity: %v", err)
 		}
 		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(queueCtx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), runtimeCtx); localErr != nil {
 			return localErr
@@ -1092,6 +1112,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, queueErr
 	}
 
+	if response == nil {
+		return nil, status.Error(codes.Aborted, "publish completion requires capacity verification; retry the request")
+	}
 	s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
 	s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
 	return response, nil
@@ -1114,34 +1137,31 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 
+	var identityErr error
+	ctx, identityErr = s.pinKnownVolumeIdentity(ctx, req.VolumeId)
+	if identityErr != nil {
+		return nil, status.Error(codes.Unavailable, identityErr.Error())
+	}
 	volumeID, _, err := s.volumeProvider.VolumeExists(ctx, req.VolumeId)
-	if err != nil || volumeID == -1 {
+	if err != nil && !errors.Is(err, opennebula.ErrVolumeNotFound) && !opennebula.IsAuthoritativeVolumeAbsence(err) {
+		return nil, status.Errorf(codes.Unavailable, "volume lookup is unknown: %v", err)
+	}
+	if volumeID == -1 {
 		klog.V(1).InfoS("Volume not found, skipping volume unpublish",
 			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId)
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 
 	nodeID, err := s.volumeProvider.NodeExists(ctx, req.NodeId)
-	if err != nil || nodeID == -1 {
-		volumeReady, err := s.volumeProvider.VolumeReadyWithTimeout(volumeID)
-		if err != nil {
-			klog.V(0).ErrorS(err, "Failed to check if volume is used",
-				"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId)
-			return nil, status.Error(codes.Internal, "failed to check if volume is used")
-		}
-
-		if !volumeReady {
-			klog.V(0).ErrorS(err, "Node not found and volume is still in use",
-				"method", "ControllerUnpublishVolume", "nodeID", req.NodeId)
-			return nil, status.Error(codes.NotFound, "node not found and volume is still in use")
-		}
-		klog.V(1).InfoS("Node not found and volume not in use, skipping volume unpublish",
-			"method", "ControllerUnpublishVolume", "nodeID", req.NodeId)
-		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	if err != nil || nodeID <= 0 {
+		return nil, status.Errorf(codes.Unavailable, "attachment node lookup is unknown: %v", err)
 	}
 
 	_, err = s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err != nil {
+		if !errors.Is(err, opennebula.ErrAttachmentNotFound) {
+			return nil, status.Errorf(codes.Unavailable, "attachment state is unknown: %v", err)
+		}
 		s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
 		klog.V(1).InfoS("Volume does not exist in node, skipping unpublish",
 			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
@@ -1840,19 +1860,28 @@ func (s *ControllerServer) withQueuedHotplug(ctx context.Context, node, operatio
 }
 
 func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node, operation, volume string) HotplugQueueValidation {
-	return s.evaluateVolumeReconcile(ctx, node, operation, volume).HotplugQueueValidation()
+	validation := s.evaluateVolumeReconcile(ctx, node, operation, volume).HotplugQueueValidation()
+	if operation == "attach" && validation.Decision == HotplugQueueValidationCompleted {
+		validation.Decision = HotplugQueueValidationValid
+	}
+	return validation
 }
 
 func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.ControllerPublishVolumeRequest, volumeID, nodeID int, protection *LocalRWOProtectionDecision, metadata *opennebula.VolumeAttachmentMetadata) (bool, *csi.ControllerPublishVolumeResponse, error) {
 	if s == nil || req == nil {
 		return false, nil, nil
 	}
-	validation := s.validateHotplugQueueRequest(ctx, req.NodeId, "attach", req.VolumeId)
+	validation := s.evaluateVolumeReconcile(ctx, req.NodeId, "attach", req.VolumeId).HotplugQueueValidation()
 	switch validation.Decision {
 	case HotplugQueueValidationCompleted:
 		target := strings.TrimSpace(validation.AttachmentTarget)
 		if target == "" {
 			return false, nil, nil
+		}
+		if validation.Reason != queueReasonManualRecoveryAdopted {
+			if err := s.volumeProvider.RestoreVolumeCapacity(ctx, req.VolumeId, nodeID, volumeID); err != nil {
+				return true, nil, status.Errorf(codes.Internal, "failed to restore volume capacity: %v", err)
+			}
 		}
 		if protection == nil {
 			protection = &LocalRWOProtectionDecision{}
@@ -1915,22 +1944,27 @@ func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *cs
 	if s == nil || req == nil {
 		return false, nil, nil
 	}
-	validation := s.validateHotplugQueueRequest(ctx, req.NodeId, "detach", req.VolumeId)
-	switch validation.Decision {
-	case HotplugQueueValidationCompleted, HotplugQueueValidationStale:
+	decision := s.evaluateVolumeReconcile(ctx, req.NodeId, "detach", req.VolumeId)
+	switch decision.Action {
+	case VolumeReconcileComplete:
+		if !errors.Is(decision.Evidence.AttachedErr, opennebula.ErrAttachmentNotFound) {
+			return true, nil, status.Error(codes.Unavailable, "attachment absence is unverified")
+		}
 		s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
 		return true, &csi.ControllerUnpublishVolumeResponse{}, nil
-	case HotplugQueueValidationPaused:
-		if detachPauseCanReturnSuccess(validation.Reason) {
+	case VolumeReconcileReject, VolumeReconcileStale:
+		return true, nil, decision.Err()
+	case VolumeReconcilePause:
+		if detachPauseCanReturnSuccess(decision.Reason) {
 			s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
 			return true, &csi.ControllerUnpublishVolumeResponse{}, nil
 		}
 		eventReason := eventReasonHotplugCooldown
-		if validation.Reason == queueReasonRecoveryModeManual || validation.Reason == queueReasonRecoveryModeObserve {
+		if decision.Reason == queueReasonRecoveryModeManual || decision.Reason == queueReasonRecoveryModeObserve {
 			eventReason = eventReasonRecoveryModeActive
 		}
-		s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReason, validation.Message)
-		return true, nil, status.Error(codes.Unavailable, validation.Message)
+		s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReason, decision.Message)
+		return true, nil, decision.Err()
 	default:
 		return false, nil, nil
 	}
@@ -2365,6 +2399,9 @@ func (s *ControllerServer) rescueSameNodeUnpublish(ctx context.Context, req *csi
 	}
 	target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err != nil {
+		if !errors.Is(err, opennebula.ErrAttachmentNotFound) {
+			return true, nil, status.Errorf(codes.Unavailable, "attachment state is unknown: %v", err)
+		}
 		return false, nil, nil
 	}
 	if s.driver.stickyAttachments != nil {
@@ -2466,8 +2503,14 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 	if strings.TrimSpace(state.NodeID) == strings.TrimSpace(req.NodeId) {
 		target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 		if err != nil {
+			if !errors.Is(err, opennebula.ErrAttachmentNotFound) {
+				return true, nil, status.Errorf(codes.Unavailable, "attachment state is unknown: %v", err)
+			}
 			_ = s.driver.stickyAttachments.Clear(req.VolumeId)
 			return false, nil, nil
+		}
+		if err := s.volumeProvider.RestoreVolumeCapacity(ctx, req.VolumeId, nodeID, volumeID); err != nil {
+			return true, nil, status.Errorf(codes.Internal, "failed to restore volume capacity: %v", err)
 		}
 		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), nil); localErr != nil {
 			return true, nil, localErr
@@ -2502,17 +2545,21 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 	}
 
 	oldNodeID, oldNodeErr := s.volumeProvider.NodeExists(ctx, state.NodeID)
-	if oldNodeErr == nil && oldNodeID != -1 {
-		if _, oldAttachErr := s.volumeProvider.GetVolumeInNode(ctx, volumeID, oldNodeID); oldAttachErr != nil {
-			if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
-				return true, nil, status.Errorf(codes.Internal, "failed to clear sticky attachment state: %v", err)
-			}
-			s.recordSafeDetach(ctx, req.VolumeId, state.NodeID)
-			s.driver.metrics.RecordStickyDetach("already_absent", state.Reason)
-			s.driver.metrics.RecordStickyDetachResidency("already_absent", time.Since(state.StartedAt))
-			s.recordPVCEventFromStickyState(ctx, state, eventReasonDetachGraceCancelled, fmt.Sprintf("cleared stale attachment state for volume %s because it is already absent from node %s", req.VolumeId, state.NodeID))
-			return false, nil, nil
+	if oldNodeErr != nil || oldNodeID <= 0 {
+		return true, nil, status.Errorf(codes.Unavailable, "old attachment node is unknown: %v", oldNodeErr)
+	}
+	if _, oldAttachErr := s.volumeProvider.GetVolumeInNode(ctx, volumeID, oldNodeID); oldAttachErr != nil {
+		if !errors.Is(oldAttachErr, opennebula.ErrAttachmentNotFound) {
+			return true, nil, status.Errorf(codes.Unavailable, "old attachment is unknown: %v", oldAttachErr)
 		}
+		if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
+			return true, nil, status.Errorf(codes.Internal, "failed to clear sticky attachment state: %v", err)
+		}
+		s.recordSafeDetach(ctx, req.VolumeId, state.NodeID)
+		s.driver.metrics.RecordStickyDetach("already_absent", state.Reason)
+		s.driver.metrics.RecordStickyDetachResidency("already_absent", time.Since(state.StartedAt))
+		s.recordPVCEventFromStickyState(ctx, state, eventReasonDetachGraceCancelled, fmt.Sprintf("cleared stale attachment state for volume %s because it is already absent from node %s", req.VolumeId, state.NodeID))
+		return false, nil, nil
 	}
 
 	if err := s.volumeProvider.DetachVolume(ctx, req.VolumeId, state.NodeID); err != nil {
@@ -2566,40 +2613,37 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 			return nil
 		}
 
-		if desired, reason, desiredErr := s.driver.kubeRuntime.VolumeDesiredOnNode(queueCtx, confirmed.VolumeID, confirmed.NodeID); desiredErr == nil && desired {
-			volumeID, _, volumeErr := s.volumeProvider.VolumeExists(queueCtx, confirmed.VolumeID)
-			nodeID, nodeErr := s.volumeProvider.NodeExists(queueCtx, confirmed.NodeID)
-			if volumeErr == nil && nodeErr == nil && volumeID != -1 && nodeID != -1 {
-				if _, attachedErr := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID); attachedErr == nil {
-					if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
-						klog.V(2).InfoS("Failed to clear sticky attachment state after same-node desired validation", "volumeID", confirmed.VolumeID, "err", err)
-						return err
-					}
-					s.driver.metrics.RecordStickyDetach("reused", confirmed.Reason)
-					s.driver.metrics.RecordStickyDetachResidency("reused", time.Since(confirmed.StartedAt))
-					s.recordPVCEventFromStickyState(queueCtx, confirmed, eventReasonSameNodeDetachRescued, fmt.Sprintf("kept expired sticky volume %s attached to node %s because Kubernetes still desires it there (%s)", confirmed.VolumeID, confirmed.NodeID, reason))
-					return nil
-				}
-			}
-		}
-
 		volumeID, _, volumeErr := s.volumeProvider.VolumeExists(queueCtx, confirmed.VolumeID)
 		nodeID, nodeErr := s.volumeProvider.NodeExists(queueCtx, confirmed.NodeID)
-		if volumeErr == nil && nodeErr == nil && volumeID != -1 && nodeID != -1 {
-			if _, attachedErr := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID); attachedErr != nil {
-				if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
-					klog.V(2).InfoS("Failed to clear already-absent sticky attachment state", "volumeID", confirmed.VolumeID, "err", err)
-					return err
-				}
-				s.recordSafeDetach(queueCtx, confirmed.VolumeID, confirmed.NodeID)
-				if s.driver.volumeQuarantine != nil {
-					_ = s.driver.volumeQuarantine.Clear(queueCtx, confirmed.VolumeID)
-				}
-				s.driver.metrics.RecordStickyDetach("already_absent", confirmed.Reason)
-				s.driver.metrics.RecordStickyDetachResidency("already_absent", time.Since(confirmed.StartedAt))
-				s.recordPVCEventFromStickyState(queueCtx, confirmed, eventReasonDetachGraceExpired, fmt.Sprintf("cleared expired sticky state for volume %s because it is already absent from node %s", confirmed.VolumeID, confirmed.NodeID))
-				return nil
+		if volumeErr != nil || nodeErr != nil || volumeID <= 0 || nodeID <= 0 {
+			return status.Errorf(codes.Unavailable, "attachment identity is unknown: volume lookup: %v; node lookup: %v", volumeErr, nodeErr)
+		}
+		if _, attachedErr := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID); attachedErr != nil {
+			if !errors.Is(attachedErr, opennebula.ErrAttachmentNotFound) {
+				return status.Errorf(codes.Unavailable, "attachment is unknown: %v", attachedErr)
 			}
+			if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
+				klog.V(2).InfoS("Failed to clear already-absent sticky attachment state", "volumeID", confirmed.VolumeID, "err", err)
+				return err
+			}
+			s.recordSafeDetach(queueCtx, confirmed.VolumeID, confirmed.NodeID)
+			if s.driver.volumeQuarantine != nil {
+				_ = s.driver.volumeQuarantine.Clear(queueCtx, confirmed.VolumeID)
+			}
+			s.driver.metrics.RecordStickyDetach("already_absent", confirmed.Reason)
+			s.driver.metrics.RecordStickyDetachResidency("already_absent", time.Since(confirmed.StartedAt))
+			s.recordPVCEventFromStickyState(queueCtx, confirmed, eventReasonDetachGraceExpired, fmt.Sprintf("cleared expired sticky state for volume %s because it is already absent from node %s", confirmed.VolumeID, confirmed.NodeID))
+			return nil
+		}
+		if desired, reason, desiredErr := s.driver.kubeRuntime.VolumeDesiredOnNode(queueCtx, confirmed.VolumeID, confirmed.NodeID); desiredErr == nil && desired {
+			if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
+				klog.V(2).InfoS("Failed to clear sticky attachment state after same-node desired validation", "volumeID", confirmed.VolumeID, "err", err)
+				return err
+			}
+			s.driver.metrics.RecordStickyDetach("reused", confirmed.Reason)
+			s.driver.metrics.RecordStickyDetachResidency("reused", time.Since(confirmed.StartedAt))
+			s.recordPVCEventFromStickyState(queueCtx, confirmed, eventReasonSameNodeDetachRescued, fmt.Sprintf("kept expired sticky volume %s attached to node %s because Kubernetes still desires it there (%s)", confirmed.VolumeID, confirmed.NodeID, reason))
+			return nil
 		}
 
 		detachStarted := time.Now()
@@ -2817,4 +2861,17 @@ func hasSingleWriterAccessMode(modes []corev1.PersistentVolumeAccessMode) bool {
 		}
 	}
 	return false
+}
+
+func (s *ControllerServer) pinKnownVolumeIdentity(ctx context.Context, volume string) (context.Context, error) {
+	if s.driver.volumeHistory == nil {
+		return ctx, nil
+	}
+	if err := s.driver.volumeHistory.RefreshEntry(ctx, volume); err != nil {
+		return ctx, err
+	}
+	if record, ok := s.driver.volumeHistory.Get(volume); ok && record.LastSuccessfulImageID > 0 {
+		return opennebula.WithExpectedImageID(ctx, record.LastSuccessfulImageID), nil
+	}
+	return ctx, nil
 }

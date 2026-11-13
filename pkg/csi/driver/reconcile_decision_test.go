@@ -85,3 +85,5 @@ func TestVolumeReconcileDecisionBlocksQuarantinedAttachBeforeStaleAttachCheck(t 
 type assertNotAttachedErr struct{}
 
 func (assertNotAttachedErr) Error() string { return "not attached" }
+
+func (assertNotAttachedErr) Unwrap() error { return opennebula.ErrAttachmentNotFound }

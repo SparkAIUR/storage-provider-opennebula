@@ -135,7 +135,7 @@ func TestNodeRecordsLocalDeviceMountFailureReport(t *testing.T) {
 }
 
 func TestLocalDeviceRecoveryRequiresProvenAttachmentAbsence(t *testing.T) {
-	for _, outcome := range []string{"metadata-attached", "unknown", "inspection-error", "other-owner", "absent", "confirmed-before-begin"} {
+	for _, outcome := range []string{"metadata-attached", "lookup-error", "unknown", "inspection-error", "other-owner", "absent", "confirmed-before-begin"} {
 		t.Run(outcome, func(t *testing.T) {
 			_, ns, server, provider, report := recoveryReviewFixture(t)
 			ctx := context.Background()
@@ -143,10 +143,13 @@ func TestLocalDeviceRecoveryRequiresProvenAttachmentAbsence(t *testing.T) {
 			provider.On("NodeReady", mock.Anything, report.Node).Return(true, nil).Once()
 			provider.On("VolumeExists", mock.Anything, report.VolumeID).Return(394, 1, nil).Once()
 			provider.On("NodeExists", mock.Anything, report.Node).Return(208, nil).Once()
-			if outcome == "metadata-attached" {
+			switch outcome {
+			case "metadata-attached":
 				provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("sdd", nil).Once()
-			} else {
+			case "lookup-error":
 				provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("", errors.New("lookup failed")).Once()
+			default:
+				provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Once()
 				var metadata *opennebula.VolumeAttachmentMetadata
 				var inspectErr error
 				if outcome == "inspection-error" {
@@ -195,6 +198,9 @@ func TestLocalDeviceRecoveryRequiresProvenAttachmentAbsence(t *testing.T) {
 				require.False(t, exists)
 			default:
 				require.Equal(t, "failed", current.LastRecoveryOutcome)
+			}
+			if outcome != "absent" {
+				provider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 			}
 			provider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
 			provider.AssertExpectations(t)
@@ -250,7 +256,7 @@ func TestLocalDeviceRecoveryPersistsHostArtifactQuarantineOnReattachConflict(t *
 	mockProvider.On("NodeReady", mock.Anything, "node-a").Return(true, nil).Once()
 	mockProvider.On("VolumeExists", mock.Anything, "vol-device-artifact").Return(575, 1, nil).Once()
 	mockProvider.On("NodeExists", mock.Anything, "node-a").Return(160, nil).Once()
-	mockProvider.On("GetVolumeInNode", mock.Anything, 575, 160).Return("", errors.New("not attached")).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 575, 160).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Once()
 	mockProvider.On("InspectVolumeAttachment", mock.Anything, report.VolumeID, "node-a").Return(&opennebula.VolumeAttachmentMetadata{VolumeHandle: report.VolumeID, ImageID: 575, RequestedNodeID: 160}, nil).Once()
 	mockProvider.On("AttachVolume", mock.Anything, "vol-device-artifact", "node-a", false, mock.Anything).Return(conflict).Once()
 	server := NewControllerServer(driver, mockProvider, nil)

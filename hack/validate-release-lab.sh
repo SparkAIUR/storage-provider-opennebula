@@ -10,8 +10,8 @@ CSI_IMAGE_TAG="${CSI_IMAGE_TAG:-}"
 LAB_KUBECONFIG="${LAB_KUBECONFIG:-${KUBECONFIG:-${ROOT_DIR}/refs/kubeconfig.yaml}}"
 VALIDATION_NAMESPACE="${VALIDATION_NAMESPACE:-opennebula-csi-release-validation}"
 SC_NAME="${SC_NAME:-opennebula-default-rwo}"
-LOCAL_NODE="${LOCAL_NODE:-hplcsiw01}"
-LOCAL_NODE_ALT="${LOCAL_NODE_ALT:-hplcsiw02}"
+LOCAL_NODE="${LOCAL_NODE:?set an approved disposable lab node}"
+LOCAL_NODE_ALT="${LOCAL_NODE_ALT:?set a second approved disposable lab node}"
 CNPG_TIMEOUT_SECONDS="${CNPG_TIMEOUT_SECONDS:-600}"
 STICKY_TIMEOUT_SECONDS="${STICKY_TIMEOUT_SECONDS:-240}"
 
@@ -54,10 +54,11 @@ wait_for_datastore_phase() {
   return 1
 }
 
-cleanup() {
-  kubectl --kubeconfig "${LAB_KUBECONFIG}" delete namespace "${VALIDATION_NAMESPACE}" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
+# Legacy invasive suite remains available only in an isolated disposable cluster.
+# It changes maintenance state and StorageClasses and is never an hpldb qualification tool.
+[[ "${ISOLATED_DISPOSABLE_CLUSTER_APPROVAL:-}" == "run invasive isolated lab suite" ]] || { echo 'Use docs/opennebula-74-upgrade.md for scoped hpldb qualification; isolated lab approval required.' >&2; exit 1; }
+[[ "${VALIDATION_NAMESPACE}" == opennebula-csi-lab-* ]] || { echo 'require unique opennebula-csi-lab-* namespace' >&2; exit 1; }
+# Failed resources are retained. Cleanup is an explicit operator action.
 
 configmap_has_key() {
   local namespace="$1"
@@ -105,6 +106,10 @@ wait_for_event_reason() {
 
 require ONE_XMLRPC
 require ONE_AUTH
+require LAB_CLUSTER_UID
+require CSI_IMAGE_DIGEST
+actual_cluster_uid="$(kubectl --kubeconfig "${LAB_KUBECONFIG}" get ns kube-system -o jsonpath='{.metadata.uid}')"
+[[ "$actual_cluster_uid" == "$LAB_CLUSTER_UID" ]] || { echo "wrong cluster UID" >&2; exit 1; }
 
 cd "${ROOT_DIR}"
 
@@ -118,15 +123,16 @@ helm template "${RELEASE_NAME}" helm/opennebula-csi \
   --set "inventoryController.enabled=true" >/tmp/opennebula-csi-release-validation-render.yaml
 
 kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1 || kubectl create namespace "${NAMESPACE}"
-kubectl delete namespace "${VALIDATION_NAMESPACE}" --ignore-not-found=true --wait=true >/dev/null 2>&1 || true
+if kubectl get namespace "${VALIDATION_NAMESPACE}" >/dev/null 2>&1; then echo "validation namespace already exists; do not adopt or clean it" >&2; exit 1; fi
 kubectl create namespace "${VALIDATION_NAMESPACE}" >/dev/null 2>&1 || true
 
 helm_args=(
   upgrade --install "${RELEASE_NAME}" helm/opennebula-csi
   --namespace "${NAMESPACE}"
   --create-namespace
-  --force-conflicts
-  --take-ownership
+  --wait
+  --wait-for-jobs
+  --timeout 150m
   --set "oneApiEndpoint=${ONE_XMLRPC}"
   --set-string "credentials.inlineAuth=${ONE_AUTH}"
   --set "inventoryController.enabled=true"
@@ -140,6 +146,7 @@ if [[ -n "${CSI_IMAGE_TAG}" ]]; then
   helm_args+=(--set "image.tag=${CSI_IMAGE_TAG}" --set "image.pullPolicy=Always")
 fi
 
+helm_args+=(--set "image.digest=${CSI_IMAGE_DIGEST}")
 helm "${helm_args[@]}"
 
 controller_name="$(first_matching_name statefulset "${RELEASE_NAME}-controller" "${RELEASE_NAME}-opennebula-csi-controller")"
@@ -148,11 +155,7 @@ inventory_name="$(first_matching_name deployment "${RELEASE_NAME}-inventory" "${
 webhook_service_name="$(first_matching_name service "${RELEASE_NAME}-last-node-webhook" "${RELEASE_NAME}-opennebula-csi-last-node-webhook")"
 webhook_config_name="$(kubectl get mutatingwebhookconfiguration -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -E "^(${RELEASE_NAME}-last-node-preference|${RELEASE_NAME}-opennebula-csi-last-node-preference)$" | head -1)"
 
-kubectl -n "${NAMESPACE}" rollout restart statefulset/"${controller_name}" || true
-kubectl -n "${NAMESPACE}" rollout restart daemonset/"${node_name}" || true
-kubectl -n "${NAMESPACE}" rollout restart deployment/"${inventory_name}" || true
-kubectl -n "${NAMESPACE}" delete pod "${controller_name}-0" --ignore-not-found=true --wait=false || true
-
+# Existing OnDelete node pods require separately supervised FUSE drain/replacement.
 kubectl -n "${NAMESPACE}" rollout status statefulset/"${controller_name}" --timeout=10m
 kubectl -n "${NAMESPACE}" rollout status daemonset/"${node_name}" --timeout=10m
 kubectl -n "${NAMESPACE}" rollout status deployment/"${inventory_name}" --timeout=10m

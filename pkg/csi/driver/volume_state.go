@@ -203,7 +203,7 @@ func (m *VolumeHistoryManager) Upsert(ctx context.Context, volumeID string, muta
 		return state, nil
 	}
 	cmClient := m.runtime.client.CoreV1().ConfigMaps(m.namespace)
-	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err = retryOnConflict(retry.DefaultRetry, func() error {
 		cm, err := cmClient.Get(ctx, volumeHistoryStateConfigMapName, metav1.GetOptions{})
 		missing := errors.IsNotFound(err)
 		if err != nil && !missing {
@@ -498,7 +498,7 @@ func (m *VolumeRepairStateManager) ClearObserved(ctx context.Context, expected V
 		return nil
 	}
 	cmClient := m.runtime.client.CoreV1().ConfigMaps(m.namespace)
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	return retryOnConflict(retry.DefaultRetry, func() error {
 		cm, err := cmClient.Get(ctx, volumeRepairStateConfigMapName, metav1.GetOptions{})
 		if errors.IsNotFound(err) {
 			return nil

@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -89,6 +90,7 @@ func (d VolumeReconcileDecision) HotplugQueueValidation() HotplugQueueValidation
 		}
 	case VolumeReconcileReject, VolumeReconcileStale:
 		return HotplugQueueValidation{
+			Err:      d.Err(),
 			Decision: HotplugQueueValidationStale,
 			Reason:   d.Reason,
 			Message:  d.Message,
@@ -133,12 +135,15 @@ func (s *ControllerServer) evaluateVolumeReconcile(ctx context.Context, node, op
 		decision.Evidence = evidence
 		switch status.Code(lookupErr) {
 		case codes.NotFound:
+			if !errors.Is(lookupErr, opennebula.ErrVolumeNotFound) {
+				return decision.with(VolumeReconcilePause, "volume_lookup_unknown", codes.Unavailable, lookupErr.Error())
+			}
 			return decision.with(VolumeReconcileStale, "volume_not_found", codes.NotFound,
 				fmt.Sprintf("volume %s no longer exists; dropping queued %s for node %s", evidence.VolumeID, evidence.Operation, evidence.NodeID))
 		case codes.FailedPrecondition:
 			return decision.with(VolumeReconcileReject, queueReasonRepairRequired, codes.FailedPrecondition, lookupErr.Error())
 		default:
-			return decision
+			return decision.with(VolumeReconcilePause, "volume_lookup_unknown", codes.Unavailable, lookupErr.Error())
 		}
 	}
 	if lookup != nil {
@@ -150,12 +155,12 @@ func (s *ControllerServer) evaluateVolumeReconcile(ctx context.Context, node, op
 	evidence.NodeLookupErr = nodeErr
 	if nodeErr != nil {
 		decision.Evidence = evidence
-		return decision
+		return decision.with(VolumeReconcilePause, "node_lookup_unknown", codes.Unavailable, nodeErr.Error())
 	}
 	if nodeID == -1 {
 		decision.Evidence = evidence
-		return decision.with(VolumeReconcileStale, "node_not_found", codes.NotFound,
-			fmt.Sprintf("node %s no longer exists; dropping queued %s for volume %s", evidence.NodeID, evidence.Operation, evidence.VolumeID))
+		return decision.with(VolumeReconcilePause, "node_lookup_unknown", codes.Unavailable,
+			fmt.Sprintf("node %s identity is unavailable for volume %s", evidence.NodeID, evidence.VolumeID))
 	}
 
 	if state, ok := s.hotplugCooldownState(ctx, evidence.NodeID); ok {
@@ -169,6 +174,7 @@ func (s *ControllerServer) evaluateVolumeReconcile(ctx context.Context, node, op
 	evidence.RecoveryErr = recoveryErr
 	if recoveryErr != nil {
 		klog.V(3).InfoS("Failed to resolve recovery control state during reconcile evaluation", "volume", evidence.VolumeID, "node", evidence.NodeID, "operation", evidence.Operation, "err", recoveryErr)
+		return decision.withEvidence(evidence).with(VolumeReconcilePause, "recovery_control_unknown", codes.Unavailable, recoveryErr.Error())
 	} else if recoveryControl.Invalid {
 		decision.Evidence = evidence
 		return decision.with(VolumeReconcileReject, queueReasonRecoveryControlInvalid, codes.FailedPrecondition, recoveryControl.Message)
@@ -179,6 +185,13 @@ func (s *ControllerServer) evaluateVolumeReconcile(ctx context.Context, node, op
 		evidence.AttachedTarget = strings.TrimSpace(target)
 		evidence.AttachedErr = attachedErr
 		evidence.Attached = attachedErr == nil
+		if attachedErr != nil && !errors.Is(attachedErr, opennebula.ErrAttachmentNotFound) {
+			return decision.withEvidence(evidence).with(VolumeReconcilePause, "attachment_unknown", codes.Unavailable,
+				fmt.Sprintf("attachment state is unknown for volume %s on node %s: %v", evidence.VolumeID, evidence.NodeID, attachedErr))
+		}
+	} else {
+		return decision.withEvidence(evidence).with(VolumeReconcilePause, "attachment_unknown", codes.Unavailable,
+			"attachment identity could not be established")
 	}
 
 	switch evidence.Operation {

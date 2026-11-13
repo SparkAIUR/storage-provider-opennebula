@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -45,7 +46,14 @@ func (d *Driver) GetDatastoreSelectionConfig(params map[string]string) (opennebu
 		return opennebula.DatastoreSelectionConfig{}, fmt.Errorf("no eligible datastores remain after inventory authority filtering")
 	}
 
+	var authorize func(context.Context, int) error
+	if provider, ok := d.inventoryEligibility.(interface {
+		AuthorizeDatastore(context.Context, int) error
+	}); ok && d.inventoryEligibility.Enabled() {
+		authorize = provider.AuthorizeDatastore
+	}
 	return opennebula.DatastoreSelectionConfig{
+		Authorize:    authorize,
 		Identifiers:  identifiers,
 		Policy:       policy,
 		AllowedTypes: d.getAllowedDatastoreTypes(),

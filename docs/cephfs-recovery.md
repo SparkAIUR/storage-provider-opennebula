@@ -44,6 +44,8 @@ Foreground FUSE clients are reaped and report their exit status. `opennebula_csi
 
 ## Release gates
 
+These gates describe the v0.5.28 release. Current publication and cluster qualification follow the [OpenNebula 7.4 upgrade runbook](opennebula-74-upgrade.md).
+
 1. Run the Go suite, race regressions, Helm lint, rendered-manifest checks, and `hack/validate-chart-version-alignment.sh v0.5.28`.
 2. Build the candidate for Linux AMD64 with its exact Git commit in build metadata.
 3. Complete independent subagent review and the two-volume CephFS failure test on `hplmon`, the user-authorized replacement for the retired `hplcsi` lab. Stop only the FUSE process matching the test volume's exact subpath. Verify host-stage and target recovery, unchanged bytes and mount identity on the other volume, then a fresh container reading the recovered volume.

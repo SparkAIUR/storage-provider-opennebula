@@ -15,9 +15,9 @@
 ##
 # Builder
 ##
-ARG BUILDPLATFORM=linux/amd64
+ARG BUILDPLATFORM
 # Build the manager binary
-FROM --platform=${BUILDPLATFORM} golang:1.24 AS builder
+FROM --platform=${BUILDPLATFORM} golang:1.27.4@sha256:5e8afd493a7124a8586e134d9b532731161d4b9becf9dee5a5956b107426f93d AS builder
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
@@ -54,7 +54,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
 ##
 # CSI Plugin image
 ##
-FROM alpine:3.22 AS opennebula-csi
+FROM alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f AS opennebula-csi
 WORKDIR /app
 
 RUN apk add --no-cache coreutils ceph-common ceph-fuse e2fsprogs e2fsprogs-extra xfsprogs xfsprogs-extra util-linux udev \

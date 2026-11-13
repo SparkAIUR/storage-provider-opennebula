@@ -49,6 +49,10 @@ func (d *Driver) maybeStartWebhookServer(ctx context.Context) {
 			MinVersion: tls.VersionTLS12,
 		},
 		Handler: http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+			if req.URL.Path == "/readyz" {
+				rw.WriteHeader(http.StatusOK)
+				return
+			}
 			if req.URL.Path != lastNodePreferenceWebhookPath {
 				http.NotFound(rw, req)
 				return

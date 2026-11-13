@@ -139,8 +139,8 @@ func TestValidateHotplugQueueRequestPausesOnlySelectedManualRecoveryVolume(t *te
 		RequestedNode: "node-a",
 	}, nil).Once()
 	provider.On("NodeExists", mock.Anything, "node-a").Return(101, nil).Twice()
-	provider.On("GetVolumeInNode", mock.Anything, 11, 101).Return("", fmt.Errorf("not attached")).Once()
-	provider.On("GetVolumeInNode", mock.Anything, 12, 101).Return("", fmt.Errorf("not attached")).Once()
+	provider.On("GetVolumeInNode", mock.Anything, 11, 101).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Once()
+	provider.On("GetVolumeInNode", mock.Anything, 12, 101).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Once()
 
 	server := NewControllerServer(driver, provider, nil)
 	manualValidation := server.validateHotplugQueueRequest(context.Background(), "node-a", "attach", "vol-manual")

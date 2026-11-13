@@ -1,3 +1,5 @@
+# Snapshotter wiring only; driver support is documented in README.md#snapshots-and-clones.
+# Enabling the sidecar does not enable new disk snapshot creation.
 credentials:
   existingSecret:
     name: opennebula-csi-auth

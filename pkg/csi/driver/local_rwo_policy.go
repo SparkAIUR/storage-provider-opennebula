@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -762,7 +763,16 @@ func (s *ControllerServer) lookupVolumeForPublish(ctx context.Context, volumeID,
 	if inspector, ok := s.volumeProvider.(opennebula.VolumeLookupInspector); ok {
 		result, err := inspector.InspectVolumeLookup(ctx, volumeID, requestedNode)
 		if err != nil {
-			return nil, history, runtimeCtx, err
+			if errors.Is(err, opennebula.ErrVolumeNotFound) {
+				result = &opennebula.VolumeLookupResult{Status: opennebula.VolumeLookupNotFound, VolumeHandle: volumeID, RequestedNode: requestedNode}
+			} else if status.Code(err) == codes.FailedPrecondition {
+				return nil, history, runtimeCtx, err
+			} else {
+				return nil, history, runtimeCtx, status.Errorf(codes.Unavailable, "volume lookup is unknown: %v", err)
+			}
+		}
+		if result == nil {
+			return nil, history, runtimeCtx, status.Error(codes.Unavailable, "volume lookup returned no observation")
 		}
 		if result.Status != opennebula.VolumeLookupPresent {
 			history = s.refreshVolumeHistory(ctx, volumeID)
@@ -770,10 +780,13 @@ func (s *ControllerServer) lookupVolumeForPublish(ctx context.Context, volumeID,
 		}
 		switch result.Status {
 		case opennebula.VolumeLookupPresent:
+			if result.ImageID <= 0 {
+				return result, history, runtimeCtx, status.Error(codes.Unavailable, "volume identity is unknown")
+			}
 			return result, history, runtimeCtx, nil
 		case opennebula.VolumeLookupNotFound:
 			if !volumeHistoryHasLocalHistoricalEvidence(history, runtimeCtx) {
-				return result, history, runtimeCtx, status.Error(codes.NotFound, "volume not found")
+				return result, history, runtimeCtx, fmt.Errorf("%w: %w", opennebula.ErrVolumeNotFound, status.Error(codes.NotFound, "volume not found"))
 			}
 			repairResult := *result
 			repairResult.Status = opennebula.VolumeLookupImageRecordMissing
@@ -783,20 +796,20 @@ func (s *ControllerServer) lookupVolumeForPublish(ctx context.Context, volumeID,
 			if volumeHistoryHasLocalHistoricalEvidence(history, runtimeCtx) {
 				return result, history, runtimeCtx, s.classifyRepairRequiredLookup(ctx, volumeID, requestedNode, runtimeCtx, history, result)
 			}
-			return result, history, runtimeCtx, status.Error(codes.NotFound, "volume not found")
+			return result, history, runtimeCtx, status.Error(codes.FailedPrecondition, firstNonEmpty(result.Message, "provider volume observations are inconsistent"))
 		}
-		if !volumeHistoryHasLocalHistoricalEvidence(history, runtimeCtx) {
-			return result, history, runtimeCtx, status.Error(codes.NotFound, "volume not found")
-		}
-		return result, history, runtimeCtx, s.classifyRepairRequiredLookup(ctx, volumeID, requestedNode, runtimeCtx, history, result)
+		return result, history, runtimeCtx, status.Error(codes.Unavailable, "volume lookup state is unknown")
 	}
 
 	imageID, sizeBytes, err := s.volumeProvider.VolumeExists(ctx, volumeID)
+	if err != nil && !errors.Is(err, opennebula.ErrVolumeNotFound) && !opennebula.IsAuthoritativeVolumeAbsence(err) {
+		return nil, history, runtimeCtx, status.Errorf(codes.Unavailable, "volume lookup is unknown: %v", err)
+	}
 	if err != nil || imageID == -1 {
 		history = s.refreshVolumeHistory(ctx, volumeID)
 		history = s.bootstrapVolumeHistoryEvidence(ctx, volumeID, runtimeCtx, history)
 		if !volumeHistoryHasLocalHistoricalEvidence(history, runtimeCtx) {
-			return nil, history, runtimeCtx, status.Error(codes.NotFound, "volume not found")
+			return nil, history, runtimeCtx, fmt.Errorf("%w: %w", opennebula.ErrVolumeNotFound, status.Error(codes.NotFound, "volume not found"))
 		}
 		result := &opennebula.VolumeLookupResult{
 			Status:        opennebula.VolumeLookupImageRecordMissing,
@@ -804,6 +817,9 @@ func (s *ControllerServer) lookupVolumeForPublish(ctx context.Context, volumeID,
 			RequestedNode: requestedNode,
 		}
 		return result, history, runtimeCtx, s.classifyRepairRequiredLookup(ctx, volumeID, requestedNode, runtimeCtx, history, result)
+	}
+	if imageID <= 0 {
+		return nil, history, runtimeCtx, status.Error(codes.Unavailable, "volume identity is unknown")
 	}
 	return &opennebula.VolumeLookupResult{
 		Status:        opennebula.VolumeLookupPresent,

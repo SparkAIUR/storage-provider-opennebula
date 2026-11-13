@@ -1,6 +1,6 @@
 {{- $lastNodePreference := (get .Values.driver "lastNodePreference") | default dict -}}
 {{- $lastNodePreferenceWebhook := (get $lastNodePreference "webhook") | default dict -}}
-{{- $enabled := and ((get $lastNodePreference "enabled") | default true) ((get $lastNodePreferenceWebhook "enabled") | default true) -}}
+{{- $enabled := and (dig "enabled" true $lastNodePreference) (dig "enabled" true $lastNodePreferenceWebhook) -}}
 {{- if $enabled -}}
 {{- $namespace := include "opennebula-csi.namespace" . -}}
 {{- $serviceName := include "opennebula-csi.lastNodeWebhookServiceName" . -}}
@@ -68,6 +68,9 @@ webhooks:
         path: {{ "/mutate-v1-pod-last-node-preference" | quote }}
         port: 443
       caBundle: {{ $caCert }}
+    matchConditions:
+      - name: exclude-driver-infrastructure
+        expression: '!(object.metadata.namespace == "{{ $namespace }}" && has(object.metadata.labels) && "app.kubernetes.io/instance" in object.metadata.labels && object.metadata.labels["app.kubernetes.io/instance"] == "{{ .Release.Name }}" && "app.kubernetes.io/name" in object.metadata.labels && object.metadata.labels["app.kubernetes.io/name"] == "{{ include "opennebula-csi.name" . }}")'
     rules:
       - operations: ["CREATE"]
         apiGroups: [""]

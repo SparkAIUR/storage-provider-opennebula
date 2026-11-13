@@ -130,42 +130,42 @@ Create chart name and version as used by the chart label.
 {{- $lastNodePreferenceWebhook := (get $lastNodePreference "webhook") | default dict -}}
 {{- $stuckAttachmentReconciler := (get $root.Values.driver "stuckAttachmentReconciler") | default dict -}}
 {{- $adaptiveTimeout := (get $root.Values.driver "adaptiveTimeout") | default dict -}}
-{{- $nodeDeviceCacheEnabled := (get $nodeDeviceCache "enabled") | default true -}}
+{{- $nodeDeviceCacheEnabled := dig "enabled" true $nodeDeviceCache -}}
 {{- $nodeDeviceCacheTTLSeconds := (get $nodeDeviceCache "ttlSeconds") | default 600 -}}
 {{- $nodeDeviceUdevSettleTimeoutSeconds := (get $nodeDeviceCache "udevSettleTimeoutSeconds") | default 10 -}}
-{{- $nodeDeviceRescanOnMissEnabled := (get $nodeDeviceCache "rescanOnMissEnabled") | default true -}}
+{{- $nodeDeviceRescanOnMissEnabled := dig "rescanOnMissEnabled" true $nodeDeviceCache -}}
 {{- $nodeExpandVerifyTimeoutSeconds := (get $nodeExpand "verifyTimeoutSeconds") | default 120 -}}
 {{- $nodeExpandRetryIntervalSeconds := (get $nodeExpand "retryIntervalSeconds") | default 2 -}}
 {{- $nodeExpandSizeToleranceBytes := (get $nodeExpand "sizeToleranceBytes") | default 134217728 -}}
-{{- $hotplugQueueEnabled := (get $hotplugQueue "enabled") | default true -}}
+{{- $hotplugQueueEnabled := dig "enabled" true $hotplugQueue -}}
 {{- $hotplugQueueMaxWaitSeconds := (get $hotplugQueue "maxWaitSeconds") | default 180 -}}
 {{- $hotplugQueueAgeBoostSeconds := (get $hotplugQueue "ageBoostSeconds") | default 30 -}}
-{{- $hotplugQueueDedupeEnabled := (get $hotplugQueue "dedupeEnabled") | default true -}}
+{{- $hotplugQueueDedupeEnabled := dig "dedupeEnabled" true $hotplugQueue -}}
 {{- $hotplugQueuePerItemWaitSeconds := (get $hotplugQueue "perItemWaitSeconds") | default 60 -}}
 {{- $hotplugQueueMaxWaitCapSeconds := (get $hotplugQueue "maxWaitCapSeconds") | default 900 -}}
 {{- $hotplugQueueMaxActiveSeconds := (get $hotplugQueue "maxActiveSeconds") | default 900 -}}
 {{- $hotplugQueueSnapshotDebounceSeconds := (get $hotplugQueue "snapshotDebounceSeconds") | default 2 -}}
-{{- $hotplugDiagnosticsEnabled := (get $hotplugDiagnostics "enabled") | default true -}}
+{{- $hotplugDiagnosticsEnabled := dig "enabled" true $hotplugDiagnostics -}}
 {{- $hotplugDiagnosticsStuckAfterSeconds := (get $hotplugDiagnostics "stuckAfterSeconds") | default 300 -}}
 {{- $hotplugDiagnosticsProgressWindowSeconds := (get $hotplugDiagnostics "progressWindowSeconds") | default 60 -}}
 {{- $hotplugDiagnosticsRecoveryMode := (get $hotplugDiagnostics "recoveryMode") | default "readOnly" -}}
-{{- $nodeHotplugGuardEnabled := (get $nodeHotplugGuard "enabled") | default true -}}
+{{- $nodeHotplugGuardEnabled := dig "enabled" true $nodeHotplugGuard -}}
 {{- $nodeHotplugGuardFailureThreshold := (get $nodeHotplugGuard "failureThreshold") | default 2 -}}
-{{- $nodeHotplugGuardRequireKubernetesReady := (get $nodeHotplugGuard "requireKubernetesReady") | default true -}}
-{{- $nodeHotplugGuardRequireOpenNebulaReady := (get $nodeHotplugGuard "requireOpenNebulaReady") | default true -}}
-{{- $localRestartEnabled := (get $localRestart "enabled") | default true -}}
+{{- $nodeHotplugGuardRequireKubernetesReady := dig "requireKubernetesReady" true $nodeHotplugGuard -}}
+{{- $nodeHotplugGuardRequireOpenNebulaReady := dig "requireOpenNebulaReady" true $nodeHotplugGuard -}}
+{{- $localRestartEnabled := dig "enabled" true $localRestart -}}
 {{- $localRestartDetachGrace := (get $localRestart "detachGraceSeconds") | default 90 -}}
 {{- $localRestartDetachGraceMax := (get $localRestart "maxDetachGraceSeconds") | default 300 -}}
-{{- $localRestartRequireNodeReady := (get $localRestart "requireNodeReady") | default true -}}
+{{- $localRestartRequireNodeReady := dig "requireNodeReady" true $localRestart -}}
 {{- $maintenanceReleaseMinSeconds := (get $maintenanceMode "releaseMinSeconds") | default 300 -}}
 {{- $maintenanceReleaseMaxSeconds := (get $maintenanceMode "releaseMaxSeconds") | default 1800 -}}
-{{- $metadataDriftQuarantineEnabled := (get $metadataDriftQuarantine "enabled") | default true -}}
+{{- $metadataDriftQuarantineEnabled := dig "enabled" true $metadataDriftQuarantine -}}
 {{- $metadataDriftQuarantineFailureThreshold := (get $metadataDriftQuarantine "failureThreshold") | default 2 -}}
 {{- $metadataDriftQuarantineTTLSeconds := (get $metadataDriftQuarantine "ttlSeconds") | default 1800 -}}
-{{- $hostArtifactQuarantineEnabled := (get $hostArtifactQuarantine "enabled") | default true -}}
+{{- $hostArtifactQuarantineEnabled := dig "enabled" true $hostArtifactQuarantine -}}
 {{- $hostArtifactQuarantineFailureThreshold := (get $hostArtifactQuarantine "failureThreshold") | default 1 -}}
 {{- $hostArtifactQuarantineTTLSeconds := (get $hostArtifactQuarantine "ttlSeconds") | default 3600 -}}
-{{- $localDeviceRecoveryEnabled := (get $localDeviceRecovery "enabled") | default true -}}
+{{- $localDeviceRecoveryEnabled := dig "enabled" true $localDeviceRecovery -}}
 {{- $localDeviceRecoveryMinAttempts := (get $localDeviceRecovery "minAttempts") | default 3 -}}
 {{- $localDeviceRecoveryMinAgeSeconds := (get $localDeviceRecovery "minAgeSeconds") | default 60 -}}
 {{- $localDeviceRecoveryIntervalSeconds := (get $localDeviceRecovery "intervalSeconds") | default 15 -}}
@@ -174,16 +174,16 @@ Create chart name and version as used by the chart label.
 {{- $localRWORecoveryActivePod := (get $localRWORecovery "activePodRecovery") | default false -}}
 {{- $localRWORecoveryMaxAttempts := (get $localRWORecovery "maxAttempts") | default 3 -}}
 {{- $localRWORecoveryBackoffSeconds := (get $localRWORecovery "backoffSeconds") | default 10 -}}
-{{- $lastNodePreferenceEnabled := (get $lastNodePreference "enabled") | default true -}}
+{{- $lastNodePreferenceEnabled := dig "enabled" true $lastNodePreference -}}
 {{- $lastNodePreferencePolicy := (get $lastNodePreference "policy") | default "local-single-writer" -}}
-{{- $lastNodePreferenceWebhookEnabled := (get $lastNodePreferenceWebhook "enabled") | default true -}}
+{{- $lastNodePreferenceWebhookEnabled := dig "enabled" true $lastNodePreferenceWebhook -}}
 {{- $lastNodePreferenceWebhookPort := (get $lastNodePreferenceWebhook "port") | default 9443 -}}
 {{- $lastNodePreferenceWebhookFailurePolicy := (get $lastNodePreferenceWebhook "failurePolicy") | default "Fail" -}}
-{{- $stuckAttachmentReconcilerEnabled := (get $stuckAttachmentReconciler "enabled") | default true -}}
+{{- $stuckAttachmentReconcilerEnabled := dig "enabled" true $stuckAttachmentReconciler -}}
 {{- $stuckAttachmentReconcilerIntervalSeconds := (get $stuckAttachmentReconciler "intervalSeconds") | default 60 -}}
 {{- $stuckAttachmentOrphanGraceSeconds := (get $stuckAttachmentReconciler "orphanGraceSeconds") | default 120 -}}
 {{- $stuckAttachmentStaleVAGraceSeconds := (get $stuckAttachmentReconciler "staleVolumeAttachmentGraceSeconds") | default 90 -}}
-{{- $adaptiveTimeoutEnabled := (get $adaptiveTimeout "enabled") | default true -}}
+{{- $adaptiveTimeoutEnabled := dig "enabled" true $adaptiveTimeout -}}
 {{- $adaptiveTimeoutMinSamples := (get $adaptiveTimeout "minSamples") | default 8 -}}
 {{- $adaptiveTimeoutSampleWindow := (get $adaptiveTimeout "sampleWindow") | default 20 -}}
 {{- $adaptiveTimeoutP95MultiplierPercent := (get $adaptiveTimeout "p95MultiplierPercent") | default 400 -}}
@@ -207,7 +207,7 @@ Create chart name and version as used by the chart label.
 {{- if eq (trim (printf "%v" $inventoryNamespace)) "" -}}
 {{- $inventoryNamespace = include "opennebula-csi.namespace" $root -}}
 {{- end }}
-{{- $inventoryValidationEnabled := (get $inventoryValidation "enabled") | default true -}}
+{{- $inventoryValidationEnabled := dig "enabled" true $inventoryValidation -}}
 {{- $inventoryValidationDefaultImage := (get $inventoryValidation "defaultImage") | default "alpine:3.22" -}}
 {{- if $root.Values.driver.defaultDatastores }}
 - name: ONE_CSI_DEFAULT_DATASTORES
@@ -381,3 +381,24 @@ Create chart name and version as used by the chart label.
 {{ toYaml . }}
 {{- end }}
 {{- end }}
+
+{{- define "opennebula-csi.image" -}}
+{{- if .digest -}}{{ .repository }}@{{ .digest }}{{- else -}}{{ .repository }}:{{ .tag }}{{- end -}}
+{{- end -}}
+
+{{- define "opennebula-csi.preflightImage" -}}
+{{- $image := .Values.preflight.image -}}
+{{- if or $image.repository $image.tag -}}
+{{- include "opennebula-csi.image" (dict "repository" (default .Values.image.repository $image.repository) "tag" (default .Values.image.tag $image.tag) "digest" (default "" $image.digest)) -}}
+{{- else -}}
+{{- include "opennebula-csi.image" .Values.image -}}
+{{- end -}}
+{{- end -}}
+{{- define "opennebula-csi.reconcileImage" -}}
+{{- $image := .Values.storageClassReconcile.image -}}
+{{- if or $image.repository $image.tag -}}
+{{- include "opennebula-csi.image" (dict "repository" (default .Values.image.repository $image.repository) "tag" (default .Values.image.tag $image.tag) "digest" (default "" $image.digest)) -}}
+{{- else -}}
+{{- include "opennebula-csi.image" .Values.image -}}
+{{- end -}}
+{{- end -}}

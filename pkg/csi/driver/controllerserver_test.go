@@ -859,7 +859,7 @@ func TestCreateVolumeClonesFromSourceVolume(t *testing.T) {
 	sharedProvider := &MockSharedFilesystemProviderTestify{}
 	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local")
 
-	mockProvider.On("CloneVolume", mock.Anything, "clone-volume", "source-volume", opennebula.DatastoreSelectionConfig{
+	mockProvider.On("CloneVolume", mock.Anything, "clone-volume", "source-volume", opennebula.DatastoreSelectionConfig{CloneRequiredBytes: 1024 * 1024 * 1024,
 		Identifiers:  []string{"100"},
 		Policy:       opennebula.DatastoreSelectionPolicyLeastUsed,
 		AllowedTypes: []string{"local"},
@@ -1023,7 +1023,7 @@ func TestControllerPublishVolume(t *testing.T) {
 			setupMock: func(m *MockOpenNebulaVolumeProviderTestify) {
 				m.On("VolumeExists", mock.Anything, "1234").Return(1, 1, nil)
 				m.On("NodeExists", mock.Anything, "test-node-id").Return(1, nil)
-				m.On("GetVolumeInNode", mock.Anything, 1, 1).Twice().Return("", errors.New("volume not attached to node"))
+				m.On("GetVolumeInNode", mock.Anything, 1, 1).Twice().Return("", fmt.Errorf("volume not attached to node: %w", opennebula.ErrAttachmentNotFound))
 				m.On("AttachVolume", mock.Anything, "1234", "test-node-id", false, mock.Anything).Return(nil)
 				m.On("GetVolumeInNode", mock.Anything, 1, 1).Once().Return("attached-volume", nil)
 			},
@@ -1057,7 +1057,7 @@ func TestControllerPublishVolume(t *testing.T) {
 			setupMock: func(m *MockOpenNebulaVolumeProviderTestify) {
 				m.On("VolumeExists", mock.Anything, "1234").Return(1, 1, nil)
 				m.On("NodeExists", mock.Anything, "test-node-id").Return(1, nil)
-				m.On("GetVolumeInNode", mock.Anything, 1, 1).Twice().Return("", errors.New("volume not attached to node"))
+				m.On("GetVolumeInNode", mock.Anything, 1, 1).Twice().Return("", fmt.Errorf("volume not attached to node: %w", opennebula.ErrAttachmentNotFound))
 				m.On("AttachVolume", mock.Anything, "1234", "test-node-id", false, mock.Anything).
 					Return(opennebula.NewDatastoreConfigError("ceph datastore mismatch"))
 			},
@@ -1102,7 +1102,7 @@ func TestControllerPublishVolumeIncludesAttachFailureDetailInInternalError(t *te
 
 	mockProvider.On("VolumeExists", mock.Anything, "vol-attach-fail").Return(1, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "test-node-id").Return(1, nil)
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 1).Twice().Return("", errors.New("volume not attached to node"))
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 1).Twice().Return("", fmt.Errorf("volume not attached to node: %w", opennebula.ErrAttachmentNotFound))
 	mockProvider.On("AttachVolume", mock.Anything, "vol-attach-fail", "test-node-id", false, mock.Anything).Return(errors.New("attachdisk: target already in use"))
 
 	_, err := cs.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
@@ -1449,27 +1449,12 @@ func TestControllerExpandVolume(t *testing.T) {
 }
 
 func TestCreateSnapshot(t *testing.T) {
-	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
-	cs := getTestControllerServer(mockProvider)
-	now := time.Now().UTC()
-
-	mockProvider.On("CreateSnapshot", mock.Anything, "test-volume", "snap-1").Return(&opennebula.VolumeSnapshot{
-		SnapshotID:     "image-snapshot:10:1",
-		SourceVolumeID: "test-volume",
-		CreationTime:   now,
-		SizeBytes:      int64(1024 * 1024 * 1024),
-		ReadyToUse:     true,
-	}, nil)
-
-	resp, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{
-		Name:           "snap-1",
-		SourceVolumeId: "test-volume",
-	})
-
-	assert.NoError(t, err)
-	assert.Equal(t, "image-snapshot:10:1", resp.GetSnapshot().GetSnapshotId())
-	assert.Equal(t, "test-volume", resp.GetSnapshot().GetSourceVolumeId())
-	mockProvider.AssertExpectations(t)
+	provider := &MockOpenNebulaVolumeProviderTestify{}
+	cs := getTestControllerServer(provider)
+	response, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "snap-1", SourceVolumeId: "test-volume"})
+	require.Equal(t, codes.Unimplemented, status.Code(err))
+	require.Nil(t, response)
+	provider.AssertNotCalled(t, "CreateSnapshot", mock.Anything, mock.Anything, mock.Anything)
 }
 
 func TestCreateSnapshotCreatesSharedFilesystemSnapshotWhenEnabled(t *testing.T) {
@@ -1919,7 +1904,7 @@ func TestControllerPublishVolumeRejectsOpenNebulaMetadataDriftAndQuarantines(t *
 	provider := new(MockOpenNebulaVolumeProviderTestify)
 	provider.On("VolumeExists", mock.Anything, "vol-drift").Return(488, volumeSize, nil)
 	provider.On("NodeExists", mock.Anything, "node-new").Return(181, nil)
-	provider.On("GetVolumeInNode", mock.Anything, 488, 181).Return("", errors.New("not attached")).Times(4)
+	provider.On("GetVolumeInNode", mock.Anything, 488, 181).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Times(4)
 	provider.On("InspectVolumeAttachment", mock.Anything, "vol-drift", "node-new").Return(&opennebula.VolumeAttachmentMetadata{
 		VolumeHandle:    "vol-drift",
 		ImageID:         488,
@@ -1986,7 +1971,7 @@ func TestControllerPublishVolumeClassifiesHostArtifactConflictAndQuarantines(t *
 	provider := new(MockOpenNebulaVolumeProviderTestify)
 	provider.On("VolumeExists", mock.Anything, "vol-host-artifact").Return(233, volumeSize, nil)
 	provider.On("NodeExists", mock.Anything, "node-161").Return(161, nil)
-	provider.On("GetVolumeInNode", mock.Anything, 233, 161).Return("", errors.New("not attached")).Twice()
+	provider.On("GetVolumeInNode", mock.Anything, 233, 161).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Twice()
 	provider.On("AttachVolume", mock.Anything, "vol-host-artifact", "node-161", false, mock.Anything).Return(conflict).Once()
 
 	cs := NewControllerServer(driver, provider, &MockSharedFilesystemProviderTestify{})
@@ -2140,7 +2125,7 @@ func TestControllerPublishVolumeReusesStickyAttachmentOnSameNode(t *testing.T) {
 	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
 	mockProvider.On("VolumeExists", mock.Anything, "vol-reuse").Return(1, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", fmt.Errorf("not attached")).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Once()
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdc", nil).Once()
 
 	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
@@ -2212,7 +2197,7 @@ func TestControllerPublishVolumeAllowsOverrideForProtectedCrossNodeAttach(t *tes
 	mockProvider.On("VolumeExists", mock.Anything, "vol-move-override").Return(1, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-new").Return(42, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-old").Return(41, nil)
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 42).Return("", fmt.Errorf("not attached")).Twice()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 42).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Twice()
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdc", nil).Once()
 	mockProvider.On("DetachVolume", mock.Anything, "vol-move-override", "node-old").Return(nil).Once()
 	mockProvider.On("AttachVolume", mock.Anything, "vol-move-override", "node-new", false, mock.Anything).Return(nil).Once()
@@ -2250,7 +2235,7 @@ func TestControllerPublishVolumeClearsStickyWhenOldAttachmentAlreadyAbsent(t *te
 
 	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
 	mockProvider.On("NodeExists", mock.Anything, "node-old").Return(41, nil)
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", fmt.Errorf("already absent")).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", fmt.Errorf("already absent: %w", opennebula.ErrAttachmentNotFound)).Once()
 
 	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
 	handled, resp, err := cs.reuseStickyAttachment(context.Background(), newPublishReq("vol-absent", "node-new"), 1, 42)
@@ -2360,7 +2345,7 @@ func TestExpireStickyDetachClearsAlreadyAbsentAttachment(t *testing.T) {
 	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
 	mockProvider.On("VolumeExists", mock.Anything, "vol-expired-absent").Return(1, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", fmt.Errorf("already absent")).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", fmt.Errorf("already absent: %w", opennebula.ErrAttachmentNotFound)).Once()
 
 	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
 	cs.expireStickyDetach(context.Background(), state)
@@ -2583,8 +2568,8 @@ func TestControllerPublishVolumeSerializesSameNodeHotplug(t *testing.T) {
 	mockProvider.On("VolumeExists", mock.Anything, "vol-1").Return(1, 1, nil)
 	mockProvider.On("VolumeExists", mock.Anything, "vol-2").Return(2, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", errors.New("not attached")).Twice()
-	mockProvider.On("GetVolumeInNode", mock.Anything, 2, 41).Return("", errors.New("not attached")).Twice()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Twice()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 2, 41).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Twice()
 	mockProvider.On("ResolveVolumeSizeBytes", mock.Anything, "vol-1").Return(int64(300*1024*1024*1024), nil).Maybe()
 	mockProvider.On("ResolveVolumeSizeBytes", mock.Anything, "vol-2").Return(int64(300*1024*1024*1024), nil).Maybe()
 	mockProvider.On("ComputeHotplugTimeout", int64(300*1024*1024*1024)).Return(5 * time.Minute).Maybe()
@@ -2639,7 +2624,7 @@ func TestControllerExpandVolumeSerializesWithPublishOnSameVolume(t *testing.T) {
 	mockProvider.On("ExpandVolume", mock.Anything, "vol-1", int64(2*1024*1024*1024), true).Return(int64(2*1024*1024*1024), nil).Once()
 	mockProvider.On("VolumeExists", mock.Anything, "vol-1").Return(1, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", errors.New("not attached")).Twice()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Twice()
 	mockProvider.On("ResolveVolumeSizeBytes", mock.Anything, "vol-1").Return(int64(2*1024*1024*1024), nil).Maybe()
 	mockProvider.On("ComputeHotplugTimeout", int64(2*1024*1024*1024)).Return(3 * time.Minute).Maybe()
 	mockProvider.On("AttachVolume", mock.Anything, "vol-1", "node-1", false, mock.Anything).Return(nil).Once()
@@ -2823,6 +2808,13 @@ func (m *MockOpenNebulaVolumeProviderTestify) GetVolumeInNode(ctx context.Contex
 	return args.Get(0).(string), args.Error(1)
 }
 
+func (m *MockOpenNebulaVolumeProviderTestify) RestoreVolumeCapacity(ctx context.Context, volume string, vmID, imageID int) error {
+	if !m.hasExpectation("RestoreVolumeCapacity") {
+		return nil
+	}
+	return m.Called(ctx, volume, vmID, imageID).Error(0)
+}
+
 func (m *MockOpenNebulaVolumeProviderTestify) ResolveVolumeSizeBytes(ctx context.Context, volume string) (int64, error) {
 	if !m.hasExpectation("ResolveVolumeSizeBytes") {
 		return int64(10 * 1024 * 1024 * 1024), nil
@@ -2863,7 +2855,7 @@ func (m *MockOpenNebulaVolumeProviderTestify) NodeReady(ctx context.Context, nod
 	return args.Bool(0), args.Error(1)
 }
 
-func (m *MockOpenNebulaVolumeProviderTestify) VolumeReadyWithTimeout(volumeID int) (bool, error) {
+func (m *MockOpenNebulaVolumeProviderTestify) VolumeReadyWithTimeout(ctx context.Context, volumeID int) (bool, error) {
 	if !m.hasExpectation("VolumeReadyWithTimeout") {
 		return true, nil
 	}
@@ -2897,7 +2889,10 @@ func (m *MockOpenNebulaVolumeProviderTestify) InspectVolumeLookup(ctx context.Co
 	if !m.hasExpectation("InspectVolumeLookup") {
 		if m.hasExpectation("VolumeExists") {
 			imageID, sizeBytes, err := m.VolumeExists(ctx, volume)
-			if err != nil || imageID == -1 {
+			if err != nil {
+				return nil, err
+			}
+			if imageID == -1 {
 				return &opennebula.VolumeLookupResult{
 					Status:        opennebula.VolumeLookupNotFound,
 					VolumeHandle:  volume,

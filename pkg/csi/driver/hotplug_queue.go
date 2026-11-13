@@ -103,6 +103,7 @@ const (
 )
 
 type HotplugQueueValidation struct {
+	Err              error
 	Decision         HotplugQueueValidationDecision
 	Reason           string
 	Message          string
@@ -423,6 +424,9 @@ func (m *HotplugQueueManager) runRequest(req *hotplugQueueRequest) error {
 			return nil
 		case HotplugQueueValidationStale:
 			m.metrics.RecordHotplugQueueDispatch(req.operation, string(req.priority), "stale")
+			if validation.Err != nil {
+				return validation.Err
+			}
 			return &HotplugQueueStaleRequestError{
 				Node:      req.node,
 				Operation: req.operation,

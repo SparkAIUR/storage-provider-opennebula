@@ -1,6 +1,8 @@
 package opennebula
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -20,6 +22,9 @@ const (
 )
 
 type DatastoreSelectionConfig struct {
+	Authorize                func(context.Context, int) error
+	CloneRequiredBytes       int64
+	CloneLimitBytes          int64
 	Identifiers              []string
 	Policy                   DatastoreSelectionPolicy
 	AllowedTypes             []string
@@ -79,18 +84,18 @@ func (e *datastoreTopologyError) Error() string {
 }
 
 func IsDatastoreConfigError(err error) bool {
-	_, ok := err.(*datastoreConfigError)
-	return ok
+	var target *datastoreConfigError
+	return errors.As(err, &target)
 }
 
 func IsDatastoreCapacityError(err error) bool {
-	_, ok := err.(*datastoreCapacityError)
-	return ok
+	var target *datastoreCapacityError
+	return errors.As(err, &target)
 }
 
 func IsDatastoreTopologyError(err error) bool {
-	_, ok := err.(*datastoreTopologyError)
-	return ok
+	var target *datastoreTopologyError
+	return errors.As(err, &target)
 }
 
 func NewDatastoreConfigError(message string) error {
@@ -280,8 +285,13 @@ func resolveDatastoreIdentifier(identifier string, poolByID map[int]datastoreSch
 	return candidate, nil
 }
 
+// NormalizeDatastore exposes the same provider state and backend attributes to inventory.
+func NormalizeDatastore(source datastoreSchema.Datastore) Datastore {
+	return datastoreFromSchema(source)
+}
+
 func datastoreFromSchema(source datastoreSchema.Datastore) Datastore {
-	enabled := true
+	enabled := false
 	if state, err := source.State(); err == nil {
 		enabled = state == datastoreSchema.Ready
 	}

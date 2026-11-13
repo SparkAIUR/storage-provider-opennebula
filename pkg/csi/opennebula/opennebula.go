@@ -18,7 +18,9 @@ package opennebula
 
 import (
 	"context"
+	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/OpenNebula/one/src/oca/go/src/goca"
@@ -193,6 +195,7 @@ type OpenNebulaVolumeProvider interface {
 	DeleteVolume(ctx context.Context, volume string) error
 	ExpandVolume(ctx context.Context, volume string, size int64, allowDetached bool) (int64, error)
 	AttachVolume(ctx context.Context, volume string, node string, immutable bool, params map[string]string) error
+	RestoreVolumeCapacity(ctx context.Context, volume string, vmID, imageID int) error
 	DetachVolume(ctx context.Context, volume string, node string) error
 	ResolveVolumeSizeBytes(ctx context.Context, volume string) (int64, error)
 	ComputeHotplugTimeout(sizeBytes int64) time.Duration
@@ -206,7 +209,7 @@ type OpenNebulaVolumeProvider interface {
 	ListSnapshots(ctx context.Context, snapshotID string, sourceVolumeID string, maxEntries int32, startingToken string) ([]VolumeSnapshot, string, error)
 	NodeExists(ctx context.Context, node string) (int, error)
 	GetVolumeInNode(ctx context.Context, volumeID int, nodeID int) (string, error)
-	VolumeReadyWithTimeout(volumeID int) (bool, error)
+	VolumeReadyWithTimeout(ctx context.Context, volumeID int) (bool, error)
 	ListCurrentAttachments(ctx context.Context) ([]ObservedAttachment, error)
 }
 
@@ -234,9 +237,12 @@ func NewClient(config OpenNebulaConfig) *OpenNebulaClient {
 }
 
 func (c *OpenNebulaClient) Probe(ctx context.Context) error {
-	_, err := c.Client.CallContext(ctx, "one.system.version")
+	response, err := goca.NewController(c.Client).SystemVersionContext(ctx)
 	if err != nil {
 		return err
+	}
+	if !strings.HasPrefix(strings.TrimSpace(response), "7.4.") {
+		return fmt.Errorf("unsupported OpenNebula server version %q; require 7.4.x", response)
 	}
 	return nil
 }

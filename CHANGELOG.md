@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.6.0-rc.1, unreleased
+
+- Reject unrecorded or pending expanded-disk detach, retain lookup rejections through queue prechecks, require literal evidence booleans, and pin workflow Helm installers to v3.21.4.
+
+- Separate requested-VM attachment and capacity checks from global ownership, preserving approved moves and shared readers; distinguish disabled datastores from unknown prerequisites.
+
+- Pause attachment reconciliation on unknown provider observations and retain sticky holds; only typed absence can authorize absence handling.
+
+- Target OpenNebula7.4.x with the7.4 GoCA SDK, Go1.27.4, Kubernetes0.36.6 libraries, CSI1.13 and current storage sidecars.
+- Preserve holds on uncertain provider evidence; pin known IDs, observe nonforced deletion, verify attached resize completion and restore verified capacity on reattach.
+- Reconcile clone retries through atomically inherited durable origin metadata. Reject new disk snapshots and detached growth until lifecycle qualification.
+- Revalidate datastore authority at allocation and report disabled/unknown Ceph bridge feasibility.
+- Add digest images, configurable probes, webhook readiness/self-exclusion, retained mandatory preflight failures, supervised OnDelete rollout and release qualification gates.
+- Serialize publish restoration and verified-capacity writes with explicit expansion; preserve clone capacity/provenance errors in CSI responses.
+- Verify capacity on publish retries, reconcile clone targets before source growth limits, bind qualification readbacks to each cluster, and pin stable release tags to the qualified source.
+- Render snapshotter v8.7.0 or its frozen digest while preserving ordinary legacy overrides; keep node replacement OnDelete.
+- Native qualification and ordered24h cluster observation remain pending. See [upgrade runbook](docs/opennebula-74-upgrade.md). Inventory batching/write reduction is a separate follow-up.
+
 ## v0.5.29, unreleased
 
 - Apply recovery authority and identity verification to raw-block publishing, including already-bound targets, before confirming recovery or exposing the device.
