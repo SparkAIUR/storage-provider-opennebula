@@ -68,3 +68,8 @@ The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI i
 - AI: Use read-only Linux FS_INFO on the mounted directory and kernel sysfs block membership to associate Btrfs with the measured device. Require one device, maximum device ID 1 and exactly one block-class sysfs member with matching canonical major/minor. The default mount-utils Btrfs resize command targets device ID 1; ambiguous layouts cannot authorize that command. This is an identity proof rule, not a user feature waiver.
 - AI: Pin FSID and mounted st_dev for the request as well as the backing device, reobserving after capacity reads and waits before resize. Unknown, malformed, failed or canceled observations fail closed. Add no cache, external binary, image dependency or mount configuration.
 - AI: Positive mounted Btrfs records in local tests are kernel/sysfs boundary fixtures. Actual ioctl rejection and local ext4 tool checks do not qualify mounted Btrfs, provider lifecycle, deployment or release. Native qualification and the 24-hour observation remain held.
+
+## 2026-11-13, Btrfs admission review correction
+
+- AI: Root source review confirmed that source-kind shortcuts could bypass Btrfs association. Check every observed Btrfs target before those shortcuts and require a block-device source. Regular-file or character-device aliases fail before capacity commands, format probes or resize. Preserve regular-image behavior for other filesystem tests and valid block aliases.
+- AI: This Linux admission correction does not change the pre-existing non-Linux success shortcut. That unsupported-platform/test-convenience behavior remains deferred outside this plan; do not claim cross-platform fail-closed behavior or native Btrfs acceptance.
