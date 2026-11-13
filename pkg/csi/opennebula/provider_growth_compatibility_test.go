@@ -16,6 +16,9 @@ import (
 
 const persistentSystemDiskFacts = `<PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM>`
 
+// Stock Ceph with a Ceph system datastore uses LN_TARGET=NONE in oned.conf.
+const persistentNoneDiskFacts = `<PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>NONE</LN_TARGET><TM_MAD>ceph</TM_MAD><TM_MAD_SYSTEM>ceph</TM_MAD_SYSTEM><DISK_TYPE>RBD</DISK_TYPE>`
+
 type growthProtocolState struct {
 	completedReads                                            atomic.Int32
 	resizeCalls, metadataWrites, otherMutations, versionCalls atomic.Int32
@@ -183,7 +186,7 @@ func TestProviderGrowthCompatibilityUnknownIdentity(t *testing.T) {
 func TestProviderGrowthCompatibilityUnaffectedAndIdempotent(t *testing.T) {
 	t.Run("persistent NONE target retains 740 support", func(t *testing.T) {
 		p, st := growthCompatibilityFixture(t, "7.4.0", false, func(c *growthFixtureConfig) {
-			c.diskFacts = strings.ReplaceAll(persistentSystemDiskFacts, "<LN_TARGET>SYSTEM</LN_TARGET>", "<LN_TARGET>NONE</LN_TARGET>")
+			c.diskFacts = persistentNoneDiskFacts
 		})
 		size, err := p.ExpandVolume(context.Background(), "volume-test", 256*sizeConversion, false)
 		require.NoError(t, err)
@@ -278,6 +281,8 @@ func TestProviderGrowthCompatibilityFreshVersionAndFailures(t *testing.T) {
 	})
 }
 
+// SYSTEM/SELF rows exercise explicit effective-target precedence, rather than
+// claiming they are both stock fs_lvm_ssh defaults. NONE rows use stock Ceph.
 func TestProviderGrowthCompatibilityEffectiveTargets(t *testing.T) {
 	for _, tc := range []struct {
 		target, version string
@@ -288,6 +293,9 @@ func TestProviderGrowthCompatibilityEffectiveTargets(t *testing.T) {
 		t.Run(tc.target+"/"+tc.version, func(t *testing.T) {
 			p, st := growthCompatibilityFixture(t, tc.version, false, func(c *growthFixtureConfig) {
 				c.diskFacts = strings.ReplaceAll(persistentSystemDiskFacts, "<LN_TARGET>SYSTEM</LN_TARGET>", "<LN_TARGET>"+tc.target+"</LN_TARGET>") + "<CLONE_TARGET>NONE</CLONE_TARGET>"
+				if tc.target == "NONE" {
+					c.diskFacts = persistentNoneDiskFacts + "<CLONE_TARGET>SYSTEM</CLONE_TARGET>"
+				}
 			})
 			_, err := p.ExpandVolume(context.Background(), "volume-test", 256*sizeConversion, false)
 			if tc.allowed {
