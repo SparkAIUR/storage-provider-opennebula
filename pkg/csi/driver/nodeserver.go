@@ -50,8 +50,15 @@ var (
 	nodeResizeFS       = func(exec utilexec.Interface, devicePath, deviceMountPath string) (bool, error) {
 		return mount.NewResizeFs(exec).Resize(devicePath, deviceMountPath)
 	}
-	nodeNeedsResizeFS = func(exec utilexec.Interface, devicePath, deviceMountPath string) (bool, error) {
-		return mount.NewResizeFs(exec).NeedResize(devicePath, deviceMountPath)
+	nodeExpandSleep = func(ctx context.Context, interval time.Duration) error {
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		}
 	}
 )
 
@@ -716,8 +723,11 @@ func (ns *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolu
 	}, nil
 }
 
-func (ns *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
 	started := nodeNow()
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
 	volumeID := req.GetVolumeId()
 	if volumeID == "" {
 		ns.recordNodeExpandOperation(started, "unknown", "invalid_argument")
@@ -776,6 +786,8 @@ func (ns *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 	}
 
 	policy := ns.nodeExpandPolicy()
+	ctx, cancel := context.WithTimeout(ctx, policy.verifyTimeout)
+	defer cancel()
 	// A PVC requests outer device capacity. Filesystem metadata is not
 	// missing storage, and a byte tolerance must not hide a short device.
 	targetMinBytes := requiredBytes
@@ -789,9 +801,15 @@ func (ns *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 	)
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
 		attempts++
 
-		lastDeviceBytes, err = ns.getBlockVolumeSize(devicePath)
+		lastDeviceBytes, err = ns.getBlockVolumeSizeWithExec(devicePath, nodeExpandExec{Interface: ns.mounter.Exec, ctx: ctx})
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, status.FromContextError(contextErr).Err()
+		}
 		if err != nil {
 			ns.recordNodeExpandOperation(started, "disk", "internal")
 			return nil, status.Errorf(codes.Internal, "failed to collect device size for volume %s at %s: %v", volumeID, devicePath, err)
@@ -826,85 +844,62 @@ func (ns *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 				"targetMinBytes", targetMinBytes,
 				"deviceBytes", lastDeviceBytes,
 				"attempt", attempts)
-			nodeDeviceSleep(policy.retryInterval)
+			if err := nodeExpandSleep(ctx, policy.retryInterval); err != nil {
+				return nil, status.FromContextError(err).Err()
+			}
 			continue
 		}
 
-		resized, err = nodeResizeFS(ns.mounter.Exec, devicePath, volumePath)
+		if err := ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
+		resized, err = nodeResizeFS(nodeExpandExec{Interface: ns.mounter.Exec, ctx: ctx}, devicePath, volumePath)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, status.FromContextError(contextErr).Err()
+		}
 		if err != nil {
 			ns.recordNodeExpandOperation(started, "disk", "internal")
 			return nil, status.Errorf(codes.Internal, "failed to resize filesystem for volume %s: %v", volumeID, err)
 		}
 
 		lastFSBytes, err = ns.filesystemSizeBytes(volumePath)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, status.FromContextError(contextErr).Err()
+		}
 		if err != nil {
 			ns.recordNodeExpandOperation(started, "disk", "internal")
 			return nil, status.Errorf(codes.Internal, "failed to collect filesystem size for volume %s at %s: %v", volumeID, volumePath, err)
 		}
 
-		// NeedResize reads filesystem geometry (ext4 block count or XFS data
-		// blocks), including metadata omitted by statfs. Keep statfs for diagnostics.
-		needsResize, err := nodeNeedsResizeFS(ns.mounter.Exec, devicePath, volumePath)
-		if err != nil {
-			ns.recordNodeExpandOperation(started, "disk", "internal")
-			return nil, status.Errorf(codes.Internal, "failed to verify filesystem geometry for volume %s: %v", volumeID, err)
-		}
+		// In mount-utils 0.36, NeedResize is eligibility for ext3/ext4/XFS,
+		// not a completion check. Resize succeeds only when the recognized
+		// filesystem tool reports convergence. Statfs excludes metadata overhead.
 		if !resized {
 			ns.recordNodeExpandOperation(started, "disk", "failed_precondition")
 			return nil, status.Errorf(codes.FailedPrecondition, "filesystem resize was not performed for volume %s", volumeID)
 		}
 
-		if !needsResize {
-			ns.recordNodeExpandOperation(started, "disk", "success")
-			klog.V(1).InfoS("NodeExpandVolume converged",
-				"method", "NodeExpandVolume",
-				"volumeID", volumeID,
-				"volumePath", volumePath,
-				"devicePath", devicePath,
-				"requiredBytes", requiredBytes,
-				"targetMinBytes", targetMinBytes,
-				"deviceBytes", lastDeviceBytes,
-				"filesystemBytes", lastFSBytes,
-				"resized", resized,
-				"attempts", attempts)
-			return &csi.NodeExpandVolumeResponse{
-				CapacityBytes: requiredBytes,
-			}, nil
+		if err := ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
 		}
-
-		if !nodeNow().Before(deadline) {
-			ns.recordNodeExpandOperation(started, "disk", "deadline_exceeded")
-			klog.V(0).InfoS("NodeExpandVolume timed out waiting for filesystem growth",
-				"method", "NodeExpandVolume",
-				"volumeID", volumeID,
-				"volumePath", volumePath,
-				"devicePath", devicePath,
-				"requiredBytes", requiredBytes,
-				"targetMinBytes", targetMinBytes,
-				"deviceBytes", lastDeviceBytes,
-				"filesystemBytes", lastFSBytes,
-				"resized", resized,
-				"attempts", attempts)
-			return nil, status.Errorf(
-				codes.DeadlineExceeded,
-				"filesystem resize did not converge for volume %s: requested_bytes=%d target_min_bytes=%d device_bytes=%d filesystem_bytes=%d attempts=%d",
-				volumeID, requiredBytes, targetMinBytes, lastDeviceBytes, lastFSBytes, attempts,
-			)
-		}
-
-		klog.V(2).InfoS("NodeExpandVolume waiting for filesystem capacity",
-			"method", "NodeExpandVolume",
-			"volumeID", volumeID,
-			"volumePath", volumePath,
-			"devicePath", devicePath,
-			"requiredBytes", requiredBytes,
-			"targetMinBytes", targetMinBytes,
-			"deviceBytes", lastDeviceBytes,
-			"filesystemBytes", lastFSBytes,
-			"resized", resized,
-			"attempt", attempts)
-		nodeDeviceSleep(policy.retryInterval)
+		ns.recordNodeExpandOperation(started, "disk", "success")
+		klog.V(1).InfoS("NodeExpandVolume converged",
+			"method", "NodeExpandVolume", "volumeID", volumeID,
+			"volumePath", volumePath, "devicePath", devicePath,
+			"requiredBytes", requiredBytes, "deviceBytes", lastDeviceBytes,
+			"filesystemBytes", lastFSBytes, "resized", resized, "attempts", attempts)
+		return &csi.NodeExpandVolumeResponse{CapacityBytes: requiredBytes}, nil
 	}
+}
+
+// mount-utils calls Command; bind those external calls to this RPC's deadline.
+type nodeExpandExec struct {
+	utilexec.Interface
+	ctx context.Context
+}
+
+func (e nodeExpandExec) Command(cmd string, args ...string) utilexec.Cmd {
+	return e.CommandContext(e.ctx, cmd, args...)
 }
 
 type nodeExpandPolicy struct {
@@ -984,6 +979,10 @@ func (ns *NodeServer) NodeGetCapabilities(_ context.Context, req *csi.NodeGetCap
 }
 
 func (ns *NodeServer) getBlockVolumeSize(volumePath string) (int64, error) {
+	return ns.getBlockVolumeSizeWithExec(volumePath, ns.mounter.Exec)
+}
+
+func (ns *NodeServer) getBlockVolumeSizeWithExec(volumePath string, executor utilexec.Interface) (int64, error) {
 	info, err := os.Stat(volumePath)
 	if err != nil {
 		return 0, err
@@ -993,7 +992,7 @@ func (ns *NodeServer) getBlockVolumeSize(volumePath string) (int64, error) {
 		return info.Size(), nil
 	}
 
-	output, err := ns.mounter.Exec.Command("blockdev", "--getsize64", volumePath).CombinedOutput()
+	output, err := executor.Command("blockdev", "--getsize64", volumePath).CombinedOutput()
 	if err != nil {
 		return 0, fmt.Errorf("blockdev failed: %w: %s", err, strings.TrimSpace(string(output)))
 	}

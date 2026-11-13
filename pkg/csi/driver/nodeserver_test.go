@@ -725,17 +725,15 @@ func TestNodeExpandVolume(t *testing.T) {
 
 	t.Run("accepts fully expanded ext4 with metadata overhead", func(t *testing.T) {
 		originalStatfs := nodeVolumePathFS
-		originalSleep := nodeDeviceSleep
+		originalSleep := nodeExpandSleep
 		originalNow := nodeNow
 		originalResizeFS := nodeResizeFS
-		originalNeedsResizeFS := nodeNeedsResizeFS
 		originalGOOS := nodeRuntimeGOOS
 		t.Cleanup(func() {
 			nodeVolumePathFS = originalStatfs
-			nodeDeviceSleep = originalSleep
+			nodeExpandSleep = originalSleep
 			nodeNow = originalNow
 			nodeResizeFS = originalResizeFS
-			nodeNeedsResizeFS = originalNeedsResizeFS
 			nodeRuntimeGOOS = originalGOOS
 		})
 
@@ -755,7 +753,7 @@ func TestNodeExpandVolume(t *testing.T) {
 		nodeRuntimeGOOS = "linux"
 		now := time.Unix(0, 0)
 		nodeNow = func() time.Time { return now }
-		nodeDeviceSleep = func(d time.Duration) { now = now.Add(d) }
+		nodeExpandSleep = func(_ context.Context, d time.Duration) error { now = now.Add(d); return nil }
 
 		resizeCalls := 0
 		nodeResizeFS = func(_ exec.Interface, _, _ string) (bool, error) {
@@ -763,11 +761,6 @@ func TestNodeExpandVolume(t *testing.T) {
 			return true, nil
 		}
 		setFilesystemBytesSequence([]int64{42158374912})
-		geometryChecks := 0
-		nodeNeedsResizeFS = func(_ exec.Interface, _, _ string) (bool, error) {
-			geometryChecks++
-			return false, nil
-		}
 
 		request := makeFilesystemRequest(volumePath)
 		request.CapacityRange.RequiredBytes = requiredBytes
@@ -776,30 +769,26 @@ func TestNodeExpandVolume(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, &csi.NodeExpandVolumeResponse{CapacityBytes: requiredBytes}, response)
 		assert.Equal(t, 1, resizeCalls)
-		assert.Equal(t, 1, geometryChecks)
-		t.Logf("CSI NodeExpandVolume fixture: required_bytes=%d device_bytes=%d statfs_bytes=42158374912 geometry_needs_resize=false geometry_checks=%d resize_calls=%d response=%v error=%v", requiredBytes, requiredBytes, geometryChecks, resizeCalls, response, err)
 	})
 
-	t.Run("retries until filesystem reaches target", func(t *testing.T) {
+	t.Run("waits for full device capacity before one successful resize", func(t *testing.T) {
 		originalStatfs := nodeVolumePathFS
-		originalSleep := nodeDeviceSleep
+		originalSleep := nodeExpandSleep
 		originalNow := nodeNow
 		originalResizeFS := nodeResizeFS
-		originalNeedsResizeFS := nodeNeedsResizeFS
 		originalGOOS := nodeRuntimeGOOS
 		t.Cleanup(func() {
 			nodeVolumePathFS = originalStatfs
-			nodeDeviceSleep = originalSleep
+			nodeExpandSleep = originalSleep
 			nodeNow = originalNow
 			nodeResizeFS = originalResizeFS
-			nodeNeedsResizeFS = originalNeedsResizeFS
 			nodeRuntimeGOOS = originalGOOS
 		})
 
 		volumePath := t.TempDir()
 		devicePath := filepath.Join(t.TempDir(), "device")
 		assert.NoError(t, os.WriteFile(devicePath, []byte("x"), 0o644))
-		assert.NoError(t, os.Truncate(devicePath, requiredBytes))
+		assert.NoError(t, os.Truncate(devicePath, requiredBytes/2))
 
 		ns := getTestNodeServerWithMountPoints([]mount.MountPoint{
 			{Path: volumePath, Device: devicePath},
@@ -811,46 +800,46 @@ func TestNodeExpandVolume(t *testing.T) {
 		nodeRuntimeGOOS = "linux"
 		now := time.Unix(0, 0)
 		nodeNow = func() time.Time { return now }
-		nodeDeviceSleep = func(d time.Duration) { now = now.Add(d) }
+		nodeExpandSleep = func(_ context.Context, d time.Duration) error {
+			now = now.Add(d)
+			if now.Sub(time.Unix(0, 0)) >= 4*time.Second {
+				assert.NoError(t, os.Truncate(devicePath, requiredBytes))
+			}
+			return nil
+		}
 
 		resizeCalls := 0
 		nodeResizeFS = func(_ exec.Interface, _, _ string) (bool, error) {
 			resizeCalls++
 			return true, nil
 		}
-		setFilesystemBytesSequence([]int64{
-			requiredBytes / 2,
-			requiredBytes / 2,
-			requiredBytes,
-		})
-		nodeNeedsResizeFS = func(_ exec.Interface, _, _ string) (bool, error) { return resizeCalls < 3, nil }
+		setFilesystemBytesSequence([]int64{requiredBytes - 67108864})
 
 		response, err := ns.NodeExpandVolume(context.Background(), makeFilesystemRequest(volumePath))
 		assert.NoError(t, err)
 		assert.Equal(t, &csi.NodeExpandVolumeResponse{CapacityBytes: requiredBytes}, response)
-		assert.Equal(t, 3, resizeCalls)
+		assert.Equal(t, 1, resizeCalls)
+		assert.Equal(t, 4*time.Second, now.Sub(time.Unix(0, 0)))
 	})
 
-	t.Run("returns deadline exceeded when filesystem never converges", func(t *testing.T) {
+	t.Run("returns deadline exceeded without resizing a permanently short device", func(t *testing.T) {
 		originalStatfs := nodeVolumePathFS
-		originalSleep := nodeDeviceSleep
+		originalSleep := nodeExpandSleep
 		originalNow := nodeNow
 		originalResizeFS := nodeResizeFS
-		originalNeedsResizeFS := nodeNeedsResizeFS
 		originalGOOS := nodeRuntimeGOOS
 		t.Cleanup(func() {
 			nodeVolumePathFS = originalStatfs
-			nodeDeviceSleep = originalSleep
+			nodeExpandSleep = originalSleep
 			nodeNow = originalNow
 			nodeResizeFS = originalResizeFS
-			nodeNeedsResizeFS = originalNeedsResizeFS
 			nodeRuntimeGOOS = originalGOOS
 		})
 
 		volumePath := t.TempDir()
 		devicePath := filepath.Join(t.TempDir(), "device")
 		assert.NoError(t, os.WriteFile(devicePath, []byte("x"), 0o644))
-		assert.NoError(t, os.Truncate(devicePath, requiredBytes))
+		assert.NoError(t, os.Truncate(devicePath, requiredBytes/2))
 
 		ns := getTestNodeServerWithMountPoints([]mount.MountPoint{
 			{Path: volumePath, Device: devicePath},
@@ -862,7 +851,7 @@ func TestNodeExpandVolume(t *testing.T) {
 		nodeRuntimeGOOS = "linux"
 		now := time.Unix(0, 0)
 		nodeNow = func() time.Time { return now }
-		nodeDeviceSleep = func(d time.Duration) { now = now.Add(d) }
+		nodeExpandSleep = func(_ context.Context, d time.Duration) error { now = now.Add(d); return nil }
 
 		resizeCalls := 0
 		nodeResizeFS = func(_ exec.Interface, _, _ string) (bool, error) {
@@ -870,29 +859,26 @@ func TestNodeExpandVolume(t *testing.T) {
 			return true, nil
 		}
 		setFilesystemBytesSequence([]int64{requiredBytes / 2})
-		nodeNeedsResizeFS = func(_ exec.Interface, _, _ string) (bool, error) { return true, nil }
 
 		response, err := ns.NodeExpandVolume(context.Background(), makeFilesystemRequest(volumePath))
 		assert.Nil(t, response)
 		assert.Error(t, err)
 		assert.Equal(t, codes.DeadlineExceeded, status.Code(err))
 		assert.Contains(t, err.Error(), "requested_bytes")
-		assert.GreaterOrEqual(t, resizeCalls, 2)
+		assert.Zero(t, resizeCalls)
 	})
 
 	t.Run("waits for device expansion before resizing filesystem", func(t *testing.T) {
 		originalStatfs := nodeVolumePathFS
-		originalSleep := nodeDeviceSleep
+		originalSleep := nodeExpandSleep
 		originalNow := nodeNow
 		originalResizeFS := nodeResizeFS
-		originalNeedsResizeFS := nodeNeedsResizeFS
 		originalGOOS := nodeRuntimeGOOS
 		t.Cleanup(func() {
 			nodeVolumePathFS = originalStatfs
-			nodeDeviceSleep = originalSleep
+			nodeExpandSleep = originalSleep
 			nodeNow = originalNow
 			nodeResizeFS = originalResizeFS
-			nodeNeedsResizeFS = originalNeedsResizeFS
 			nodeRuntimeGOOS = originalGOOS
 		})
 
@@ -913,12 +899,13 @@ func TestNodeExpandVolume(t *testing.T) {
 		nodeNow = func() time.Time { return now }
 
 		sleepCalls := 0
-		nodeDeviceSleep = func(d time.Duration) {
+		nodeExpandSleep = func(_ context.Context, d time.Duration) error {
 			sleepCalls++
 			now = now.Add(d)
 			if sleepCalls == 1 {
-				_ = os.Truncate(devicePath, requiredBytes)
+				assert.NoError(t, os.Truncate(devicePath, requiredBytes))
 			}
+			return nil
 		}
 
 		resizeCalls := 0
@@ -927,13 +914,36 @@ func TestNodeExpandVolume(t *testing.T) {
 			return true, nil
 		}
 		setFilesystemBytesSequence([]int64{requiredBytes})
-		nodeNeedsResizeFS = func(_ exec.Interface, _, _ string) (bool, error) { return false, nil }
 
 		response, err := ns.NodeExpandVolume(context.Background(), makeFilesystemRequest(volumePath))
 		assert.NoError(t, err)
 		assert.Equal(t, &csi.NodeExpandVolumeResponse{CapacityBytes: requiredBytes}, response)
 		assert.Equal(t, 1, sleepCalls)
 		assert.Equal(t, 1, resizeCalls)
+	})
+}
+
+// Resize=false is a negative result, even with full device/statfs capacity.
+func TestNodeExpandUnperformedResizeAndCephFS(t *testing.T) {
+	t.Run("unperformed resize", func(t *testing.T) {
+		oldResize, oldGOOS, oldFS := nodeResizeFS, nodeRuntimeGOOS, nodeVolumePathFS
+		t.Cleanup(func() { nodeResizeFS, nodeRuntimeGOOS, nodeVolumePathFS = oldResize, oldGOOS, oldFS })
+		nodeRuntimeGOOS = "linux"
+		nodeResizeFS = func(exec.Interface, string, string) (bool, error) { return false, nil }
+		nodeVolumePathFS = func(_ string, st *unix.Statfs_t) error { st.Bsize = 4096; st.Blocks = 512; return nil }
+		device := filepath.Join(t.TempDir(), "device")
+		assert.NoError(t, os.WriteFile(device, make([]byte, 4096), 0600))
+		volumePath := t.TempDir()
+		ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Path: volumePath, Device: device}})
+		response, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{VolumeId: "owned-fixture", VolumePath: volumePath, StagingTargetPath: volumePath, CapacityRange: &csi.CapacityRange{RequiredBytes: 4096}})
+		assert.Nil(t, response)
+		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	})
+	t.Run("CephFS remains unsupported", func(t *testing.T) {
+		ns := getTestNodeServer(nil)
+		response, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{VolumeId: "cephfs:test", VolumePath: "/fixture", CapacityRange: &csi.CapacityRange{RequiredBytes: 4096}})
+		assert.Nil(t, response)
+		assert.Equal(t, codes.Unimplemented, status.Code(err))
 	})
 }
 
@@ -1043,4 +1053,21 @@ func TestNodeGetInfoIncludesAccessibleTopologyWhenEnabled(t *testing.T) {
 	if assert.NotNil(t, response.GetAccessibleTopology()) {
 		assert.Equal(t, "111", response.GetAccessibleTopology().Segments[topologySystemDSLabel])
 	}
+}
+
+func TestNodeExpandDeadlineInterruptsDeviceWait(t *testing.T) {
+	oldGOOS := nodeRuntimeGOOS
+	t.Cleanup(func() { nodeRuntimeGOOS = oldGOOS })
+	nodeRuntimeGOOS = "linux"
+	device := filepath.Join(t.TempDir(), "device")
+	assert.NoError(t, os.WriteFile(device, []byte("short"), 0600))
+	volumePath := t.TempDir()
+	ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Path: volumePath, Device: device}})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	response, err := ns.NodeExpandVolume(ctx, &csi.NodeExpandVolumeRequest{VolumeId: "owned-fixture", VolumePath: volumePath, StagingTargetPath: volumePath, CapacityRange: &csi.CapacityRange{RequiredBytes: 4096}})
+	assert.Nil(t, response)
+	assert.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	assert.Less(t, time.Since(started), time.Second, "RPC deadline must interrupt the two-second device retry wait")
 }

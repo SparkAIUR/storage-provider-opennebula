@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased node expansion correction
+
+- Complete node expansion after verifying the full requested device capacity and successful mount-utils filesystem resize. Kubernetes 0.36 NeedResize reports XFS/ext eligibility, not completion; lower statfs capacity includes filesystem overhead.
+- Honor cancellation during filesystem commands and device-capacity waits, and recheck it before acknowledging success. Native expansion and ordinary reattach acceptance remain pending.
+
 ## v0.6.0-rc.2, unreleased
 
 - Accept explicitly bound Ceph bridge IP/name aliases using versioned operator configuration tied to a non-secret datastore fingerprint and current registered host IDs/names. Verify every upstream-selectable bridge before allocation; a healthy member cannot mask an unknown or ineligible endpoint.
