@@ -8,7 +8,7 @@
 - Give preflight bootstrap resources, both Jobs and reconcile inputs release-revision names. Retain failed Jobs and their inputs across later revisions without TTL cleanup.
 - Preserve the RC1 failure evidence and require fresh RC2 publication/native qualification. See [bridge identity contract](docs/ceph-bridge-identities.md).
 
-## v0.6.0-rc.1, unreleased
+## v0.6.0-rc.1
 
 - Reject unrecorded or pending expanded-disk detach, retain lookup rejections through queue prechecks, require literal evidence booleans, and pin workflow Helm installers to v3.21.4.
 
