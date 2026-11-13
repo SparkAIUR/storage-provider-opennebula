@@ -533,13 +533,15 @@ func TestControllerPublishRealAttachRestorationContext(t *testing.T) {
 	for _, observation := range []struct {
 		method string
 		read   int32
+		modes  []string
 	}{
-		{"one.vm.info", 5},
-		{"one.image.info", 4},
-		{"one.system.version", 1},
+		{"one.vm.info", 3, []string{"deadline"}}, // Queue deadline during the earlier capacity read.
+		{"one.vm.info", 5, []string{"deadline", "cancel", "denied"}},
+		{"one.image.info", 4, []string{"deadline", "cancel", "denied"}},
+		{"one.system.version", 1, []string{"deadline", "cancel", "denied"}},
 	} {
-		for _, mode := range []string{"deadline", "cancel", "denied"} {
-			t.Run(observation.method+"/"+mode, func(t *testing.T) {
+		for _, mode := range observation.modes {
+			t.Run(fmt.Sprintf("%s/read=%d/%s", observation.method, observation.read, mode), func(t *testing.T) {
 				var attached, interrupted atomic.Bool
 				var reads atomic.Int32
 				cancelReady := make(chan context.CancelFunc, 1)

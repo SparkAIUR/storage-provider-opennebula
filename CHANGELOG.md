@@ -2,12 +2,8 @@
 
 ## Unreleased provider growth prerequisite
 
-- Current user direction supersedes provider upgrade preparation: remain on OpenNebula 7.4.0 and take no direct OpenNebula host actions. Basic support and positively identified NONE-target growth remain available; known-unsafe SYSTEM/SELF growth stays denied pending a qualified 7.4.0 API-only path. This is a technical safety restriction, not a native acceptance waiver.
-
-- Require canonical OpenNebula 7.4.1+ before persistent SYSTEM/SELF-target disk growth, including capacity-restoration growth. Fail closed on unknown identity, version or observation failure before growth mutations. Publish may already have attached or detached a sticky attachment before restoration reaches the guard.
-- Preserve context error identity through queued direct and embedded post-attach restoration so active timeouts remain DeadlineExceeded and cancellations remain Canceled.
-- Preserve actionable FailedPrecondition for growth prerequisites across all publish restoration paths. Preserve cancellation and deadline errors after fresh VM, image and version observations, before classifying prerequisites or allowing growth.
-- Preserve basic 7.4.0 readiness, satisfied-capacity retries and positively identified NONE-target growth. Native lifecycle acceptance and provider upgrade approval remain separate gates.
+- Add an operation-specific [persistent growth prerequisite](docs/opennebula-74-upgrade.md#provider-growth-metadata-prerequisite-2026-11-13), including restoration, while retaining basic OpenNebula 7.4.0 support. See that contract for allowed growth, mutation limits and open native gates.
+- Preserve actionable FailedPrecondition for publish restoration prerequisites and context error identity through queued direct and embedded post-attach restoration.
 
 ## v0.6.0-rc.2, unreleased
 

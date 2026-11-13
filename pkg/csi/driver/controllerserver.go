@@ -1036,6 +1036,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "sizeBytes", sizeBytes, "hotplugTimeout", hotplugTimeout, "deviceDiscoveryTimeout", deviceDiscoveryTimeout)
 		attachStarted := time.Now()
 		err = s.volumeProvider.AttachVolume(queueCtx, req.VolumeId, req.NodeId, immutableVolume, params)
+		if ctxErr := queueCtx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
 			if conflict, ok := opennebula.AsHostArtifactConflictError(err); ok {
 				return s.handleHostArtifactConflict(queueCtx, req, conflict)
@@ -1874,6 +1877,9 @@ func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node
 
 func (s *ControllerServer) restoreVolumeCapacity(ctx context.Context, volume string, nodeID, volumeID int) error {
 	err := s.volumeProvider.RestoreVolumeCapacity(ctx, volume, nodeID, volumeID)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
 	if err == nil {
 		return nil
 	}
