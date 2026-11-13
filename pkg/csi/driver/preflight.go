@@ -94,6 +94,11 @@ func (r *PreflightRunner) Run(ctx context.Context) PreflightReport {
 		}
 	}
 
+	bridgeIdentities, err := loadCephBridgeIdentities(r.Config)
+	if err != nil {
+		appendResult("ceph_bridge_identities", "fail", err.Error())
+		return PreflightReport{Passed: false, Results: results}
+	}
 	endpoint, _ := r.Config.GetString(config.OpenNebulaRPCEndpointVar)
 	credentials, _ := r.Config.GetString(config.OpenNebulaCredentialsVar)
 	if strings.TrimSpace(endpoint) == "" || strings.TrimSpace(credentials) == "" {
@@ -136,10 +141,18 @@ func (r *PreflightRunner) Run(ctx context.Context) PreflightReport {
 		names := make([]string, 0, len(resolvedDatastores))
 		for _, ds := range resolvedDatastores {
 			names = append(names, fmt.Sprintf("%d(%s:%s)", ds.ID, ds.Category, ds.Backend))
-			if err := opennebula.ProvisioningFeasible(ctx, ctrl, ds); err != nil {
+			if ds.Ceph != nil {
+				fingerprint, fingerprintErr := opennebula.CephBridgeConfigFingerprint(ds)
+				if fingerprintErr != nil {
+					appendResult(fmt.Sprintf("datastore_%d_bridge_fingerprint", ds.ID), "fail", fingerprintErr.Error())
+				} else {
+					appendResult(fmt.Sprintf("datastore_%d_bridge_fingerprint", ds.ID), "pass", "non-secret Ceph bridge configuration fingerprint: "+fingerprint)
+				}
+			}
+			if err := opennebula.ProvisioningFeasible(ctx, ctrl, ds, bridgeIdentities); err != nil {
 				appendResult(fmt.Sprintf("datastore_%d_feasibility", ds.ID), "fail", err.Error())
 			} else {
-				appendResult(fmt.Sprintf("datastore_%d_feasibility", ds.ID), "pass", "provider state and bridge prerequisites verified")
+				appendResult(fmt.Sprintf("datastore_%d_feasibility", ds.ID), "pass", "bridge identities and current registered-host eligibility verified")
 			}
 		}
 		appendResult("datastore_resolution", "pass", fmt.Sprintf("validated datastores: %s", strings.Join(names, ", ")))

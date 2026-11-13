@@ -3,14 +3,15 @@ package opennebula
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/OpenNebula/one/src/oca/go/src/goca"
-	host "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/host"
 )
 
 // ProvisioningFeasible is observation-only; it never changes host or datastore state.
-func ProvisioningFeasible(ctx context.Context, ctrl *goca.Controller, ds Datastore) error {
+func ProvisioningFeasible(ctx context.Context, ctrl *goca.Controller, ds Datastore, identities CephBridgeIdentities) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !ds.Enabled {
 		return fmt.Errorf("datastore %d is disabled in OpenNebula", ds.ID)
 	}
@@ -20,28 +21,15 @@ func ProvisioningFeasible(ctx context.Context, ctrl *goca.Controller, ds Datasto
 	if ds.Ceph == nil {
 		return fmt.Errorf("datastore %d has no Ceph bridge configuration", ds.ID)
 	}
+	if ctrl == nil {
+		return fmt.Errorf("ceph bridge provider observation unavailable")
+	}
 	pool, err := ctrl.Hosts().InfoContext(ctx)
 	if err != nil {
 		return fmt.Errorf("ceph bridge availability unknown: %w", err)
 	}
-	return CephBridgeFeasible(ds.Ceph.BridgeList, pool.Hosts)
-}
-
-func CephBridgeFeasible(bridges string, hosts []host.Host) error {
-	wanted := strings.Fields(strings.ReplaceAll(bridges, ",", " "))
-	if len(wanted) == 0 {
-		return fmt.Errorf("ceph BRIDGE_LIST is empty")
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	for _, name := range wanted {
-		for _, h := range hosts {
-			if h.Name != name {
-				continue
-			}
-			state, err := h.State()
-			if err == nil && state == host.Monitored {
-				return nil
-			}
-		}
-	}
-	return fmt.Errorf("no configured Ceph bridge has verified monitored/enabled host state; unregistered bridges require external read-only verification")
+	return CephBridgeFeasible(ds, pool.Hosts, identities)
 }

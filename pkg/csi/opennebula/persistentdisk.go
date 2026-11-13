@@ -46,12 +46,13 @@ const (
 )
 
 type PersistentDiskVolumeProvider struct {
-	ctrl            *goca.Controller
-	hotplugPolicy   HotplugTimeoutPolicy
-	hotplugPollWait time.Duration
+	ctrl             *goca.Controller
+	bridgeIdentities CephBridgeIdentities
+	hotplugPolicy    HotplugTimeoutPolicy
+	hotplugPollWait  time.Duration
 }
 
-func NewPersistentDiskVolumeProvider(client *OpenNebulaClient, policy HotplugTimeoutPolicy) (*PersistentDiskVolumeProvider, error) {
+func NewPersistentDiskVolumeProvider(client *OpenNebulaClient, policy HotplugTimeoutPolicy, identities CephBridgeIdentities) (*PersistentDiskVolumeProvider, error) {
 	if client == nil {
 		return nil, fmt.Errorf("client reference is nil")
 	}
@@ -65,9 +66,10 @@ func NewPersistentDiskVolumeProvider(client *OpenNebulaClient, policy HotplugTim
 		policy.PollInterval = hotplugPollInterval
 	}
 	return &PersistentDiskVolumeProvider{
-		ctrl:            goca.NewController(client.Client),
-		hotplugPolicy:   policy,
-		hotplugPollWait: policy.PollInterval,
+		ctrl:             goca.NewController(client.Client),
+		bridgeIdentities: identities,
+		hotplugPolicy:    policy,
+		hotplugPollWait:  policy.PollInterval,
 	}, nil
 }
 
@@ -118,7 +120,7 @@ func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name st
 			continue
 		}
 
-		if err := ProvisioningFeasible(ctx, p.ctrl, datastore); err != nil {
+		if err := ProvisioningFeasible(ctx, p.ctrl, datastore, p.bridgeIdentities); err != nil {
 			return nil, err
 		}
 		if selection.Authorize != nil {
@@ -242,7 +244,7 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 		}
 		for _, candidate := range candidates {
 			if candidate.ID == *target.DatastoreID {
-				if err := ProvisioningFeasible(ctx, p.ctrl, candidate); err != nil {
+				if err := ProvisioningFeasible(ctx, p.ctrl, candidate, p.bridgeIdentities); err != nil {
 					return nil, err
 				}
 				if selection.Authorize != nil {
@@ -291,7 +293,7 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 			continue
 		}
 
-		if err := ProvisioningFeasible(ctx, p.ctrl, datastore); err != nil {
+		if err := ProvisioningFeasible(ctx, p.ctrl, datastore, p.bridgeIdentities); err != nil {
 			return nil, err
 		}
 		if selection.Authorize != nil {

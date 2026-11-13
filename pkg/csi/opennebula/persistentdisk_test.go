@@ -65,7 +65,7 @@ func TestPersistentDiskLifecycle(t *testing.T) {
 		Per100GiB:    60 * time.Second,
 		MaxTimeout:   5 * time.Minute,
 		PollInterval: time.Second,
-	})
+	}, CephBridgeIdentities{})
 	if err != nil {
 		t.Fatalf("failed to create PersistentDiskVolumeProvider: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestPersistentDiskDetachedExpansion(t *testing.T) {
 		Per100GiB:    60 * time.Second,
 		MaxTimeout:   5 * time.Minute,
 		PollInterval: time.Second,
-	})
+	}, CephBridgeIdentities{})
 	require.NoError(t, err)
 
 	ctx := context.Background()

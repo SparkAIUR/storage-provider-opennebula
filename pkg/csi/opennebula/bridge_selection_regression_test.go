@@ -12,5 +12,5 @@ func TestBridgeSelectionRejectsHealthyPlusUnknown(t *testing.T) {
 		return true, `<HOST_POOL><HOST><ID>7</ID><NAME>ready.example.invalid</NAME><STATE>2</STATE></HOST></HOST_POOL>`, 0
 	})
 	ds := Datastore{ID: 42, Enabled: true, Type: "ceph", Backend: "ceph", Ceph: &CephDatastoreAttributes{BridgeList: "unknown.example.invalid ready.example.invalid"}}
-	require.Error(t, ProvisioningFeasible(context.Background(), p.ctrl, ds))
+	require.Error(t, ProvisioningFeasible(context.Background(), p.ctrl, ds, CephBridgeIdentities{}))
 }

@@ -29,6 +29,7 @@ const (
 	OpenNebulaRPCEndpointVar                   = "ONE_XMLRPC"
 	OpenNebulaCredentialsVar                   = "ONE_AUTH"
 	DefaultDatastoresVar                       = "ONE_CSI_DEFAULT_DATASTORES"
+	CephBridgeIdentitiesVar                    = "ONE_CSI_CEPH_BRIDGE_IDENTITIES"
 	DatastorePolicyVar                         = "ONE_CSI_DATASTORE_SELECTION_POLICY"
 	AllowedDatastoreTypesVar                   = "ONE_CSI_ALLOWED_DATASTORE_TYPES"
 	FeatureGatesVar                            = "ONE_CSI_FEATURE_GATES"
@@ -234,6 +235,7 @@ func initViper() *viper.Viper {
 	})
 
 	viper.SetDefault(OpenNebulaRPCEndpointVar, defaultOpenNebulaRPCEndpoint)
+	viper.SetDefault(CephBridgeIdentitiesVar, "")
 	viper.SetDefault(DatastorePolicyVar, defaultDatastorePolicy)
 	viper.SetDefault(AllowedDatastoreTypesVar, defaultAllowedDatastoreTypes)
 	viper.SetDefault(FeatureGatesVar, defaultFeatureGates)

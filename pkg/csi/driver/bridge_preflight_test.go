@@ -59,3 +59,21 @@ func TestBridgeIdentityPreflightUsesIndependentBinding(t *testing.T) {
 	}
 	t.Fatalf("missing datastore feasibility result: %+v", report.Results)
 }
+
+func TestBridgeIdentityMalformedPreflightConfigFailsBeforeTransport(t *testing.T) {
+	calls := 0
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		t.Error("malformed policy must not dispatch provider requests")
+	}))
+	defer endpoint.Close()
+	cfg := config.LoadConfiguration()
+	cfg.OverrideVal(config.OpenNebulaRPCEndpointVar, endpoint.URL)
+	cfg.OverrideVal(config.OpenNebulaCredentialsVar, "fixture:fixture")
+	cfg.OverrideVal(config.CephBridgeIdentitiesVar, `{"version":99,"datastores":[]}`)
+	report := NewPreflightRunner(cfg, nil, PreflightOptions{}).Run(context.Background())
+	require.False(t, report.Passed)
+	require.Len(t, report.Results, 1)
+	require.Equal(t, "ceph_bridge_identities", report.Results[0].Check)
+	require.Zero(t, calls)
+}

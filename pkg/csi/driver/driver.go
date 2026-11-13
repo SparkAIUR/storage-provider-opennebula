@@ -108,6 +108,10 @@ func NewDriver(options *DriverOptions) *Driver {
 }
 
 func (d *Driver) Run(ctx context.Context) error {
+	bridgeIdentities, err := loadCephBridgeIdentities(d.PluginConfig)
+	if err != nil {
+		return err
+	}
 	klog.InfoS("Starting OpenNebula CSI driver",
 		"name", d.name,
 		"version", d.version,
@@ -202,6 +206,7 @@ func (d *Driver) Run(ctx context.Context) error {
 			Credentials: credentials,
 		}),
 		loadHotplugTimeoutPolicy(d.PluginConfig),
+		bridgeIdentities,
 	)
 	if err != nil || volumeProvider == nil {
 		return fmt.Errorf("failed to create PersistentDiskVolumeProvider: %v", err)
