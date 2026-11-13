@@ -2,6 +2,11 @@
 
 Current source target is OpenNebula 7.4.0, with no direct OpenNebula host actions. This integration grants no native acceptance or feature waiver; affected persistent growth/reattach and the 24-hour observation remain open.
 
+## v0.6.0-rc.3, unreleased
+
+- Prepare a new qualification candidate containing the reviewed node expansion contract, mounted-device binding, operation-specific provider growth prerequisite and deadline fixture correction. Align chart, application and default driver image versions without changing runtime behavior.
+- Preserve RC1/RC2 artifacts and failed native receipts. Publication, hpldb-only rollout approval, native expansion/reattach qualification and the 24-hour observation remain separate gates.
+
 ## Unreleased test reliability
 
 - Synchronize node expansion deadline injection with the actual RPC command context. Preserve deadline status and mutation assertions without relying on parent-to-child cancellation scheduling. Production behavior and native qualification gates are unchanged.

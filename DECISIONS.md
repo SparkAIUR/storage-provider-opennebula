@@ -120,3 +120,9 @@ The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI i
 
 - AI: Capture the actual operation context at the first capacity command and await its cancellation before injecting the deadline observation error. Waiting for the caller context alone does not synchronize child cancellation. Retain all filesystem formats, command boundaries, deadline status and mutation assertions; production context handling is unchanged.
 - AI: Preserve the independent Plan007 runtime failure receipt alongside the corrected fixture results. Local validation does not qualify native expansion or reattach, waive acceptance, or start the 24-hour observation. The current OpenNebula 7.4.0/no-direct-host instruction remains in force.
+
+## 2026-11-13, RC3 qualification metadata
+
+- HUMAN: Proceed with validation for hpldb. OpenNebula 7.4.0 remains the target, with no direct OpenNebula host actions and no hplsvc/bravo activation.
+- AI: Prepare the unused v0.6.0-rc.3 candidate by aligning chart version, appVersion and the default driver image tag. Package the reviewed merged source without changing code, dependencies, runtime configuration or Helm behavior beyond those version defaults. Preserve all earlier candidate artifacts and receipts.
+- AI: Bind later build metadata to the exact frozen source commit and tree. Local packaging checks do not claim publication, deployment or native acceptance. Protected publication, artifact freeze, reviewed hpldb-only GitOps and fresh node UID approvals remain later gates; affected LVM growth/reattach and the 24-hour observation remain open, with no feature waiver.
