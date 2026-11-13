@@ -401,3 +401,66 @@ func TestNodeExpandBtrfsKernelObservation(t *testing.T) {
 	_, err = readNodeBtrfsFilesystemInfo(ctx, "/proc/self")
 	require.ErrorIs(t, err, context.Canceled)
 }
+
+// A mount observed as Btrfs must never use the regular-image or character-device
+// capacity shortcuts, even when all source aliases consistently name B.
+func TestNodeExpandBtrfsRejectsNonBlockSources(t *testing.T) {
+	for _, scenario := range []string{"regular both aliases", "regular no staging", "character both aliases", "character no staging", "regular Btrfs staging only"} {
+		t.Run(scenario, func(t *testing.T) {
+			root := t.TempDir()
+			image := filepath.Join(root, "image-b")
+			require.NoError(t, os.WriteFile(image, nil, 0600))
+			require.NoError(t, os.Truncate(image, 2147483648))
+			source := image
+			if strings.HasPrefix(scenario, "character") {
+				source = "/dev/null"
+			}
+			stageSource, publishSource := filepath.Join(root, "stage-alias"), filepath.Join(root, "publish-alias")
+			require.NoError(t, os.Symlink(source, stageSource))
+			require.NoError(t, os.Symlink(source, publishSource))
+			stage, publish := filepath.Join(root, "stage"), filepath.Join(root, "publish")
+			require.NoError(t, os.Mkdir(stage, 0700))
+			require.NoError(t, os.Mkdir(publish, 0700))
+			publishType := "btrfs"
+			if scenario == "regular Btrfs staging only" {
+				publishType = "xfs"
+			}
+			ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Path: stage, Device: stageSource, Type: "btrfs"}, {Path: publish, Device: publishSource, Type: publishType}})
+			commands := &testingexec.FakeExec{}
+			capacityCalls, resizeCalls, allCalls := 0, 0, 0
+			action := func(cmd string, args ...string) utilexec.Cmd {
+				allCalls++
+				return testingexec.InitFakeCmd(&testingexec.FakeCmd{CombinedOutputScript: []testingexec.FakeAction{func() ([]byte, []byte, error) {
+					switch cmd {
+					case "blockdev":
+						capacityCalls++
+						return []byte("2147483648\n"), nil, nil
+					case "blkid":
+						return []byte("TYPE=btrfs\n"), nil, nil
+					case "btrfs":
+						resizeCalls++
+						require.Equal(t, []string{"filesystem", "resize", "max", publish}, args)
+						return []byte("resized"), nil, nil
+					default:
+						t.Fatalf("unexpected command %s %v", cmd, args)
+						return nil, nil, nil
+					}
+				}}}, cmd, args...)
+			}
+			for range 16 {
+				commands.CommandScript = append(commands.CommandScript, action)
+			}
+			ns.mounter.Exec = commands
+			if strings.Contains(scenario, "no staging") {
+				stage = ""
+			}
+			response, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{VolumeId: "btrfs-nonblock-fixture", VolumePath: publish, StagingTargetPath: stage, CapacityRange: &csi.CapacityRange{RequiredBytes: 2147483648}})
+			t.Logf("capacity_calls=%d resize_calls=%d all_commands=%d response=%v error=%v", capacityCalls, resizeCalls, allCalls, response, err)
+			require.Equal(t, codes.FailedPrecondition, status.Code(err))
+			require.Nil(t, response)
+			require.Zero(t, resizeCalls)
+			require.Zero(t, capacityCalls)
+			require.Zero(t, allCalls, "reject before format probes or capacity commands")
+		})
+	}
+}
