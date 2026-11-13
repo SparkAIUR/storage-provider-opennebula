@@ -2,7 +2,7 @@
 
 ## Unreleased node expansion correction
 
-- Complete node expansion after verifying the full requested device capacity and successful mount-utils filesystem resize. Kubernetes 0.36 NeedResize reports XFS/ext eligibility, not completion; lower statfs capacity includes filesystem overhead.
+- Correct node expansion completion for the pinned mount-utils dependency. This supersedes the v0.5.29 geometry check; see the [node expansion contract](docs/node-expansion.md#verification-contract).
 - Honor cancellation during filesystem commands and device-capacity waits, and recheck it before acknowledging success. Native expansion and ordinary reattach acceptance remain pending.
 
 ## v0.6.0-rc.2, unreleased
