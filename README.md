@@ -1,6 +1,6 @@
 # SparkAI OpenNebula CSI
 
-`storage-provider-opennebula` is the SparkAI fork of the OpenNebula CSI driver for Kubernetes. It publishes container images to `ghcr.io/sparkaiur/opennebula-csi:<tag>` and `docker.io/nudevco/opennebula-csi:<tag>`, and Helm charts to `https://sparkaiur.github.io/storage-provider-opennebula/charts/`.
+`storage-provider-opennebula` is the SparkAI fork of the OpenNebula CSI driver for Kubernetes. The 0.6.0 candidate supports OpenNebula 7.4.x only, over XML-RPC. See [release artifacts](#release-artifacts) for distribution and the [upgrade runbook](docs/opennebula-74-upgrade.md) for candidate qualification and rollout gates.
 
 This fork is focused on Omni deployments on OpenNebula and removes the old requirement that a datastore literally named `default` must exist for PVC provisioning.
 
@@ -11,32 +11,32 @@ This fork is focused on Omni deployments on OpenNebula and removes the old requi
 - Support `least-used`, `ordered`, and `autopilot` datastore selection policies.
 - Support `Filesystem` and `Block` volume modes.
 - Support `ReadWriteOnce`, `ReadOnlyMany`, and CephFS-backed filesystem volumes for `ReadWriteOnce`, `ReadOnlyMany`, and `ReadWriteMany`.
-- Support CSI volume expansion for attached volumes, detached persistent disks, and dynamic CephFS subvolumes.
+- Support CSI volume expansion for attached disks and dynamic CephFS subvolumes. See [volume expansion](#volume-expansion) for restrictions.
 - Support `NodeGetVolumeStats`, driver-native Prometheus metrics, Kubernetes Events, and PV placement annotations.
 - Support preflight validation through the binary and an optional Helm Job.
-- Support CSI snapshots plus PVC-to-PVC clone for disk-backed OpenNebula volumes.
+- Support disk-backed PVC-to-PVC clones and existing snapshot management. See [snapshots and clones](#snapshots-and-clones) for restrictions.
 - Support gated topology accessibility plus CephFS snapshot/clone and self-healing flows.
 - Support `local`, OpenNebula Ceph RBD, and SparkAI CephFS datastores.
 - Keep the internal selection/provider structure ready for future `nfs` support.
 
 ## Validated Staging Matrix
 
-The staging lab has validated the following matrix across recent releases:
+The staging lab validated the following matrix on earlier releases. These results do not qualify the OpenNebula 7.4 candidate; its [native qualification gates](docs/opennebula-74-upgrade.md) remain open.
 
 - local RWO volumes on an OpenNebula image datastore
 - Ceph RBD RWO volumes on a Ceph-backed image datastore with a Ceph system datastore
 - CephFS static and dynamic RWX volumes on a SparkAI CephFS `FILE` datastore
 - ROX clones on the disk-backed path
 
-Staging-validated stable features:
+Historical staging coverage:
 
 - Local RWO create, mount, resize, detach, reattach, and delete cleanup
 - Ceph RBD RWO create, mount, resize, detach, reattach, and delete cleanup
 - CephFS static RWX create, publish across nodes, and retain-on-delete behavior
 - CephFS dynamic RWX create, publish across nodes, resize, snapshot create/delete, clone, snapshot restore, and delete cleanup
-- Disk-path CSI snapshots and PVC clones
+- Disk-path CSI snapshots and PVC clones, subject to the [current restrictions](#snapshots-and-clones)
 - `NodeGetVolumeStats`, driver metrics, PV placement annotations, and Kubernetes Events
-- `detachedDiskExpansion`
+- `detachedDiskExpansion`, subject to the [current restrictions](#volume-expansion)
 - `cephfsExpansion`
 
 See the [feature-gate reference](helm/opennebula-csi/README.md#feature-gates) for optional features and their defaults.
@@ -48,7 +48,7 @@ See the [feature-gate reference](helm/opennebula-csi/README.md#feature-gates) fo
   `docker.io/nudevco/opennebula-csi:<tag>`
 - Release versions and changes: [CHANGELOG.md](CHANGELOG.md).
 - Validation and rollout evidence: [node expansion](docs/node-expansion.md) and [CephFS recovery](docs/cephfs-recovery.md).
-- Helm repo: `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
+- Historical Helm repo: `https://sparkaiur.github.io/storage-provider-opennebula/charts/`. For current publication channels, see the [upgrade runbook](docs/opennebula-74-upgrade.md).
 - Chart name: `opennebula-csi`
 - Source repo: `https://github.com/SparkAIUR/storage-provider-opennebula`
 
@@ -260,7 +260,7 @@ Behavior:
 - `preferred-node` is soft. It injects preferred hostname affinity even when pod-level `last-node-preference: disabled` opt-out is set, because this is an explicit operator decision rather than an automatic heuristic.
 - historical `last-attached-node` is also soft. If the node is missing, tombstoned, or topology-incompatible, the driver downgrades it to warnings and skips the hint instead of blocking admission or maintenance reconciliation.
 - `storage-provider.opennebula.sparkaiur.io/allow-cross-node-until` remains the only cross-node override. It can authorize an explicit `required-node` that conflicts with inferred protected ownership, but it does not bypass topology validation, repair-required states, or quarantine.
-- `storage-provider.opennebula.sparkaiur.io/preferred-last-node` is deprecated on PVs and will be removed in `v0.6.0`. The driver still reads it as a fallback through `v0.5.x` and reports it in annotation audits.
+- For the deprecated `storage-provider.opennebula.sparkaiur.io/preferred-last-node` fallback, see [compatibility guidance](helm/opennebula-csi/DEBUGGING.md#deprecated-annotation).
 
 The admission webhook now defaults to `failurePolicy: Fail`. Ignoring webhook failures would silently bypass explicit `required-node` safety constraints.
 
@@ -437,8 +437,10 @@ Current behavior:
 - Block volumes do not require node-side filesystem expansion.
 - CephFS shared-filesystem volumes support expansion for dynamic subvolumes by default.
 - Static CephFS paths created with `sharedFilesystemPath` are not expandable.
-- Detached-volume expansion is enabled by default and uses image-level resize via `one.image.update`.
+- Detached disk growth is rejected, including when the legacy `detachedDiskExpansion` gate is set to `true`.
 - Shrinking remains unsupported for disk and CephFS paths.
+
+See the [upgrade safety contract](docs/opennebula-74-upgrade.md) for verified capacity restoration, detach prerequisites and the expansion procedure for legacy disks.
 
 Node resize convergence can be tuned with:
 
@@ -449,11 +451,14 @@ For the legacy tolerance setting, see [node expansion compatibility](docs/node-e
 
 ## Snapshots and clones
 
-Stable disk-path data-management features:
+Disk-path data-management behavior:
 
-- CSI `CreateSnapshot`, `DeleteSnapshot`, and `ListSnapshots` for OpenNebula image-backed volumes
+- New disk `CreateSnapshot` requests return `Unimplemented` pending backend lifecycle qualification.
+- Existing snapshot handles remain listable. See the [upgrade safety contract](docs/opennebula-74-upgrade.md) for snapshot deletion and source-retention requirements.
 - PVC-to-PVC clone through CSI `VolumeContentSource.volume`
 - the chart can deploy the external `csi-snapshotter` sidecar
+
+See the [upgrade safety contract](docs/opennebula-74-upgrade.md) for clone provenance, capacity errors and lost-response handling.
 
 Current limitations:
 
@@ -603,7 +608,7 @@ Stable features are enabled by default. Higher-risk features remain behind featu
 
 The chart renders the gates from [values.yaml](helm/opennebula-csi/values.yaml) into `ONE_CSI_FEATURE_GATES`. See the [chart reference](helm/opennebula-csi/README.md#feature-gates) for configuration and [defaultFeatureGates](pkg/csi/driver/feature_gates.go) for standalone driver defaults.
 
-- `detachedDiskExpansion` enables image-level resize for detached persistent disks
+- `detachedDiskExpansion` is retained for configuration compatibility; see [volume expansion](#volume-expansion) for its current restriction
 - `cephfsExpansion` enables dynamic CephFS subvolume quota resize
 - `cephfsSnapshots` enables CephFS snapshot RPCs
 - `cephfsClones` enables CephFS PVC clone and snapshot restore flows
@@ -616,6 +621,8 @@ The chart renders the gates from [values.yaml](helm/opennebula-csi/values.yaml) 
 ## Helm installation
 
 Add the SparkAI chart repo:
+
+The commands below use the historical stable channel. For the 0.6.0 candidate and qualified stable channels, follow the [upgrade runbook](docs/opennebula-74-upgrade.md).
 
 ```bash
 helm repo add sparkai-opennebula https://sparkaiur.github.io/storage-provider-opennebula/charts/
@@ -764,16 +771,19 @@ For CephFS-backed Omni deployments:
 
 ## Staging validation gate
 
-The repo includes a staging validation gate used on a live Omni + Talos + OpenNebula cluster before release:
+The repo retains legacy staging tools for approved isolated disposable clusters:
 
 - a local validation script: `hack/validate-staging-cephfs.sh`
 - a manual GitHub Actions workflow: `.github/workflows/staging-cephfs-validation.yaml`
-- the workflow builds and pushes an ephemeral `ghcr.io/sparkaiur/opennebula-csi:staging-<sha>` image before deploying, so staging always exercises the branch under test instead of the last tagged release
+- the workflow builds and pushes an ephemeral `ghcr.io/sparkaiur/opennebula-csi:staging-<sha>` image, but does not supply the installer's new approval, cluster UID and digest inputs; it cannot complete validation as configured
+
+See the [upgrade runbook](docs/opennebula-74-upgrade.md) for the isolated-lab boundary and current qualification procedure.
 
 Local staging runs can override the deployed image with:
 
 - `CSI_IMAGE_REPOSITORY`
 - `CSI_IMAGE_TAG`
+- `CSI_IMAGE_DIGEST`, required for immutable image selection
 
 Required staging secrets for the workflow:
 
@@ -817,6 +827,8 @@ helm template opennebula-csi helm/opennebula-csi --values examples/helm-values-c
 
 ### Opt-in test suites
 
+The default Go suite includes `TestFixtureCSISanity`, an offline serialized CSI contract subset. It does not establish native provider or device behavior. The full opt-in `TestDriver` suite remains separate.
+
 These suites are disabled by default because they require real infrastructure:
 
 - `RUN_CSI_SANITY_TESTS=1 go test ./pkg/csi/driver -run TestDriver`
@@ -825,34 +837,9 @@ These suites are disabled by default because they require real infrastructure:
 
 ## Release flow
 
-Every semantic release must be validated on the approved test cluster before the tag is created. `hplcsi` is retired; use the target and procedure in the release-specific [CephFS recovery](docs/cephfs-recovery.md#hplmon-test-procedure) or [node expansion](docs/node-expansion.md#validation) guide.
+The [OpenNebula 7.4 upgrade runbook](docs/opennebula-74-upgrade.md) owns candidate publication, native qualification, immutable stable promotion, protected-environment approvals and supervised node replacement. Follow it before publishing or activating this candidate.
 
-Required release gate:
-
-1. Build the candidate image from the branch under test
-2. Deploy that candidate image by immutable digest to a selected test node after checking its existing storage consumers
-3. Validate the feature area touched by the change on live infrastructure
-4. Only after lab validation passes, create or move the semantic tag and publish the release
-
-At minimum, release validation should include:
-
-- `go test ./...`
-- `helm template opennebula-csi ./helm/opennebula-csi ...`
-- for v0.5.28, `hack/validate-cephfs-recovery.py --cluster hplmon --node <candidate-node> --peer-node <peer-node> --expected-image-digest sha256:<manifest-digest>` following [the bounded hplmon procedure](docs/cephfs-recovery.md#hplmon-test-procedure)
-- a live lab validation for the feature or hotfix being released, including local attach/mount, local expansion, inventory CRDs, and workload bootstrap/init smoke checks when touching fast-path mount behavior
-
-The legacy `hack/validate-release-lab.sh` assumes the retired lab and performs Helm ownership changes and broad smoke tests. It is not the hplmon recovery procedure. Use a bounded node canary and isolated test volumes; do not run that script against hplmon without adapting and reviewing its operations.
-
-Push the semantic tag for the release being cut only after its validation passes to trigger the release workflow. Follow the release-specific guide for required native checks and evidence.
-
-The workflow will:
-
-1. Build and publish `ghcr.io/sparkaiur/opennebula-csi:<tag>` and `latest`
-2. Build and publish `docker.io/nudevco/opennebula-csi:<tag>` and `latest`
-3. Package the Helm chart
-4. Publish the chart tarball and `index.yaml` to `gh-pages/charts/`
-5. Re-index the Helm repo with `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
-6. Create a GitHub release for the tag
+The [CephFS recovery](docs/cephfs-recovery.md) and [node expansion](docs/node-expansion.md) guides retain earlier release evidence and feature-specific checks. They do not replace the current qualification gates.
 
 ## Inventory Datastore Status
 
@@ -864,11 +851,13 @@ When the inventory controller is enabled, `kubectl get opennebuladatastores` is 
   - `Enabled`: healthy and explicitly referenced by at least one StorageClass
   - `Available`: healthy, not explicitly disabled, and not explicitly referenced by any StorageClass
   - `Disabled`: explicitly disabled through the datastore object
-  - `Unavailable`: unhealthy, missing, invalid, or backend-mismatched
+  - `Unavailable`: unhealthy, missing, invalid, backend-mismatched, or disabled in OpenNebula
 - `Capacity` is rendered as `{available} / {total} ({usedPercent}%)`
 - `Metrics` shows a compact fio summary when validation succeeded, otherwise `-`
 
 Validation remains informational only and does not by itself make a datastore unavailable.
+
+Provider-disabled datastores report `Invalid` health and `ProviderDisabled` provisioning conditions. Failed provider prerequisite observations report `LookupFailed` and `ProviderPrerequisiteUnknown`, distinct from a known disabled state.
 
 ## Inventory Operator Controls
 
@@ -916,6 +905,3 @@ go run ./cmd/opennebula-csi \
 ## Upstream
 
 This project is derived from the OpenNebula storage provider. The fork keeps the Apache 2.0 license and focuses on SparkAI-specific OpenNebula and Omni requirements.
-
-
-OpenNebula7.4 upgrade: see [candidate support and supervised qualification](docs/opennebula-74-upgrade.md). The0.6.0 RC requires native hpldb qualification before production progression; local tests do not establish deployment acceptance.

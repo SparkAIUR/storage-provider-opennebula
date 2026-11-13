@@ -18,7 +18,7 @@ Images published for this chart:
 
 Chart repo:
 
-- `https://sparkaiur.github.io/storage-provider-opennebula/charts/`
+- Historical channel: `https://sparkaiur.github.io/storage-provider-opennebula/charts/`. Current candidate and qualified stable channels are documented in the [upgrade runbook](../../docs/opennebula-74-upgrade.md).
 
 Operator debugging guide:
 
@@ -30,14 +30,14 @@ Operator debugging guide:
 - datastore selection policies: `least-used`, `ordered`, `autopilot`
 - local, Ceph RBD, and SparkAI CephFS datastore backends
 - `ReadWriteOnce`, `ReadOnlyMany`, and CephFS-backed filesystem volumes for `ReadWriteOnce`, `ReadOnlyMany`, and `ReadWriteMany`
-- CSI resize, metrics, preflight checks, snapshots, and clone workflows
-- stable detached-disk expansion and dynamic CephFS expansion
+- metrics and preflight checks
+- [volume expansion](../../README.md#volume-expansion) and [snapshot/clone workflows](../../README.md#snapshots-and-clones) within the driver's current support contract
 - gated alpha features for CephFS snapshot/clone and CephFS self-healing
 
 ## Prerequisites
 
 - Kubernetes cluster with CSI sidecar compatibility for the versions used by this chart
-- OpenNebula API endpoint reachable from controller and node pods
+- OpenNebula API endpoint reachable from controller and node pods; see [supported versions](../../README.md)
 - OpenNebula credentials available either in an existing Secret or inline through Helm values
 - OpenNebula datastores prepared for the backends you intend to use
 - for CephFS:
@@ -48,6 +48,8 @@ Operator debugging guide:
 ## Install
 
 Add the chart repo:
+
+These commands use the historical stable channel. For this candidate, follow the [upgrade runbook](../../docs/opennebula-74-upgrade.md).
 
 ```bash
 helm repo add sparkai-opennebula https://sparkaiur.github.io/storage-provider-opennebula/charts/
@@ -365,7 +367,7 @@ Behavior:
 - `preferred-node` is soft. It injects preferred hostname affinity even when pod-level `last-node-preference: disabled` opt-out is set, because this is an explicit operator decision rather than an automatic heuristic.
 - historical `last-attached-node` is also soft. If the node is missing, tombstoned, or topology-incompatible, the driver downgrades it to warnings and skips the hint instead of blocking admission or maintenance reconciliation.
 - `storage-provider.opennebula.sparkaiur.io/allow-cross-node-until` remains the only cross-node override. It can authorize an explicit `required-node` that conflicts with inferred protected ownership, but it does not bypass topology validation, repair-required states, or quarantine.
-- `storage-provider.opennebula.sparkaiur.io/preferred-last-node` is deprecated on PVs and will be removed in `v0.6.0`. The driver still reads it as a fallback through `v0.5.x` and reports it in annotation audits.
+- For the deprecated `storage-provider.opennebula.sparkaiur.io/preferred-last-node` fallback, see [compatibility guidance](DEBUGGING.md#deprecated-annotation).
 
 The admission webhook now defaults to `failurePolicy: Fail`. Ignoring webhook failures would silently bypass explicit `required-node` safety constraints.
 
@@ -396,7 +398,7 @@ The admission webhook now defaults to `failurePolicy: Fail`. Ignoring webhook fa
 | `credentials.existingSecret.key` | Secret key inside `credentials.existingSecret.name` used for `ONE_AUTH`. | `"credentials"` | No |
 | `credentials.inlineAuth` | Inline OpenNebula credentials used to create a Secret from the chart. | `""` | Conditional |
 
-One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set.
+One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set. For the release-blocking preflight hook, see the [preflight requirements](#preflight).
 
 ### Image
 
@@ -404,7 +406,14 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | --- | --- | --- | --- |
 | `image.repository` | Driver image repository used by controller, node, and default preflight image selection. | `"nudevco/opennebula-csi"` | No |
 | `image.tag` | Driver image tag. | See [values.yaml](./values.yaml). | No |
+| `image.digest` | OCI digest, including `sha256:`, used instead of the tag when non-empty. Applies to controller, node, inventory and default hook images. | See [values.yaml](./values.yaml). | No |
 | `image.pullPolicy` | Image pull policy for the driver image. | `"IfNotPresent"` | No |
+
+### Sidecar images and probes
+
+`sidecarImages` configures `provisioner`, `attacher`, `resizer`, `snapshotter`, `registrar` and `liveness`. Each accepts `repository`, `tag` and `digest`; a non-empty digest takes precedence over its tag. See [values.yaml](./values.yaml) for the pinned versions. The legacy snapshotter override is documented [below](#snapshotter).
+
+`probes.enabled` controls startup, liveness and readiness probes for the controller and node driver containers. Tune `probes.startup`, `probes.liveness` and `probes.readiness` using the timing fields in [values.yaml](./values.yaml). Controller readiness checks the webhook's HTTPS `/readyz` endpoint when the webhook is enabled; other probes use the liveness sidecar's `/healthz` endpoint.
 
 ### Driver
 
@@ -490,7 +499,7 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `featureGates.compatibilityAwareSelection` | Enable compatibility-aware filtering for datastores such as `COMPATIBLE_SYS_DS`. | `true` | No |
-| `featureGates.detachedDiskExpansion` | Enable detached persistent-disk expansion through image-level resize. Stable and enabled by default in `v0.4.3`. | `true` | No |
+| `featureGates.detachedDiskExpansion` | Legacy compatibility setting; see [current expansion restrictions](../../README.md#volume-expansion). | See [values.yaml](./values.yaml). | No |
 | `featureGates.cephfsExpansion` | Enable CephFS dynamic subvolume expansion. Stable and enabled by default in `v0.4.3`. | `true` | No |
 | `featureGates.cephfsSnapshots` | Enable CephFS snapshot RPC flows. | `false` | No |
 | `featureGates.cephfsClones` | Enable CephFS PVC clone and snapshot restore flows. | `false` | No |
@@ -523,6 +532,8 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | `controller.kubeAPI.burst` | Kubernetes client burst for the controller driver container. | `100` | No |
 
 ### Node
+
+Node replacement follows the [supervised upgrade procedure](../../docs/opennebula-74-upgrade.md); the chart does not automatically replace existing node pods.
 
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
@@ -567,19 +578,7 @@ At least one datastore source must be configured through `driver.defaultDatastor
 
 ### Inventory Datastore Status
 
-When `inventoryController.enabled=true`, `kubectl get opennebuladatastores` becomes the primary datastore inventory view.
-
-- object names remain stable as `ds-<id>`
-- the displayed `Name` column uses the OpenNebula datastore name
-- `Status` values are:
-  - `Enabled`: healthy and explicitly referenced by at least one StorageClass
-  - `Available`: healthy, not explicitly disabled, and not explicitly referenced by any StorageClass
-  - `Disabled`: explicitly disabled on the datastore object
-  - `Unavailable`: unhealthy, missing, invalid, or backend-mismatched
-- `Capacity` is rendered as `{available} / {total} ({usedPercent}%)`
-- `Metrics` shows a compact fio summary when validation succeeded, otherwise `-`
-
-Validation remains informational only and does not by itself turn a datastore unavailable.
+For the meaning of datastore display values and provider prerequisite conditions when `inventoryController.enabled=true`, see [inventory datastore status](../../README.md#inventory-datastore-status).
 
 ### Inventory Operator Controls
 
@@ -659,6 +658,7 @@ The driver image includes cluster-operator modes that work well with a kubeconfi
 | `preflight.failReleaseOnError` | Add Helm hook annotations so failed preflight blocks the release. | `true` | No |
 | `preflight.image.repository` | Override image repository for the preflight Job. Empty falls back to `image.repository`. | `""` | No |
 | `preflight.image.tag` | Override image tag for the preflight Job. Empty falls back to `image.tag`. | `""` | No |
+| `preflight.image.digest` | Digest for an explicitly overridden repository or tag. Without either override, the hook uses the main `image` configuration, including its digest. | unset | No |
 | `preflight.datastores` | Datastore identifiers checked by preflight. | `[]` | No |
 | `preflight.localImmediateBindingPolicy` | Policy for local-backed StorageClasses using `Immediate` binding during preflight. Supported values: `warn`, `fail`. | `"warn"` | No |
 | `preflight.nodeStageSecretRefs` | `namespace/name` secret refs validated for CephFS node stage. | `[]` | Conditional |
@@ -667,13 +667,17 @@ The driver image includes cluster-operator modes that work well with a kubeconfi
 `preflight.nodeStageSecretRefs` and `preflight.provisionerSecretRefs` are only needed when validating CephFS secret wiring.
 For local-backed classes, preflight now checks `volumeBindingMode` and warns by default if `Immediate` is used instead of `WaitForFirstConsumer`.
 
+When `preflight.enabled=true` and `preflight.failReleaseOnError=true`, the hook requires `credentials.existingSecret.name` to exist before installation. Inline credentials cannot bootstrap this hook. Dedicated hook RBAC is created before the Job; referenced CephFS secrets must also exist. A failed mandatory Job is retained for inspection until the next hook creation, with no automatic retry or TTL cleanup. Datastore checks include provider-enabled state and observed Ceph bridge availability.
+
 ### Snapshotter
 
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `snapshotter.enabled` | Deploy the `csi-snapshotter` sidecar in the controller pod. | `true` | No |
-| `snapshotter.image` | Legacy image override; empty selects `sidecarImages.snapshotter` with default v8.7.0 or its configured digest. Stable promotion clears this override. | `""` | No |
+| `snapshotter.image` | Legacy image override; empty selects `sidecarImages.snapshotter`. See the [upgrade runbook](../../docs/opennebula-74-upgrade.md) for promotion constraints. | `""` | No |
 | `snapshotter.extraArgs` | Additional args for the snapshotter sidecar. | `[]` | No |
+
+The sidecar requires snapshot CRDs. Enabling it does not change the driver's [snapshot support contract](../../README.md#snapshots-and-clones).
 
 ### StorageClasses
 
@@ -702,6 +706,7 @@ Legacy classes without an applied hash can be adopted when their live spec exact
 | `storageClassReconcile.adoptUnannotated` | Adopt unannotated legacy StorageClasses only when their live spec exactly matches the desired chart spec. | `true` | No |
 | `storageClassReconcile.image.repository` | Override image repository for the reconcile hook. Empty falls back to `image.repository`. | `""` | No |
 | `storageClassReconcile.image.tag` | Override image tag for the reconcile hook. Empty falls back to `image.tag`. | `""` | No |
+| `storageClassReconcile.image.digest` | Digest for an explicitly overridden repository or tag. Without either override, the hook uses the main `image` configuration, including its digest. | unset | No |
 
 Common `storageClasses[].parameters` used by this driver:
 
@@ -726,7 +731,7 @@ Common `storageClasses[].parameters` used by this driver:
 | StorageClass-managed provisioning | `storageClasses[].name` plus `storageClasses[].parameters.datastoreIDs` or `driver.defaultDatastores` |
 | CephFS filesystem provisioning | CephFS datastore IDs, StorageClass secret refs, Kubernetes Secrets with `adminID/adminKey` and `userID/userKey` |
 | Topology accessibility | See [topology requirements](../../README.md#topology-accessibility). |
-| Detached disk expansion | Enabled by default |
+| Detached disk expansion | See [current expansion restrictions](../../README.md#volume-expansion) |
 | CephFS expansion | Enabled by default |
 | CephFS snapshots alpha | `featureGates.cephfsSnapshots=true` |
 | CephFS clones alpha | `featureGates.cephfsClones=true` |

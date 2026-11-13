@@ -1230,9 +1230,10 @@ func IsAuthoritativeVolumeAbsence(err error) bool {
 	return errors.As(err, &response) && response.Code == gocaerrors.OneNoExistsError
 }
 
-// These errors mean absence observed through a successful provider response, never transport failure.
 var ErrCloneCapacity = errors.New("unsupported clone capacity")
 var ErrCloneConflict = errors.New("incompatible or uncertain clone target")
+
+// These errors mean absence observed through a successful provider response, never transport failure.
 var ErrVolumeNotFound = errors.New("volume not found")
 var ErrAttachmentNotFound = errors.New("volume attachment not found")
 

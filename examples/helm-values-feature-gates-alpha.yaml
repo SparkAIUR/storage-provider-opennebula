@@ -1,4 +1,5 @@
-# Example values for staging the alpha feature gates added in v0.4.1.
+# Legacy alpha-gate example. For current support, see README.md#feature-gates.
+# detachedDiskExpansion is retained for compatibility and cannot enable growth.
 #
 # Topology accessibility expects Kubernetes nodes to carry:
 #   topology.opennebula.sparkaiur.io/system-ds=<opennebula-system-datastore-id>

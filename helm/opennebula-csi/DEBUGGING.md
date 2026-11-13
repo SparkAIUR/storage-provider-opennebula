@@ -1,6 +1,6 @@
 # Local RWO Annotation Debugging Guide
 
-This guide is for operators debugging local single-writer OpenNebula volumes in the `v0.5.x` line.
+This guide is for operators debugging local single-writer OpenNebula volumes, including the annotation compatibility retained by the 0.6.0 candidate.
 
 It focuses on the driver-owned annotation contract under:
 
@@ -768,7 +768,7 @@ Avoid these failure-amplifying patterns:
 
 `storage-provider.opennebula.sparkaiur.io/preferred-last-node` is deprecated.
 
-Current behavior in `v0.5.x`:
+Current behavior, retained in the 0.6.0 candidate:
 
 - still read as a fallback on PVs
 - warning surfaced in annotation audit

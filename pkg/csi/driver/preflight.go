@@ -136,7 +136,11 @@ func (r *PreflightRunner) Run(ctx context.Context) PreflightReport {
 		names := make([]string, 0, len(resolvedDatastores))
 		for _, ds := range resolvedDatastores {
 			names = append(names, fmt.Sprintf("%d(%s:%s)", ds.ID, ds.Category, ds.Backend))
- if err:=opennebula.ProvisioningFeasible(ctx,ctrl,ds);err!=nil{appendResult(fmt.Sprintf("datastore_%d_feasibility",ds.ID),"fail",err.Error())}else{appendResult(fmt.Sprintf("datastore_%d_feasibility",ds.ID),"pass","provider state and bridge prerequisites verified")}
+			if err := opennebula.ProvisioningFeasible(ctx, ctrl, ds); err != nil {
+				appendResult(fmt.Sprintf("datastore_%d_feasibility", ds.ID), "fail", err.Error())
+			} else {
+				appendResult(fmt.Sprintf("datastore_%d_feasibility", ds.ID), "pass", "provider state and bridge prerequisites verified")
+			}
 		}
 		appendResult("datastore_resolution", "pass", fmt.Sprintf("validated datastores: %s", strings.Join(names, ", ")))
 	}
