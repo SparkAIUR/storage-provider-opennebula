@@ -113,6 +113,11 @@ func TestNodeExpandMountUtilsBinding(t *testing.T) {
 			}
 			ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Path: stage, Device: stageDevice}, {Path: publish, Device: publishedDevice}})
 			mounter := ns.mounter.Interface.(*mount.FakeMounter)
+			if scenario == "kernel block aliases" {
+				for i := range mounter.MountPoints {
+					mounter.MountPoints[i].Type = "xfs"
+				}
+			}
 			if strings.Contains(scenario, "btrfs") {
 				for i := range mounter.MountPoints {
 					mounter.MountPoints[i].Type = "btrfs"
@@ -462,5 +467,79 @@ func TestNodeExpandBtrfsRejectsNonBlockSources(t *testing.T) {
 			require.Zero(t, capacityCalls)
 			require.Zero(t, allCalls, "reject before format probes or capacity commands")
 		})
+	}
+}
+
+// Observed real filesystem types must not use the blank-type local-image
+// contract to measure image B while the mounted filesystem is still A.
+func TestNodeExpandObservedFilesystemRejectsNonBlockSources(t *testing.T) {
+	for _, fsType := range []string{"ext3", "ext4", "xfs", "btrfs"} {
+		for _, scenario := range []string{"regular both aliases", "regular no staging", "character both aliases", "character no staging", "regular staging type only"} {
+			t.Run(fsType+"/"+scenario, func(t *testing.T) {
+				root := t.TempDir()
+				image := filepath.Join(root, "image-b")
+				require.NoError(t, os.WriteFile(image, nil, 0600))
+				require.NoError(t, os.Truncate(image, 2147483648))
+				source := image
+				if strings.HasPrefix(scenario, "character") {
+					source = "/dev/null"
+				}
+				stageSource, publishSource := filepath.Join(root, "stage-alias"), filepath.Join(root, "publish-alias")
+				require.NoError(t, os.Symlink(source, stageSource))
+				require.NoError(t, os.Symlink(source, publishSource))
+				stage, publish := filepath.Join(root, "stage"), filepath.Join(root, "publish")
+				require.NoError(t, os.Mkdir(stage, 0700))
+				require.NoError(t, os.Mkdir(publish, 0700))
+				publishType := fsType
+				if scenario == "regular staging type only" {
+					publishType = ""
+				}
+				ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Path: stage, Device: stageSource, Type: fsType}, {Path: publish, Device: publishSource, Type: publishType}})
+				commands := &testingexec.FakeExec{}
+				capacityCalls, resizeCalls, allCalls := 0, 0, 0
+				action := func(cmd string, args ...string) utilexec.Cmd {
+					allCalls++
+					return testingexec.InitFakeCmd(&testingexec.FakeCmd{CombinedOutputScript: []testingexec.FakeAction{func() ([]byte, []byte, error) {
+						switch cmd {
+						case "blockdev":
+							capacityCalls++
+							require.Equal(t, []string{"--getsize64", publishSource}, args)
+							return []byte("2147483648\n"), nil, nil
+						case "blkid":
+							return []byte("TYPE=" + fsType + "\n"), nil, nil
+						case "resize2fs":
+							require.Contains(t, []string{"ext3", "ext4"}, fsType)
+							require.Equal(t, []string{publishSource}, args)
+							resizeCalls++
+						case "xfs_growfs":
+							require.Equal(t, "xfs", fsType)
+							require.Equal(t, []string{"-d", publish}, args)
+							resizeCalls++
+						case "btrfs":
+							require.Equal(t, "btrfs", fsType)
+							require.Equal(t, []string{"filesystem", "resize", "max", publish}, args)
+							resizeCalls++
+						default:
+							t.Fatalf("unexpected command %s %v", cmd, args)
+						}
+						return []byte("tool convergence"), nil, nil
+					}}}, cmd, args...)
+				}
+				for range 16 {
+					commands.CommandScript = append(commands.CommandScript, action)
+				}
+				ns.mounter.Exec = commands
+				if strings.Contains(scenario, "no staging") {
+					stage = ""
+				}
+				response, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{VolumeId: "observed-fs-nonblock-fixture", VolumePath: publish, StagingTargetPath: stage, CapacityRange: &csi.CapacityRange{RequiredBytes: 2147483648}})
+				t.Logf("capacity_calls=%d resize_calls=%d all_commands=%d response=%v error=%v", capacityCalls, resizeCalls, allCalls, response, err)
+				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				require.Nil(t, response)
+				require.Zero(t, resizeCalls)
+				require.Zero(t, capacityCalls)
+				require.Zero(t, allCalls, "observed filesystem admission must precede capacity/format/resize commands")
+			})
+		}
 	}
 }
