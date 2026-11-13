@@ -27,6 +27,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
@@ -50,8 +51,18 @@ var (
 	nodeResizeFS       = func(exec utilexec.Interface, devicePath, deviceMountPath string) (bool, error) {
 		return mount.NewResizeFs(exec).Resize(devicePath, deviceMountPath)
 	}
-	nodeNeedsResizeFS = func(exec utilexec.Interface, devicePath, deviceMountPath string) (bool, error) {
-		return mount.NewResizeFs(exec).NeedResize(devicePath, deviceMountPath)
+	nodeExpandBtrfsIdentity = func(context.Context, string) (nodeExpandBtrfsID, error) {
+		return nodeExpandBtrfsID{}, fmt.Errorf("btrfs mounted identity is unavailable on this platform")
+	}
+	nodeExpandSleep = func(ctx context.Context, interval time.Duration) error {
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		}
 	}
 )
 
@@ -716,8 +727,11 @@ func (ns *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolu
 	}, nil
 }
 
-func (ns *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
 	started := nodeNow()
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
 	volumeID := req.GetVolumeId()
 	if volumeID == "" {
 		ns.recordNodeExpandOperation(started, "unknown", "invalid_argument")
@@ -766,16 +780,18 @@ func (ns *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 		}, nil
 	}
 
-	devicePath, err := ns.getMountedDevicePath(req.GetStagingTargetPath())
-	if err != nil && req.GetStagingTargetPath() != volumePath {
-		devicePath, err = ns.getMountedDevicePath(volumePath)
+	policy := ns.nodeExpandPolicy()
+	ctx, cancel := context.WithTimeout(ctx, policy.verifyTimeout)
+	defer cancel()
+	_, deviceID, err := ns.nodeExpandMountedDevice(ctx, volumePath, req.GetStagingTargetPath())
+	if contextErr := ctx.Err(); contextErr != nil {
+		return nil, status.FromContextError(contextErr).Err()
 	}
 	if err != nil {
 		ns.recordNodeExpandOperation(started, "disk", "failed_precondition")
 		return nil, status.Errorf(codes.FailedPrecondition, "failed to resolve device path for volume expansion: %v", err)
 	}
 
-	policy := ns.nodeExpandPolicy()
 	// A PVC requests outer device capacity. Filesystem metadata is not
 	// missing storage, and a byte tolerance must not hide a short device.
 	targetMinBytes := requiredBytes
@@ -789,12 +805,42 @@ func (ns *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 	)
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
 		attempts++
 
-		lastDeviceBytes, err = ns.getBlockVolumeSize(devicePath)
+		// A wait may outlive a mount or device alias. Never reuse its old binding.
+		devicePath, err := ns.nodeExpandBoundDevice(ctx, volumePath, req.GetStagingTargetPath(), deviceID)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, status.FromContextError(contextErr).Err()
+		}
+		if err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "volume expansion binding changed: %v", err)
+		}
+		lastDeviceBytes, err = ns.getBlockVolumeSizeWithExec(devicePath, nodeExpandExec{Interface: ns.mounter.Exec, ctx: ctx})
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, status.FromContextError(contextErr).Err()
+		}
 		if err != nil {
 			ns.recordNodeExpandOperation(started, "disk", "internal")
 			return nil, status.Errorf(codes.Internal, "failed to collect device size for volume %s at %s: %v", volumeID, devicePath, err)
+		}
+		// Bind the capacity observation to the device that was queried, even if
+		// that path was an alias which changed during blockdev.
+		observedID, err := nodeExpandBackingIdentity(devicePath)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, status.FromContextError(contextErr).Err()
+		}
+		if err != nil || observedID != deviceID.backing {
+			return nil, status.Errorf(codes.FailedPrecondition, "capacity device identity changed at %s: %v", devicePath, err)
+		}
+		devicePath, err = ns.nodeExpandBoundDevice(ctx, volumePath, req.GetStagingTargetPath(), deviceID)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, status.FromContextError(contextErr).Err()
+		}
+		if err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "volume expansion binding changed: %v", err)
 		}
 
 		if lastDeviceBytes < targetMinBytes {
@@ -826,85 +872,304 @@ func (ns *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 				"targetMinBytes", targetMinBytes,
 				"deviceBytes", lastDeviceBytes,
 				"attempt", attempts)
-			nodeDeviceSleep(policy.retryInterval)
+			if err := nodeExpandSleep(ctx, policy.retryInterval); err != nil {
+				return nil, status.FromContextError(err).Err()
+			}
 			continue
 		}
 
-		resized, err = nodeResizeFS(ns.mounter.Exec, devicePath, volumePath)
+		if err := ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
+		checkBinding := func() error {
+			if err := ctx.Err(); err != nil {
+				return status.FromContextError(err).Err()
+			}
+			_, err := ns.nodeExpandBoundDevice(ctx, volumePath, req.GetStagingTargetPath(), deviceID)
+			if contextErr := ctx.Err(); contextErr != nil {
+				return status.FromContextError(contextErr).Err()
+			}
+			if err != nil {
+				return status.Errorf(codes.FailedPrecondition, "volume expansion binding changed: %v", err)
+			}
+			observedID, err := nodeExpandBackingIdentity(devicePath)
+			if contextErr := ctx.Err(); contextErr != nil {
+				return status.FromContextError(contextErr).Err()
+			}
+			if err != nil || observedID != deviceID.backing {
+				return status.Errorf(codes.FailedPrecondition, "resize source identity changed at %s: %v", devicePath, err)
+			}
+			return nil
+		}
+		var bindingErr error
+		resized, err = nodeResizeFS(nodeExpandExec{Interface: ns.mounter.Exec, ctx: ctx, before: func() error {
+			bindingErr = checkBinding()
+			return bindingErr
+		}}, devicePath, volumePath)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, status.FromContextError(contextErr).Err()
+		}
+		if bindingErr != nil {
+			return nil, bindingErr
+		}
+		if bindingErr := checkBinding(); bindingErr != nil {
+			return nil, bindingErr
+		}
 		if err != nil {
 			ns.recordNodeExpandOperation(started, "disk", "internal")
 			return nil, status.Errorf(codes.Internal, "failed to resize filesystem for volume %s: %v", volumeID, err)
 		}
 
 		lastFSBytes, err = ns.filesystemSizeBytes(volumePath)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, status.FromContextError(contextErr).Err()
+		}
+		if bindingErr := checkBinding(); bindingErr != nil {
+			return nil, bindingErr
+		}
 		if err != nil {
 			ns.recordNodeExpandOperation(started, "disk", "internal")
 			return nil, status.Errorf(codes.Internal, "failed to collect filesystem size for volume %s at %s: %v", volumeID, volumePath, err)
 		}
 
-		// NeedResize reads filesystem geometry (ext4 block count or XFS data
-		// blocks), including metadata omitted by statfs. Keep statfs for diagnostics.
-		needsResize, err := nodeNeedsResizeFS(ns.mounter.Exec, devicePath, volumePath)
-		if err != nil {
-			ns.recordNodeExpandOperation(started, "disk", "internal")
-			return nil, status.Errorf(codes.Internal, "failed to verify filesystem geometry for volume %s: %v", volumeID, err)
-		}
+		// In mount-utils 0.36, NeedResize is eligibility for ext3/ext4/XFS,
+		// not a completion check. Resize succeeds only when the recognized
+		// filesystem tool reports convergence. Statfs excludes metadata overhead.
 		if !resized {
 			ns.recordNodeExpandOperation(started, "disk", "failed_precondition")
 			return nil, status.Errorf(codes.FailedPrecondition, "filesystem resize was not performed for volume %s", volumeID)
 		}
 
-		if !needsResize {
-			ns.recordNodeExpandOperation(started, "disk", "success")
-			klog.V(1).InfoS("NodeExpandVolume converged",
-				"method", "NodeExpandVolume",
-				"volumeID", volumeID,
-				"volumePath", volumePath,
-				"devicePath", devicePath,
-				"requiredBytes", requiredBytes,
-				"targetMinBytes", targetMinBytes,
-				"deviceBytes", lastDeviceBytes,
-				"filesystemBytes", lastFSBytes,
-				"resized", resized,
-				"attempts", attempts)
-			return &csi.NodeExpandVolumeResponse{
-				CapacityBytes: requiredBytes,
-			}, nil
+		if err := ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
 		}
-
-		if !nodeNow().Before(deadline) {
-			ns.recordNodeExpandOperation(started, "disk", "deadline_exceeded")
-			klog.V(0).InfoS("NodeExpandVolume timed out waiting for filesystem growth",
-				"method", "NodeExpandVolume",
-				"volumeID", volumeID,
-				"volumePath", volumePath,
-				"devicePath", devicePath,
-				"requiredBytes", requiredBytes,
-				"targetMinBytes", targetMinBytes,
-				"deviceBytes", lastDeviceBytes,
-				"filesystemBytes", lastFSBytes,
-				"resized", resized,
-				"attempts", attempts)
-			return nil, status.Errorf(
-				codes.DeadlineExceeded,
-				"filesystem resize did not converge for volume %s: requested_bytes=%d target_min_bytes=%d device_bytes=%d filesystem_bytes=%d attempts=%d",
-				volumeID, requiredBytes, targetMinBytes, lastDeviceBytes, lastFSBytes, attempts,
-			)
-		}
-
-		klog.V(2).InfoS("NodeExpandVolume waiting for filesystem capacity",
-			"method", "NodeExpandVolume",
-			"volumeID", volumeID,
-			"volumePath", volumePath,
-			"devicePath", devicePath,
-			"requiredBytes", requiredBytes,
-			"targetMinBytes", targetMinBytes,
-			"deviceBytes", lastDeviceBytes,
-			"filesystemBytes", lastFSBytes,
-			"resized", resized,
-			"attempt", attempts)
-		nodeDeviceSleep(policy.retryInterval)
+		ns.recordNodeExpandOperation(started, "disk", "success")
+		klog.V(1).InfoS("NodeExpandVolume converged",
+			"method", "NodeExpandVolume", "volumeID", volumeID,
+			"volumePath", volumePath, "devicePath", devicePath,
+			"requiredBytes", requiredBytes, "deviceBytes", lastDeviceBytes,
+			"filesystemBytes", lastFSBytes, "resized", resized, "attempts", attempts)
+		return &csi.NodeExpandVolumeResponse{CapacityBytes: requiredBytes}, nil
 	}
+}
+
+// Device nodes can have different inodes while naming the same kernel device.
+// Regular backing files retain the existing local-image capacity contract.
+type nodeExpandDeviceID struct {
+	kind   uint32
+	device uint64
+	inode  uint64
+}
+
+func nodeExpandBackingIdentity(devicePath string) (nodeExpandDeviceID, error) {
+	var st unix.Stat_t
+	if err := unix.Stat(devicePath, &st); err != nil {
+		return nodeExpandDeviceID{}, err
+	}
+	kind := uint32(st.Mode) & unix.S_IFMT
+	switch kind {
+	case unix.S_IFBLK, unix.S_IFCHR:
+		return nodeExpandDeviceID{kind: kind, device: uint64(st.Rdev)}, nil
+	case unix.S_IFREG:
+		return nodeExpandDeviceID{kind: kind, device: uint64(st.Dev), inode: st.Ino}, nil
+	default:
+		return nodeExpandDeviceID{}, fmt.Errorf("unsupported backing device at %s", devicePath)
+	}
+}
+
+type nodeExpandBtrfsID struct {
+	filesystemDevice uint64
+	filesystem       [16]byte
+	device           uint64
+}
+
+type nodeExpandBindingID struct {
+	backing          nodeExpandDeviceID
+	filesystemDevice uint64
+	btrfsFilesystem  [16]byte
+}
+
+func (ns *NodeServer) nodeExpandMountedDevice(ctx context.Context, volumePath, stagingPath string) (string, nodeExpandBindingID, error) {
+	if err := ctx.Err(); err != nil {
+		return "", nodeExpandBindingID{}, err
+	}
+	mountPoints, err := ns.mounter.List()
+	if contextErr := ctx.Err(); contextErr != nil {
+		return "", nodeExpandBindingID{}, contextErr
+	}
+	if err != nil {
+		return "", nodeExpandBindingID{}, err
+	}
+	// Read both mount bindings from one observation. A supplied staging path
+	// must be observable too; failure there cannot authorize a publish fallback.
+	deviceAt := func(target string) (string, error) {
+		var device string
+		for _, mp := range mountPoints {
+			if mp.Path == target {
+				if device != "" || mp.Device == "" {
+					return "", fmt.Errorf("mount %s has ambiguous or absent backing device", target)
+				}
+				device = mp.Device
+			}
+		}
+		if device != "" {
+			return device, nil
+		}
+		return "", fmt.Errorf("mount %s does not expose a backing device", target)
+	}
+	devicePath, err := deviceAt(volumePath)
+	if err != nil {
+		return "", nodeExpandBindingID{}, err
+	}
+	id, err := nodeExpandBackingIdentity(devicePath)
+	if contextErr := ctx.Err(); contextErr != nil {
+		return "", nodeExpandBindingID{}, contextErr
+	}
+	if err != nil {
+		return "", nodeExpandBindingID{}, err
+	}
+	// Real mount observations must name block sources before local-image
+	// shortcuts. Only blank-type synthetic fixtures may use regular images.
+	for _, mp := range mountPoints {
+		if (mp.Path == volumePath || (stagingPath != "" && mp.Path == stagingPath)) && mp.Type != "" && id.kind != unix.S_IFBLK {
+			return "", nodeExpandBindingID{}, fmt.Errorf("observed filesystem mount requires a block-device capacity source")
+		}
+	}
+	if stagingPath != "" && stagingPath != volumePath {
+		stagingDevice, err := deviceAt(stagingPath)
+		if err != nil {
+			return "", nodeExpandBindingID{}, err
+		}
+		stagingID, err := nodeExpandBackingIdentity(stagingDevice)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return "", nodeExpandBindingID{}, contextErr
+		}
+		if err != nil {
+			return "", nodeExpandBindingID{}, err
+		}
+		if stagingID != id {
+			return "", nodeExpandBindingID{}, fmt.Errorf("staging and published mounts have different backing devices")
+		}
+	}
+	binding := nodeExpandBindingID{backing: id}
+	if id.kind == unix.S_IFBLK {
+		// A mount source alias can be retargeted without changing the mounted
+		// filesystem. Verify the kernel filesystem identity as well as the node.
+		var filesystemDevice uint64
+		for i, target := range []string{volumePath, stagingPath} {
+			if target == "" {
+				continue
+			}
+			info, err := nodeVolumePathStat(target)
+			if contextErr := ctx.Err(); contextErr != nil {
+				return "", nodeExpandBindingID{}, contextErr
+			}
+			if err != nil {
+				return "", nodeExpandBindingID{}, err
+			}
+			st, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				return "", nodeExpandBindingID{}, fmt.Errorf("mount %s filesystem identity is unavailable", target)
+			}
+			if i == 0 {
+				filesystemDevice = uint64(st.Dev)
+				binding.filesystemDevice = filesystemDevice
+			}
+			// Btrfs st_dev is anonymous. Require kernel filesystem membership
+			// instead of treating mount agreement as device association.
+			btrfs := false
+			for _, mp := range mountPoints {
+				if mp.Path == target {
+					btrfs = mp.Type == "btrfs"
+					break
+				}
+			}
+			if btrfs {
+				witness, e := nodeExpandBtrfsIdentity(ctx, target)
+				if contextErr := ctx.Err(); contextErr != nil {
+					return "", nodeExpandBindingID{}, contextErr
+				}
+				if e != nil {
+					return "", nodeExpandBindingID{}, fmt.Errorf("mount %s Btrfs association is unknown: %w", target, e)
+				}
+				if witness.device != id.device || witness.filesystemDevice != uint64(st.Dev) || witness.filesystem == ([16]byte{}) {
+					return "", nodeExpandBindingID{}, fmt.Errorf("mount %s Btrfs membership does not match capacity device", target)
+				}
+				if i == 0 {
+					binding.btrfsFilesystem = witness.filesystem
+				} else if binding.btrfsFilesystem != witness.filesystem {
+					return "", nodeExpandBindingID{}, fmt.Errorf("staging and published Btrfs filesystem identities differ")
+				}
+			}
+			if uint64(st.Dev) != filesystemDevice || (!btrfs && uint64(st.Dev) != id.device) {
+				return "", nodeExpandBindingID{}, fmt.Errorf("mount %s filesystem identity does not match backing device", target)
+			}
+		}
+	}
+	return devicePath, binding, nil
+}
+
+func (ns *NodeServer) nodeExpandBoundDevice(ctx context.Context, volumePath, stagingPath string, expected nodeExpandBindingID) (string, error) {
+	devicePath, id, err := ns.nodeExpandMountedDevice(ctx, volumePath, stagingPath)
+	if err != nil {
+		return "", err
+	}
+	if id != expected {
+		return "", fmt.Errorf("mounted backing device identity changed")
+	}
+	return devicePath, nil
+}
+
+// mount-utils calls Command; bind those external calls to this RPC's deadline.
+type nodeExpandExec struct {
+	utilexec.Interface
+	ctx    context.Context
+	before func() error
+}
+
+func (e nodeExpandExec) Command(cmd string, args ...string) utilexec.Cmd {
+	return e.CommandContext(e.ctx, cmd, args...)
+}
+
+func (e nodeExpandExec) CommandContext(ctx context.Context, cmd string, args ...string) utilexec.Cmd {
+	command := e.Interface.CommandContext(ctx, cmd, args...)
+	if e.before == nil {
+		return command
+	}
+	return nodeExpandBoundCommand{Cmd: command, before: e.before}
+}
+
+type nodeExpandBoundCommand struct {
+	utilexec.Cmd
+	before func() error
+}
+
+func (c nodeExpandBoundCommand) CombinedOutput() ([]byte, error) {
+	if err := c.before(); err != nil {
+		return nil, err
+	}
+	return c.Cmd.CombinedOutput()
+}
+
+func (c nodeExpandBoundCommand) Output() ([]byte, error) {
+	if err := c.before(); err != nil {
+		return nil, err
+	}
+	return c.Cmd.Output()
+}
+
+func (c nodeExpandBoundCommand) Run() error {
+	if err := c.before(); err != nil {
+		return err
+	}
+	return c.Cmd.Run()
+}
+
+func (c nodeExpandBoundCommand) Start() error {
+	if err := c.before(); err != nil {
+		return err
+	}
+	return c.Cmd.Start()
 }
 
 type nodeExpandPolicy struct {
@@ -984,6 +1249,10 @@ func (ns *NodeServer) NodeGetCapabilities(_ context.Context, req *csi.NodeGetCap
 }
 
 func (ns *NodeServer) getBlockVolumeSize(volumePath string) (int64, error) {
+	return ns.getBlockVolumeSizeWithExec(volumePath, ns.mounter.Exec)
+}
+
+func (ns *NodeServer) getBlockVolumeSizeWithExec(volumePath string, executor utilexec.Interface) (int64, error) {
 	info, err := os.Stat(volumePath)
 	if err != nil {
 		return 0, err
@@ -993,7 +1262,7 @@ func (ns *NodeServer) getBlockVolumeSize(volumePath string) (int64, error) {
 		return info.Size(), nil
 	}
 
-	output, err := ns.mounter.Exec.Command("blockdev", "--getsize64", volumePath).CombinedOutput()
+	output, err := executor.Command("blockdev", "--getsize64", volumePath).CombinedOutput()
 	if err != nil {
 		return 0, fmt.Errorf("blockdev failed: %w: %s", err, strings.TrimSpace(string(output)))
 	}
@@ -1162,28 +1431,6 @@ func (ns *NodeServer) deviceCandidates(volumeName string) []string {
 	}
 
 	return candidates
-}
-
-func (ns *NodeServer) getMountedDevicePath(targetPath string) (string, error) {
-	if targetPath == "" {
-		return "", fmt.Errorf("mount path is required")
-	}
-
-	mountPoints, err := ns.mounter.List()
-	if err != nil {
-		return "", fmt.Errorf("failed to list mount points: %w", err)
-	}
-
-	for _, mountPoint := range mountPoints {
-		if mountPoint.Path == targetPath {
-			if mountPoint.Device == "" {
-				return "", fmt.Errorf("mount point %s does not expose a backing device", targetPath)
-			}
-			return mountPoint.Device, nil
-		}
-	}
-
-	return "", fmt.Errorf("mount point %s was not found", targetPath)
 }
 
 func (ns *NodeServer) checkMountPoint(srcPath string, targetPath string, volumeCapability *csi.VolumeCapability) (mountPointMatch, error) {

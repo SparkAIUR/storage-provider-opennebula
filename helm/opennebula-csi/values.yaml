@@ -36,7 +36,7 @@ driver:
   nodeExpand:
     verifyTimeoutSeconds: 120
     retryIntervalSeconds: 2
-    # Deprecated: accepted for chart compatibility; geometry verification ignores it.
+    # Legacy compatibility setting; see docs/node-expansion.md#verification-contract.
     sizeToleranceBytes: 134217728
   nodeDeviceCache:
     enabled: true

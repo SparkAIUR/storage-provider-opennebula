@@ -76,3 +76,42 @@ The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI i
 ## 2026-11-13, queued embedded restoration context errors
 
 - AI: Retain cancellation and deadline error identity through both direct restoration and AttachVolume's embedded restoration. Convert context errors to CSI status only after queue dispatch can classify its active timeout. Preserve prerequisite, capacity, conflict and unknown-error mappings without changing attachment policy or success bookkeeping. Synthetic transport regressions exercise real attach/restoration observations with a still-connected CSI caller; they do not establish native acceptance or start the 24-hour observation.
+
+## 2026-11-13, node expansion dependency contract correction
+
+- AI: Replace the earlier mount-utils geometry assumption with the [node expansion verification contract](docs/node-expansion.md#verification-contract) for the pinned dependency, including RPC cancellation through command execution and retry waits. Preserve the earlier decision as history; its geometry claim does not describe this dependency. Provider capacity, attachment identity and reattach policies remain unchanged.
+- AI: Keep this source correction separate from immutable RC2 artifacts. Offline fixtures and tests do not complete native expansion, ordinary reattach qualification or the 24-hour observation. Existing hpldb-only authorization and the required later review remain unchanged.
+
+## 2026-11-13, node expansion mount binding correction
+
+- HUMAN: Apply the functional mount/device binding correction in the source pipeline. OpenNebula 7.4.0 remains the target; this round authorizes no direct OpenNebula host actions or provider, package, service, GitOps or upgrade changes.
+- AI: Resolve published and supplied staging bindings together, compare OS backing and mounted-filesystem identities rather than path strings, and retain that identity through device-capacity waits and reads. Remove the staging-resolution fallback and its unused helper. Unknown or changed identity rejects before filesystem resize. Keep exact requested capacity, mount-utils convergence, fatal statfs availability errors and cancellation behavior.
+- AI: Preserve the original expansion regressions and add executable binding, command-boundary and local ext4 image RPC checks. Local image checks use a synthetic mount table and do not qualify native mounted volumes. Copilot's monthly-quota HTTP 402 remains a failed external check under the standing exception, not a source fix or clean pass.
+
+## 2026-11-13, Btrfs mounted-device association and attribution correction
+
+- HUMAN: OpenNebula 7.4.0 remains the target, with no direct OpenNebula host actions. The user authorized implementation work; this does not authorize provider, package, service, GitOps or upgrade actions.
+- AI: Correct the attribution in the earlier mount binding entry. The functional binding design came from AI Oracle/root source review, not a specific human technical choice. Preserve the earlier entry as history; its HUMAN line records implementation authorization and operating constraints.
+- AI: Use read-only Linux FS_INFO on the mounted directory and kernel sysfs block membership to associate Btrfs with the measured device. Require one device, maximum device ID 1 and exactly one block-class sysfs member with matching canonical major/minor. The default mount-utils Btrfs resize command targets device ID 1; ambiguous layouts cannot authorize that command. This is an identity proof rule, not a user feature waiver.
+- AI: Pin FSID and mounted st_dev for the request as well as the backing device, reobserving after capacity reads and waits before resize. Unknown, malformed, failed or canceled observations fail closed. Add no cache, external binary, image dependency or mount configuration.
+- AI: Positive mounted Btrfs records in local tests are kernel/sysfs boundary fixtures. Actual ioctl rejection and local ext4 tool checks do not qualify mounted Btrfs, provider lifecycle, deployment or release. Native qualification and the 24-hour observation remain held.
+
+## 2026-11-13, Btrfs admission review correction
+
+- AI: Root source review confirmed that source-kind shortcuts could bypass Btrfs association. Check every observed Btrfs target before those shortcuts and require a block-device source. Regular-file or character-device aliases fail before capacity commands, format probes or resize. Preserve regular-image behavior for other filesystem tests and valid block aliases.
+- AI: This Linux admission correction does not change the pre-existing non-Linux success shortcut. That unsupported-platform/test-convenience behavior remains deferred outside this plan; do not claim cross-platform fail-closed behavior or native Btrfs acceptance.
+
+## 2026-11-13, real mounted-filesystem source admission
+
+- AI: Root reproduced the same source-kind bypass for XFS after the Btrfs-only correction. Apply block-source admission to every nonempty observed mount type before regular-file or character-device shortcuts. Real file-backed mounts expose loop block devices; blank mount types remain an explicit synthetic local-image contract. Preserve the Btrfs association witness and ext4/XFS device checks.
+- AI: Keep the earlier Btrfs tests and receipts, add full-handler ext3/ext4/XFS/Btrfs regressions, and rerun root's unchanged XFS overlay. This is the final scoped review revision, with no new filesystem feature, provider policy or non-Linux shortcut change. No native qualification is claimed.
+
+## 2026-11-13, binding checks across filesystem commands
+
+- AI: The pre-Resize observation cannot authorize a later filesystem command because mount-utils first awaits a format probe. Check the pinned published/staging association and exact captured source at child execution, after the resizer and after statfs. Keep checks synchronous and local to the RPC; preserve binding failures across mount-utils error formatting and give cancellation precedence after each observation.
+- AI: Exercise actual pinned mount-utils with block-source and kernel-boundary fixtures for ext3/ext4/XFS/Btrfs across probing, command construction, resize and statfs. Valid aliases and successful no-ops retain requested capacity. These fixtures do not qualify mounted Btrfs or native OpenNebula 7.4.0 expansion; provider, rollout and 24-hour gates remain held.
+
+## 2026-11-13, reviewed source integration
+
+- AI: Combine reviewed provider source PR7 at 2eb6e4a and node source PR8 at 641d317 through ordinary local merges. Resolve only the three overlapping documentation files by retaining both contracts and their decision history. All code, test and Helm blobs remain exact component versions.
+- AI: Preserve the current HUMAN 7.4.0/no-direct-host instruction and the superseded status of earlier upgrade preparation. This source integration neither changes the operation-specific growth prerequisite nor grants a native acceptance or feature waiver. Native qualification and the 24-hour observation remain open.
