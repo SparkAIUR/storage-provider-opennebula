@@ -20,6 +20,9 @@ func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context
 		return &datastoreConfigError{message: fmt.Sprintf("persistent disk growth requires verified OpenNebula 7.4.1+ metadata support for non-NONE transfer targets: %s", reason)}
 	}
 	info, err := p.ctrl.VM(vmID).InfoContext(ctx, true)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
 	if err != nil {
 		return deny(fmt.Sprintf("cannot inspect VM identity: %v", err))
 	}
@@ -53,6 +56,9 @@ func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context
 		return deny("disk growth remains pending")
 	}
 	image, err := p.ctrl.Image(imageID).InfoContext(ctx, true)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
 	if err != nil {
 		return deny(fmt.Sprintf("cannot inspect image persistence: %v", err))
 	}

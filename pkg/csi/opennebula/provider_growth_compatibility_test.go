@@ -5,12 +5,12 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"github.com/OpenNebula/one/src/oca/go/src/goca"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/OpenNebula/one/src/oca/go/src/goca"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,6 +30,7 @@ type growthFixtureConfig struct {
 	initialMB                  int64
 	versionReply               func() (bool, string, int)
 	pendingReads               int32
+	beforeObservation          func(string)
 }
 
 func growthCompatibilityFixture(t *testing.T, version string, restoring bool, options ...func(*growthFixtureConfig)) (*PersistentDiskVolumeProvider, *growthProtocolState) {
@@ -61,6 +62,9 @@ func growthCompatibilityFixture(t *testing.T, version string, restoring bool, op
 		return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE><ORIGINAL_SIZE>128</ORIGINAL_SIZE>%s%s</DISK></TEMPLATE></VM>`, st.sizeMB.Load(), cfg.diskFacts, markers)
 	}
 	p := lifecycleFixture(t, func(method string) (bool, string, int) {
+		if cfg.beforeObservation != nil {
+			cfg.beforeObservation(method)
+		}
 		switch method {
 		case "one.imagepool.info":
 			return true, "<IMAGE_POOL>" + image() + "</IMAGE_POOL>", 0
@@ -307,5 +311,63 @@ func TestProviderGrowthCompatibilityEffectiveTargets(t *testing.T) {
 				require.Zero(t, st.metadataWrites.Load())
 			}
 		})
+	}
+}
+
+func TestProviderGrowthCompatibilityObservationContextErrors(t *testing.T) {
+	for _, restoring := range []bool{false, true} {
+		for _, method := range []string{"one.vm.info", "one.image.info"} {
+			for _, mode := range []string{"cancel", "deadline"} {
+				t.Run(fmt.Sprintf("%s/%s/restoration=%t", method, mode, restoring), func(t *testing.T) {
+					ctx, cancel := context.WithCancel(context.Background())
+					expected := context.Canceled
+					if mode == "deadline" {
+						cancel()
+						ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+						expected = context.DeadlineExceeded
+					}
+					defer cancel()
+					selectedRead := int32(2)
+					if restoring && method == "one.vm.info" {
+						selectedRead = 4
+					}
+					var reads, laterObservations atomic.Int32
+					var interrupted atomic.Bool
+					p, st := growthCompatibilityFixture(t, "7.4.0", restoring, func(c *growthFixtureConfig) {
+						c.diskFacts = persistentNoneDiskFacts
+						c.beforeObservation = func(observed string) {
+							if interrupted.Load() {
+								laterObservations.Add(1)
+							}
+							if observed != method || reads.Add(1) != selectedRead {
+								return
+							}
+							interrupted.Store(true)
+							if mode == "cancel" {
+								cancel()
+							}
+							<-ctx.Done()
+						}
+					})
+					beforeMarker := st.marker.Load()
+					var err error
+					if restoring {
+						err = p.RestoreVolumeCapacity(ctx, "volume-test", 11, 7)
+					} else {
+						_, err = p.ExpandVolume(ctx, "volume-test", 256*sizeConversion, false)
+					}
+					require.True(t, interrupted.Load(), "must reach the fresh compatibility observation")
+					require.ErrorIs(t, err, expected)
+					require.False(t, IsDatastoreConfigError(err))
+					require.Zero(t, laterObservations.Load())
+					require.Zero(t, st.versionCalls.Load())
+					require.Zero(t, st.resizeCalls.Load())
+					require.Zero(t, st.metadataWrites.Load())
+					require.Zero(t, st.otherMutations.Load())
+					require.Equal(t, beforeMarker, st.marker.Load())
+					require.EqualValues(t, 128, st.sizeMB.Load())
+				})
+			}
+		}
 	}
 }

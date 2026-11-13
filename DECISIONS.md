@@ -68,3 +68,7 @@ The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI i
 - HUMAN: Approve the controller error mapping and CSI regressions beyond the original nine-file scope, plus correction of the growth-phase documentation guarantee. Keep OpenNebula 7.4.0 as the target and preserve the prohibition on direct host and native actions.
 - AI: Map restoration prerequisite denials to actionable FailedPrecondition at the shared controller boundary for already-attached, queue-completed, post-attach and same-node sticky publish paths. Preserve cancellation and deadline classification and Internal for other restoration failures.
 - AI: Limit the compatibility guard's mutation guarantee to disk growth and capacity metadata. Publish may already have attached or detached a sticky attachment before the guard runs; no new lifecycle containment is introduced. Native affected-growth/reattach qualification and the 24-hour observation remain open.
+
+## 2026-11-13, growth observation context precedence
+
+- AI: Check the operation context immediately after each fresh VM, image and version observation. Cancellation and deadline expiry take precedence over either successful replies or prerequisite denials, preserving their error identity for all controller restoration consumers. Synthetic transport regressions cover interrupted observations during expansion and restoration without growth or capacity metadata mutations. OpenNebula 7.4.0 remains the target; native qualification and the 24-hour observation remain open.
