@@ -62,3 +62,9 @@ The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI i
 - HUMAN: "do not perform any action on OpenNebula hosts directly. We're on 7.4.0 so maintain work with that." This supersedes the earlier HUMAN choice to require 7.4.1+ and prepare a provider upgrade. Preserve that earlier entry as historical context; provider upgrade preparation is no longer the current direction.
 - AI: Keep basic 7.4.0 support, Probe/readiness, already-satisfied retries and positively identified NONE-target growth. Retain the operation-specific denial of known-unsafe persistent SYSTEM/SELF growth pending a qualified 7.4.0 API-only path. Do not raise the global provider minimum or infer approval for a feature waiver.
 - AI: Keep work implementation-only, with no direct host actions or assumed backend upgrade. This restriction does not establish positive affected-LVM expansion/reattach qualification on 7.4.0, complete native acceptance or start the 24-hour observation.
+
+## 2026-11-13, publish restoration prerequisite propagation
+
+- HUMAN: Approve the controller error mapping and CSI regressions beyond the original nine-file scope, plus correction of the growth-phase documentation guarantee. Keep OpenNebula 7.4.0 as the target and preserve the prohibition on direct host and native actions.
+- AI: Map restoration prerequisite denials to actionable FailedPrecondition at the shared controller boundary for already-attached, queue-completed, post-attach and same-node sticky publish paths. Preserve cancellation and deadline classification and Internal for other restoration failures.
+- AI: Limit the compatibility guard's mutation guarantee to disk growth and capacity metadata. Publish may already have attached or detached a sticky attachment before the guard runs; no new lifecycle containment is introduced. Native affected-growth/reattach qualification and the 24-hour observation remain open.

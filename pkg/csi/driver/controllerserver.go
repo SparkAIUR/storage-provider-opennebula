@@ -972,8 +972,8 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 		target, err := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
 		if err == nil {
-			if err := s.volumeProvider.RestoreVolumeCapacity(queueCtx, req.VolumeId, nodeID, volumeID); err != nil {
-				return status.Errorf(codes.Internal, "failed to restore volume capacity: %v", err)
+			if err := s.restoreVolumeCapacity(queueCtx, req.VolumeId, nodeID, volumeID); err != nil {
+				return err
 			}
 			if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(queueCtx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), runtimeCtx); localErr != nil {
 				s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "unavailable", time.Since(started))
@@ -1060,8 +1060,8 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		if err != nil {
 			return status.Errorf(codes.Unavailable, "failed to verify attached volume: %v", err)
 		}
-		if err := s.volumeProvider.RestoreVolumeCapacity(queueCtx, req.VolumeId, nodeID, volumeID); err != nil {
-			return status.Errorf(codes.Internal, "failed to restore volume capacity: %v", err)
+		if err := s.restoreVolumeCapacity(queueCtx, req.VolumeId, nodeID, volumeID); err != nil {
+			return err
 		}
 		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(queueCtx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), runtimeCtx); localErr != nil {
 			return localErr
@@ -1867,6 +1867,23 @@ func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node
 	return validation
 }
 
+func (s *ControllerServer) restoreVolumeCapacity(ctx context.Context, volume string, nodeID, volumeID int) error {
+	err := s.volumeProvider.RestoreVolumeCapacity(ctx, volume, nodeID, volumeID)
+	if err == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return status.Error(codes.Canceled, err.Error())
+	case errors.Is(err, context.DeadlineExceeded):
+		return status.Error(codes.DeadlineExceeded, err.Error())
+	case opennebula.IsDatastoreConfigError(err):
+		return status.Error(codes.FailedPrecondition, err.Error())
+	default:
+		return status.Errorf(codes.Internal, "failed to restore volume capacity: %v", err)
+	}
+}
+
 func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.ControllerPublishVolumeRequest, volumeID, nodeID int, protection *LocalRWOProtectionDecision, metadata *opennebula.VolumeAttachmentMetadata) (bool, *csi.ControllerPublishVolumeResponse, error) {
 	if s == nil || req == nil {
 		return false, nil, nil
@@ -1879,8 +1896,8 @@ func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.
 			return false, nil, nil
 		}
 		if validation.Reason != queueReasonManualRecoveryAdopted {
-			if err := s.volumeProvider.RestoreVolumeCapacity(ctx, req.VolumeId, nodeID, volumeID); err != nil {
-				return true, nil, status.Errorf(codes.Internal, "failed to restore volume capacity: %v", err)
+			if err := s.restoreVolumeCapacity(ctx, req.VolumeId, nodeID, volumeID); err != nil {
+				return true, nil, err
 			}
 		}
 		if protection == nil {
@@ -2509,8 +2526,8 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 			_ = s.driver.stickyAttachments.Clear(req.VolumeId)
 			return false, nil, nil
 		}
-		if err := s.volumeProvider.RestoreVolumeCapacity(ctx, req.VolumeId, nodeID, volumeID); err != nil {
-			return true, nil, status.Errorf(codes.Internal, "failed to restore volume capacity: %v", err)
+		if err := s.restoreVolumeCapacity(ctx, req.VolumeId, nodeID, volumeID); err != nil {
+			return true, nil, err
 		}
 		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), nil); localErr != nil {
 			return true, nil, localErr
