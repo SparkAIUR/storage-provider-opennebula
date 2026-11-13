@@ -2,6 +2,8 @@
 
 ## Unreleased Btrfs mounted-device binding
 
+- Require a block source for every nonempty observed mount type before local-image shortcuts. Cover ext3/ext4/XFS/Btrfs aliases, no-staging and staging-only observations; retain blank-type synthetic regular-image validation.
+
 - Reject every observed Btrfs target backed by a regular file or character device before capacity commands or resize, including alias-only and no-staging requests. Other filesystem local-image checks remain supported.
 
 - Associate the actual mounted Btrfs filesystem with its capacity device using read-only kernel FS_INFO and sysfs block membership. Pin its FSID and mounted device identity through capacity reads and waits.

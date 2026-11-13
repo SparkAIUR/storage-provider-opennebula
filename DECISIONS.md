@@ -73,3 +73,8 @@ The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI i
 
 - AI: Root source review confirmed that source-kind shortcuts could bypass Btrfs association. Check every observed Btrfs target before those shortcuts and require a block-device source. Regular-file or character-device aliases fail before capacity commands, format probes or resize. Preserve regular-image behavior for other filesystem tests and valid block aliases.
 - AI: This Linux admission correction does not change the pre-existing non-Linux success shortcut. That unsupported-platform/test-convenience behavior remains deferred outside this plan; do not claim cross-platform fail-closed behavior or native Btrfs acceptance.
+
+## 2026-11-13, real mounted-filesystem source admission
+
+- AI: Root reproduced the same source-kind bypass for XFS after the Btrfs-only correction. Apply block-source admission to every nonempty observed mount type before regular-file or character-device shortcuts. Real file-backed mounts expose loop block devices; blank mount types remain an explicit synthetic local-image contract. Preserve the Btrfs association witness and ext4/XFS device checks.
+- AI: Keep the earlier Btrfs tests and receipts, add full-handler ext3/ext4/XFS/Btrfs regressions, and rerun root's unchanged XFS overlay. This is the final scoped review revision, with no new filesystem feature, provider policy or non-Linux shortcut change. No native qualification is claimed.

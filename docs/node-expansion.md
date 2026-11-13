@@ -14,6 +14,12 @@ A successful statfs read is a required availability check, not a growth measurem
 
 `driver.nodeExpand.sizeToleranceBytes` and `ONE_CSI_NODE_EXPAND_SIZE_TOLERANCE_BYTES` are deprecated and ignored as of v0.5.29. Existing configuration remains accepted but cannot relax the device-capacity or resize-result checks. The implementation is in [NodeExpandVolume](../pkg/csi/driver/nodeserver.go). Raw-block and CephFS behavior is unchanged.
 
+## Real mounted-filesystem sources
+
+Any nonempty filesystem type in the Linux mount observation requires a block-device source before the regular-file or character-device capacity shortcuts. This applies to ext3, ext4, XFS and Btrfs, including staging-only observations and requests with no staging path. A real file-backed mounted filesystem exposes a loop block device, not its regular backing image as the mounted source. Invalid source kinds reject before external capacity, format or resize commands.
+
+Blank mount types remain the explicit synthetic regular-image contract used by isolated local ext4 image/gRPC tests. They do not establish real mounted-volume identity. Valid block aliases retain existing mounted-device checks, with the additional Btrfs witness below.
+
 ## Btrfs association
 
 Btrfs subvolumes use an [anonymous mounted device number](https://btrfs.readthedocs.io/en/stable/btrfs-subvolume.html#mount-options), so mounted st_dev cannot be equated with block st_rdev. Agreement between staging and published mounts is insufficient: both may still refer to filesystem A after their shared source alias points at device B.
@@ -51,3 +57,5 @@ See [the sanitized hplmon evidence](node-expansion-hplmon-validation.json). Reru
 Linux binding regressions create disposable local block-device nodes to exercise actual st_rdev identity while modeling mounted stat, FS_INFO and sysfs records at explicit external boundaries. They cover valid aliases and anonymous identities, both stale sources, no staging path, FSID or mounted-device changes during reads/waits, unavailable or ambiguous membership and cancellation/deadline. The real FS_INFO call rejects a local procfs directory. These are not actual mounted Btrfs positives. Existing real local ext4 image/gRPC/tool tests remain separate from synthetic mount observations, and all native/provider/rollout gates remain open.
 
 Review correction: the initial Btrfs witness was reached only inside the block-source branch, permitting a Btrfs mount with retargeted regular-file or character-device sources to bypass it. Full-handler regressions reproduce that false success and now require FailedPrecondition, no response and zero capacity/resize commands. The correction is scoped to Linux; the pre-existing non-Linux success shortcut is deferred and is not evidence of cross-platform fail-closed behavior.
+
+Final admission review: the Btrfs-only source-kind check was insufficient for the original all-filesystem binding contract. Full-handler regressions now retain Btrfs coverage and add ext3/ext4/XFS cases for both source aliases, no staging and staging-only observed types. Every denied case requires FailedPrecondition, nil response and zero capacity/format/resize commands. Root's independent XFS overlay is executed unchanged. The non-Linux shortcut remains deferred; no cross-platform or native acceptance is implied.

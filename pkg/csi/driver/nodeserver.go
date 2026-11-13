@@ -986,11 +986,11 @@ func (ns *NodeServer) nodeExpandMountedDevice(ctx context.Context, volumePath, s
 	if err != nil {
 		return "", nodeExpandBindingID{}, err
 	}
-	// Filesystem admission precedes source-kind shortcuts. A Btrfs mount
-	// cannot be associated with capacity from a regular file or character node.
+	// Real mount observations must name block sources before local-image
+	// shortcuts. Only blank-type synthetic fixtures may use regular images.
 	for _, mp := range mountPoints {
-		if (mp.Path == volumePath || (stagingPath != "" && mp.Path == stagingPath)) && mp.Type == "btrfs" && id.kind != unix.S_IFBLK {
-			return "", nodeExpandBindingID{}, fmt.Errorf("btrfs mount requires a block-device capacity source")
+		if (mp.Path == volumePath || (stagingPath != "" && mp.Path == stagingPath)) && mp.Type != "" && id.kind != unix.S_IFBLK {
+			return "", nodeExpandBindingID{}, fmt.Errorf("observed filesystem mount requires a block-device capacity source")
 		}
 	}
 	if stagingPath != "" && stagingPath != volumePath {
