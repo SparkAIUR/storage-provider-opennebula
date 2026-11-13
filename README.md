@@ -324,6 +324,8 @@ For Ceph Image Datastores the driver requires:
 - `CEPH_SECRET`
 - `BRIDGE_LIST`
 
+For supported bridge endpoint syntax and operator-reviewed identity bindings, see the [Ceph bridge identity contract](docs/ceph-bridge-identities.md).
+
 For Ceph System Datastores in Ceph mode the driver requires:
 
 - `TM_MAD=ceph`

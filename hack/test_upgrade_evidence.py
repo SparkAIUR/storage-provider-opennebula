@@ -438,6 +438,9 @@ class PromoteCLITest(unittest.TestCase):
                 "offline fixture",
             )
             candidate = copy.deepcopy(self.candidate)
+            candidate["chartVersion"] = yaml.safe_load(
+                (root / "helm/opennebula-csi/Chart.yaml").read_text()
+            )["version"]
             candidate["sourceCommit"] = git("rev-parse", "HEAD")
             candidate["sourceTree"] = git("rev-parse", "HEAD^{tree}")
             for name in [
@@ -470,6 +473,9 @@ class PromoteCLITest(unittest.TestCase):
                 [("hpldb", 3, "1.36"), ("hplsvc", 10, "1.35"), ("bravo", 13, "1.35")]
             ):
                 bundle = copy.deepcopy(self.bundle)
+                bundle["helmRelease"]["status"]["lastAttemptedRevision"] = candidate[
+                    "chartVersion"
+                ]
                 bundle["cluster"] = cluster
                 bundle["clusterUID"] = cluster
                 bundle["candidateSHA256"] = binding

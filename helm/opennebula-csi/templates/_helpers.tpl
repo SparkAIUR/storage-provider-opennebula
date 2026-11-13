@@ -208,7 +208,9 @@ Create chart name and version as used by the chart label.
 {{- $inventoryNamespace = include "opennebula-csi.namespace" $root -}}
 {{- end }}
 {{- $inventoryValidationEnabled := dig "enabled" true $inventoryValidation -}}
-{{- $inventoryValidationDefaultImage := (get $inventoryValidation "defaultImage") | default "alpine:3.22" -}}
+{{- $inventoryValidationDefaultImage := (get $inventoryValidation "defaultImage") | default "alpine:3.22" }}
+- name: ONE_CSI_CEPH_BRIDGE_IDENTITIES
+  value: {{ if $root.Values.driver.cephBridgeIdentities }}{{ toJson $root.Values.driver.cephBridgeIdentities | quote }}{{ else }}""{{ end }}
 {{- if $root.Values.driver.defaultDatastores }}
 - name: ONE_CSI_DEFAULT_DATASTORES
   value: {{ join "," $root.Values.driver.defaultDatastores | quote }}
@@ -401,4 +403,11 @@ Create chart name and version as used by the chart label.
 {{- else -}}
 {{- include "opennebula-csi.image" .Values.image -}}
 {{- end -}}
+{{- end -}}
+
+{{/* Revision is retained after truncation, independently of Chart.Version. */}}
+{{- define "opennebula-csi.revisionName" -}}
+{{- $suffix := printf "-%s-r%d" .component (int .root.Release.Revision) -}}
+{{- $base := include "opennebula-csi.fullname" .root -}}
+{{- printf "%s%s" (trunc (int (sub 63 (len $suffix))) $base | trimSuffix "-") $suffix -}}
 {{- end -}}

@@ -323,7 +323,8 @@ func validateCompatibleSystemDatastore(imageDS datastoreSchema.Datastore, system
 }
 
 func getDatastoreAttribute(ds datastoreSchema.Datastore, key string) string {
-	switch strings.ToUpper(strings.TrimSpace(key)) {
+	key = strings.ToUpper(strings.TrimSpace(key))
+	switch key {
 	case "DS_MAD":
 		return strings.TrimSpace(ds.DSMad)
 	case "TM_MAD":
@@ -335,9 +336,12 @@ func getDatastoreAttribute(ds datastoreSchema.Datastore, key string) string {
 		}
 	}
 
-	value, err := ds.Template.GetStr(strings.ToUpper(strings.TrimSpace(key)))
+	value, err := ds.Template.GetStr(key)
 	if err != nil {
 		return ""
+	}
+	if key == cephAttrBridgeList {
+		return value
 	}
 
 	return strings.TrimSpace(value)

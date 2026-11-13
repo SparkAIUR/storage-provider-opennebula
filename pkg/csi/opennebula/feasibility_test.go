@@ -15,10 +15,11 @@ func TestCephBridgeFeasibility(t *testing.T) {
 	}{
 		{"empty", "", nil, false}, {"unregistered", "bridge", nil, false},
 		{"disabled", "bridge", []host.Host{{Name: "bridge", StateRaw: int(host.Disabled)}}, false},
-		{"one ready", "bad bridge", []host.Host{{Name: "bridge", StateRaw: int(host.Monitored)}}, true},
+		{"healthy plus unknown selectable", "bad bridge", []host.Host{{Name: "bridge", StateRaw: int(host.Monitored)}}, false},
+		{"literal ready", "bridge", []host.Host{{Name: "bridge", StateRaw: int(host.Monitored)}}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := CephBridgeFeasible(tc.bridges, tc.hosts)
+			err := CephBridgeFeasible(Datastore{ID: 42, Ceph: &CephDatastoreAttributes{BridgeList: tc.bridges}}, tc.hosts, CephBridgeIdentities{})
 			if tc.pass {
 				require.NoError(t, err)
 			} else {

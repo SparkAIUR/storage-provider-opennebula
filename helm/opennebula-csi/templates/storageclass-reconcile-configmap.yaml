@@ -28,7 +28,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ printf "%s-storageclass-reconcile" (include "opennebula-csi.fullname" .) | trunc 63 | trimSuffix "-" }}
+  name: {{ include "opennebula-csi.revisionName" (dict "root" . "component" "storageclass-reconcile") }}
   namespace: {{ include "opennebula-csi.namespace" . }}
   labels:
     app.kubernetes.io/name: {{ include "opennebula-csi.name" . }}

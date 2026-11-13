@@ -45,7 +45,7 @@ func lifecycleFixture(t *testing.T, reply func(string) (bool, string, int), insp
 		require.NoError(t, err)
 	}))
 	t.Cleanup(server.Close)
-	p, err := NewPersistentDiskVolumeProvider(NewClient(OpenNebulaConfig{Endpoint: server.URL, Credentials: "fixture:fixture"}), HotplugTimeoutPolicy{BaseTimeout: time.Second, MaxTimeout: time.Second, PollInterval: time.Millisecond})
+	p, err := NewPersistentDiskVolumeProvider(NewClient(OpenNebulaConfig{Endpoint: server.URL, Credentials: "fixture:fixture"}), HotplugTimeoutPolicy{BaseTimeout: time.Second, MaxTimeout: time.Second, PollInterval: time.Millisecond}, CephBridgeIdentities{})
 	require.NoError(t, err)
 	return p
 }

@@ -15,13 +15,15 @@ credentials:
 image:
   digest: ""
   repository: "nudevco/opennebula-csi"
-  tag: "v0.6.0-rc.1"
+  tag: "v0.6.0-rc.2"
   pullPolicy: "IfNotPresent"
 
 imagePullSecrets: []
 debugPort: null
 
 driver:
+  # Version1 operator bindings for nonliteral Ceph bridge identities; empty denies unknown aliases.
+  cephBridgeIdentities: {}
   logLevel: 5
   defaultDatastores: []
   datastoreSelectionPolicy: "least-used"

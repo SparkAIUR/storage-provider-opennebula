@@ -1092,10 +1092,14 @@ func openNebulaAttachmentMetadataSnapshot(ctx context.Context, cfg config.CSIPlu
 	if !endpointOK || !credentialsOK || strings.TrimSpace(endpoint) == "" || strings.TrimSpace(credentials) == "" {
 		return snapshot
 	}
+	identities, err := loadCephBridgeIdentities(cfg)
+	if err != nil {
+		return snapshot
+	}
 	provider, err := opennebula.NewPersistentDiskVolumeProvider(opennebula.NewClient(opennebula.OpenNebulaConfig{
 		Endpoint:    endpoint,
 		Credentials: credentials,
-	}), loadHotplugTimeoutPolicy(cfg))
+	}), loadHotplugTimeoutPolicy(cfg), identities)
 	if err != nil {
 		return snapshot
 	}

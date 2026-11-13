@@ -85,3 +85,14 @@ func TestApplyKubeAPIClientRateLimit(t *testing.T) {
 	assert.Equal(t, float32(50), restConfig.QPS)
 	assert.Equal(t, 100, restConfig.Burst)
 }
+
+func TestCephBridgeIdentityConfigurationIsEmptyByDefault(t *testing.T) {
+	cfg := LoadConfiguration()
+	raw, ok := cfg.GetString(CephBridgeIdentitiesVar)
+	require.True(t, ok)
+	require.Empty(t, raw)
+	t.Setenv(CephBridgeIdentitiesVar, `{"version":1,"datastores":[]}`)
+	raw, ok = cfg.GetString(CephBridgeIdentitiesVar)
+	require.True(t, ok)
+	require.Equal(t, `{"version":1,"datastores":[]}`, raw)
+}

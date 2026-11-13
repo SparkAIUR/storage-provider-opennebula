@@ -14,23 +14,22 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ printf "%s-preflight" (include "opennebula-csi.fullname" .) }}
+  name: {{ include "opennebula-csi.revisionName" (dict "root" . "component" "preflight") }}
   namespace: {{ include "opennebula-csi.namespace" . }}
   labels:
     app.kubernetes.io/name: {{ include "opennebula-csi.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: preflight
-  {{- if .Values.preflight.failReleaseOnError }}
   annotations:
+  {{- if .Values.preflight.failReleaseOnError }}
     "helm.sh/hook": pre-install,pre-upgrade
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "helm.sh/hook-delete-policy": hook-succeeded
+  {{- else }}
+    "helm.sh/resource-policy": keep
   {{- end }}
 spec:
   activeDeadlineSeconds: 300
   backoffLimit: 0
-  {{- if not .Values.preflight.failReleaseOnError }}
-  ttlSecondsAfterFinished: 300
-  {{- end }}
   template:
     metadata:
       labels:
@@ -39,7 +38,7 @@ spec:
         app.kubernetes.io/component: preflight
     spec:
       restartPolicy: Never
-      serviceAccountName: {{ include "opennebula-csi.fullname" . }}-preflight
+      serviceAccountName: {{ include "opennebula-csi.revisionName" (dict "root" . "component" "preflight") }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}

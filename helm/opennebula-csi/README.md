@@ -419,6 +419,7 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
+| `driver.cephBridgeIdentities` | Operator-reviewed Ceph bridge bindings; see the [binding configuration contract](../../docs/ceph-bridge-identities.md#binding-configuration). | See [values.yaml](./values.yaml). | Conditional |
 | `driver.logLevel` | Kubernetes `-v` log level passed to the driver binary. | `5` | No |
 | `driver.defaultDatastores` | Default list of OpenNebula datastore IDs or aliases used when StorageClasses do not override `datastoreIDs`. | `[]` | Conditional |
 | `driver.datastoreSelectionPolicy` | Default datastore selection policy. Supported values: `least-used`, `ordered`, `autopilot`. | `"least-used"` | No |
@@ -667,7 +668,7 @@ The driver image includes cluster-operator modes that work well with a kubeconfi
 `preflight.nodeStageSecretRefs` and `preflight.provisionerSecretRefs` are only needed when validating CephFS secret wiring.
 For local-backed classes, preflight now checks `volumeBindingMode` and warns by default if `Immediate` is used instead of `WaitForFirstConsumer`.
 
-When `preflight.enabled=true` and `preflight.failReleaseOnError=true`, the hook requires `credentials.existingSecret.name` to exist before installation. Inline credentials cannot bootstrap this hook. Dedicated hook RBAC is created before the Job; referenced CephFS secrets must also exist. A failed mandatory Job is retained for inspection until the next hook creation, with no automatic retry or TTL cleanup. Datastore checks include provider-enabled state and observed Ceph bridge availability.
+When `preflight.enabled=true` and `preflight.failReleaseOnError=true`, the hook requires `credentials.existingSecret.name` to exist before installation. Inline credentials cannot bootstrap this hook. Dedicated hook RBAC is created before the Job; referenced CephFS secrets must also exist. Datastore checks include provider-enabled state. See the [bridge identity and failed-hook retention contract](../../docs/ceph-bridge-identities.md) for bridge prerequisites and retained resources.
 
 ### Snapshotter
 
@@ -698,6 +699,8 @@ The sidecar requires snapshot CRDs. Enabling it does not change the driver's [sn
 Rendered StorageClasses are fingerprinted with `storage-provider.opennebula.sparkaiur.io/*` annotations. The optional `storageClassReconcile` pre-upgrade hook creates missing classes and recreates chart-owned classes when their desired spec hash changes, provided the live spec still matches the previously applied hash. The hash covers the fields in [storageClassSpecHash](../../pkg/csi/driver/storageclass_reconcile.go), including mutable settings such as expansion and mount options.
 
 Legacy classes without an applied hash can be adopted when their live spec exactly matches the desired spec and `adoptUnannotated` is enabled. Otherwise, unowned classes, missing applied hashes, and manual spec changes fail the hook under `manualMutationPolicy: fail`; `skip` leaves them alone in the hook. Skipping does not make an incompatible immutable change safe for Helm's later upgrade step. The hook changes StorageClass objects only; it does not rewrite PVCs or PVs.
+
+For reconcile Job and input ConfigMap naming and retention, see the [failed-hook retention contract](../../docs/ceph-bridge-identities.md#failed-hook-retention).
 
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |

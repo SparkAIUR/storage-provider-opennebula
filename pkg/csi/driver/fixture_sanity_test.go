@@ -27,7 +27,7 @@ func TestFixtureCSISanity(t *testing.T) {
 	listener, err := net.Listen("unix", socket)
 	require.NoError(t, err)
 	d := newTestDriver()
-	d.version = "v0.6.0-rc.1"
+	d.version = "v0.6.0-rc.2"
 	d.nodeID = "fixture-node"
 	provider := &MockOpenNebulaVolumeProviderTestify{}
 	server := grpc.NewServer()

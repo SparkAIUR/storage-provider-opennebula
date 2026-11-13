@@ -46,12 +46,13 @@ const (
 )
 
 type PersistentDiskVolumeProvider struct {
-	ctrl            *goca.Controller
-	hotplugPolicy   HotplugTimeoutPolicy
-	hotplugPollWait time.Duration
+	ctrl             *goca.Controller
+	bridgeIdentities CephBridgeIdentities
+	hotplugPolicy    HotplugTimeoutPolicy
+	hotplugPollWait  time.Duration
 }
 
-func NewPersistentDiskVolumeProvider(client *OpenNebulaClient, policy HotplugTimeoutPolicy) (*PersistentDiskVolumeProvider, error) {
+func NewPersistentDiskVolumeProvider(client *OpenNebulaClient, policy HotplugTimeoutPolicy, identities CephBridgeIdentities) (*PersistentDiskVolumeProvider, error) {
 	if client == nil {
 		return nil, fmt.Errorf("client reference is nil")
 	}
@@ -65,9 +66,10 @@ func NewPersistentDiskVolumeProvider(client *OpenNebulaClient, policy HotplugTim
 		policy.PollInterval = hotplugPollInterval
 	}
 	return &PersistentDiskVolumeProvider{
-		ctrl:            goca.NewController(client.Client),
-		hotplugPolicy:   policy,
-		hotplugPollWait: policy.PollInterval,
+		ctrl:             goca.NewController(client.Client),
+		bridgeIdentities: identities,
+		hotplugPolicy:    policy,
+		hotplugPollWait:  policy.PollInterval,
 	}, nil
 }
 
@@ -118,7 +120,7 @@ func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name st
 			continue
 		}
 
-		if err := ProvisioningFeasible(ctx, p.ctrl, datastore); err != nil {
+		if err := ProvisioningFeasible(ctx, p.ctrl, datastore, p.bridgeIdentities); err != nil {
 			return nil, err
 		}
 		if selection.Authorize != nil {
@@ -233,22 +235,21 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 		if e != nil {
 			return nil, e
 		}
-		target, e = p.verifiedCloneTarget(ctx, target, sourceVolumeID)
-		if e != nil {
-			return nil, e
-		}
 		if target.DatastoreID == nil {
 			return nil, fmt.Errorf("clone target datastore unavailable")
 		}
 		for _, candidate := range candidates {
 			if candidate.ID == *target.DatastoreID {
-				if err := ProvisioningFeasible(ctx, p.ctrl, candidate); err != nil {
+				if err := ProvisioningFeasible(ctx, p.ctrl, candidate, p.bridgeIdentities); err != nil {
 					return nil, err
 				}
 				if selection.Authorize != nil {
 					if e := selection.Authorize(ctx, candidate.ID); e != nil {
 						return nil, e
 					}
+				}
+				if _, e = p.verifiedCloneTarget(ctx, target, sourceVolumeID); e != nil {
+					return nil, e
 				}
 				if err := p.waitForResourceStatusContext(ctx, existing, p.hotplugPolicy.BaseTimeout, p.volumeReadyContext); err != nil {
 					return nil, err
@@ -278,9 +279,6 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 	if selection.CloneRequiredBytes > sourceSizeBytes || (selection.CloneLimitBytes > 0 && sourceSizeBytes > selection.CloneLimitBytes) {
 		return nil, fmt.Errorf("%w: source capacity %d is outside requested clone range", ErrCloneCapacity, sourceSizeBytes)
 	}
-	if _, err = p.normalizeImageIdentity(ctx, sourceImage); err != nil {
-		return nil, err
-	}
 	attemptedDatastores := make([]int, 0, len(candidates))
 	insufficientCapacity := make([]string, 0)
 	for _, datastore := range candidates {
@@ -291,13 +289,17 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 			continue
 		}
 
-		if err := ProvisioningFeasible(ctx, p.ctrl, datastore); err != nil {
+		if err := ProvisioningFeasible(ctx, p.ctrl, datastore, p.bridgeIdentities); err != nil {
 			return nil, err
 		}
 		if selection.Authorize != nil {
 			if err := selection.Authorize(ctx, datastore.ID); err != nil {
 				return nil, err
 			}
+		}
+		sourceImage, err = p.normalizeImageIdentity(ctx, sourceImage)
+		if err != nil {
+			return nil, err
 		}
 		finishAttempt := beginDatastoreAttempt(datastore.ID)
 		cloneID, err := p.ctrl.Image(sourceVolumeID).CloneContext(ctx, name, datastore.ID)

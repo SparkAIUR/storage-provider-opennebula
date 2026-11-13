@@ -84,6 +84,7 @@ type Syncer struct {
 	scheme                 *runtime.Scheme
 	kube                   kubernetes.Interface
 	ctrl                   *goca.Controller
+	bridgeIdentities       opennebula.CephBridgeIdentities
 	namespace              string
 	resyncDatastores       time.Duration
 	resyncNodes            time.Duration
@@ -95,6 +96,11 @@ type Syncer struct {
 }
 
 func Run(ctx context.Context, cfg config.CSIPluginConfig, options Options) error {
+	rawIdentities, _ := cfg.GetString(config.CephBridgeIdentitiesVar)
+	bridgeIdentities, err := opennebula.ParseCephBridgeIdentities(rawIdentities)
+	if err != nil {
+		return fmt.Errorf("%s: %w", config.CephBridgeIdentitiesVar, err)
+	}
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
 		return err
@@ -143,6 +149,7 @@ func Run(ctx context.Context, cfg config.CSIPluginConfig, options Options) error
 
 	syncer := &Syncer{
 		client:                 mgr.GetClient(),
+		bridgeIdentities:       bridgeIdentities,
 		apiReader:              mgr.GetAPIReader(),
 		scheme:                 scheme,
 		kube:                   kube,
@@ -316,7 +323,7 @@ func (s *Syncer) syncDatastores(ctx context.Context) error {
 		}
 		nextStatus := s.buildDatastoreStatusWithPool(item, ds, dsPool.Datastores, pvs.Items, pvcByNSName, scs.Items, vas.Items, latestBenchmarks[ds.ID])
 		if normalized := normalizeDatastore(ds, dsPool.Datastores); normalized.Enabled && item.Spec.Enabled && item.Spec.Discovery.Allowed && !item.Spec.MaintenanceMode {
-			if err := opennebula.ProvisioningFeasible(ctx, s.ctrl, normalized); err != nil {
+			if err := opennebula.ProvisioningFeasible(ctx, s.ctrl, normalized, s.bridgeIdentities); err != nil {
 				nextStatus.Health = inventoryv1alpha1.DatastoreHealthLookupFailed
 				nextStatus.Phase = inventoryv1alpha1.DatastorePhaseUnavailable
 				for i := range nextStatus.Conditions {

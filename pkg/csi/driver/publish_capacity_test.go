@@ -116,7 +116,7 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 				require.NoError(t, err)
 			}))
 			t.Cleanup(endpoint.Close)
-			capacity, err := opennebula.NewPersistentDiskVolumeProvider(opennebula.NewClient(opennebula.OpenNebulaConfig{Endpoint: endpoint.URL, Credentials: "fixture:fixture"}), opennebula.HotplugTimeoutPolicy{BaseTimeout: time.Second, MaxTimeout: time.Second, PollInterval: time.Millisecond})
+			capacity, err := opennebula.NewPersistentDiskVolumeProvider(opennebula.NewClient(opennebula.OpenNebulaConfig{Endpoint: endpoint.URL, Credentials: "fixture:fixture"}), opennebula.HotplugTimeoutPolicy{BaseTimeout: time.Second, MaxTimeout: time.Second, PollInterval: time.Millisecond}, opennebula.CephBridgeIdentities{})
 			require.NoError(t, err)
 			provider := &MockOpenNebulaVolumeProviderTestify{}
 			provider.On("VolumeExists", mock.Anything, "volume-test").Return(7, desired, nil)
@@ -260,7 +260,7 @@ func TestControllerPublishAndExpandSerializeVerifiedCapacity(t *testing.T) {
 					require.NoError(t, err)
 				}))
 				t.Cleanup(endpoint.Close)
-				capacity, err := opennebula.NewPersistentDiskVolumeProvider(opennebula.NewClient(opennebula.OpenNebulaConfig{Endpoint: endpoint.URL, Credentials: "fixture:fixture"}), opennebula.HotplugTimeoutPolicy{BaseTimeout: time.Second, MaxTimeout: time.Second, PollInterval: time.Millisecond})
+				capacity, err := opennebula.NewPersistentDiskVolumeProvider(opennebula.NewClient(opennebula.OpenNebulaConfig{Endpoint: endpoint.URL, Credentials: "fixture:fixture"}), opennebula.HotplugTimeoutPolicy{BaseTimeout: time.Second, MaxTimeout: time.Second, PollInterval: time.Millisecond}, opennebula.CephBridgeIdentities{})
 				require.NoError(t, err)
 				provider := &MockOpenNebulaVolumeProviderTestify{}
 				provider.On("VolumeExists", mock.Anything, "volume-test").Return(7, int(256*mib), nil)

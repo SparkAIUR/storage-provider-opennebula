@@ -7,7 +7,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ printf "%s-storageclass-reconcile" (include "opennebula-csi.fullname" .) | trunc 63 | trimSuffix "-" }}
+  name: {{ include "opennebula-csi.revisionName" (dict "root" . "component" "storageclass-reconcile") }}
   namespace: {{ include "opennebula-csi.namespace" . }}
   labels:
     app.kubernetes.io/name: {{ include "opennebula-csi.name" . }}
@@ -16,10 +16,10 @@ metadata:
   annotations:
     "helm.sh/hook": pre-upgrade
     "helm.sh/hook-weight": "-10"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "helm.sh/hook-delete-policy": hook-succeeded
 spec:
   backoffLimit: 0
-  ttlSecondsAfterFinished: 300
+  activeDeadlineSeconds: 300
   template:
     metadata:
       labels:
@@ -40,7 +40,7 @@ spec:
           args:
             - "--mode=storageclass-reconcile"
             - "--storageclass-reconcile-namespace={{ include "opennebula-csi.namespace" . }}"
-            - "--storageclass-reconcile-configmap={{ printf "%s-storageclass-reconcile" (include "opennebula-csi.fullname" .) | trunc 63 | trimSuffix "-" }}"
+            - "--storageclass-reconcile-configmap={{ include "opennebula-csi.revisionName" (dict "root" . "component" "storageclass-reconcile") }}"
             - "--storageclass-reconcile-manual-policy={{ $manualMutationPolicy }}"
             - "--storageclass-reconcile-adopt-unannotated={{ $adoptUnannotated }}"
             - "--v={{ .Values.driver.logLevel }}"
