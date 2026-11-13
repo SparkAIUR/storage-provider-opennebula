@@ -1042,6 +1042,8 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			}
 			s.handleHotplugTimeout(queueCtx, req.NodeId, req.VolumeId, params, "attach", "disk", err)
 			switch {
+			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+				return err
 			case opennebula.IsDatastoreConfigError(err):
 				return status.Error(codes.FailedPrecondition, err.Error())
 			case opennebula.IsDatastoreCapacityError(err):
@@ -1105,6 +1107,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		if errors.As(queueErr, &staleQueueErr) {
 			s.recordPVCWarningFromParams(ctx, req.GetVolumeContext(), eventReasonHotplugQueueStale, staleQueueErr.Error())
 			return nil, status.Error(codes.Aborted, staleQueueErr.Error())
+		}
+		if errors.Is(queueErr, context.Canceled) || errors.Is(queueErr, context.DeadlineExceeded) {
+			return nil, status.FromContextError(queueErr).Err()
 		}
 		if status.Code(queueErr) == codes.Unknown {
 			return nil, status.Error(codes.Aborted, queueErr.Error())
@@ -1873,10 +1878,8 @@ func (s *ControllerServer) restoreVolumeCapacity(ctx context.Context, volume str
 		return nil
 	}
 	switch {
-	case errors.Is(err, context.Canceled):
-		return status.Error(codes.Canceled, err.Error())
-	case errors.Is(err, context.DeadlineExceeded):
-		return status.Error(codes.DeadlineExceeded, err.Error())
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return err
 	case opennebula.IsDatastoreConfigError(err):
 		return status.Error(codes.FailedPrecondition, err.Error())
 	default:

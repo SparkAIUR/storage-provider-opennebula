@@ -30,13 +30,14 @@ type nodeAttachmentProtocol struct {
 	claimNew          bool
 	ready             bool
 	pending           bool
+	version           string
 }
 
 // This fixture models durable shareable storage, not ephemeral cloned disks.
 // Image.cc emits PERSISTENT=YES/CLONE=NO/SAVE=YES and SHAREABLE=YES for a
 // persistent raw image with PERSISTENT_TYPE=SHAREABLE. The former PERSISTENT=0
 // contradicted both that intent and its USED_PERS state.
-func nodeAttachmentProvider(t *testing.T) (*opennebula.PersistentDiskVolumeProvider, *nodeAttachmentProtocol) {
+func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Context)) (*opennebula.PersistentDiskVolumeProvider, *nodeAttachmentProtocol) {
 	t.Helper()
 	state := &nodeAttachmentProtocol{disks: map[int]int{41: 256}, marker: 256 * 1024 * 1024}
 	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -52,6 +53,9 @@ func nodeAttachmentProvider(t *testing.T) (*opennebula.PersistentDiskVolumeProvi
 			} `xml:"params>param"`
 		}
 		require.NoError(t, xml.NewDecoder(r.Body).Decode(&call))
+		for _, observer := range observe {
+			observer(call.Method, r.Context())
+		}
 		number := func(i int) int { v := call.Params[i].Value; return v.Int + v.I4 + v.I8 }
 		state.mu.Lock()
 		defer state.mu.Unlock()
@@ -117,7 +121,10 @@ func nodeAttachmentProvider(t *testing.T) (*opennebula.PersistentDiskVolumeProvi
 				state.mutations = append(state.mutations, fmt.Sprintf("detach:%d", id))
 				body = strconv.Itoa(id)
 			case "one.system.version":
-				body = "7.4.1"
+				body = state.version
+				if body == "" {
+					body = "7.4.1"
+				}
 			case "one.vm.diskresize":
 				id := number(1)
 				require.Equal(t, 2, number(2))

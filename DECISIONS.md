@@ -72,3 +72,7 @@ The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI i
 ## 2026-11-13, growth observation context precedence
 
 - AI: Check the operation context immediately after each fresh VM, image and version observation. Cancellation and deadline expiry take precedence over either successful replies or prerequisite denials, preserving their error identity for all controller restoration consumers. Synthetic transport regressions cover interrupted observations during expansion and restoration without growth or capacity metadata mutations. OpenNebula 7.4.0 remains the target; native qualification and the 24-hour observation remain open.
+
+## 2026-11-13, queued embedded restoration context errors
+
+- AI: Retain cancellation and deadline error identity through both direct restoration and AttachVolume's embedded restoration. Convert context errors to CSI status only after queue dispatch can classify its active timeout. Preserve prerequisite, capacity, conflict and unknown-error mappings without changing attachment policy or success bookkeeping. Synthetic transport regressions exercise real attach/restoration observations with a still-connected CSI caller; they do not establish native acceptance or start the 24-hour observation.

@@ -39,6 +39,18 @@ func (p *capacityProtocolProvider) ExpandVolume(ctx context.Context, volume stri
 	return p.capacity.ExpandVolume(ctx, volume, size, allowDetached)
 }
 
+type cancelableCapacityAttachProvider struct {
+	*opennebula.PersistentDiskVolumeProvider
+	cancelReady chan context.CancelFunc
+}
+
+func (p *cancelableCapacityAttachProvider) AttachVolume(ctx context.Context, volume, node string, immutable bool, params map[string]string) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	p.cancelReady <- cancel
+	return p.PersistentDiskVolumeProvider.AttachVolume(ctx, volume, node, immutable, params)
+}
+
 func reviewControllerClient(t *testing.T, controller *ControllerServer) csi.ControllerClient {
 	t.Helper()
 	listener := bufconn.Listen(1024 * 1024)
@@ -458,50 +470,130 @@ func TestControllerProviderGrowthCompatibilityFailedPrecondition(t *testing.T) {
 }
 
 func TestControllerPublishCapacityRestorationContextErrors(t *testing.T) {
-	for _, path := range []string{"already_attached", "queued_completion", "post_attach", "sticky_reuse"} {
-		for _, failure := range []struct {
-			name string
-			err  error
-			code codes.Code
-		}{
-			{"canceled", fmt.Errorf("restore interrupted: %w", context.Canceled), codes.Canceled},
-			{"deadline", fmt.Errorf("restore interrupted: %w", context.DeadlineExceeded), codes.DeadlineExceeded},
-			{"unknown", fmt.Errorf("resize outcome uncertain"), codes.Internal},
-		} {
-			t.Run(path+"/"+failure.name, func(t *testing.T) {
-				provider := &MockOpenNebulaVolumeProviderTestify{}
-				provider.On("VolumeExists", mock.Anything, "volume-test").Return(7, 256*1024*1024, nil)
-				provider.On("NodeExists", mock.Anything, "node-test").Return(11, nil)
-				if path != "already_attached" {
-					count := 1
-					if path == "post_attach" || path == "sticky_reuse" {
-						count = 2
+	for _, queued := range []bool{false, true} {
+		for _, path := range []string{"already_attached", "queued_completion", "post_attach", "sticky_reuse"} {
+			for _, failure := range []struct {
+				name string
+				err  error
+				code codes.Code
+			}{
+				{"canceled", fmt.Errorf("restore interrupted: %w", context.Canceled), codes.Canceled},
+				{"deadline", fmt.Errorf("restore interrupted: %w", context.DeadlineExceeded), codes.DeadlineExceeded},
+				{"unknown", fmt.Errorf("resize outcome uncertain"), codes.Internal},
+			} {
+				t.Run(fmt.Sprintf("queued=%t/%s/%s", queued, path, failure.name), func(t *testing.T) {
+					provider := &MockOpenNebulaVolumeProviderTestify{}
+					provider.On("VolumeExists", mock.Anything, "volume-test").Return(7, 256*1024*1024, nil)
+					provider.On("NodeExists", mock.Anything, "node-test").Return(11, nil)
+					if path != "already_attached" {
+						count := 1
+						if path == "post_attach" || path == "sticky_reuse" {
+							count = 2
+						}
+						provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("", opennebula.ErrAttachmentNotFound).Times(count)
 					}
-					provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("", opennebula.ErrAttachmentNotFound).Times(count)
-				}
-				provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("vdb", nil).Once()
-				provider.On("RestoreVolumeCapacity", mock.Anything, "volume-test", 11, 7).Return(failure.err).Once()
-				if path == "post_attach" {
-					provider.On("AttachVolume", mock.Anything, "volume-test", "node-test", false, mock.Anything).Return(nil).Once()
+					provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("vdb", nil).Once()
+					provider.On("RestoreVolumeCapacity", mock.Anything, "volume-test", 11, 7).Return(failure.err).Once()
+					if path == "post_attach" {
+						provider.On("AttachVolume", mock.Anything, "volume-test", "node-test", false, mock.Anything).Return(nil).Once()
+					}
+					driver := newTestDriver()
+					if path == "sticky_reuse" {
+						pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+						driver = newStickyTestDriver(t, pv, pvc, newReadyNode("node-test", true), activePodForPVC("capacity-pod", pvc.Name, "node-test"))
+						require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{VolumeID: "volume-test", NodeID: "node-test", Backend: "local", StartedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute), GraceSeconds: 60}))
+					}
+					controller := NewControllerServer(driver, provider, &MockSharedFilesystemProviderTestify{})
+					if queued {
+						driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+						driver.hotplugQueue.Configure(true, 0, 0, time.Second, nil)
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					response, err := reviewControllerClient(t, controller).ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-test"))
+					require.Nil(t, response)
+					require.Equal(t, failure.code, status.Code(err))
+					if queued && failure.code == codes.DeadlineExceeded {
+						require.ErrorContains(t, err, "executing hotplug queue request")
+					} else {
+						require.ErrorContains(t, err, failure.err.Error())
+					}
+					if path == "sticky_reuse" {
+						_, exists := driver.stickyAttachments.Get("volume-test")
+						require.True(t, exists)
+					}
+					provider.AssertExpectations(t)
+				})
+			}
+		}
+	}
+}
+
+func TestControllerPublishRealAttachRestorationContext(t *testing.T) {
+	for _, observation := range []struct {
+		method string
+		read   int32
+	}{
+		{"one.vm.info", 5},
+		{"one.image.info", 4},
+		{"one.system.version", 1},
+	} {
+		for _, mode := range []string{"deadline", "cancel", "denied"} {
+			t.Run(observation.method+"/"+mode, func(t *testing.T) {
+				var attached, interrupted atomic.Bool
+				var reads atomic.Int32
+				cancelReady := make(chan context.CancelFunc, 1)
+				provider, state := nodeAttachmentProvider(t, func(method string, requestCtx context.Context) {
+					if method == "one.vm.attach" {
+						attached.Store(true)
+						return
+					}
+					if !attached.Load() || method != observation.method || reads.Add(1) != observation.read {
+						return
+					}
+					interrupted.Store(true)
+					if mode == "denied" {
+						return
+					}
+					if mode == "cancel" {
+						cancel := <-cancelReady
+						cancel()
+					}
+					<-requestCtx.Done()
+				})
+				state.mu.Lock()
+				delete(state.disks, 41)
+				state.version = "7.4.0"
+				state.mu.Unlock()
+				var volumeProvider opennebula.OpenNebulaVolumeProvider = provider
+				if mode == "cancel" {
+					volumeProvider = &cancelableCapacityAttachProvider{provider, cancelReady}
 				}
 				driver := newTestDriver()
-				if path == "sticky_reuse" {
-					pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
-					driver = newStickyTestDriver(t, pv, pvc, newReadyNode("node-test", true), activePodForPVC("capacity-pod", pvc.Name, "node-test"))
-					require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{VolumeID: "volume-test", NodeID: "node-test", Backend: "local", StartedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute), GraceSeconds: 60}))
-				}
-				controller := NewControllerServer(driver, provider, &MockSharedFilesystemProviderTestify{})
+				controller := NewControllerServer(driver, volumeProvider, &MockSharedFilesystemProviderTestify{})
+				driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+				driver.hotplugQueue.Configure(true, 0, 0, 500*time.Millisecond, nil)
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				response, err := reviewControllerClient(t, controller).ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-test"))
+				response, err := reviewControllerClient(t, controller).ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-new"))
 				require.Nil(t, response)
-				require.Equal(t, failure.code, status.Code(err))
-				require.ErrorContains(t, err, failure.err.Error())
-				if path == "sticky_reuse" {
-					_, exists := driver.stickyAttachments.Get("volume-test")
-					require.True(t, exists)
+				require.NoError(t, ctx.Err(), "the parent CSI caller must remain connected")
+				require.True(t, interrupted.Load(), "must reach the growth prerequisite observation inside real AttachVolume")
+				switch mode {
+				case "deadline":
+					require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+					require.ErrorContains(t, err, "executing hotplug queue request")
+				case "cancel":
+					require.Equal(t, codes.Canceled, status.Code(err))
+				case "denied":
+					require.Equal(t, codes.FailedPrecondition, status.Code(err))
+					require.ErrorContains(t, err, "7.4.0")
 				}
-				provider.AssertExpectations(t)
+				state.mu.Lock()
+				defer state.mu.Unlock()
+				require.Equal(t, []string{"attach:42:false"}, state.mutations)
+				require.Equal(t, 128, state.disks[42])
+				require.EqualValues(t, 256*1024*1024, state.marker)
 			})
 		}
 	}
