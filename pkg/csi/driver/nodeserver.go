@@ -27,6 +27,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
@@ -776,18 +777,18 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		}, nil
 	}
 
-	devicePath, err := ns.getMountedDevicePath(req.GetStagingTargetPath())
-	if err != nil && req.GetStagingTargetPath() != volumePath {
-		devicePath, err = ns.getMountedDevicePath(volumePath)
+	policy := ns.nodeExpandPolicy()
+	ctx, cancel := context.WithTimeout(ctx, policy.verifyTimeout)
+	defer cancel()
+	_, deviceID, err := ns.nodeExpandMountedDevice(volumePath, req.GetStagingTargetPath())
+	if contextErr := ctx.Err(); contextErr != nil {
+		return nil, status.FromContextError(contextErr).Err()
 	}
 	if err != nil {
 		ns.recordNodeExpandOperation(started, "disk", "failed_precondition")
 		return nil, status.Errorf(codes.FailedPrecondition, "failed to resolve device path for volume expansion: %v", err)
 	}
 
-	policy := ns.nodeExpandPolicy()
-	ctx, cancel := context.WithTimeout(ctx, policy.verifyTimeout)
-	defer cancel()
 	// A PVC requests outer device capacity. Filesystem metadata is not
 	// missing storage, and a byte tolerance must not hide a short device.
 	targetMinBytes := requiredBytes
@@ -806,6 +807,14 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		}
 		attempts++
 
+		// A wait may outlive a mount or device alias. Never reuse its old binding.
+		devicePath, err := ns.nodeExpandBoundDevice(volumePath, req.GetStagingTargetPath(), deviceID)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, status.FromContextError(contextErr).Err()
+		}
+		if err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "volume expansion binding changed: %v", err)
+		}
 		lastDeviceBytes, err = ns.getBlockVolumeSizeWithExec(devicePath, nodeExpandExec{Interface: ns.mounter.Exec, ctx: ctx})
 		if contextErr := ctx.Err(); contextErr != nil {
 			return nil, status.FromContextError(contextErr).Err()
@@ -813,6 +822,22 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		if err != nil {
 			ns.recordNodeExpandOperation(started, "disk", "internal")
 			return nil, status.Errorf(codes.Internal, "failed to collect device size for volume %s at %s: %v", volumeID, devicePath, err)
+		}
+		// Bind the capacity observation to the device that was queried, even if
+		// that path was an alias which changed during blockdev.
+		observedID, err := nodeExpandBackingIdentity(devicePath)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, status.FromContextError(contextErr).Err()
+		}
+		if err != nil || observedID != deviceID {
+			return nil, status.Errorf(codes.FailedPrecondition, "capacity device identity changed at %s: %v", devicePath, err)
+		}
+		devicePath, err = ns.nodeExpandBoundDevice(volumePath, req.GetStagingTargetPath(), deviceID)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, status.FromContextError(contextErr).Err()
+		}
+		if err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "volume expansion binding changed: %v", err)
 		}
 
 		if lastDeviceBytes < targetMinBytes {
@@ -890,6 +915,120 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 			"filesystemBytes", lastFSBytes, "resized", resized, "attempts", attempts)
 		return &csi.NodeExpandVolumeResponse{CapacityBytes: requiredBytes}, nil
 	}
+}
+
+// Device nodes can have different inodes while naming the same kernel device.
+// Regular backing files retain the existing local-image capacity contract.
+type nodeExpandDeviceID struct {
+	kind   uint32
+	device uint64
+	inode  uint64
+}
+
+func nodeExpandBackingIdentity(devicePath string) (nodeExpandDeviceID, error) {
+	var st unix.Stat_t
+	if err := unix.Stat(devicePath, &st); err != nil {
+		return nodeExpandDeviceID{}, err
+	}
+	kind := uint32(st.Mode) & unix.S_IFMT
+	switch kind {
+	case unix.S_IFBLK, unix.S_IFCHR:
+		return nodeExpandDeviceID{kind: kind, device: uint64(st.Rdev)}, nil
+	case unix.S_IFREG:
+		return nodeExpandDeviceID{kind: kind, device: uint64(st.Dev), inode: st.Ino}, nil
+	default:
+		return nodeExpandDeviceID{}, fmt.Errorf("unsupported backing device at %s", devicePath)
+	}
+}
+
+func (ns *NodeServer) nodeExpandMountedDevice(volumePath, stagingPath string) (string, nodeExpandDeviceID, error) {
+	mountPoints, err := ns.mounter.List()
+	if err != nil {
+		return "", nodeExpandDeviceID{}, err
+	}
+	// Read both mount bindings from one observation. A supplied staging path
+	// must be observable too; failure there cannot authorize a publish fallback.
+	deviceAt := func(target string) (string, error) {
+		var device string
+		for _, mp := range mountPoints {
+			if mp.Path == target {
+				if device != "" || mp.Device == "" {
+					return "", fmt.Errorf("mount %s has ambiguous or absent backing device", target)
+				}
+				device = mp.Device
+			}
+		}
+		if device != "" {
+			return device, nil
+		}
+		return "", fmt.Errorf("mount %s does not expose a backing device", target)
+	}
+	devicePath, err := deviceAt(volumePath)
+	if err != nil {
+		return "", nodeExpandDeviceID{}, err
+	}
+	id, err := nodeExpandBackingIdentity(devicePath)
+	if err != nil {
+		return "", nodeExpandDeviceID{}, err
+	}
+	if stagingPath != "" && stagingPath != volumePath {
+		stagingDevice, err := deviceAt(stagingPath)
+		if err != nil {
+			return "", nodeExpandDeviceID{}, err
+		}
+		stagingID, err := nodeExpandBackingIdentity(stagingDevice)
+		if err != nil {
+			return "", nodeExpandDeviceID{}, err
+		}
+		if stagingID != id {
+			return "", nodeExpandDeviceID{}, fmt.Errorf("staging and published mounts have different backing devices")
+		}
+	}
+	if id.kind == unix.S_IFBLK {
+		// A mount source alias can be retargeted without changing the mounted
+		// filesystem. Verify the kernel filesystem identity as well as the node.
+		var filesystemDevice uint64
+		for i, target := range []string{volumePath, stagingPath} {
+			if target == "" {
+				continue
+			}
+			info, err := nodeVolumePathStat(target)
+			if err != nil {
+				return "", nodeExpandDeviceID{}, err
+			}
+			st, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				return "", nodeExpandDeviceID{}, fmt.Errorf("mount %s filesystem identity is unavailable", target)
+			}
+			if i == 0 {
+				filesystemDevice = uint64(st.Dev)
+			}
+			// Btrfs subvolumes use anonymous filesystem device numbers rather
+			// than the backing block number. Both binds must still agree.
+			btrfs := false
+			for _, mp := range mountPoints {
+				if mp.Path == target {
+					btrfs = mp.Type == "btrfs"
+					break
+				}
+			}
+			if uint64(st.Dev) != filesystemDevice || (!btrfs && uint64(st.Dev) != id.device) {
+				return "", nodeExpandDeviceID{}, fmt.Errorf("mount %s filesystem identity does not match backing device", target)
+			}
+		}
+	}
+	return devicePath, id, nil
+}
+
+func (ns *NodeServer) nodeExpandBoundDevice(volumePath, stagingPath string, expected nodeExpandDeviceID) (string, error) {
+	devicePath, id, err := ns.nodeExpandMountedDevice(volumePath, stagingPath)
+	if err != nil {
+		return "", err
+	}
+	if id != expected {
+		return "", fmt.Errorf("mounted backing device identity changed")
+	}
+	return devicePath, nil
 }
 
 // mount-utils calls Command; bind those external calls to this RPC's deadline.
@@ -1161,28 +1300,6 @@ func (ns *NodeServer) deviceCandidates(volumeName string) []string {
 	}
 
 	return candidates
-}
-
-func (ns *NodeServer) getMountedDevicePath(targetPath string) (string, error) {
-	if targetPath == "" {
-		return "", fmt.Errorf("mount path is required")
-	}
-
-	mountPoints, err := ns.mounter.List()
-	if err != nil {
-		return "", fmt.Errorf("failed to list mount points: %w", err)
-	}
-
-	for _, mountPoint := range mountPoints {
-		if mountPoint.Path == targetPath {
-			if mountPoint.Device == "" {
-				return "", fmt.Errorf("mount point %s does not expose a backing device", targetPath)
-			}
-			return mountPoint.Device, nil
-		}
-	}
-
-	return "", fmt.Errorf("mount point %s was not found", targetPath)
 }
 
 func (ns *NodeServer) checkMountPoint(srcPath string, targetPath string, volumeCapability *csi.VolumeCapability) (mountPointMatch, error) {

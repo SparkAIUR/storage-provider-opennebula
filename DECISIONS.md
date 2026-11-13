@@ -54,3 +54,9 @@ The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI i
 
 - AI: Replace the earlier mount-utils geometry assumption with the [node expansion verification contract](docs/node-expansion.md#verification-contract) for the pinned dependency, including RPC cancellation through command execution and retry waits. Preserve the earlier decision as history; its geometry claim does not describe this dependency. Provider capacity, attachment identity and reattach policies remain unchanged.
 - AI: Keep this source correction separate from immutable RC2 artifacts. Offline fixtures and tests do not complete native expansion, ordinary reattach qualification or the 24-hour observation. Existing hpldb-only authorization and the required later review remain unchanged.
+
+## 2026-11-13, node expansion mount binding correction
+
+- HUMAN: Apply the functional mount/device binding correction in the source pipeline. OpenNebula 7.4.0 remains the target; this round authorizes no direct OpenNebula host actions or provider, package, service, GitOps or upgrade changes.
+- AI: Resolve published and supplied staging bindings together, compare OS backing and mounted-filesystem identities rather than path strings, and retain that identity through device-capacity waits and reads. Remove the staging-resolution fallback and its unused helper. Unknown or changed identity rejects before filesystem resize. Keep exact requested capacity, mount-utils convergence, fatal statfs availability errors and cancellation behavior.
+- AI: Preserve the original expansion regressions and add executable binding, command-boundary and local ext4 image RPC checks. Local image checks use a synthetic mount table and do not qualify native mounted volumes. Copilot's monthly-quota HTTP 402 remains a failed external check under the standing exception, not a source fix or clean pass.

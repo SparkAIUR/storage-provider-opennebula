@@ -4,6 +4,7 @@
 
 - Correct node expansion completion for the pinned mount-utils dependency. This supersedes the v0.5.29 geometry check; see the [node expansion contract](docs/node-expansion.md#verification-contract).
 - Honor cancellation during filesystem commands and device-capacity waits, and recheck it before acknowledging success. Native expansion and ordinary reattach acceptance remain pending.
+- Bind node expansion capacity and filesystem resize to the same observable backing device. Accept device aliases, reject missing or mismatched staging/published bindings, and refresh identity after capacity waits and reads.
 
 ## v0.6.0-rc.2, unreleased
 

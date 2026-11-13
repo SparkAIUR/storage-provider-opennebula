@@ -109,6 +109,8 @@ func TestNodeExpandMountUtilsSafety(t *testing.T) {
 		name, format                        string
 		sizes                               []int64
 		resizeError, formatError, statError bool
+		blockOutput                         string
+		blockError, noop                    bool
 		cancelAt                            string
 		want                                codes.Code
 		wantResize, wantSleep               int
@@ -129,6 +131,11 @@ func TestNodeExpandMountUtilsSafety(t *testing.T) {
 		{name: "cancel while waiting for device", format: "xfs", sizes: []int64{requested / 2}, cancelAt: "wait", want: codes.Canceled, wantSleep: 1},
 		{name: "statfs diagnostic error fails", format: "xfs", statError: true, want: codes.Internal, wantResize: 1},
 		{name: "btrfs existing resize support", format: "btrfs", wantResize: 1},
+		{name: "malformed blockdev", format: "xfs", blockOutput: "not bytes", want: codes.Internal},
+		{name: "failed blockdev", format: "xfs", blockError: true, want: codes.Internal},
+		{name: "already grown xfs succeeds without growth", format: "xfs", noop: true, wantResize: 1},
+		{name: "already grown ext succeeds without growth", format: "ext4", noop: true, wantResize: 1},
+		{name: "cancel after format probing", format: "xfs", cancelAt: "format", want: codes.Canceled},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			oldFS, oldSleep, oldNow := nodeVolumePathFS, nodeExpandSleep, nodeNow
@@ -176,6 +183,12 @@ func TestNodeExpandMountUtilsSafety(t *testing.T) {
 					}
 					deviceReads++
 					output = fmt.Sprint(size)
+					if tc.blockOutput != "" {
+						output = tc.blockOutput
+					}
+					if tc.blockError {
+						commandErr = errors.New("blockdev fixture failure")
+					}
 					if tc.cancelAt == "device" {
 						cancel()
 					}
@@ -199,15 +212,28 @@ func TestNodeExpandMountUtilsSafety(t *testing.T) {
 					case "btrfs":
 						require.Equal(t, []string{"filesystem", "resize", "max", volumePath}, args)
 					}
-					resizeCalls++
 					if tc.resizeError {
 						commandErr = errors.New("resize fixture failure")
 						output = "tool refused growth"
+					}
+					if tc.noop {
+						output = "data size unchanged, skipping\nNothing to do!\n"
 					}
 				default:
 					t.Fatalf("unexpected command %s %v", cmd, args)
 				}
 				return testingexec.InitFakeCmd(&testingexec.FakeCmd{CombinedOutputScript: []testingexec.FakeAction{func() ([]byte, []byte, error) {
+					// Model the process boundary, where CommandContext refuses to
+					// execute a child after format probing canceled the RPC.
+					if err := ctx.Err(); err != nil {
+						return nil, nil, err
+					}
+					if cmd == "xfs_growfs" || cmd == "resize2fs" || cmd == "btrfs" {
+						resizeCalls++
+					}
+					if cmd == "blkid" && tc.cancelAt == "format" {
+						cancel()
+					}
 					if (tc.cancelAt == "deadline-resize" && cmd == "xfs_growfs") || (tc.cancelAt == "deadline-device" && cmd == "blockdev") {
 						<-ctx.Done()
 						return nil, nil, ctx.Err()

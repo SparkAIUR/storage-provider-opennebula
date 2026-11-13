@@ -1,0 +1,275 @@
+//go:build linux
+
+package driver
+
+import (
+	"context"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
+	mount "k8s.io/mount-utils"
+	utilexec "k8s.io/utils/exec"
+	testingexec "k8s.io/utils/exec/testing"
+)
+
+// Real mount-utils must not acknowledge XFS's successful no-op on device B
+// using device A's larger capacity. Device nodes are external-boundary fixtures.
+func TestNodeExpandMountUtilsBinding(t *testing.T) {
+	for _, scenario := range []string{"different devices", "valid alias", "kernel block aliases", "kernel btrfs anonymous identity", "kernel btrfs mount mismatch", "kernel published mount mismatch", "kernel staging mount mismatch", "kernel mount identity unavailable", "kernel mount changes during capacity read", "mount changes during capacity read", "alias changes during capacity read"} {
+		t.Run(scenario, func(t *testing.T) {
+			root := t.TempDir()
+			alias := filepath.Join(root, "alias")
+			require.NoError(t, os.Symlink("/dev/null", alias))
+			publish := filepath.Join(root, "publish")
+			require.NoError(t, os.Mkdir(publish, 0700))
+			stage := filepath.Join(root, "stage")
+			require.NoError(t, os.Mkdir(stage, 0700))
+			stageDevice := "/dev/null"
+			publishedDevice := alias
+			mountChanged := false
+			if strings.HasPrefix(scenario, "kernel ") {
+				stageDevice, publishedDevice = filepath.Join(root, "block-a"), filepath.Join(root, "block-b")
+				for _, device := range []string{stageDevice, publishedDevice} {
+					if err := unix.Mknod(device, unix.S_IFBLK|0600, int(unix.Mkdev(7, 253))); err != nil {
+						if err == unix.EPERM {
+							t.Skip("block-node alias fixture requires mknod permission")
+						}
+						require.NoError(t, err)
+					}
+				}
+				a, err := os.Stat(stageDevice)
+				require.NoError(t, err)
+				b, err := os.Stat(publishedDevice)
+				require.NoError(t, err)
+				require.False(t, os.SameFile(a, b), "distinct nodes must be accepted by kernel device identity, not inode")
+				oldStat := nodeVolumePathStat
+				t.Cleanup(func() { nodeVolumePathStat = oldStat })
+				// These are synthetic mount observations. The backing nodes
+				// above are real distinct OS nodes with kernel ID 7:253.
+				nodeVolumePathStat = func(target string) (os.FileInfo, error) {
+					if scenario == "kernel mount identity unavailable" {
+						return nil, os.ErrNotExist
+					}
+					info, err := os.Stat(target)
+					if err != nil {
+						return nil, err
+					}
+					st := *info.Sys().(*syscall.Stat_t)
+					st.Dev = unix.Mkdev(7, 253)
+					if strings.Contains(scenario, "btrfs") {
+						st.Dev = unix.Mkdev(0, 253)
+					}
+					if (scenario == "kernel published mount mismatch" && target == publish) || (scenario == "kernel staging mount mismatch" && target == stage) || mountChanged || (scenario == "kernel btrfs mount mismatch" && target == publish) {
+						st.Dev = unix.Mkdev(7, 252)
+					}
+					return nodeExpandMountFileInfo{FileInfo: info, state: &st}, nil
+				}
+
+			}
+			if scenario == "different devices" {
+				publishedDevice = "/dev/zero"
+			}
+			ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Path: stage, Device: stageDevice}, {Path: publish, Device: publishedDevice}})
+			mounter := ns.mounter.Interface.(*mount.FakeMounter)
+			if strings.Contains(scenario, "btrfs") {
+				for i := range mounter.MountPoints {
+					mounter.MountPoints[i].Type = "btrfs"
+				}
+			}
+			commands := &testingexec.FakeExec{}
+			resizeCalls := 0
+			action := func(cmd string, args ...string) utilexec.Cmd {
+				return testingexec.InitFakeCmd(&testingexec.FakeCmd{CombinedOutputScript: []testingexec.FakeAction{func() ([]byte, []byte, error) {
+					switch cmd {
+					case "blockdev":
+						if scenario == "kernel mount changes during capacity read" {
+							mountChanged = true
+						}
+						require.Len(t, args, 2)
+						require.Equal(t, "--getsize64", args[0])
+						require.Contains(t, []string{stageDevice, publishedDevice}, args[1])
+						if scenario == "mount changes during capacity read" {
+							mounter.MountPoints[1].Device = "/dev/zero"
+						}
+						if scenario == "alias changes during capacity read" {
+							require.NoError(t, os.Remove(alias))
+							require.NoError(t, os.Symlink("/dev/zero", alias))
+						}
+						return []byte("2147483648\n"), nil, nil
+					case "blkid":
+						if strings.Contains(scenario, "btrfs") {
+							return []byte("TYPE=btrfs\n"), nil, nil
+						}
+						return []byte("TYPE=xfs\n"), nil, nil
+					case "btrfs":
+						require.Equal(t, []string{"filesystem", "resize", "max", publish}, args)
+						resizeCalls++
+						return []byte("no change"), nil, nil
+					case "xfs_growfs":
+						require.Equal(t, []string{"-d", publish}, args)
+						resizeCalls++
+						return []byte("data size unchanged, skipping\n"), nil, nil
+					default:
+						t.Fatalf("unexpected command %s %v", cmd, args)
+						return nil, nil, nil
+					}
+				}}}, cmd, args...)
+			}
+			for range 10 {
+				commands.CommandScript = append(commands.CommandScript, action)
+			}
+			ns.mounter.Exec = commands
+			response, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{VolumeId: "binding-fixture", VolumePath: publish, StagingTargetPath: stage, CapacityRange: &csi.CapacityRange{RequiredBytes: 2147483648}})
+			if scenario == "valid alias" || scenario == "kernel block aliases" || scenario == "kernel btrfs anonymous identity" {
+				require.NoError(t, err)
+				require.Equal(t, int64(2147483648), response.GetCapacityBytes())
+				require.Equal(t, 1, resizeCalls)
+			} else {
+				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				require.Nil(t, response)
+				require.Zero(t, resizeCalls)
+			}
+		})
+	}
+}
+
+// Opt-in local image test. No provider, host device, loop mount or cluster is
+// involved. CSI gRPC invokes the real pinned mount-utils and filesystem tools.
+func TestNodeExpandLocalFilesystemRPC(t *testing.T) {
+	if os.Getenv("ONE_CSI_LOCAL_FILESYSTEM_TEST") != "1" {
+		t.Skip("set ONE_CSI_LOCAL_FILESYSTEM_TEST=1 with local e2fsprogs to exercise an ext4 image")
+	}
+	for _, tool := range []string{"mkfs.ext4", "blkid", "resize2fs"} {
+		_, err := exec.LookPath(tool)
+		require.NoError(t, err, "required local filesystem tool %s", tool)
+	}
+	root := t.TempDir()
+	device, alias := filepath.Join(root, "ext4.img"), filepath.Join(root, "alias")
+	require.NoError(t, os.WriteFile(device, nil, 0600))
+	const initial = int64(64 << 20)
+	const requested = int64(128 << 20)
+	require.NoError(t, os.Truncate(device, initial))
+	output, err := exec.Command("mkfs.ext4", "-F", "-b", "4096", "-O", "^64bit", device).CombinedOutput()
+	require.NoError(t, err, "%s", output)
+	// The external tool's explicit-size no-op is the independent oracle. If
+	// the RPC acknowledged an ungrown filesystem, this command would grow it
+	// and report growth instead. No filesystem geometry parser is involved.
+	requireFullFilesystem := func() {
+		output, err := exec.Command("resize2fs", "-f", device, "131072K").CombinedOutput()
+		require.NoError(t, err, "%s", output)
+		require.Contains(t, string(output), "Nothing to do!", "128 MiB must already be present before the verification command")
+	}
+	require.NoError(t, os.Truncate(device, requested))
+	require.NoError(t, os.Symlink(device, alias))
+	publish, stage := filepath.Join(root, "publish"), filepath.Join(root, "stage")
+	require.NoError(t, os.Mkdir(publish, 0700))
+	require.NoError(t, os.Mkdir(stage, 0700))
+	ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Path: stage, Device: device}, {Path: publish, Device: alias}})
+	ns.mounter.Exec = utilexec.New()
+	listener := bufconn.Listen(1 << 20)
+	server := grpc.NewServer()
+	csi.RegisterNodeServer(server, ns)
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { server.Stop(); _ = listener.Close() })
+	conn, err := grpc.NewClient("passthrough:///local-filesystem", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, conn.Close()) }()
+	client := csi.NewNodeClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req := &csi.NodeExpandVolumeRequest{VolumeId: "local-image", VolumePath: publish, StagingTargetPath: stage, CapacityRange: &csi.CapacityRange{RequiredBytes: requested}}
+	for attempt := range 2 {
+		response, err := client.NodeExpandVolume(ctx, req)
+		require.NoError(t, err)
+		require.Equal(t, requested, response.GetCapacityBytes())
+		requireFullFilesystem()
+		t.Logf("actual local ext4 RPC attempt=%d image_bytes=%d explicit_size_verification=no-op", attempt+1, requested)
+	}
+	// A mismatched published image must fail without changing either image.
+	other := filepath.Join(root, "other.img")
+	require.NoError(t, os.WriteFile(other, nil, 0600))
+	require.NoError(t, os.Truncate(other, initial))
+	ns.mounter.Interface.(*mount.FakeMounter).MountPoints[1].Device = other
+	response, err := client.NodeExpandVolume(ctx, req)
+	require.Nil(t, response)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	f, err := os.Open(other)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, f.Close()) }()
+	first := make([]byte, 4096)
+	_, err = io.ReadFull(f, first)
+	require.NoError(t, err)
+	require.Equal(t, make([]byte, 4096), first)
+	requireFullFilesystem()
+	t.Log("mismatched local image rejected before mutation")
+}
+
+// Real CommandContext must stop a resize child when cancellation arrives after
+// mount-utils has read the format. The marker is the external mutation oracle.
+func TestNodeExpandCancellationAfterFormatProcessBoundary(t *testing.T) {
+	root := t.TempDir()
+	device, marker := filepath.Join(root, "device"), filepath.Join(root, "resize-ran")
+	require.NoError(t, os.WriteFile(device, make([]byte, 8192), 0600))
+	publish := filepath.Join(root, "publish")
+	ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Path: publish, Device: device}})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	commands := &nodeExpandCancelAfterProbeExec{Interface: utilexec.New(), cancel: cancel, marker: marker}
+	ns.mounter.Exec = commands
+	response, err := ns.NodeExpandVolume(ctx, &csi.NodeExpandVolumeRequest{VolumeId: "binding-fixture", VolumePath: publish, CapacityRange: &csi.CapacityRange{RequiredBytes: 8192}})
+	require.Equal(t, codes.Canceled, status.Code(err))
+	require.Nil(t, response)
+	require.True(t, commands.probed, "exercise cancellation after the format process actually exited")
+	_, err = os.Stat(marker)
+	require.True(t, os.IsNotExist(err), "the resize process must never mutate after cancellation")
+}
+
+type nodeExpandCancelAfterProbeExec struct {
+	utilexec.Interface
+	cancel context.CancelFunc
+	marker string
+	probed bool
+}
+
+func (e *nodeExpandCancelAfterProbeExec) CommandContext(ctx context.Context, cmd string, args ...string) utilexec.Cmd {
+	if cmd == "blkid" {
+		return nodeExpandAfterProbeCmd{Cmd: e.Interface.CommandContext(ctx, "sh", "-c", "printf 'TYPE=xfs\\n'"), after: func() { e.probed = true; e.cancel() }}
+	}
+	return e.Interface.CommandContext(ctx, "sh", "-c", "printf mutated > \"$1\"", "sh", e.marker)
+}
+
+type nodeExpandAfterProbeCmd struct {
+	utilexec.Cmd
+	after func()
+}
+
+func (c nodeExpandAfterProbeCmd) CombinedOutput() ([]byte, error) {
+	output, err := c.Cmd.CombinedOutput()
+	if err == nil {
+		c.after()
+	}
+	return output, err
+}
+
+// Override only the mount-stat external boundary; device-node identity is real.
+type nodeExpandMountFileInfo struct {
+	os.FileInfo
+	state *syscall.Stat_t
+}
+
+func (f nodeExpandMountFileInfo) Sys() any { return f.state }
