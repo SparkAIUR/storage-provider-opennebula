@@ -33,6 +33,9 @@ def main():
     parser.add_argument("--gitops", type=Path, required=True)
     args = parser.parse_args()
     root = args.gitops
+    current_chart_version = yaml.safe_load(
+        Path("helm/opennebula-csi/Chart.yaml").read_text()
+    )["version"]
     common = "infrastructure/opennebula-csi/kustomization.yaml"
     require(
         (root / common).read_bytes()
@@ -74,7 +77,7 @@ def main():
         )
         require(spec["timeout"] == f"{budget}m", "Helm wait budget differs")
         require(
-            spec["chart"]["spec"]["version"] == "0.6.0-rc.1"
+            spec["chart"]["spec"]["version"] == current_chart_version
             and spec["chart"]["spec"]["sourceRef"]["name"]
             == "opennebula-csi-candidates",
             "candidate channel/version differs",

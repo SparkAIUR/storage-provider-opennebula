@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.0-rc.2, unreleased
+
+- Accept explicitly bound Ceph bridge IP/name aliases using versioned operator configuration tied to a non-secret datastore fingerprint and current registered host IDs/names. Verify every upstream-selectable bridge before allocation; a healthy member cannot mask an unknown or ineligible endpoint.
+- Share the parsed policy across preflight, runtime and inventory. Expose the required fingerprint through read-only preflight diagnostics without treating host eligibility as Ceph authorization.
+- Give preflight bootstrap resources, both Jobs and reconcile inputs release-revision names. Retain failed Jobs and their inputs across later revisions without TTL cleanup.
+- Preserve the RC1 failure evidence and require fresh RC2 publication/native qualification. See [bridge identity contract](docs/ceph-bridge-identities.md).
+
 ## v0.6.0-rc.1, unreleased
 
 - Reject unrecorded or pending expanded-disk detach, retain lookup rejections through queue prechecks, require literal evidence booleans, and pin workflow Helm installers to v3.21.4.

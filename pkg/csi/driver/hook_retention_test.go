@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -15,10 +16,13 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-func renderRevisionHooks(t *testing.T, name string, revision int, mandatory bool) map[string][]byte {
+func renderRevisionHooks(t *testing.T, name string, revision int, mandatory bool, chartVersion ...string) map[string][]byte {
 	t.Helper()
 	chart, err := loader.Load("../../../helm/opennebula-csi")
 	require.NoError(t, err)
+	if len(chartVersion) > 0 {
+		chart.Metadata.Version = chartVersion[0]
+	}
 	values := map[string]interface{}{"credentials": map[string]interface{}{"existingSecret": map[string]interface{}{"name": "fixture"}}, "preflight": map[string]interface{}{"enabled": true, "failReleaseOnError": mandatory}, "storageClassReconcile": map[string]interface{}{"enabled": true}, "storageClasses": []interface{}{map[string]interface{}{"name": "fixture", "parameters": map[string]interface{}{"datastoreIDs": "42"}}}}
 	ctx, err := chartutil.ToRenderValues(chart, values, chartutil.ReleaseOptions{Name: name, Namespace: "fixture", Revision: revision, IsUpgrade: true}, chartutil.DefaultCapabilities)
 	require.NoError(t, err)
@@ -116,4 +120,55 @@ func TestHookRetentionAcrossReleaseRevisions(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestBridgeIdentityCommonChartEnvironment(t *testing.T) {
+	for _, configured := range []bool{false, true} {
+		t.Run(fmt.Sprint(configured), func(t *testing.T) {
+			values := map[string]interface{}{"preflight": map[string]interface{}{"enabled": true, "failReleaseOnError": true}, "inventoryController": map[string]interface{}{"enabled": true}}
+			want := ""
+			if configured {
+				want = `{"version":1,"datastores":[{"datastoreID":42,"configFingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","endpoints":[{"endpoint":"192.0.2.10","hostID":0,"hostName":"bridge-a.example.invalid"}]}]}`
+				var binding map[string]interface{}
+				require.NoError(t, json.Unmarshal([]byte(want), &binding))
+				values["driver"] = map[string]interface{}{"cephBridgeIdentities": binding}
+			}
+			output, err := renderUpgradeChart(t, values)
+			require.NoError(t, err)
+			for _, name := range []string{"csi-controller-server.yaml", "csi-node-server.yaml", "inventory-controller.yaml", "preflight-job.yaml"} {
+				var object struct {
+					Spec struct{ Template struct{ Spec corev1.PodSpec } }
+				}
+				require.NoError(t, yaml.Unmarshal([]byte(output["opennebula-csi/templates/"+name]), &object))
+				count := 0
+				for _, container := range object.Spec.Template.Spec.Containers {
+					for _, variable := range container.Env {
+						if variable.Name == "ONE_CSI_CEPH_BRIDGE_IDENTITIES" {
+							count++
+							if configured {
+								require.JSONEq(t, want, variable.Value)
+							} else {
+								require.Empty(t, variable.Value)
+							}
+						}
+					}
+				}
+				require.Equal(t, 1, count, name)
+			}
+		})
+	}
+}
+
+func TestHookObjectsDoNotChangeWhenChartVersionIsPromoted(t *testing.T) {
+	candidate := renderRevisionHooks(t, "fixture", 7, true, "0.6.0-rc.2")
+	stable := renderRevisionHooks(t, "fixture", 7, true, "0.6.0")
+	compared := 0
+	for key, object := range candidate {
+		if strings.Contains(key, "preflight") || strings.Contains(key, "storageclass-reconcile") {
+			require.Contains(t, stable, key)
+			require.YAMLEq(t, string(object), string(stable[key]))
+			compared++
+		}
+	}
+	require.Equal(t, 6, compared) // two Jobs, three bootstrap objects and the paired input ConfigMap
 }
