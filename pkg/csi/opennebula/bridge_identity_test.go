@@ -61,6 +61,7 @@ func TestParseCephBridgeIdentitiesRejectsMalformedAndDuplicateInputs(t *testing.
 	}
 	for name, raw := range map[string]string{
 		"malformed": "{", "unknown version": `{"version":2,"datastores":[]}`, "missing version": `{"datastores":[]}`, "missing datastores": `{"version":1}`, "unknown field": `{"version":1,"datastores":[],"allowUnregistered":true}`,
+		"noncanonical case alias": strings.Replace(valid, `"hostID"`, `"HostID"`, 1), "case-aliased duplicate": strings.Replace(valid, `"version":1`, `"version":1,"Version":1`, 1),
 		"duplicate object key": `{"version":1,"version":1,"datastores":[]}`, "duplicate nested key": strings.Replace(valid, `"hostID":0`, `"hostID":0,"hostID":7`, 1),
 		"missing hostID": strings.Replace(valid, `"hostID":0,`, "", 1), "missing datastoreID": strings.Replace(valid, `"datastoreID":42,`, "", 1), "invalid hash": strings.Replace(valid, fp, "unknown", 1), "negative hostID": strings.Replace(valid, `"hostID":0`, `"hostID":-1`, 1),
 		"duplicate datastore":       `{"version":1,"datastores":[` + entry + `,` + entry + `]}`,
@@ -78,7 +79,7 @@ func TestParseCephBridgeIdentitiesRejectsMalformedAndDuplicateInputs(t *testing.
 	}
 }
 func TestCephBridgeIdentityActualHostPoolObservations(t *testing.T) {
-	for _, scenario := range []string{"literal", "IP binding", "host zero", "empty mapping", "wrong ID", "renamed", "reused ID", "missing host", "duplicate ID", "duplicate name", "hash drift", "bridge order drift", "healthy plus unknown", "mapped disabled plus healthy", "literal disabled plus healthy", "literal monitoring-disabled plus healthy", "literal error plus healthy", "literal offline plus healthy", "no eligible", "monitoring update", "comma stays literal", "unicode space stays literal", "API error", "canceled"} {
+	for _, scenario := range []string{"literal", "IP binding", "host zero", "empty mapping", "wrong ID", "renamed", "reused ID", "missing host", "duplicate ID", "duplicate name", "hash drift", "bridge order drift", "healthy plus unknown", "mapped disabled plus healthy", "literal disabled plus healthy", "literal monitoring-disabled plus healthy", "literal monitoring-error plus healthy", "literal error plus healthy", "literal offline plus healthy", "no eligible", "monitoring update", "comma stays literal", "unicode space stays literal", "API error", "canceled"} {
 		t.Run(scenario, func(t *testing.T) {
 			ds := bridgeFixtureDatastore()
 			fp, err := CephBridgeConfigFingerprint(ds)
@@ -126,12 +127,11 @@ func TestCephBridgeIdentityActualHostPoolObservations(t *testing.T) {
 				raw = bridgeFixtureBinding(fp, 7, hosts[0].Name)
 				hosts[0].StateRaw = int(host.Disabled)
 				hosts = append(hosts, host.Host{ID: 8, Name: "bridge-b.example.invalid", StateRaw: 2})
-			case "literal disabled plus healthy", "literal monitoring-disabled plus healthy", "literal error plus healthy", "literal offline plus healthy":
+			case "literal disabled plus healthy", "literal monitoring-disabled plus healthy", "literal monitoring-error plus healthy", "literal error plus healthy", "literal offline plus healthy":
 				ds.Ceph.BridgeList = "bridge-a.example.invalid bridge-b.example.invalid"
 				raw = ""
-				hosts[0].StateRaw = map[string]int{"literal disabled plus healthy": 4, "literal monitoring-disabled plus healthy": 7, "literal error plus healthy": 3, "literal offline plus healthy": 8}[scenario]
+				hosts[0].StateRaw = map[string]int{"literal disabled plus healthy": 4, "literal monitoring-disabled plus healthy": 7, "literal monitoring-error plus healthy": 5, "literal error plus healthy": 3, "literal offline plus healthy": 8}[scenario]
 				hosts = append(hosts, host.Host{ID: 8, Name: "bridge-b.example.invalid", StateRaw: 2})
-				pass = true
 			case "no eligible":
 				ds.Ceph.BridgeList = hosts[0].Name
 				raw = ""
@@ -206,13 +206,16 @@ func TestCephBridgeAuthorizationDoesNotCacheProviderEligibility(t *testing.T) {
 
 func TestBridgeIdentityRejectsAllocationAndCloneBeforeMutation(t *testing.T) {
 	for _, operation := range []string{"create", "clone"} {
-		for _, scenario := range []string{"verified", "unmapped", "mapped-disabled", "hash-drift", "observation-failed", "canceled-observation"} {
+		for _, scenario := range []string{"verified", "unmapped", "mapped-disabled", "hash-drift", "observation-failed", "canceled-observation", "literal-disabled-mixed", "literal-monitoring-disabled-mixed", "literal-monitoring-error-mixed"} {
 			t.Run(operation+"/"+scenario, func(t *testing.T) {
 				ds := bridgeFixtureDatastore()
+				if strings.HasPrefix(scenario, "literal-") {
+					ds.Ceph.BridgeList = "bridge-a.example.invalid bridge-b.example.invalid"
+				}
 				fingerprint, err := CephBridgeConfigFingerprint(ds)
 				require.NoError(t, err)
 				raw := bridgeFixtureBinding(fingerprint, 7, "bridge-a.example.invalid")
-				if scenario == "unmapped" {
+				if scenario == "unmapped" || strings.HasPrefix(scenario, "literal-") {
 					raw = ""
 				}
 				if scenario == "hash-drift" {
@@ -226,7 +229,7 @@ func TestBridgeIdentityRejectsAllocationAndCloneBeforeMutation(t *testing.T) {
 				p := lifecycleFixture(t, func(method string) (bool, string, int) {
 					switch method {
 					case "one.datastorepool.info":
-						return true, `<DATASTORE_POOL><DATASTORE><ID>42</ID><NAME>fixture</NAME><TYPE>IMAGE</TYPE><STATE>0</STATE><DS_MAD>ceph</DS_MAD><TM_MAD>ceph</TM_MAD><FREE_MB>1024</FREE_MB><TOTAL_MB>2048</TOTAL_MB><TEMPLATE><DISK_TYPE>RBD</DISK_TYPE><BRIDGE_LIST>192.0.2.10</BRIDGE_LIST><CEPH_HOST>monitor.example.invalid:6789</CEPH_HOST><POOL_NAME>volumes</POOL_NAME><CEPH_USER>csi</CEPH_USER><CEPH_SECRET>fixture-secret-reference</CEPH_SECRET></TEMPLATE></DATASTORE></DATASTORE_POOL>`, 0
+						return true, strings.Replace(`<DATASTORE_POOL><DATASTORE><ID>42</ID><NAME>fixture</NAME><TYPE>IMAGE</TYPE><STATE>0</STATE><DS_MAD>ceph</DS_MAD><TM_MAD>ceph</TM_MAD><FREE_MB>1024</FREE_MB><TOTAL_MB>2048</TOTAL_MB><TEMPLATE><DISK_TYPE>RBD</DISK_TYPE><BRIDGE_LIST>192.0.2.10</BRIDGE_LIST><CEPH_HOST>monitor.example.invalid:6789</CEPH_HOST><POOL_NAME>volumes</POOL_NAME><CEPH_USER>csi</CEPH_USER><CEPH_SECRET>fixture-secret-reference</CEPH_SECRET></TEMPLATE></DATASTORE></DATASTORE_POOL>`, "<BRIDGE_LIST>192.0.2.10</BRIDGE_LIST>", "<BRIDGE_LIST>"+ds.Ceph.BridgeList+"</BRIDGE_LIST>", 1), 0
 					case "one.hostpool.info":
 						if scenario == "canceled-observation" {
 							cancel()
@@ -235,10 +238,20 @@ func TestBridgeIdentityRejectsAllocationAndCloneBeforeMutation(t *testing.T) {
 							return false, "host observation unavailable", 0x800
 						}
 						state := 2
-						if scenario == "mapped-disabled" {
+						if scenario == "mapped-disabled" || scenario == "literal-disabled-mixed" {
 							state = 4
 						}
-						return true, fmt.Sprintf(`<HOST_POOL><HOST><ID>7</ID><NAME>bridge-a.example.invalid</NAME><STATE>%d</STATE></HOST></HOST_POOL>`, state), 0
+						if scenario == "literal-monitoring-disabled-mixed" {
+							state = 7
+						}
+						if scenario == "literal-monitoring-error-mixed" {
+							state = 5
+						}
+						body := fmt.Sprintf(`<HOST_POOL><HOST><ID>7</ID><NAME>bridge-a.example.invalid</NAME><STATE>%d</STATE></HOST>`, state)
+						if strings.HasPrefix(scenario, "literal-") {
+							body += `<HOST><ID>8</ID><NAME>bridge-b.example.invalid</NAME><STATE>2</STATE></HOST>`
+						}
+						return true, body + "</HOST_POOL>", 0
 					case "one.imagepool.info":
 						return true, `<IMAGE_POOL><IMAGE><ID>7</ID><NAME>source</NAME></IMAGE></IMAGE_POOL>`, 0
 					case "one.image.info":
@@ -265,6 +278,9 @@ func TestBridgeIdentityRejectsAllocationAndCloneBeforeMutation(t *testing.T) {
 					_, err = provider.CloneVolume(ctx, "new-clone", "source", selection)
 				}
 				require.Error(t, err)
+				if strings.HasPrefix(scenario, "literal-") {
+					require.ErrorContains(t, err, "not currently MONITORED")
+				}
 				expected := int32(0)
 				if scenario == "verified" {
 					expected = 1

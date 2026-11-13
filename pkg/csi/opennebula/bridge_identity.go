@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/netip"
 	"regexp"
 	"strings"
-	"unicode"
 
 	host "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/host"
 )
@@ -84,12 +84,27 @@ func ParseCephBridgeIdentities(raw string) (CephBridgeIdentities, error) {
 	return policy, nil
 }
 
+// Supported endpoints are bare IP addresses without zones, or ASCII host/SSH
+// aliases beginning with a letter/digit and containing only letters/digits . _ -.
 func identityToken(value string) bool {
-	return value != "" && !strings.ContainsFunc(value, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) })
+	if value == "" || len(value) > 253 {
+		return false
+	}
+	if address, err := netip.ParseAddr(value); err == nil {
+		return address.Zone() == ""
+	}
+	for i, r := range value {
+		alphanumeric := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+		if !alphanumeric && (i == 0 || (r != '.' && r != '_' && r != '-')) {
+			return false
+		}
+	}
+	return true
 }
 
 // Walk JSON tokens before decoding so repeated object keys cannot silently replace
-// reviewed fields. Unknown fields and missing required values are checked separately.
+// reviewed fields. Only canonical field spellings are accepted; encoding/json
+// alone also accepts case aliases. Required values are checked separately.
 func rejectDuplicateJSONFields(decoder *json.Decoder) error {
 	token, err := decoder.Token()
 	if err != nil {
@@ -108,6 +123,11 @@ func rejectDuplicateJSONFields(decoder *json.Decoder) error {
 				key, ok := keyToken.(string)
 				if !ok {
 					return fmt.Errorf("invalid object key")
+				}
+				switch key {
+				case "version", "datastores", "datastoreID", "configFingerprint", "endpoints", "endpoint", "hostID", "hostName":
+				default:
+					return fmt.Errorf("unknown or noncanonical bridge identity field %q", key)
 				}
 				if keys[key] {
 					return fmt.Errorf("duplicate JSON field %q", key)
@@ -149,8 +169,22 @@ func readJSONValue(decoder *json.Decoder) error {
 }
 
 // bridgeTokens mirrors Bash's default IFS used by libfs.sh, preserving order.
-func bridgeTokens(raw string) []string {
-	return strings.FieldsFunc(raw, func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' })
+func bridgeTokens(raw string) ([]string, error) {
+	tokens := strings.FieldsFunc(raw, func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' })
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("ceph BRIDGE_LIST is empty")
+	}
+	seen := map[string]bool{}
+	for _, token := range tokens {
+		if !identityToken(token) {
+			return nil, fmt.Errorf("unsupported Ceph bridge endpoint %q", token)
+		}
+		if seen[token] {
+			return nil, fmt.Errorf("duplicate provider BRIDGE_LIST endpoint %q", token)
+		}
+		seen[token] = true
+	}
+	return tokens, nil
 }
 
 // CephBridgeConfigFingerprint hashes encoding/json's compact encoding of this
@@ -159,6 +193,10 @@ func bridgeTokens(raw string) []string {
 func CephBridgeConfigFingerprint(ds Datastore) (string, error) {
 	if ds.Ceph == nil {
 		return "", fmt.Errorf("datastore %d has no Ceph configuration", ds.ID)
+	}
+	bridges, err := bridgeTokens(ds.Ceph.BridgeList)
+	if err != nil {
+		return "", err
 	}
 	backend := strings.ToLower(strings.TrimSpace(ds.Backend))
 	if backend == "ceph" || backend == "rbd" || strings.EqualFold(ds.Type, "ceph") {
@@ -182,7 +220,7 @@ func CephBridgeConfigFingerprint(ds Datastore) (string, error) {
 		User      string   `json:"user"`
 		RBDFormat string   `json:"rbdFormat"`
 		ECPool    string   `json:"ecPool"`
-	}{1, ds.ID, category, backend, strings.ToLower(strings.TrimSpace(ds.DSMad)), strings.ToLower(strings.TrimSpace(ds.TMMad)), strings.ToUpper(strings.TrimSpace(ds.DiskType)), append([]string{}, bridgeTokens(ds.Ceph.BridgeList)...), append([]string{}, normalizeMonitorList(ds.Ceph.CephHost)...), strings.TrimSpace(ds.Ceph.PoolName), strings.TrimSpace(ds.Ceph.CephUser), strings.TrimSpace(ds.Ceph.RBDFormat), strings.TrimSpace(ds.Ceph.ECPoolName)}
+	}{1, ds.ID, category, backend, strings.ToLower(strings.TrimSpace(ds.DSMad)), strings.ToLower(strings.TrimSpace(ds.TMMad)), strings.ToUpper(strings.TrimSpace(ds.DiskType)), append([]string{}, bridges...), append([]string{}, normalizeMonitorList(ds.Ceph.CephHost)...), strings.TrimSpace(ds.Ceph.PoolName), strings.TrimSpace(ds.Ceph.CephUser), strings.TrimSpace(ds.Ceph.RBDFormat), strings.TrimSpace(ds.Ceph.ECPoolName)}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
@@ -194,9 +232,9 @@ func CephBridgeFeasible(ds Datastore, hosts []host.Host, policy CephBridgeIdenti
 	if ds.Ceph == nil {
 		return fmt.Errorf("datastore %d has no Ceph configuration", ds.ID)
 	}
-	endpoints := bridgeTokens(ds.Ceph.BridgeList)
-	if len(endpoints) == 0 {
-		return fmt.Errorf("ceph BRIDGE_LIST is empty")
+	endpoints, err := bridgeTokens(ds.Ceph.BridgeList)
+	if err != nil {
+		return err
 	}
 	byID := map[int][]host.Host{}
 	byName := map[string][]host.Host{}
@@ -207,9 +245,6 @@ func CephBridgeFeasible(ds Datastore, hosts []host.Host, policy CephBridgeIdenti
 	binding, bound := policy.datastores[ds.ID]
 	configured := map[string]bool{}
 	for _, endpoint := range endpoints {
-		if configured[endpoint] {
-			return fmt.Errorf("duplicate provider BRIDGE_LIST endpoint %q", endpoint)
-		}
 		configured[endpoint] = true
 	}
 	if bound {
@@ -245,14 +280,7 @@ func CephBridgeFeasible(ds Datastore, hosts []host.Host, policy CephBridgeIdenti
 			if mapped && (expected.id != selected.ID || expected.name != selected.Name) {
 				return fmt.Errorf("binding conflicts with literal registered endpoint %q", endpoint)
 			}
-			state, err := selected.State()
-			if err != nil {
-				return err
-			}
-			// libfs removes literal NAMEs whose CLI STAT is err, dsbl or off.
-			if state == host.Error || state == host.Disabled || state == host.MonitoringDisabled || state == host.Offline {
-				continue
-			}
+
 		} else {
 			if !mapped {
 				return fmt.Errorf("selectable Ceph bridge %q has no verified registered identity", endpoint)

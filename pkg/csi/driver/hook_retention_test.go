@@ -49,7 +49,7 @@ func TestHookRetentionAcrossReleaseRevisions(t *testing.T) {
 		for _, mandatory := range []bool{true, false} {
 			t.Run(fmt.Sprint(name, mandatory), func(t *testing.T) {
 				previous := map[string]string{}
-				for _, revision := range []int{2, 3} {
+				for _, revision := range []int{12, 13} {
 					objects := renderRevisionHooks(t, name, revision, mandatory)
 					jobs := map[string]batchv1.Job{}
 					var config corev1.ConfigMap

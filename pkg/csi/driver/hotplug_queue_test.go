@@ -329,7 +329,7 @@ func TestHotplugQueueRetriesFailedSnapshotPersistence(t *testing.T) {
 }
 
 func TestHotplugQueueBlockedSnapshotPreservesAdmissionAndCompletionOrder(t *testing.T) {
-	client := fake.NewSimpleClientset()
+	client := fake.NewSimpleClientset(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: hotplugQueueStateConfigMapName, Namespace: "default"}, Data: map[string]string{}})
 	base := client.CoreV1().ConfigMaps("default")
 	entered, release := make(chan struct{}), make(chan struct{})
 	var blocked atomic.Bool
@@ -362,7 +362,11 @@ func TestHotplugQueueBlockedSnapshotPreservesAdmissionAndCompletionOrder(t *test
 	go func() {
 		a <- manager.Run(ctx, "node-a", "attach", "a", hotplugQueuePriorityNormal, func(context.Context) error { <-activeDone; return nil })
 	}()
-	<-entered
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("snapshot Patch barrier was not entered")
+	}
 	b := make(chan error, 1)
 	go func() {
 		b <- manager.Run(ctx, "node-b", "attach", "b", hotplugQueuePriorityNormal, func(context.Context) error { return nil })
