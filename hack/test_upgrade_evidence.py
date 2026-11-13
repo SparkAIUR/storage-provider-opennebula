@@ -411,7 +411,9 @@ class PromoteCLITest(unittest.TestCase):
             shutil.copytree(Path(__file__).resolve().parents[1] / "helm", root / "helm")
             chart_values = root / "helm/opennebula-csi/values.yaml"
             legacy_values = yaml.safe_load(chart_values.read_text())
-            legacy_values["snapshotter"]["image"] = "registry.example/snapshotter:legacy"
+            legacy_values["snapshotter"]["image"] = (
+                "registry.example/snapshotter:legacy"
+            )
             chart_values.write_text(yaml.safe_dump(legacy_values, sort_keys=False))
 
             def git(*args):
@@ -438,6 +440,9 @@ class PromoteCLITest(unittest.TestCase):
                 "offline fixture",
             )
             candidate = copy.deepcopy(self.candidate)
+            candidate["chartVersion"] = yaml.safe_load(
+                (root / "helm/opennebula-csi/Chart.yaml").read_text()
+            )["version"]
             candidate["sourceCommit"] = git("rev-parse", "HEAD")
             candidate["sourceTree"] = git("rev-parse", "HEAD^{tree}")
             for name in [
@@ -470,6 +475,9 @@ class PromoteCLITest(unittest.TestCase):
                 [("hpldb", 3, "1.36"), ("hplsvc", 10, "1.35"), ("bravo", 13, "1.35")]
             ):
                 bundle = copy.deepcopy(self.bundle)
+                bundle["helmRelease"]["status"]["lastAttemptedRevision"] = candidate[
+                    "chartVersion"
+                ]
                 bundle["cluster"] = cluster
                 bundle["clusterUID"] = cluster
                 bundle["candidateSHA256"] = binding
@@ -522,7 +530,9 @@ class PromoteCLITest(unittest.TestCase):
                 substituted = copy.deepcopy(receipt)
                 foreign = "hplsvc" if cluster == "hpldb" else "hpldb"
                 readback = copy.deepcopy(receipt["clusters"][foreign]["readback"])
-                readback["capturedAt"] = receipt["clusters"][cluster]["readback"]["capturedAt"]
+                readback["capturedAt"] = receipt["clusters"][cluster]["readback"][
+                    "capturedAt"
+                ]
                 substituted["clusters"][cluster]["readback"] = readback
                 with self.assertRaisesRegex(ValueError, "readback cluster differs"):
                     validate_receipt(substituted, candidate, True)
@@ -569,13 +579,26 @@ class PromoteCLITest(unittest.TestCase):
                 )
                 self.assertEqual(values["snapshotter"]["image"], "")
             rendered = subprocess.check_output(
-                ["helm", "template", "fixture", str(root / "out/opennebula-csi-0.6.0.tgz"),
-                 "--set", "credentials.existingSecret.name=fixture"], text=True
+                [
+                    "helm",
+                    "template",
+                    "fixture",
+                    str(root / "out/opennebula-csi-0.6.0.tgz"),
+                    "--set",
+                    "credentials.existingSecret.name=fixture",
+                ],
+                text=True,
             )
-            controller = next(o for o in yaml.safe_load_all(rendered) if o and o.get("kind") == "StatefulSet")
+            controller = next(
+                o
+                for o in yaml.safe_load_all(rendered)
+                if o and o.get("kind") == "StatefulSet"
+            )
             containers = controller["spec"]["template"]["spec"]["containers"]
             images = {c["name"]: c["image"] for c in containers}
-            self.assertEqual(images["csi-snapshotter"], candidate["images"]["csi-snapshotter"])
+            self.assertEqual(
+                images["csi-snapshotter"], candidate["images"]["csi-snapshotter"]
+            )
 
 
 class CandidateGuardTest(unittest.TestCase):
