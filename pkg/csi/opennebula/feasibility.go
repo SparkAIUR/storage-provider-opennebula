@@ -22,7 +22,7 @@ func ProvisioningFeasible(ctx context.Context, ctrl *goca.Controller, ds Datasto
 	}
 	pool, err := ctrl.Hosts().InfoContext(ctx)
 	if err != nil {
-		return fmt.Errorf("Ceph bridge availability unknown: %w", err)
+		return fmt.Errorf("ceph bridge availability unknown: %w", err)
 	}
 	return CephBridgeFeasible(ds.Ceph.BridgeList, pool.Hosts)
 }
@@ -30,7 +30,7 @@ func ProvisioningFeasible(ctx context.Context, ctrl *goca.Controller, ds Datasto
 func CephBridgeFeasible(bridges string, hosts []host.Host) error {
 	wanted := strings.Fields(strings.ReplaceAll(bridges, ",", " "))
 	if len(wanted) == 0 {
-		return fmt.Errorf("Ceph BRIDGE_LIST is empty")
+		return fmt.Errorf("ceph BRIDGE_LIST is empty")
 	}
 	for _, name := range wanted {
 		for _, h := range hosts {

@@ -143,11 +143,12 @@ func TestLocalDeviceRecoveryRequiresProvenAttachmentAbsence(t *testing.T) {
 			provider.On("NodeReady", mock.Anything, report.Node).Return(true, nil).Once()
 			provider.On("VolumeExists", mock.Anything, report.VolumeID).Return(394, 1, nil).Once()
 			provider.On("NodeExists", mock.Anything, report.Node).Return(208, nil).Once()
-			if outcome == "metadata-attached" {
+			switch outcome {
+			case "metadata-attached":
 				provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("sdd", nil).Once()
-			} else if outcome == "lookup-error" {
+			case "lookup-error":
 				provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("", errors.New("lookup failed")).Once()
-			} else {
+			default:
 				provider.On("GetVolumeInNode", mock.Anything, 394, 208).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Once()
 				var metadata *opennebula.VolumeAttachmentMetadata
 				var inspectErr error

@@ -57,7 +57,7 @@ func nodeAttachmentProvider(t *testing.T) (*opennebula.PersistentDiskVolumeProvi
 				name = "node-new"
 			}
 			disk := ""
-			if size, ok := state.disks[id]; ok && !(direct && state.hideDiskInfo) {
+			if size, ok := state.disks[id]; ok && (!direct || !state.hideDiskInfo) {
 				marker := ""
 				if state.pending {
 					marker = "<RESIZE>YES</RESIZE><SIZE_PREV>128</SIZE_PREV>"
@@ -141,7 +141,8 @@ func nodeAttachmentProvider(t *testing.T) (*opennebula.PersistentDiskVolumeProvi
 		}
 		var escaped strings.Builder
 		require.NoError(t, xml.EscapeText(&escaped, []byte(body)))
-		fmt.Fprintf(w, `<methodResponse><params><param><value><array><data><value><boolean>%d</boolean></value><value><string>%s</string></value><value><int>%d</int></value></data></array></value></param></params></methodResponse>`, ok, escaped.String(), code)
+		_, err := fmt.Fprintf(w, `<methodResponse><params><param><value><array><data><value><boolean>%d</boolean></value><value><string>%s</string></value><value><int>%d</int></value></data></array></value></param></params></methodResponse>`, ok, escaped.String(), code)
+		require.NoError(t, err)
 	}))
 	t.Cleanup(endpoint.Close)
 	provider, err := opennebula.NewPersistentDiskVolumeProvider(opennebula.NewClient(opennebula.OpenNebulaConfig{Endpoint: endpoint.URL, Credentials: "fixture:fixture"}), opennebula.HotplugTimeoutPolicy{BaseTimeout: time.Second, MaxTimeout: time.Second, PollInterval: time.Millisecond})

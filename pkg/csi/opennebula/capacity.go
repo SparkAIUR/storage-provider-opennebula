@@ -41,7 +41,7 @@ func (p *PersistentDiskVolumeProvider) completedDiskSize(ctx context.Context, vm
 	if strings.Contains(lcm.String(), "RESIZE") {
 		return 0, nil
 	}
-	if !((state == vm.Active && lcm == vm.Running) || (state == vm.Poweroff && lcm == vm.LcmInit)) {
+	if (state != vm.Active || lcm != vm.Running) && (state != vm.Poweroff || lcm != vm.LcmInit) {
 		return 0, fmt.Errorf("VM is not in an eligible resize-completion state: %s/%s", state, lcm)
 	}
 	for _, disk := range info.Template.GetDisks() {
@@ -77,7 +77,9 @@ func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, 
 		size = existing
 	}
 	tpl := img.NewTemplate()
-	tpl.AddPair(requestedSizeTag, strconv.FormatInt(size, 10))
+	if err := tpl.AddPair(requestedSizeTag, strconv.FormatInt(size, 10)); err != nil {
+		return err
+	}
 	if err := p.ctrl.Image(id).UpdateContext(ctx, tpl.String(), parameters.Merge); err != nil {
 		return err
 	}

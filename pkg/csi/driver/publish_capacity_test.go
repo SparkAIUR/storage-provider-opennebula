@@ -43,11 +43,15 @@ func reviewControllerClient(t *testing.T, controller *ControllerServer) csi.Cont
 	listener := bufconn.Listen(1024 * 1024)
 	server := grpc.NewServer()
 	csi.RegisterControllerServer(server, controller)
-	go server.Serve(listener)
+	go func() {
+		if err := server.Serve(listener); err != nil {
+			t.Errorf("serve capacity fixture endpoint: %v", err)
+		}
+	}()
 	t.Cleanup(server.Stop)
 	connection, err := grpc.NewClient("passthrough:///capacity-fixture", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
-	t.Cleanup(func() { connection.Close() })
+	t.Cleanup(func() { require.NoError(t, connection.Close()) })
 	return csi.NewControllerClient(connection)
 }
 
@@ -108,7 +112,8 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 				}
 				var escaped strings.Builder
 				require.NoError(t, xml.EscapeText(&escaped, []byte(body)))
-				fmt.Fprintf(w, `<methodResponse><params><param><value><array><data><value><boolean>%d</boolean></value><value><string>%s</string></value><value><int>%d</int></value></data></array></value></param></params></methodResponse>`, ok, escaped.String(), code)
+				_, err := fmt.Fprintf(w, `<methodResponse><params><param><value><array><data><value><boolean>%d</boolean></value><value><string>%s</string></value><value><int>%d</int></value></data></array></value></param></params></methodResponse>`, ok, escaped.String(), code)
+				require.NoError(t, err)
 			}))
 			t.Cleanup(endpoint.Close)
 			capacity, err := opennebula.NewPersistentDiskVolumeProvider(opennebula.NewClient(opennebula.OpenNebulaConfig{Endpoint: endpoint.URL, Credentials: "fixture:fixture"}), opennebula.HotplugTimeoutPolicy{BaseTimeout: time.Second, MaxTimeout: time.Second, PollInterval: time.Millisecond})
@@ -251,7 +256,8 @@ func TestControllerPublishAndExpandSerializeVerifiedCapacity(t *testing.T) {
 					}
 					var escaped strings.Builder
 					require.NoError(t, xml.EscapeText(&escaped, []byte(body)))
-					fmt.Fprintf(w, `<methodResponse><params><param><value><array><data><value><boolean>1</boolean></value><value><string>%s</string></value><value><int>0</int></value></data></array></value></param></params></methodResponse>`, escaped.String())
+					_, err := fmt.Fprintf(w, `<methodResponse><params><param><value><array><data><value><boolean>1</boolean></value><value><string>%s</string></value><value><int>0</int></value></data></array></value></param></params></methodResponse>`, escaped.String())
+					require.NoError(t, err)
 				}))
 				t.Cleanup(endpoint.Close)
 				capacity, err := opennebula.NewPersistentDiskVolumeProvider(opennebula.NewClient(opennebula.OpenNebulaConfig{Endpoint: endpoint.URL, Credentials: "fixture:fixture"}), opennebula.HotplugTimeoutPolicy{BaseTimeout: time.Second, MaxTimeout: time.Second, PollInterval: time.Millisecond})

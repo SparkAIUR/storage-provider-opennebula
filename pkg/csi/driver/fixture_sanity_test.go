@@ -34,7 +34,11 @@ func TestFixtureCSISanity(t *testing.T) {
 	csi.RegisterIdentityServer(server, NewIdentityServer(d))
 	csi.RegisterControllerServer(server, NewControllerServer(d, provider, &MockSharedFilesystemProviderTestify{}))
 	csi.RegisterNodeServer(server, NewNodeServer(d, mount.NewSafeFormatAndMount(mount.NewFakeMounter(nil), utilexec.New())))
-	go server.Serve(listener)
+	go func() {
+		if err := server.Serve(listener); err != nil {
+			t.Errorf("serve fixture CSI endpoint: %v", err)
+		}
+	}()
 	defer server.Stop()
 	cfg := sanity.NewTestConfig()
 	cfg.Address = "unix://" + socket

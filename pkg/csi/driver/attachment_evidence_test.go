@@ -105,7 +105,7 @@ func TestControllerPublishPreservesUnknownStickyAttachment(t *testing.T) {
 					checks++
 				}
 				provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("", opennebula.ErrAttachmentNotFound).Times(checks)
-				var recheckErr error = errors.New("provider lookup unavailable")
+				recheckErr := errors.New("provider lookup unavailable")
 				if absent {
 					recheckErr = fmt.Errorf("confirmed absent: %w", opennebula.ErrAttachmentNotFound)
 					provider.On("AttachVolume", mock.Anything, before.VolumeID, before.NodeID, false, mock.Anything).Return(nil).Once()

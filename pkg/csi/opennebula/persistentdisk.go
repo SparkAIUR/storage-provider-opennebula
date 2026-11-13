@@ -317,7 +317,7 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 		if target.ID == sourceVolumeID || target.Name != name {
 			return nil, fmt.Errorf("clone target identity differs from request")
 		}
-		target, e = p.verifiedCloneTarget(ctx, target, sourceVolumeID)
+		_, e = p.verifiedCloneTarget(ctx, target, sourceVolumeID)
 		if e != nil {
 			return nil, e
 		}
@@ -356,7 +356,7 @@ func (p *PersistentDiskVolumeProvider) CreateSnapshot(ctx context.Context, sourc
 		return nil, fmt.Errorf("source volume cannot be empty")
 	}
 
-	sourceVolumeID, sourceSize, err := p.VolumeExists(ctx, sourceVolume)
+	sourceVolumeID, _, err := p.VolumeExists(ctx, sourceVolume)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve source volume %q: %w", sourceVolume, err)
 	}
@@ -364,11 +364,6 @@ func (p *PersistentDiskVolumeProvider) CreateSnapshot(ctx context.Context, sourc
 		return nil, fmt.Errorf("source volume %q was not found", sourceVolume)
 	}
 
-	if strings.TrimSpace(snapshotName) == "" {
-		snapshotName = fmt.Sprintf("%s-snapshot", sourceVolume)
-	}
-
-	_ = sourceSize
 	return nil, fmt.Errorf("new OpenNebula disk snapshots are unavailable until the complete backend snapshot lifecycle is qualified")
 }
 
@@ -1384,9 +1379,6 @@ func (p *PersistentDiskVolumeProvider) NodeReady(ctx context.Context, node strin
 	return p.nodeReadyContext(ctx, nodeID)
 }
 
-func (p *PersistentDiskVolumeProvider) volumeReady(volumeID int) (bool, error) {
-	return p.volumeReadyContext(context.Background(), volumeID)
-}
 func (p *PersistentDiskVolumeProvider) volumeReadyContext(ctx context.Context, volumeID int) (bool, error) {
 	image, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
 	if err != nil {
@@ -1422,9 +1414,6 @@ func (p *PersistentDiskVolumeProvider) volumeDeletedContext(ctx context.Context,
 	return false, nil
 }
 
-func (p *PersistentDiskVolumeProvider) nodeReady(nodeID int) (bool, error) {
-	return p.nodeReadyContext(context.Background(), nodeID)
-}
 func (p *PersistentDiskVolumeProvider) nodeReadyContext(ctx context.Context, nodeID int) (bool, error) {
 	vmInfo, err := p.ctrl.VM(nodeID).InfoContext(ctx, true)
 	if err != nil {
@@ -1594,9 +1583,6 @@ func (p *PersistentDiskVolumeProvider) resolveDetachVolumeSizeBytes(ctx context.
 	return size, nil
 }
 
-func (p *PersistentDiskVolumeProvider) waitForResourceStatus(volumeID int, timeout time.Duration, check func(int) (bool, error)) error {
-	return p.waitForResourceStatusContext(context.Background(), volumeID, timeout, func(_ context.Context, id int) (bool, error) { return check(id) })
-}
 func (p *PersistentDiskVolumeProvider) waitForResourceStatusContext(parent context.Context, volumeID int, timeout time.Duration, check func(context.Context, int) (bool, error)) error {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()

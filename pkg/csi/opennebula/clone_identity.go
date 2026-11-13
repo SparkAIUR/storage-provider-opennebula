@@ -3,9 +3,10 @@ package opennebula
 import (
 	"context"
 	"fmt"
+	"strconv"
+
 	"github.com/OpenNebula/one/src/oca/go/src/goca/parameters"
 	img "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/image"
-	"strconv"
 )
 
 const imageSelfTag = "CSI_IMAGE_ID"
@@ -49,9 +50,13 @@ func (p *PersistentDiskVolumeProvider) normalizeImageIdentity(ctx context.Contex
 		return nil, fmt.Errorf("image cannot be its own clone parent")
 	}
 	tpl := img.NewTemplate()
-	tpl.AddPair(imageSelfTag, strconv.Itoa(info.ID))
+	if err := tpl.AddPair(imageSelfTag, strconv.Itoa(info.ID)); err != nil {
+		return nil, err
+	}
 	if parent > 0 {
-		tpl.AddPair(cloneParentTag, strconv.Itoa(parent))
+		if err := tpl.AddPair(cloneParentTag, strconv.Itoa(parent)); err != nil {
+			return nil, err
+		}
 	}
 	if err := p.ctrl.Image(info.ID).UpdateContext(ctx, tpl.String(), parameters.Merge); err != nil {
 		return nil, err
@@ -81,7 +86,7 @@ func (p *PersistentDiskVolumeProvider) verifiedCloneTarget(ctx context.Context, 
 	if err != nil {
 		return nil, err
 	}
-	if !((self == sourceID) || (self == target.ID && parent == sourceID)) {
+	if self != sourceID && (self != target.ID || parent != sourceID) {
 		return nil, fmt.Errorf("%w: target has no durable clone origin", ErrCloneConflict)
 	}
 	current, err := p.normalizeImageIdentity(ctx, target)

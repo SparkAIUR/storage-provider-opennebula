@@ -51,7 +51,8 @@ func TestDatastoreSyncDistinguishesDisabledAndUnknownPrerequisites(t *testing.T)
 				}
 				var escaped strings.Builder
 				require.NoError(t, xml.EscapeText(&escaped, []byte(body)))
-				fmt.Fprintf(w, `<methodResponse><params><param><value><array><data><value><boolean>%d</boolean></value><value><string>%s</string></value><value><int>%d</int></value></data></array></value></param></params></methodResponse>`, ok, escaped.String(), code)
+				_, err := fmt.Fprintf(w, `<methodResponse><params><param><value><array><data><value><boolean>%d</boolean></value><value><string>%s</string></value><value><int>%d</int></value></data></array></value></param></params></methodResponse>`, ok, escaped.String(), code)
+				require.NoError(t, err)
 			}))
 			t.Cleanup(endpoint.Close)
 			scheme := runtime.NewScheme()

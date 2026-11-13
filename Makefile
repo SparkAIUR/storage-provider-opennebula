@@ -16,16 +16,15 @@ else
 GOBIN := $(shell go env GOBIN)
 endif
 
-GOLANGCI_LINT_VERSION		?= 2.2.1
-HELM_VERSION				?= 3.17.3
+GOLANGCI_LINT_VERSION		?= 2.15.0
+HELM_VERSION				?= 3.21.4
 
-SYSTEM_HELM := $(shell command -v helm 2>/dev/null)
-GOLANGCI_LINT	:= $(SELF)/bin/golangci-lint
-ifeq ($(SYSTEM_HELM),)
-HELM := $(SELF)/bin/helm
-else
-HELM := $(SYSTEM_HELM)
-endif
+LOCAL_GOLANGCI_LINT := $(SELF)/bin/golangci-lint-v$(GOLANGCI_LINT_VERSION)
+LOCAL_HELM := $(SELF)/bin/helm-v$(HELM_VERSION)
+GOLANGCI_LINT ?= $(LOCAL_GOLANGCI_LINT)
+HELM ?= $(LOCAL_HELM)
+HELM_OS := $(shell go env GOHOSTOS)
+HELM_ARCH := $(shell go env GOHOSTARCH)
 
 CLOSEST_TAG ?= $(shell git -C $(SELF) describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)
 BUILD_VERSION ?= $(shell git -C $(SELF) describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -175,34 +174,19 @@ manifests-dev: $(HELM)
 .PHONY: golangci-lint helm
 
 golangci-lint: $(GOLANGCI_LINT)
-$(GOLANGCI_LINT):
-	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,v$(GOLANGCI_LINT_VERSION))
+$(LOCAL_GOLANGCI_LINT):
+	@mkdir -p "$(@D)"
+	@tool_dir=$$(mktemp -d "$(@D)/.golangci-lint.XXXXXX"); \
+	trap 'rm -rf "$$tool_dir"' EXIT; \
+	GOBIN="$$tool_dir" go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v$(GOLANGCI_LINT_VERSION); \
+	mv "$$tool_dir/golangci-lint" "$@"
 
-ifeq ($(SYSTEM_HELM),)
 helm: $(HELM)
-$(HELM):
-	@[ -f $@-v$(HELM_VERSION) ] || \
-	{ curl -fsSL https://get.helm.sh/helm-v$(HELM_VERSION)-linux-amd64.tar.gz \
-	| tar -xzO -f- linux-amd64/helm \
-	| install -m u=rwx,go= -o $(USER) -D /dev/fd/0 $@-v$(HELM_VERSION); }
-	@ln -sf $@-v$(HELM_VERSION) $@
-else
-helm:
-	@printf 'Using system helm at %s\n' "$(HELM)"
-endif
-
-# go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
-# $1 - target path with name of binary
-# $2 - package url which can be installed
-# $3 - specific version of package
-define go-install-tool
-@[ -f "$(1)-$(3)" ] || { \
-set -e; \
-package=$(2)@$(3); \
-echo "Downloading $${package}"; \
-rm -f $(1) ||:; \
-GOBIN=$(SELF)/bin go install $${package}; \
-mv $(1) $(1)-$(3); \
-}; \
-ln -sf $(1)-$(3) $(1)
-endef
+$(LOCAL_HELM):
+	@mkdir -p "$(@D)"
+	@tool_dir=$$(mktemp -d "$(@D)/.helm.XXXXXX"); \
+	trap 'rm -rf "$$tool_dir"' EXIT; \
+	curl -fsSL https://get.helm.sh/helm-v$(HELM_VERSION)-$(HELM_OS)-$(HELM_ARCH).tar.gz \
+		| tar -xzO -f- $(HELM_OS)-$(HELM_ARCH)/helm > "$$tool_dir/helm"; \
+	chmod 755 "$$tool_dir/helm"; \
+	mv "$$tool_dir/helm" "$@"

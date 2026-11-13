@@ -31,3 +31,7 @@
 ## OpenNebula7.4 candidate boundary
 
 The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI identities, CRDs, handles, maintenance keys and persisted holds remain compatible. New disk snapshots and detached growth fail closed; CephFS remains independent. Stable promotion reuses the qualified image digest and RC binary VendorVersion. Inventory request batching and status-write reduction follow recovery in a separate branch. Native provider tests and24h observation per cluster are release gates, not claims established by offline fixtures. See docs/opennebula-74-upgrade.md.
+
+## 2026-11-12, local lint toolchain
+
+- AI: Pin golangci-lint to 2.15.0 for Go 1.27 analysis. Default Makefile tools use versioned binaries under `bin/`, with Helm 3.21.4 built for the host platform. Explicit `HELM` and `GOLANGCI_LINT` overrides remain supported; local commands no longer select system Helm automatically.

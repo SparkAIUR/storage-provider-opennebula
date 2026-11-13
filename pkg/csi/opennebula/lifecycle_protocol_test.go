@@ -37,10 +37,12 @@ func lifecycleFixture(t *testing.T, reply func(string) (bool, string, int), insp
 		}
 		w.Header().Set("Content-Type", "text/xml")
 		if ok && call.Method == "one.image.clone" {
-			fmt.Fprintf(w, `<?xml version="1.0"?><methodResponse><params><param><value><array><data><value><boolean>1</boolean></value><value><int>%s</int></value><value><int>0</int></value></data></array></value></param></params></methodResponse>`, body)
+			_, err := fmt.Fprintf(w, `<?xml version="1.0"?><methodResponse><params><param><value><array><data><value><boolean>1</boolean></value><value><int>%s</int></value><value><int>0</int></value></data></array></value></param></params></methodResponse>`, body)
+			require.NoError(t, err)
 			return
 		}
-		fmt.Fprintf(w, `<?xml version="1.0"?><methodResponse><params><param><value><array><data><value><boolean>%d</boolean></value><value><string>%s</string></value><value><int>%d</int></value></data></array></value></param></params></methodResponse>`, b, escaped.String(), code)
+		_, err = fmt.Fprintf(w, `<?xml version="1.0"?><methodResponse><params><param><value><array><data><value><boolean>%d</boolean></value><value><string>%s</string></value><value><int>%d</int></value></data></array></value></param></params></methodResponse>`, b, escaped.String(), code)
+		require.NoError(t, err)
 	}))
 	t.Cleanup(server.Close)
 	p, err := NewPersistentDiskVolumeProvider(NewClient(OpenNebulaConfig{Endpoint: server.URL, Credentials: "fixture:fixture"}), HotplugTimeoutPolicy{BaseTimeout: time.Second, MaxTimeout: time.Second, PollInterval: time.Millisecond})
