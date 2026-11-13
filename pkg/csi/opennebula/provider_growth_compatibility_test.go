@@ -70,12 +70,13 @@ func TestProviderGrowthCompatibility740RejectsBeforeMutation(t *testing.T) {
 			} else {
 				_, err = p.ExpandVolume(context.Background(), "volume-test", 256*sizeConversion, false)
 			}
-			require.Error(t, err, "7.4.0 cannot preserve persistent SYSTEM-target size through detach/reattach")
+			t.Logf("resize=%d metadataWrites=%d otherMutations=%d error=%v", st.resizeCalls.Load(), st.metadataWrites.Load(), st.otherMutations.Load(), err)
 			require.Zero(t, st.resizeCalls.Load(), "reject before diskresize")
 			require.Zero(t, st.metadataWrites.Load(), "reject before image metadata changes")
 			require.Zero(t, st.otherMutations.Load(), "no attach/detach/allocate/update mutations")
 			require.Equal(t, beforeMarker, st.marker.Load(), "durable capacity retained")
 			require.EqualValues(t, 128, st.sizeMB.Load(), "attachment remains unchanged")
+			require.Error(t, err, "7.4.0 cannot preserve persistent SYSTEM-target size through detach/reattach")
 		})
 	}
 }
