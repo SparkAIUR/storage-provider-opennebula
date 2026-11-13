@@ -110,6 +110,12 @@ func TestNodeExpandMountUtilsBinding(t *testing.T) {
 					mounter.MountPoints[i].Type = "btrfs"
 				}
 			}
+			ctx, cancel := context.WithCancel(context.Background())
+			if scenario == "kernel btrfs deadline observation" {
+				cancel()
+				ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
+			}
+			defer cancel()
 			commands := &testingexec.FakeExec{}
 			resizeCalls := 0
 			action := func(cmd string, args ...string) utilexec.Cmd {
@@ -163,13 +169,20 @@ func TestNodeExpandMountUtilsBinding(t *testing.T) {
 			if scenario == "kernel btrfs stale no staging" {
 				stage = ""
 			}
-			response, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{VolumeId: "binding-fixture", VolumePath: publish, StagingTargetPath: stage, CapacityRange: &csi.CapacityRange{RequiredBytes: 2147483648}})
+			response, err := ns.NodeExpandVolume(ctx, &csi.NodeExpandVolumeRequest{VolumeId: "binding-fixture", VolumePath: publish, StagingTargetPath: stage, CapacityRange: &csi.CapacityRange{RequiredBytes: 2147483648}})
 			if scenario == "valid alias" || scenario == "kernel block aliases" || scenario == "kernel btrfs anonymous identity" {
 				require.NoError(t, err)
 				require.Equal(t, int64(2147483648), response.GetCapacityBytes())
 				require.Equal(t, 1, resizeCalls)
 			} else {
-				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				wantCode := codes.FailedPrecondition
+				if scenario == "kernel btrfs canceled observation" {
+					wantCode = codes.Canceled
+				}
+				if scenario == "kernel btrfs deadline observation" {
+					wantCode = codes.DeadlineExceeded
+				}
+				require.Equal(t, wantCode, status.Code(err))
 				require.Nil(t, response)
 				require.Zero(t, resizeCalls)
 			}
