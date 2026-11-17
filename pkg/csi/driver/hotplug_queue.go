@@ -317,6 +317,10 @@ func (m *HotplugQueueManager) Snapshot() map[string]HotplugQueueNodeSnapshot {
 }
 
 func (m *HotplugQueueManager) HasVolume(volume string) bool {
+	return m.hasVolume(volume, "")
+}
+
+func (m *HotplugQueueManager) hasVolume(volume, cleanupNode string) bool {
 	if m == nil || volume == "" {
 		return false
 	}
@@ -330,7 +334,7 @@ func (m *HotplugQueueManager) HasVolume(volume string) bool {
 			return true
 		}
 		for _, req := range nodeQueue.pending {
-			if req.volume == volume {
+			if req.volume == volume && (cleanupNode == "" || req.node == cleanupNode || req.operation != "attach") {
 				return true
 			}
 		}

@@ -133,6 +133,13 @@ func (s *ControllerServer) evaluateVolumeReconcile(ctx context.Context, node, op
 	evidence.RuntimeCtx = runtimeCtx
 	if lookupErr != nil {
 		decision.Evidence = evidence
+		if evidence.Operation == VolumeReconcileDetach && !errors.Is(lookupErr, opennebula.ErrVolumeNotFound) {
+			klog.V(2).InfoS("Detach image lookup failed", "err", lookupErr)
+			if status.Code(lookupErr) == codes.FailedPrecondition {
+				return decision.with(VolumeReconcileReject, queueReasonRepairRequired, codes.FailedPrecondition, "cannot verify detach image identity")
+			}
+			return decision.with(VolumeReconcilePause, "volume_lookup_unknown", codes.Unavailable, "cannot verify detach image identity")
+		}
 		switch status.Code(lookupErr) {
 		case codes.NotFound:
 			if !errors.Is(lookupErr, opennebula.ErrVolumeNotFound) {
@@ -155,7 +162,12 @@ func (s *ControllerServer) evaluateVolumeReconcile(ctx context.Context, node, op
 	evidence.NodeLookupErr = nodeErr
 	if nodeErr != nil {
 		decision.Evidence = evidence
-		return decision.with(VolumeReconcilePause, "node_lookup_unknown", codes.Unavailable, nodeErr.Error())
+		message := nodeErr.Error()
+		if evidence.Operation == VolumeReconcileDetach {
+			klog.V(2).InfoS("Detach node identity lookup failed", "err", nodeErr)
+			message = "attachment node identity is unavailable"
+		}
+		return decision.with(VolumeReconcilePause, "node_lookup_unknown", codes.Unavailable, message)
 	}
 	if nodeID == -1 {
 		decision.Evidence = evidence
@@ -186,8 +198,13 @@ func (s *ControllerServer) evaluateVolumeReconcile(ctx context.Context, node, op
 		evidence.AttachedErr = attachedErr
 		evidence.Attached = attachedErr == nil
 		if attachedErr != nil && !errors.Is(attachedErr, opennebula.ErrAttachmentNotFound) {
-			return decision.withEvidence(evidence).with(VolumeReconcilePause, "attachment_unknown", codes.Unavailable,
-				fmt.Sprintf("attachment state is unknown for volume %s on node %s: %v", evidence.VolumeID, evidence.NodeID, attachedErr))
+			message := fmt.Sprintf("attachment state is unknown for volume %s on node %s", evidence.VolumeID, evidence.NodeID)
+			if evidence.Operation == VolumeReconcileDetach {
+				klog.V(2).InfoS(message, "err", attachedErr)
+			} else {
+				message = fmt.Sprintf("%s: %v", message, attachedErr)
+			}
+			return decision.withEvidence(evidence).with(VolumeReconcilePause, "attachment_unknown", codes.Unavailable, message)
 		}
 	} else {
 		return decision.withEvidence(evidence).with(VolumeReconcilePause, "attachment_unknown", codes.Unavailable,

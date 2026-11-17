@@ -44,7 +44,7 @@ func cephRetentionUnavailable(message string, err error) error {
 // rescueCephSameNodeUnpublish completes only logical deletion of a stale VA.
 // The disk stays owned by the same VM; no physical detach is asserted or recorded.
 // This is separate from local-only maintenance and sticky-grace eligibility.
-func (s *ControllerServer) rescueCephSameNodeUnpublish(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, imageID, nodeID int, runtimeCtx *VolumeRuntimeContext, runtimeErr error) (handled bool, response *csi.ControllerUnpublishVolumeResponse, resultErr error) {
+func (s *ControllerServer) rescueCephSameNodeUnpublish(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, imageID, nodeID int, runtimeCtx *VolumeRuntimeContext) (handled bool, response *csi.ControllerUnpublishVolumeResponse, resultErr error) {
 	defer func() {
 		if handled && ctx.Err() != nil {
 			response = nil
@@ -52,18 +52,6 @@ func (s *ControllerServer) rescueCephSameNodeUnpublish(ctx context.Context, req 
 		}
 	}()
 	if s == nil || s.driver == nil || req == nil || s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
-		return false, nil, nil
-	}
-	if runtimeErr != nil {
-		if strings.EqualFold(s.currentVolumeHistory(req.VolumeId).Backend, "ceph") {
-			return true, nil, cephRetentionUnavailable("volume runtime lookup failed", runtimeErr)
-		}
-		return false, nil, nil
-	}
-	if runtimeCtx == nil || !isCephBackend(runtimeCtx.Backend) {
-		if strings.EqualFold(strings.TrimSpace(s.currentVolumeHistory(req.VolumeId).Backend), "ceph") {
-			return true, nil, cephRetentionUnavailable("current backend contradicts pinned Ceph history", nil)
-		}
 		return false, nil, nil
 	}
 	if s.driver.operationLocks == nil {
@@ -179,16 +167,17 @@ func validateCephRetentionDisk(req *csi.ControllerUnpublishVolumeRequest, imageI
 }
 
 func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, runtimeCtx *VolumeRuntimeContext, nodeID, diskID int) (*cephRetentionAuthority, error) {
-	if runtimeCtx == nil || !strings.EqualFold(strings.TrimSpace(runtimeCtx.Backend), "ceph") {
-		return nil, cephRetentionUnavailable("Ceph backend identity changed", nil)
+	backend, err := runtimeCtx.verifiedAttachmentBackend()
+	if err != nil || !isCephBackend(backend) {
+		return nil, cephRetentionUnavailable("Ceph backend identity changed", err)
 	}
 	runtime := s.driver.kubeRuntime
 	pv, err := runtime.client.CoreV1().PersistentVolumes().Get(ctx, runtimeCtx.PVName, metav1.GetOptions{})
 	if err != nil {
 		return nil, cephRetentionUnavailable("PV lookup failed", err)
 	}
-	backend, backendErr := persistentVolumeBackend(pv)
-	if pv.UID == "" || pv.DeletionTimestamp != nil || pv.Status.Phase != corev1.VolumeBound || pv.Spec.CSI == nil || pv.Spec.CSI.Driver != s.driver.name || pv.Spec.CSI.VolumeHandle != req.VolumeId || pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.UID == "" || backendErr != nil || !isCephBackend(backend) {
+	currentBackend, backendErr := persistentVolumeBackend(pv)
+	if pv.UID == "" || pv.DeletionTimestamp != nil || pv.Status.Phase != corev1.VolumeBound || pv.Spec.CSI == nil || pv.Spec.CSI.Driver != s.driver.name || pv.Spec.CSI.VolumeHandle != req.VolumeId || pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.UID == "" || backendErr != nil || !isCephBackend(currentBackend) {
 		return nil, cephRetentionUnavailable("bound PV identity is incomplete or inconsistent", nil)
 	}
 	pvc, err := runtime.client.CoreV1().PersistentVolumeClaims(pv.Spec.ClaimRef.Namespace).Get(ctx, pv.Spec.ClaimRef.Name, metav1.GetOptions{})
@@ -313,7 +302,7 @@ func (s *ControllerServer) attachmentProtectionChecks(ctx context.Context, volum
 	}
 	if volumeQuarantinePresent {
 		var state VolumeQuarantineState
-		if decodeErr := decodeCephRetentionProtection(rawVolumeQuarantine, &state); decodeErr != nil {
+		if decodeErr := decodeAttachmentQuarantine(rawVolumeQuarantine, &state); decodeErr != nil {
 			return attachmentEvidenceUnavailable("volume quarantine is malformed", decodeErr)
 		}
 		if state.VolumeID != volumeID || (state.Reason == "" && state.Classification == "") || !validQuarantineObservation(state.FailureCount, state.FirstObservedAt, state.LastObservedAt, state.ExpiresAt) {
@@ -334,7 +323,7 @@ func (s *ControllerServer) attachmentProtectionChecks(ctx context.Context, volum
 	if err == nil {
 		for key, raw := range cm.Data {
 			var state HostArtifactQuarantineState
-			if decodeErr := decodeCephRetentionProtection(raw, &state); decodeErr != nil {
+			if decodeErr := decodeAttachmentQuarantine(raw, &state); decodeErr != nil {
 				return attachmentEvidenceUnavailable("host artifact quarantine is malformed", decodeErr)
 			}
 			recordTarget := opennebula.HostArtifactAttachmentTarget{VMID: state.VMID, NodeName: state.NodeName, DiskID: state.DiskID}
@@ -359,6 +348,22 @@ func attachmentEvidenceUnavailable(message string, err error) error {
 		klog.V(2).InfoS("Attachment authority read failed", "check", message, "err", err)
 	}
 	return status.Error(codes.Unavailable, message)
+}
+
+func decodeAttachmentQuarantine(raw string, state any) error {
+	if err := decodeCephRetentionProtection(raw, state); err != nil {
+		return err
+	}
+	var fields struct {
+		ExpiresAt *time.Time `json:"expiresAt"`
+	}
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
+		return err
+	}
+	if fields.ExpiresAt == nil {
+		return fmt.Errorf("quarantine expiry is missing")
+	}
+	return nil
 }
 
 func validQuarantineObservation(count int, first, last, expiry time.Time) bool {
@@ -389,6 +394,34 @@ func cephHistoryHasObservedAuthority(history VolumeHistoryRecord) bool {
 	return history.Version == stateObjectVersion && isCephBackend(history.Backend) &&
 		volumeHistoryHasObservedSuccess(history) && !history.Bootstrapped &&
 		(history.EvidenceSource == "" || history.EvidenceSource == volumeHistoryEvidenceSourceObserved)
+}
+
+func verifiedAttachmentBackend(annotation, attribute string) (string, error) {
+	annotation = strings.ToLower(strings.TrimSpace(annotation))
+	attribute = strings.ToLower(strings.TrimSpace(attribute))
+	if annotation != "" && attribute != "" && annotation != attribute {
+		return "", fmt.Errorf("persistent volume backend assertions disagree")
+	}
+	backend := firstNonEmpty(annotation, attribute)
+	if backend == "" {
+		return "", fmt.Errorf("persistent volume backend is unknown")
+	}
+	return backend, nil
+}
+
+func persistentVolumeBackend(pv *corev1.PersistentVolume) (string, error) {
+	var attribute string
+	if pv.Spec.CSI != nil {
+		attribute = pv.Spec.CSI.VolumeAttributes[annotationBackend]
+	}
+	return verifiedAttachmentBackend(pv.Annotations[annotationBackend], attribute)
+}
+
+func (runtimeCtx *VolumeRuntimeContext) verifiedAttachmentBackend() (string, error) {
+	if runtimeCtx == nil {
+		return "", fmt.Errorf("volume runtime backend is unavailable")
+	}
+	return verifiedAttachmentBackend(runtimeCtx.Backend, runtimeCtx.backendAttribute)
 }
 
 func isCephBackend(backend string) bool {

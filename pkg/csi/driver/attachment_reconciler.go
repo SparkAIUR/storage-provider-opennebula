@@ -192,7 +192,8 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 		if pv == nil || pv.Spec.CSI == nil || ambiguousHandles[pv.Spec.CSI.VolumeHandle] {
 			continue
 		}
-		if unresolvedVolume[volumeHandle] || r.skipDiskAttachmentReconcile(ctx, volumeHandle, pv) {
+		backend, backendErr := persistentVolumeBackend(pv)
+		if unresolvedVolume[volumeHandle] || backendErr != nil || strings.EqualFold(backend, "cephfs") || opennebula.IsSharedFilesystemVolumeID(volumeHandle) {
 			continue
 		}
 		pvcKey := pvcKeyForPV(pv)
@@ -217,7 +218,16 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			if matchingVA != nil {
 				continue
 			}
-			if users[""] || users[attachment.NodeName] || (singleWriter && len(users) > 0) {
+			remoteCephDemand := singleWriter && isCephBackend(backend) && len(observed) == 1 &&
+				!users[""] && !users[attachment.NodeName] && len(users) == 1
+			if users[""] || users[attachment.NodeName] || (singleWriter && len(users) > 0 && !remoteCephDemand) {
+				continue
+			}
+			queueScope := ""
+			if remoteCephDemand {
+				queueScope = attachment.NodeName
+			}
+			if r.skipVolume(ctx, volumeHandle, queueScope) {
 				continue
 			}
 			if len(vas) > 0 {
@@ -405,7 +415,7 @@ func nodeMissing(existingNodes map[string]struct{}, node string) bool {
 }
 
 func (r *AttachmentReconciler) skipDiskAttachmentReconcile(ctx context.Context, volumeHandle string, pv *corev1.PersistentVolume) bool {
-	if r.skipVolume(ctx, volumeHandle) {
+	if r.skipVolume(ctx, volumeHandle, "") {
 		return true
 	}
 	// The stuck attachment reconciler compares Kubernetes VolumeAttachment
@@ -423,7 +433,7 @@ func (r *AttachmentReconciler) skipDiskAttachmentReconcile(ctx context.Context, 
 	return false
 }
 
-func (r *AttachmentReconciler) skipVolume(ctx context.Context, volumeHandle string) bool {
+func (r *AttachmentReconciler) skipVolume(ctx context.Context, volumeHandle, cleanupNode string) bool {
 	if r == nil || r.server == nil || r.server.driver == nil {
 		return true
 	}
@@ -443,7 +453,7 @@ func (r *AttachmentReconciler) skipVolume(ctx context.Context, volumeHandle stri
 			return true
 		}
 	}
-	if r.server.driver.hotplugQueue != nil && r.server.driver.hotplugQueue.HasVolume(volumeHandle) {
+	if r.server.driver.hotplugQueue != nil && r.server.driver.hotplugQueue.hasVolume(volumeHandle, cleanupNode) {
 		return true
 	}
 	return false

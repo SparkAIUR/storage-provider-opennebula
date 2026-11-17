@@ -39,11 +39,12 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		return attachmentEvidenceUnavailable("cannot verify owned PV identity for detach", err)
 	}
 	runtimeCtx.PVAnnotations = pv.Annotations
-	runtimeCtx.Backend, err = persistentVolumeBackend(pv)
+	runtimeCtx.Backend = strings.TrimSpace(pv.Annotations[annotationBackend])
+	backend, err := persistentVolumeBackend(pv)
 	if err != nil {
 		return attachmentEvidenceUnavailable("cannot verify detach backend", err)
 	}
-	if identity.ceph && !isCephBackend(runtimeCtx.Backend) {
+	if identity.ceph && !isCephBackend(backend) {
 		return status.Error(codes.Unavailable, "Ceph backend changed before detach")
 	}
 	var pvc *corev1.PersistentVolumeClaim
@@ -83,7 +84,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if err != nil {
 		return attachmentEvidenceUnavailable("detach history is unreadable", err)
 	}
-	if history.Backend != "" && (isCephBackend(history.Backend) || isCephBackend(runtimeCtx.Backend)) && !strings.EqualFold(history.Backend, runtimeCtx.Backend) {
+	if history.Backend != "" && (isCephBackend(history.Backend) || isCephBackend(backend)) && !strings.EqualFold(history.Backend, backend) {
 		return status.Error(codes.Unavailable, "detach backend contradicts observed history")
 	}
 	if history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != identity.imageID {
@@ -106,6 +107,23 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if err != nil || desired.desiresNode(nodeName) {
 		return attachmentEvidenceUnavailable("current volume release is unverified", err)
 	}
+	if identity.background && isCephBackend(backend) && desired.Desired && hasSingleWriterAccessMode(pv.Spec.AccessModes) {
+		if desired.MultipleNodes || !cephHistoryHasObservedAuthority(history) {
+			return attachmentEvidenceUnavailable("remote-demand Ceph cleanup evidence is unverified", nil)
+		}
+		inspector, ok := s.volumeProvider.(opennebula.VolumeAttachmentInspector)
+		if !ok {
+			return attachmentEvidenceUnavailable("cannot verify sole Ceph attachment for remote-demand cleanup", nil)
+		}
+		metadata, err := inspector.InspectVolumeAttachment(ctx, volume, nodeName)
+		if err != nil || metadata == nil || metadata.ImageID != identity.imageID || metadata.ImageName != volume ||
+			metadata.RequestedNodeID != identity.vmID || !metadata.AttachedToRequestedNode ||
+			metadata.ImageRunningVMs != 1 || len(metadata.ImageVMIDs) != 1 || metadata.ImageVMIDs[0] != identity.vmID ||
+			len(metadata.DiskRecords) != 1 || metadata.DiskRecords[0].NodeID != identity.vmID || metadata.DiskRecords[0].DiskID != identity.diskID {
+			return attachmentEvidenceUnavailable("cannot verify sole Ceph attachment for remote-demand cleanup", err)
+		}
+	}
+
 	protection, err := s.localRWOProtectionProjection(ctx, volume, nodeName, runtimeCtx, false, true)
 	if err != nil || protection.Invalid {
 		return attachmentEvidenceUnavailable("detach protection is unverified", err)
@@ -128,7 +146,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			ready = condition.Status == corev1.ConditionTrue
 		}
 	}
-	if !ready && (terminalConsumer || identity.background || isCephBackend(runtimeCtx.Backend)) {
+	if !ready && (terminalConsumer || identity.background || isCephBackend(backend)) {
 		return status.Error(codes.Unavailable, "detach node release observation is unavailable")
 	}
 	uniqueName := corev1.UniqueVolumeName(fmt.Sprintf("kubernetes.io/csi/%s^%s", s.driver.name, volume))

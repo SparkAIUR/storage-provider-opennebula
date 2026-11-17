@@ -1148,11 +1148,11 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	var identityErr error
 	ctx, identityErr = s.pinKnownVolumeIdentity(ctx, req.VolumeId)
 	if identityErr != nil {
-		return nil, status.Error(codes.Unavailable, identityErr.Error())
+		return nil, attachmentEvidenceUnavailable("volume identity is unavailable", identityErr)
 	}
 	volumeID, _, err := s.volumeProvider.VolumeExists(ctx, req.VolumeId)
 	if err != nil && !errors.Is(err, opennebula.ErrVolumeNotFound) && !opennebula.IsAuthoritativeVolumeAbsence(err) {
-		return nil, status.Errorf(codes.Unavailable, "volume lookup is unknown: %v", err)
+		return nil, attachmentEvidenceUnavailable("volume lookup is unknown", err)
 	}
 	if volumeID == -1 {
 		klog.V(1).InfoS("Volume not found, skipping volume unpublish",
@@ -1162,13 +1162,13 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 
 	nodeID, err := s.volumeProvider.NodeExists(ctx, req.NodeId)
 	if err != nil || nodeID <= 0 {
-		return nil, status.Errorf(codes.Unavailable, "attachment node lookup is unknown: %v", err)
+		return nil, attachmentEvidenceUnavailable("attachment node identity is unavailable", err)
 	}
 
 	_, err = s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err != nil {
 		if !errors.Is(err, opennebula.ErrAttachmentNotFound) {
-			return nil, status.Errorf(codes.Unavailable, "attachment state is unknown: %v", err)
+			return nil, attachmentEvidenceUnavailable("attachment state is unknown", err)
 		}
 		s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
 		klog.V(1).InfoS("Volume does not exist in node, skipping unpublish",
@@ -1181,12 +1181,10 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	if s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
 		recoveryRuntimeCtx, recoveryRuntimeErr = s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId)
 	}
-	if errors.Is(recoveryRuntimeErr, errPersistentVolumeBackendConflict) {
-		return nil, attachmentEvidenceUnavailable("persistent volume backend assertions disagree", recoveryRuntimeErr)
-	}
 	ceph := isCephBackend(s.currentVolumeHistory(req.VolumeId).Backend) ||
-		isCephBackend(runtimeCtxField(recoveryRuntimeCtx, func(v *VolumeRuntimeContext) string { return v.Backend }))
-	if !ceph {
+		(recoveryRuntimeCtx != nil && (isCephBackend(recoveryRuntimeCtx.Backend) || isCephBackend(recoveryRuntimeCtx.backendAttribute)))
+	backend, backendErr := recoveryRuntimeCtx.verifiedAttachmentBackend()
+	if !ceph && backendErr == nil {
 		if rescued, response, rescueErr := s.rescueSameNodeUnpublish(ctx, req, volumeID, nodeID); rescued {
 			return response, rescueErr
 		}
@@ -1211,8 +1209,17 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 
+	if s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
+		if recoveryRuntimeErr != nil {
+			return nil, attachmentEvidenceUnavailable("cannot verify unpublish binding", recoveryRuntimeErr)
+		}
+		if backendErr != nil || (ceph && !isCephBackend(backend)) {
+			return nil, attachmentEvidenceUnavailable("cannot verify unpublish backend", backendErr)
+		}
+	}
+
 	if ceph {
-		if rescued, response, rescueErr := s.rescueCephSameNodeUnpublish(ctx, req, volumeID, nodeID, recoveryRuntimeCtx, recoveryRuntimeErr); rescued {
+		if rescued, response, rescueErr := s.rescueCephSameNodeUnpublish(ctx, req, volumeID, nodeID, recoveryRuntimeCtx); rescued {
 			return response, rescueErr
 		}
 	}
@@ -2000,8 +2007,10 @@ func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *cs
 	case VolumeReconcileReject, VolumeReconcileStale:
 		return true, nil, decision.Err()
 	case VolumeReconcilePause:
-		if !ceph && detachPauseCanReturnSuccess(decision.Reason) && !isCephBackend(decision.Evidence.History.Backend) &&
-			!isCephBackend(runtimeCtxField(decision.Evidence.RuntimeCtx, func(v *VolumeRuntimeContext) string { return v.Backend })) &&
+		backend, backendErr := decision.Evidence.RuntimeCtx.verifiedAttachmentBackend()
+		if !ceph && backendErr == nil && !isCephBackend(backend) &&
+			decision.Evidence.RuntimeCtx.Backend != "" && detachPauseCanReturnSuccess(decision.Reason) &&
+			!isCephBackend(decision.Evidence.History.Backend) &&
 			!isCephBackend(s.currentVolumeHistory(req.VolumeId).Backend) {
 			s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
 			return true, &csi.ControllerUnpublishVolumeResponse{}, nil
@@ -2593,11 +2602,11 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 
 	oldNodeID, oldNodeErr := s.volumeProvider.NodeExists(ctx, state.NodeID)
 	if oldNodeErr != nil || oldNodeID <= 0 {
-		return true, nil, status.Errorf(codes.Unavailable, "old attachment node is unknown: %v", oldNodeErr)
+		return true, nil, attachmentEvidenceUnavailable("old attachment node is unknown", oldNodeErr)
 	}
 	if _, oldAttachErr := s.volumeProvider.GetVolumeInNode(ctx, volumeID, oldNodeID); oldAttachErr != nil {
 		if !errors.Is(oldAttachErr, opennebula.ErrAttachmentNotFound) {
-			return true, nil, status.Errorf(codes.Unavailable, "old attachment is unknown: %v", oldAttachErr)
+			return true, nil, attachmentEvidenceUnavailable("old attachment is unknown", oldAttachErr)
 		}
 		if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
 			return true, nil, status.Errorf(codes.Internal, "failed to clear sticky attachment state: %v", err)
@@ -2666,11 +2675,11 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 		volumeID, _, volumeErr := s.volumeProvider.VolumeExists(queueCtx, confirmed.VolumeID)
 		nodeID, nodeErr := s.volumeProvider.NodeExists(queueCtx, confirmed.NodeID)
 		if volumeErr != nil || nodeErr != nil || volumeID <= 0 || nodeID <= 0 {
-			return status.Errorf(codes.Unavailable, "attachment identity is unknown: volume lookup: %v; node lookup: %v", volumeErr, nodeErr)
+			return attachmentEvidenceUnavailable("attachment identity is unknown", errors.Join(volumeErr, nodeErr))
 		}
 		if _, attachedErr := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID); attachedErr != nil {
 			if !errors.Is(attachedErr, opennebula.ErrAttachmentNotFound) {
-				return status.Errorf(codes.Unavailable, "attachment is unknown: %v", attachedErr)
+				return attachmentEvidenceUnavailable("attachment is unknown", attachedErr)
 			}
 			if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
 				klog.V(2).InfoS("Failed to clear already-absent sticky attachment state", "volumeID", confirmed.VolumeID, "err", err)

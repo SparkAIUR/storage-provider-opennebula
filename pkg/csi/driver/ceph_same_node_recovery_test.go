@@ -476,62 +476,167 @@ func TestControllerUnpublishCephCancellationAfterLockWait(t *testing.T) {
 // Its existing bookkeeping is intentionally not redefined by this correction.
 func TestControllerUnpublishCephPreservesExplicitManualRecovery(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		t.Run(fmt.Sprintf("queued=%v", queued), func(t *testing.T) {
-			f := newCephRestartTestFixture(t, queued)
-			f.pvc.Annotations[annotationRecoveryMode] = recoveryModeManual
-			f.syncObjects(t)
-			response, err := f.unpublish(t)
-			require.NoError(t, err)
-			require.NotNil(t, response)
-			require.Zero(t, f.provider.inspections.Load(), "explicit manual contract must not invoke automatic retention")
-			f.requireNoProviderMutation(t)
-		})
+		for _, conflicting := range []bool{false, true} {
+			t.Run(fmt.Sprintf("queued=%v/conflicting=%v", queued, conflicting), func(t *testing.T) {
+				f := newCephRestartTestFixture(t, queued)
+				if conflicting {
+					f.pv.Annotations[annotationBackend] = "local"
+					f.pv.Spec.CSI.VolumeAttributes = map[string]string{annotationBackend: "ceph"}
+				}
+				f.pvc.Annotations[annotationRecoveryMode] = recoveryModeManual
+				f.syncObjects(t)
+				response, err := f.unpublish(t)
+				require.NoError(t, err)
+				require.NotNil(t, response)
+				require.Zero(t, f.provider.inspections.Load(), "explicit manual contract must not invoke automatic retention")
+				history, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
+				require.False(t, history.LastSafeDetachTime.IsZero(), "manual acknowledgement retains historical bookkeeping")
+				f.requireNoProviderMutation(t)
+			})
+		}
+	}
+}
+
+func TestCephLegacyStaticUnpublishRequiresBackendEvidence(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, attribute := range []string{"", "local"} {
+			t.Run(fmt.Sprintf("queued=%v/attribute=%s", queued, attribute), func(t *testing.T) {
+				f := newCephRestartTestFixture(t, queued)
+				delete(f.pv.Annotations, annotationBackend)
+				if attribute != "" {
+					f.pv.Spec.CSI.VolumeAttributes = map[string]string{annotationBackend: attribute}
+				}
+				f.syncObjects(t)
+				_, err := f.server.driver.volumeHistory.Upsert(context.Background(), cephRestartVolume, func(record *VolumeHistoryRecord) {
+					record.Backend = "local"
+				})
+				require.NoError(t, err)
+				runtimeCtx, err := f.server.driver.kubeRuntime.ResolveVolumeRuntimeContext(context.Background(), cephRestartVolume)
+				require.NoError(t, err)
+				require.False(t, runtimeContextEligibleForMaintenance(runtimeCtx, cephRestartVolume))
+				response, err := f.unpublish(t)
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.Nil(t, response)
+				history, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
+				require.True(t, history.LastSafeDetachTime.IsZero())
+				f.requireNoProviderMutation(t)
+			})
+		}
 	}
 }
 
 func TestCephRetentionSurvivesControllerRestartAndOrphanCleanup(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		t.Run(fmt.Sprintf("queued=%v", queued), func(t *testing.T) {
-			f := newCephRestartTestFixture(t, queued)
-			response, err := f.unpublish(t)
-			require.NoError(t, err)
-			require.NotNil(t, response)
-			f.requireNoProviderMutation(t)
-			// External-attacher has consumed the ACK and removed its VA. The replacement
-			// never publishes and its consumer disappears before a new VA is created.
-			oldClient := f.server.driver.kubeRuntime.client
-			require.NoError(t, oldClient.StorageV1().VolumeAttachments().Delete(context.Background(), f.va.Name, metav1.DeleteOptions{}))
-			require.NoError(t, oldClient.CoreV1().Pods(f.pod.Namespace).Delete(context.Background(), f.pod.Name, metav1.DeleteOptions{}))
-			persisted, err := oldClient.CoreV1().ConfigMaps("default").List(context.Background(), metav1.ListOptions{})
-			require.NoError(t, err)
-			objects := []kruntime.Object{f.pv.DeepCopy(), f.pvc.DeepCopy(), f.node.DeepCopy()}
-			for i := range persisted.Items {
-				objects = append(objects, persisted.Items[i].DeepCopy())
-			}
-			// A new runtime/client/managers/controller receives only durable API state;
-			// no in-memory retention record or another Unpublish call is available.
-			driver := newStickyTestDriver(t, objects...)
-			base := new(MockOpenNebulaVolumeProviderTestify)
-			base.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{{VolumeHandle: cephRestartVolume, ImageID: 3137, NodeName: "node-a", NodeID: 575, DiskID: 1, Backend: "ceph"}}, opennebula.VMNameInventory{"node-a": {575}}, nil).Twice()
-			base.On("VolumeExists", mock.Anything, cephRestartVolume).Return(3137, 1024*1024*1024, nil)
-			base.On("NodeExists", mock.Anything, "node-a").Return(575, nil)
-			physical := &cleanupReadbackProvider{MockOpenNebulaVolumeProviderTestify: base, attached: true, imageID: 3137, vmID: 575, diskID: 1}
-			base.On("DetachVolume", mock.Anything, cephRestartVolume, "node-a").Run(func(mock.Arguments) { physical.attached = false }).Return(nil).Once()
-			server := NewControllerServer(driver, physical, nil)
-			if queued {
-				driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
-				driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
-			}
-			reconciler := NewAttachmentReconciler(server)
-			reconciler.orphanGrace = time.Nanosecond
-			require.NoError(t, reconciler.ReconcileOnce(context.Background()))
-			base.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
-			require.NoError(t, reconciler.ReconcileOnce(context.Background()))
-			base.AssertNumberOfCalls(t, "DetachVolume", 1)
-			base.AssertNotCalled(t, "DeleteVolume", mock.Anything, mock.Anything)
-			base.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
-			base.AssertExpectations(t)
-		})
+		for _, demand := range []string{"none", "remote-orphan", "remote-divergent", "remote-in-use", "remote-multiple-owners"} {
+			t.Run(fmt.Sprintf("queued=%v/%s", queued, demand), func(t *testing.T) {
+				f := newCephRestartTestFixture(t, queued)
+				response, err := f.unpublish(t)
+				require.NoError(t, err)
+				require.NotNil(t, response)
+				f.requireNoProviderMutation(t)
+				// External-attacher has consumed the ACK and removed its VA. The replacement
+				// never publishes and its consumer disappears before a new VA is created.
+				oldClient := f.server.driver.kubeRuntime.client
+				require.NoError(t, oldClient.StorageV1().VolumeAttachments().Delete(context.Background(), f.va.Name, metav1.DeleteOptions{}))
+				require.NoError(t, oldClient.CoreV1().Pods(f.pod.Namespace).Delete(context.Background(), f.pod.Name, metav1.DeleteOptions{}))
+				persisted, err := oldClient.CoreV1().ConfigMaps("default").List(context.Background(), metav1.ListOptions{})
+				require.NoError(t, err)
+				objects := []kruntime.Object{f.pv.DeepCopy(), f.pvc.DeepCopy(), f.node.DeepCopy()}
+				for i := range persisted.Items {
+					objects = append(objects, persisted.Items[i].DeepCopy())
+				}
+				if demand != "none" {
+					objects[2].(*corev1.Node).Spec.Unschedulable = true
+					pod := activePodForPVC("remote-replacement", f.pvc.Name, "node-b")
+					objects = append(objects, newReadyNode("node-b", true), pod)
+					if demand != "remote-orphan" {
+						objects = append(objects, &storagev1.VolumeAttachment{
+							ObjectMeta: metav1.ObjectMeta{Name: "pending-remote-va", UID: "pending-remote-uid"},
+							Spec: storagev1.VolumeAttachmentSpec{NodeName: "node-b", Attacher: DefaultDriverName,
+								Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &f.pv.Name}},
+						})
+					}
+					if demand == "remote-in-use" {
+						objects[2].(*corev1.Node).Status.VolumesInUse = []corev1.UniqueVolumeName{"kubernetes.io/csi/" + DefaultDriverName + "^" + cephRestartVolume}
+					}
+				}
+				// A new runtime/client/managers/controller receives only durable API state;
+				// no in-memory retention record or another Unpublish call is available.
+				driver := newStickyTestDriver(t, objects...)
+				base := new(MockOpenNebulaVolumeProviderTestify)
+				base.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{{VolumeHandle: cephRestartVolume, ImageID: 3137, NodeName: "node-a", NodeID: 575, DiskID: 1, Backend: "ceph"}}, opennebula.VMNameInventory{"node-a": {575}}, nil).Twice()
+				base.On("VolumeExists", mock.Anything, cephRestartVolume).Return(3137, 1024*1024*1024, nil)
+				base.On("NodeExists", mock.Anything, "node-a").Return(575, nil)
+				physical := &cleanupReadbackProvider{MockOpenNebulaVolumeProviderTestify: base, attached: true, imageID: 3137, vmID: 575, diskID: 1}
+				detachAllowed := demand != "remote-in-use" && demand != "remote-multiple-owners"
+				if detachAllowed {
+					base.On("DetachVolume", mock.Anything, cephRestartVolume, "node-a").Run(func(mock.Arguments) { physical.attached = false }).Return(nil).Once()
+				}
+				if demand != "none" {
+					metadata := &opennebula.VolumeAttachmentMetadata{
+						ImageID: 3137, ImageName: cephRestartVolume, RequestedNodeID: 575,
+						ImageRunningVMs: 1, ImageVMIDs: []int{575}, AttachedToRequestedNode: true,
+						DiskRecords: []opennebula.VolumeDiskRecord{{NodeID: 575, DiskID: 1}},
+					}
+					if demand == "remote-multiple-owners" {
+						metadata.DiskRecords = append(metadata.DiskRecords, opennebula.VolumeDiskRecord{NodeID: 576, DiskID: 1})
+					}
+					base.On("InspectVolumeAttachment", mock.Anything, cephRestartVolume, "node-a").Return(metadata, nil).Maybe()
+				}
+				server := NewControllerServer(driver, physical, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, func(ctx context.Context, node, operation, volume string) HotplugQueueValidation {
+						if node == "node-b" {
+							return HotplugQueueValidation{Decision: HotplugQueueValidationValid}
+						}
+						return server.validateHotplugQueueRequest(ctx, node, operation, volume)
+					})
+					if demand != "none" {
+						ctx, cancel := context.WithCancel(context.Background())
+						blocked := make(chan struct{})
+						blockerDone, publishDone := make(chan error, 1), make(chan error, 1)
+						go func() {
+							blockerDone <- driver.hotplugQueue.Run(ctx, "node-b", "test", "other-volume", hotplugQueuePriorityNormal, func(ctx context.Context) error {
+								close(blocked)
+								<-ctx.Done()
+								return ctx.Err()
+							})
+						}()
+						t.Cleanup(func() { cancel(); <-blockerDone; <-publishDone })
+						go func() {
+							select {
+							case <-blocked:
+							case <-ctx.Done():
+								publishDone <- ctx.Err()
+								return
+							}
+							publishDone <- server.withQueuedHotplug(ctx, "node-b", "attach", cephRestartVolume, hotplugQueuePriorityNormal, func(context.Context) error {
+								return fmt.Errorf("pending Publish ran before the destination queue was released")
+							})
+						}()
+						require.Eventually(t, func() bool {
+							return len(driver.hotplugQueue.Snapshot()["node-b"].Queued) == 1
+						}, time.Second, time.Millisecond)
+					}
+				}
+				reconciler := NewAttachmentReconciler(server)
+				reconciler.orphanGrace = time.Nanosecond
+				require.NoError(t, reconciler.ReconcileOnce(context.Background()))
+				base.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+				require.NoError(t, reconciler.ReconcileOnce(context.Background()))
+				if detachAllowed {
+					base.AssertNumberOfCalls(t, "DetachVolume", 1)
+					require.False(t, physical.attached)
+				} else {
+					base.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+					require.True(t, physical.attached)
+				}
+				base.AssertNotCalled(t, "DeleteVolume", mock.Anything, mock.Anything)
+				base.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+				base.AssertExpectations(t)
+			})
+		}
 	}
 }
 

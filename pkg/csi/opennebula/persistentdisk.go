@@ -34,6 +34,8 @@ import (
 	imk "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/image/keys"
 	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/shared"
 	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/vm"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
 )
 
@@ -975,125 +977,110 @@ func (p *PersistentDiskVolumeProvider) DetachVolume(ctx context.Context, volume,
 
 func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, authorize DetachAuthorization) (bool, error) {
 	nodeID, err := p.NodeExists(ctx, node)
-	if err != nil || nodeID == -1 {
-		return false, fmt.Errorf("failed to check if node exists: %w", err)
+	if err != nil || nodeID < 0 {
+		return false, detachEvidenceError(ctx, "detach VM identity is unavailable", err)
 	}
 
 	volumeID, _, err := p.VolumeExists(ctx, volume)
-	if err != nil || volumeID == -1 {
-		return false, fmt.Errorf("failed to check if volume exists: %w", err)
+	if err != nil || volumeID < 0 {
+		return false, detachEvidenceError(ctx, "detach image identity is unavailable", err)
 	}
-	sizeBytes, err := p.resolveDetachVolumeSizeBytes(ctx, volumeID, nodeID)
+	diskID, sizeBytes, err := p.observeDetachDisk(ctx, volumeID, nodeID)
+	if errors.Is(err, ErrAttachmentNotFound) {
+		_, observedErr := p.GetVolumeInNode(ctx, volumeID, nodeID)
+		if errors.Is(observedErr, ErrAttachmentNotFound) {
+			return false, nil
+		}
+		return false, detachEvidenceError(ctx, "detach attachment absence is unverified", observedErr)
+	}
 	if err != nil {
-		return false, fmt.Errorf("failed to resolve volume size for detach of %s: %w", volume, err)
+		return false, detachEvidenceError(ctx, "detach disk identity or completed capacity is unverified", err)
 	}
 	hotplugTimeout := p.ComputeHotplugTimeout(sizeBytes)
-	klog.V(1).InfoS("Computed dynamic hotplug timeout for detach",
-		"volume", volume,
-		"node", node,
-		"sizeBytes", sizeBytes,
-		"timeout", hotplugTimeout)
 
-	vmController := p.ctrl.VM(nodeID)
-	vmInfo, err := vmController.InfoContext(ctx, true)
-	if err != nil {
-		return false, fmt.Errorf("failed to get VM info: %w", err)
+	accepted := false
+	var authorityErr error
+	deny := func(err error) error {
+		authorityErr = err
+		return errors.New("detach authorization denied")
 	}
-
-	for _, disk := range vmInfo.Template.GetDisks() {
-		diskImageID, present, err := diskImageReference(disk)
+	detachDisk := func() error {
+		currentNode, err := p.NodeExists(ctx, node)
+		if err != nil || currentNode != nodeID {
+			return deny(detachEvidenceError(ctx, "detach VM identity changed", fmt.Errorf("expected VM %d, observed %d: %v", nodeID, currentNode, err)))
+		}
+		currentDisk, _, err := p.observeDetachDisk(ctx, volumeID, nodeID)
+		if errors.Is(err, ErrAttachmentNotFound) {
+			_, observedErr := p.GetVolumeInNode(ctx, volumeID, nodeID)
+			if errors.Is(observedErr, ErrAttachmentNotFound) {
+				return nil
+			}
+			return deny(detachEvidenceError(ctx, "detach attachment absence is unverified", observedErr))
+		}
 		if err != nil {
-			return false, err
+			return deny(detachEvidenceError(ctx, "detach disk identity or completed capacity is unverified", err))
 		}
-		if present && diskImageID == volumeID {
-			diskID, err := disk.Get(shared.DiskID)
-			if err != nil {
-				return false, fmt.Errorf(
-					"failed to get disk ID from volume %s on node %s: %w",
-					volume, node, err)
-			}
-			diskIDInt, err := strconv.Atoi(diskID)
-			if err != nil {
-				return false, fmt.Errorf("invalid disk ID format: %w", err)
-			}
-			accepted := false
-			var authorityErr error
-			detachDisk := func() error {
-				if _, err := p.resolveDetachVolumeSizeBytes(ctx, volumeID, nodeID); err != nil {
-					return err
-				}
-				currentNode, err := p.NodeExists(ctx, node)
-				if err != nil || currentNode != nodeID {
-					return fmt.Errorf("detach VM identity changed: %v", err)
-				}
-				currentDisk, _, err := p.volumeDiskInVM(ctx, volumeID, nodeID)
-				if errors.Is(err, ErrAttachmentNotFound) {
-					if _, observedErr := p.GetVolumeInNode(ctx, volumeID, nodeID); errors.Is(observedErr, ErrAttachmentNotFound) {
-						return nil
-					}
-					return fmt.Errorf("detach attachment absence is unverified")
-				}
-				if err != nil || currentDisk != diskIDInt {
-					return fmt.Errorf("detach disk identity changed: %v", err)
-				}
-				if authorize != nil {
-					authorityErr = authorize(ctx, volumeID, nodeID, diskIDInt)
-					if authorityErr != nil {
-						return errors.New("detach authorization denied")
-					}
-				}
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-				err = vmController.Disk(diskIDInt).DetachContext(ctx)
-				accepted = err == nil
-				return err
-			}
-			detachErr := detachDisk()
-			if authorityErr != nil {
-				return false, authorityErr
-			}
-			if detachErr != nil && !isHotplugStateError(detachErr) {
-				return false, fmt.Errorf("failed to detach volume %s from node %s: %w",
-					diskID, node, detachErr)
-			}
-
-			var retryDetach func() error
-			if detachErr != nil {
-				retryDetach = detachDisk
-			}
-
-			if err := p.waitForDetachState(ctx, hotplugTimeout, p.hotplugPollWait, func() (bool, bool, error) {
-				attached := false
-				if _, infoErr := p.GetVolumeInNode(ctx, volumeID, nodeID); infoErr == nil {
-					attached = true
-				} else if !errors.Is(infoErr, ErrAttachmentNotFound) {
-					return false, false, infoErr
-				}
-				ready, readyErr := p.nodeReadyContext(ctx, nodeID)
-				if readyErr != nil {
-					return attached, false, readyErr
-				}
-				return attached, ready, nil
-			}, retryDetach, volume, node); err != nil {
-				if authorityErr != nil {
-					klog.V(2).InfoS("Detach retry denied after provider error", "volume", volume, "node", node, "err", detachErr)
-					return false, authorityErr
-				}
-				if detachErr != nil {
-					return false, fmt.Errorf("%w (initial detach error: %v)", err, detachErr)
-				}
-				return false, err
-			}
-			return accepted, nil
+		if currentDisk != diskID {
+			return deny(detachEvidenceError(ctx, "detach disk identity changed", fmt.Errorf("expected disk %d, observed %d", diskID, currentDisk)))
 		}
+		if authorize != nil {
+			if err := authorize(ctx, volumeID, nodeID, diskID); err != nil {
+				return deny(err)
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return deny(status.FromContextError(err).Err())
+		}
+		err = p.ctrl.VM(nodeID).Disk(diskID).DetachContext(ctx)
+		accepted = err == nil
+		return err
 	}
-	if _, err := p.GetVolumeInNode(ctx, volumeID, nodeID); !errors.Is(err, ErrAttachmentNotFound) {
-		return false, fmt.Errorf("attachment absence could not be verified before detach completion: %v", err)
+	detachErr := detachDisk()
+	if authorityErr != nil {
+		return false, authorityErr
 	}
-	klog.V(1).InfoS("Volume already absent from node, treating detach as successful",
-		"method", "DetachVolume", "volumeID", volumeID, "volumeHandle", volume, "nodeID", nodeID, "node", node)
-	return false, nil
+	if detachErr != nil && !isHotplugStateError(detachErr) {
+		return false, fmt.Errorf("failed to detach volume %s from node %s: %w", volume, node, detachErr)
+	}
+
+	var retryDetach func() error
+	if detachErr != nil {
+		retryDetach = detachDisk
+	}
+	if err := p.waitForDetachState(ctx, hotplugTimeout, p.hotplugPollWait, func() (bool, bool, error) {
+		_, infoErr := p.GetVolumeInNode(ctx, volumeID, nodeID)
+		attached := infoErr == nil
+		if !attached && !errors.Is(infoErr, ErrAttachmentNotFound) {
+			return false, false, deny(detachEvidenceError(ctx, "detach readback is unverified", infoErr))
+		}
+		ready, readyErr := p.nodeReadyContext(ctx, nodeID)
+		if readyErr != nil {
+			return attached, false, deny(detachEvidenceError(ctx, "detach VM state is unavailable", readyErr))
+		}
+		return attached, ready, nil
+	}, retryDetach, volume, node); err != nil {
+		if detachErr != nil {
+			klog.V(2).InfoS("Initial detach attempt failed", "volume", volume, "node", node, "err", detachErr)
+		}
+		if authorityErr != nil {
+			return false, authorityErr
+		}
+		return false, err
+	}
+	return accepted, nil
+}
+
+func detachEvidenceError(ctx context.Context, message string, cause error) error {
+	if cause != nil {
+		klog.V(2).InfoS("Provider detach evidence failed", "check", message, "err", cause)
+	}
+	if err := ctx.Err(); err != nil {
+		return status.FromContextError(err).Err()
+	}
+	if IsDatastoreConfigError(cause) {
+		return status.Error(codes.FailedPrecondition, message)
+	}
+	return status.Error(codes.Unavailable, message)
 }
 
 func (p *PersistentDiskVolumeProvider) ListVolumes(ctx context.Context, owner string, maxEntries int32, startingToken string) ([]string, error) {
@@ -1235,35 +1222,41 @@ func (p *PersistentDiskVolumeProvider) volumeDiskInVM(ctx context.Context, image
 	if err != nil {
 		return 0, 0, err
 	}
-	if info.ID != vmID {
-		return 0, 0, fmt.Errorf("requested VM identity changed")
+	diskID, disk, err := volumeDiskFromVM(info, imageID, vmID)
+	if err != nil {
+		return 0, 0, err
 	}
-	selected := -1
-	var size int64
+	size, err := diskSizeBytesFromTemplate(*disk)
+	return diskID, size, err
+}
+
+func volumeDiskFromVM(info *vm.VM, imageID, vmID int) (int, *shared.Disk, error) {
+	if info.ID != vmID {
+		return 0, nil, fmt.Errorf("requested VM %d identity changed to %d", vmID, info.ID)
+	}
+	var selected *shared.Disk
+	var diskID int
 	for _, disk := range info.Template.GetDisks() {
 		id, present, err := diskImageReference(disk)
 		if err != nil {
-			return 0, 0, err
+			return 0, nil, err
 		}
 		if !present || id != imageID {
 			continue
 		}
-		if selected >= 0 {
-			return 0, 0, fmt.Errorf("image %d has multiple disks on VM %d", imageID, vmID)
+		if selected != nil {
+			return 0, nil, fmt.Errorf("image %d has multiple disks on VM %d", imageID, vmID)
 		}
-		selected, err = disk.GetI(shared.DiskID)
-		if err != nil || selected < 0 {
-			return 0, 0, fmt.Errorf("invalid disk identity for image %d on VM %d", imageID, vmID)
+		diskID, err = disk.GetI(shared.DiskID)
+		if err != nil || diskID < 0 {
+			return 0, nil, fmt.Errorf("invalid disk identity for image %d on VM %d: %v", imageID, vmID, err)
 		}
-		size, err = diskSizeBytesFromTemplate(disk)
-		if err != nil {
-			return 0, 0, err
-		}
+		selected = &disk
 	}
-	if selected < 0 {
-		return 0, 0, fmt.Errorf("%w: image %d VM %d", ErrAttachmentNotFound, imageID, vmID)
+	if selected == nil {
+		return 0, nil, fmt.Errorf("%w: image %d VM %d", ErrAttachmentNotFound, imageID, vmID)
 	}
-	return selected, size, nil
+	return diskID, selected, nil
 }
 
 func diskSizeBytesFromTemplate(disk shared.Disk) (int64, error) {
@@ -1614,32 +1607,31 @@ func (p *PersistentDiskVolumeProvider) waitForDetachState(ctx context.Context, t
 	}
 }
 
-func (p *PersistentDiskVolumeProvider) resolveDetachVolumeSizeBytes(ctx context.Context, volumeID, vmID int) (int64, error) {
-	disk, _, diskErr := p.volumeDiskInVM(ctx, volumeID, vmID)
-	if diskErr != nil && !errors.Is(diskErr, ErrAttachmentNotFound) {
-		return 0, diskErr
-	}
+func (p *PersistentDiskVolumeProvider) observeDetachDisk(ctx context.Context, volumeID, vmID int) (int, int64, error) {
 	image, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	size, err := effectiveImageSize(image)
+	if err != nil || size <= 0 || image.ID != volumeID {
+		return 0, 0, fmt.Errorf("durable capacity or identity is unverified for image %d: %v", volumeID, err)
+	}
+	info, err := p.ctrl.VM(vmID).InfoContext(ctx, true)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	if size <= 0 {
-		return 0, fmt.Errorf("volume %d size is unavailable", volumeID)
+	diskID, disk, err := volumeDiskFromVM(info, volumeID, vmID)
+	if err != nil {
+		return 0, 0, err
 	}
-	if diskErr == nil {
-		completed, err := p.completedDiskSize(ctx, vmID, disk, volumeID)
-		if err != nil || completed <= 0 {
-			return 0, &datastoreConfigError{message: fmt.Sprintf("completed capacity is not verified for image %d on VM %d: %v", volumeID, vmID, err)}
-		}
-		if completed != size {
-			return 0, &datastoreConfigError{message: fmt.Sprintf("disk capacity %d differs from durable image capacity %d; verify expansion and persist capacity before detaching", completed, size)}
-		}
+	completed, err := completedSelectedDiskSize(info, *disk)
+	if err != nil || completed <= 0 {
+		return 0, 0, &datastoreConfigError{message: fmt.Sprintf("completed capacity is not verified for image %d on VM %d: %v", volumeID, vmID, err)}
 	}
-	return size, nil
+	if completed != size {
+		return 0, 0, &datastoreConfigError{message: fmt.Sprintf("disk capacity %d differs from durable image capacity %d; verify expansion and persist capacity before detaching", completed, size)}
+	}
+	return diskID, completed, nil
 }
 
 func (p *PersistentDiskVolumeProvider) waitForResourceStatusContext(parent context.Context, volumeID int, timeout time.Duration, check func(context.Context, int) (bool, error)) error {

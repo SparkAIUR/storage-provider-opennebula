@@ -297,6 +297,8 @@ func TestSupportBundleProjectsLiveMaintenanceAttachmentWithoutWrites(t *testing.
 	require.Equal(t, legacy.Name, protection["vol-diagnostics-second"].RequiredNode)
 	require.Equal(t, node.Name, history["vol-live-diagnostics"].LastSuccessfulNodeName)
 	require.True(t, history["vol-live-diagnostics"].Bootstrapped)
+	require.Equal(t, history["vol-live-diagnostics"], protection["vol-live-diagnostics"].History)
+	require.Equal(t, history["vol-diagnostics-second"], protection["vol-diagnostics-second"].History)
 	require.Equal(t, node.Name, protection["vol-live-diagnostics"].RequiredNode)
 	require.True(t, protection["vol-live-diagnostics"].Protected)
 	current, err := client.CoreV1().PersistentVolumes().Get(context.Background(), pv.Name, metav1.GetOptions{})

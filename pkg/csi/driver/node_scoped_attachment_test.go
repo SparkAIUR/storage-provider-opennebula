@@ -32,6 +32,7 @@ type nodeAttachmentProtocol struct {
 	mu                sync.Mutex
 	disks             map[int]int
 	vmNames           map[int]string
+	diskSlot          string
 	marker            int64
 	mutations         []string
 	failMethod        string
@@ -81,7 +82,8 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				if state.pending {
 					marker = "<RESIZE>YES</RESIZE><SIZE_PREV>128</SIZE_PREV>"
 				}
-				disk = fmt.Sprintf(`<DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><SAVE>YES</SAVE><SHAREABLE>YES</SHAREABLE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>ssh</TM_MAD><TM_MAD_SYSTEM>ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE><SERIAL>onecsi-7</SERIAL>%s</DISK>`, size, marker)
+				slot := firstNonEmpty(state.diskSlot, "2")
+				disk = fmt.Sprintf(`<DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><SAVE>YES</SAVE><SHAREABLE>YES</SHAREABLE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>ssh</TM_MAD><TM_MAD_SYSTEM>ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>%s</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE><SERIAL>onecsi-7</SERIAL>%s</DISK>`, slot, size, marker)
 			}
 			return fmt.Sprintf(`<VM><ID>%d</ID><NAME>%s</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE>%s</TEMPLATE><HISTORY_RECORDS><HISTORY><SEQ>0</SEQ><DS_ID>200</DS_ID></HISTORY></HISTORY_RECORDS></VM>`, id, name, disk)
 		}
@@ -379,6 +381,76 @@ func TestControllerDetachRechecksReleaseAtProviderAttempt(t *testing.T) {
 				require.Equal(t, []string{"detach:41"}, state.mutations)
 			}
 		})
+	}
+}
+
+func TestControllerDetachRejectsDriftInFinalProviderObservation(t *testing.T) {
+	for _, retry := range []bool{false, true} {
+		for _, drift := range []string{"size", "resize", "slot"} {
+			t.Run(fmt.Sprintf("retry=%v/%s", retry, drift), func(t *testing.T) {
+				ctx := context.Background()
+				pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+				driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
+				driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+				imageReads, attempts := 0, 0
+				resolvedAttemptVM := false
+				var protocol *nodeAttachmentProtocol
+				provider, state := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+					switch method {
+					case "one.image.info":
+						imageReads++
+					case "one.vmpool.info":
+						resolvedAttemptVM = imageReads >= 5 && (!retry || attempts > 0)
+					case "one.vm.detach":
+						attempts++
+						resolvedAttemptVM = false
+					case "one.vm.info":
+						if !resolvedAttemptVM || imageReads < 6 || (retry && imageReads < 7) {
+							return
+						}
+						protocol.mu.Lock()
+						defer protocol.mu.Unlock()
+						switch drift {
+						case "size":
+							protocol.disks[41] = 384
+						case "resize":
+							protocol.pending = true
+						case "slot":
+							protocol.diskSlot = "provider-private-malformed-slot"
+						}
+					}
+				})
+				protocol = state
+				state.mu.Lock()
+				state.rejectFirstDetach = retry
+				state.mu.Unlock()
+				client := reviewControllerClient(t, NewControllerServer(driver, provider, nil))
+				response, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: "node-old"})
+				require.Nil(t, response)
+				wantCode := codes.FailedPrecondition
+				if drift == "slot" {
+					wantCode = codes.Unavailable
+				}
+				require.Equal(t, wantCode, status.Code(err))
+				require.Equal(t, "detach disk identity or completed capacity is unverified", status.Convert(err).Message())
+				events, err := driver.kubeRuntime.client.CoreV1().Events(pvc.Namespace).List(ctx, metav1.ListOptions{})
+				require.NoError(t, err)
+				for _, event := range events.Items {
+					require.NotContains(t, event.Message, "provider-private-")
+				}
+				state.mu.Lock()
+				defer state.mu.Unlock()
+				require.True(t, resolvedAttemptVM)
+				require.Contains(t, state.disks, 41)
+				require.Empty(t, state.mutations)
+				if retry {
+					require.Equal(t, 1, state.detachAttempts)
+				} else {
+					require.Zero(t, state.detachAttempts)
+				}
+				require.True(t, driver.volumeHistory.Snapshot()["volume-test"].LastSafeDetachTime.IsZero())
+			})
+		}
 	}
 }
 

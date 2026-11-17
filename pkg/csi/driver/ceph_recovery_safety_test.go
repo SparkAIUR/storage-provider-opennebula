@@ -655,6 +655,57 @@ func TestControllerUnpublishCephRejectsContradictoryQuarantineTimes(t *testing.T
 	}
 }
 
+func TestControllerUnpublishCephRequiresSerializedQuarantineExpiry(t *testing.T) {
+	for _, host := range []bool{false, true} {
+		for _, expiry := range []string{"omitted", "null", "zero"} {
+			t.Run(fmt.Sprintf("host=%v/%s", host, expiry), func(t *testing.T) {
+				f := newCephRestartTestFixture(t, false)
+				cm, key := volumeQuarantineStateConfigMapName, cephRestartVolume
+				now := time.Now().UTC()
+				var pending any = VolumeQuarantineState{VolumeID: cephRestartVolume, Reason: "metadata drift", FailureCount: 1, FirstObservedAt: now, LastObservedAt: now}
+				if host {
+					cm, key = hostArtifactStateConfigMapName, "vm-575"
+					pending = HostArtifactQuarantineState{Key: key, VMID: 575, VolumeID: cephRestartVolume, FailureCount: 1, FirstObservedAt: now, LastObservedAt: now}
+				}
+				raw, err := json.Marshal(pending)
+				require.NoError(t, err)
+				var fields map[string]json.RawMessage
+				require.NoError(t, json.Unmarshal(raw, &fields))
+				switch expiry {
+				case "omitted":
+					delete(fields, "expiresAt")
+				case "null":
+					fields["expiresAt"] = json.RawMessage("null")
+				case "zero":
+					require.JSONEq(t, `"0001-01-01T00:00:00Z"`, string(fields["expiresAt"]))
+				}
+				raw, err = json.Marshal(fields)
+				require.NoError(t, err)
+				require.NoError(t, f.server.driver.kubeRuntime.UpsertConfigMapData(context.Background(), "default", cm, map[string]string{key: string(raw)}))
+				if expiry != "zero" {
+					defer func() {
+						ctx := context.Background()
+						require.NoError(t, f.server.driver.kubeRuntime.client.CoreV1().Pods(f.pod.Namespace).Delete(ctx, f.pod.Name, metav1.DeleteOptions{}))
+						response, err := f.unpublish(t)
+						require.Equal(t, codes.Unavailable, status.Code(err))
+						require.Nil(t, response)
+						f.requireNoProviderMutation(t)
+					}()
+				}
+				response, err := f.unpublish(t)
+				if expiry == "zero" {
+					require.NoError(t, err)
+					require.NotNil(t, response)
+				} else {
+					require.Equal(t, codes.Unavailable, status.Code(err))
+					require.Nil(t, response)
+				}
+				f.requireNoProviderMutation(t)
+			})
+		}
+	}
+}
+
 func TestControllerUnpublishCephQuarantineMatchesActualTarget(t *testing.T) {
 	for _, mode := range []string{"pending", "unrelated-disk", "same-disk", "same-vm", "same-node"} {
 		t.Run(mode, func(t *testing.T) {

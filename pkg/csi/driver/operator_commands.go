@@ -1283,14 +1283,6 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 				}
 			}
 
-			existingHistory := historySnapshot[pv.Spec.CSI.VolumeHandle]
-			if !volumeHistoryHasObservedSuccess(existingHistory) {
-				if seed, ok := buildVolumeHistoryBootstrapEvidence(ctx, runtime, pv.Spec.CSI.VolumeHandle, runtimeCtx); ok {
-					mergeVolumeHistoryBootstrap(&existingHistory, seed)
-					normalizeVolumeHistoryRecord(&existingHistory)
-					historySnapshot[pv.Spec.CSI.VolumeHandle] = existingHistory
-				}
-			}
 		}
 		existingRecoveryState := recoverySnapshot[pv.Spec.CSI.VolumeHandle]
 		recoveryState := resolvedRecoveryControlState(pv.Spec.CSI.VolumeHandle, runtimeCtx, existingRecoveryState)
@@ -1307,6 +1299,9 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 				Message: err.Error(),
 			}
 			continue
+		}
+		if decision.History.VolumeID != "" {
+			historySnapshot[pv.Spec.CSI.VolumeHandle] = decision.History
 		}
 		if decision.Protected || strings.TrimSpace(decision.Reason) != "" || strings.TrimSpace(decision.PreferredNode) != "" || strings.TrimSpace(decision.ExplicitRequiredNode) != "" || strings.TrimSpace(decision.ExplicitPreferredNode) != "" || strings.TrimSpace(decision.PlacementDecision) != "" || len(decision.Warnings) > 0 {
 			protectionSnapshot[pv.Spec.CSI.VolumeHandle] = decision

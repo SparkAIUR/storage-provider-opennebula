@@ -40,16 +40,6 @@ func (p *PersistentDiskVolumeProvider) completedDiskSize(ctx context.Context, vm
 // completedDiskSizeFromVM keeps completion checks on the same VM observation
 // as the identity checks made by read-only attachment inspectors.
 func completedDiskSizeFromVM(info *vm.VM, diskID, imageID int) (int64, error) {
-	state, lcm, err := info.State()
-	if err != nil {
-		return 0, err
-	}
-	if strings.Contains(lcm.String(), "RESIZE") {
-		return 0, nil
-	}
-	if (state != vm.Active || lcm != vm.Running) && (state != vm.Poweroff || lcm != vm.LcmInit) {
-		return 0, fmt.Errorf("VM is not in an eligible resize-completion state: %s/%s", state, lcm)
-	}
 	var selected *shared.Disk
 	for _, disk := range info.Template.GetDisks() {
 		iid, present, err := diskImageReference(disk)
@@ -71,13 +61,27 @@ func completedDiskSizeFromVM(info *vm.VM, diskID, imageID int) (int64, error) {
 	if selected == nil {
 		return 0, fmt.Errorf("resize identity changed: image %d vm %d disk %d", imageID, info.ID, diskID)
 	}
-	if prev, e := selected.Get("SIZE_PREV"); e == nil && strings.TrimSpace(prev) != "" {
+	return completedSelectedDiskSize(info, *selected)
+}
+
+func completedSelectedDiskSize(info *vm.VM, disk shared.Disk) (int64, error) {
+	state, lcm, err := info.State()
+	if err != nil {
+		return 0, err
+	}
+	if strings.Contains(lcm.String(), "RESIZE") {
 		return 0, nil
 	}
-	if marker, e := selected.Get("RESIZE"); e == nil && marker != "" && marker != "NO" && marker != "0" && marker != "false" {
+	if (state != vm.Active || lcm != vm.Running) && (state != vm.Poweroff || lcm != vm.LcmInit) {
+		return 0, fmt.Errorf("VM is not in an eligible resize-completion state: %s/%s", state, lcm)
+	}
+	if prev, e := disk.Get("SIZE_PREV"); e == nil && strings.TrimSpace(prev) != "" {
 		return 0, nil
 	}
-	return diskSizeBytesFromTemplate(*selected)
+	if marker, e := disk.Get("RESIZE"); e == nil && marker != "" && marker != "NO" && marker != "0" && marker != "false" {
+		return 0, nil
+	}
+	return diskSizeBytesFromTemplate(disk)
 }
 
 func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, id int, size int64) error {
