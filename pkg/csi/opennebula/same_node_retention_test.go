@@ -149,8 +149,21 @@ func TestSameNodeRetentionRejectsUncertainOrUnsafeEvidence(t *testing.T) {
 		"duplicate disk": func(c *retentionProtocolCase) {
 			c.extraDisk = `<DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>3</DISK_ID><TARGET>vdc</TARGET><SERIAL>onecsi-7</SERIAL><SIZE>1024</SIZE></DISK>`
 		},
-		"missing serial":         func(c *retentionProtocolCase) { c.serial = "" },
-		"missing target":         func(c *retentionProtocolCase) { c.target = "" },
+		"missing serial": func(c *retentionProtocolCase) { c.serial = "" },
+		"missing target": func(c *retentionProtocolCase) { c.target = "" },
+		"CSI serial in census lacks image ID": func(c *retentionProtocolCase) {
+			c.extraVM = `<VM><ID>12</ID><NAME>other</NAME><TEMPLATE><DISK><DISK_ID>4</DISK_ID><SERIAL>onecsi-7</SERIAL></DISK></TEMPLATE></VM>`
+		},
+		"CSI serial in census conflicts with image ID": func(c *retentionProtocolCase) {
+			c.extraVM = `<VM><ID>12</ID><NAME>other</NAME><TEMPLATE><DISK><DISK_ID>4</DISK_ID><IMAGE_ID>8</IMAGE_ID><SERIAL>onecsi-7</SERIAL></DISK></TEMPLATE></VM>`
+		},
+		"fresh disk serial lacks image ID": func(c *retentionProtocolCase) {
+			c.beforeReply = func(method string) {
+				if method == "one.vm.info" {
+					c.extraDisk = `<DISK><DISK_ID>4</DISK_ID><SERIAL>onecsi-7</SERIAL></DISK>`
+				}
+			}
+		},
 		"resize marker":          func(c *retentionProtocolCase) { c.resize = "<RESIZE>YES</RESIZE>" },
 		"previous size marker":   func(c *retentionProtocolCase) { c.resize = "<SIZE_PREV>512</SIZE_PREV>" },
 		"unstable VM":            func(c *retentionProtocolCase) { c.lcmState = 16 },

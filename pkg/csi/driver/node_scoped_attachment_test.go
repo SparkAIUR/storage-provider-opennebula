@@ -1466,3 +1466,193 @@ func TestDetachRechecksNodeMountUseAfterBindingReads(t *testing.T) {
 		})
 	}
 }
+
+type delayedAbsenceProvider struct {
+	*opennebula.PersistentDiskVolumeProvider
+	afterAbsent func(context.Context)
+}
+
+func (p delayedAbsenceProvider) GetVolumeInNode(ctx context.Context, imageID, vmID int) (string, error) {
+	target, err := p.PersistentDiskVolumeProvider.GetVolumeInNode(ctx, imageID, vmID)
+	if errors.Is(err, opennebula.ErrAttachmentNotFound) {
+		p.afterAbsent(ctx)
+	}
+	return target, err
+}
+
+func TestUnpublishRechecksInitialAbsenceAfterConcurrentPublish(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queued=%t", queued), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true), activePodForPVC("writer", pvc.Name, "node-old"))
+			provider, protocol := nodeAttachmentProvider(t)
+			protocol.mu.Lock()
+			delete(protocol.disks, 41)
+			protocol.marker = 128 * 1024 * 1024
+			protocol.mu.Unlock()
+			absent, resume := make(chan struct{}), make(chan struct{})
+			var first atomic.Bool
+			wrapped := delayedAbsenceProvider{provider, func(ctx context.Context) {
+				if first.CompareAndSwap(false, true) {
+					close(absent)
+					select {
+					case <-resume:
+					case <-ctx.Done():
+					}
+				}
+			}}
+			server := NewControllerServer(driver, wrapped, nil)
+			if queued {
+				driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, time.Second, 0)
+				driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+			}
+			client := reviewControllerClient(t, server)
+			done := make(chan error, 1)
+			go func() {
+				_, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: "node-old"})
+				done <- err
+			}()
+			select {
+			case <-absent:
+			case <-ctx.Done():
+				t.Fatal("Unpublish did not observe initial absence")
+			}
+			reply, err := client.ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-old"))
+			require.NoError(t, err)
+			require.Equal(t, "vdb", reply.GetPublishContext()["volumeName"])
+			close(resume)
+			require.Equal(t, codes.Aborted, status.Code(<-done))
+			history, _ := driver.volumeHistory.Get("volume-test")
+			require.False(t, history.LastSuccessfulPublishTime.IsZero())
+			require.True(t, history.LastSafeDetachTime.IsZero())
+			protocol.mu.Lock()
+			defer protocol.mu.Unlock()
+			require.Equal(t, []string{"attach:41:false"}, protocol.mutations)
+		})
+	}
+}
+
+func TestUnpublishJoiningStickyExpiryVerifiesOwnCompletion(t *testing.T) {
+	for _, absent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("absent=%t", absent), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
+			driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+			provider, protocol := nodeAttachmentProvider(t)
+			server := NewControllerServer(driver, provider, nil)
+			queue := NewHotplugQueueManager(nil, "default", driver.metrics, 4*time.Second, 0)
+			queue.Configure(true, 0, 0, 0, nil)
+			driver.hotplugQueue = queue
+			blocker, release := context.WithCancel(ctx)
+			defer release()
+			started, blockerDone := make(chan struct{}), make(chan error, 1)
+			go func() {
+				blockerDone <- queue.Run(blocker, "node-old", "test", "other-volume", hotplugQueuePriorityNormal, func(ctx context.Context) error {
+					close(started)
+					<-ctx.Done()
+					return ctx.Err()
+				})
+			}()
+			select {
+			case <-started:
+			case <-ctx.Done():
+				t.Fatal("queue blocker did not start")
+			}
+			sticky := StickyAttachmentState{VolumeID: "volume-test", NodeID: "node-old", Backend: "local", StartedAt: time.Now().Add(-time.Minute), ExpiresAt: time.Now().Add(-time.Second)}
+			require.NoError(t, driver.stickyAttachments.StartGrace(sticky))
+			expiryDone := make(chan struct{})
+			go func() {
+				defer close(expiryDone)
+				server.expireStickyDetach(ctx, sticky)
+			}()
+			waitForPending := func(coalesced int) {
+				require.Eventually(t, func() bool {
+					pending := queue.Snapshot()["node-old"].Queued
+					return len(pending) == 1 && pending[0].Volume == sticky.VolumeID && pending[0].Coalesced == coalesced
+				}, time.Second, time.Millisecond)
+			}
+			waitForPending(0)
+			client := reviewControllerClient(t, server)
+			unpublishDone := make(chan error, 1)
+			go func() {
+				_, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: sticky.VolumeID, NodeId: sticky.NodeID})
+				unpublishDone <- err
+			}()
+			waitForPending(1)
+			require.NoError(t, driver.stickyAttachments.Clear(sticky.VolumeID))
+			if absent {
+				protocol.mu.Lock()
+				delete(protocol.disks, 41)
+				protocol.mu.Unlock()
+			}
+			release()
+			require.ErrorIs(t, <-blockerDone, context.Canceled)
+			err := <-unpublishDone
+			<-expiryDone
+			if absent {
+				require.NoError(t, err)
+			} else {
+				require.Equal(t, codes.Aborted, status.Code(err))
+			}
+			history, _ := driver.volumeHistory.Get(sticky.VolumeID)
+			require.Equal(t, !absent, history.LastSafeDetachTime.IsZero())
+			protocol.mu.Lock()
+			defer protocol.mu.Unlock()
+			require.Zero(t, protocol.detachAttempts)
+		})
+	}
+}
+
+func TestUnpublishDeniesAbsenceWhenCSISerialIdentifiesTheDisk(t *testing.T) {
+	for _, imageReference := range []string{"", "<IMAGE_ID>8</IMAGE_ID>"} {
+		t.Run(fmt.Sprintf("image-reference=%q", imageReference), func(t *testing.T) {
+			ctx := context.Background()
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
+			provider, protocol := nodeAttachmentProvider(t)
+			protocol.mu.Lock()
+			delete(protocol.disks, 41)
+			protocol.extraDiskBefore = "<DISK><DISK_ID>4</DISK_ID><TARGET>vdb</TARGET><SERIAL>onecsi-7</SERIAL>" + imageReference + "</DISK>"
+			protocol.mu.Unlock()
+
+			client := reviewControllerClient(t, NewControllerServer(driver, provider, nil))
+			reply, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: "node-old"})
+			require.Nil(t, reply)
+			require.Equal(t, codes.Unavailable, status.Code(err))
+			_, err = provider.GetVolumeInNode(ctx, 7, 41)
+			require.ErrorContains(t, err, "CSI disk serial contradicts VM disk image identity")
+			_, _, err = provider.ListCurrentAttachments(ctx)
+			require.ErrorContains(t, err, "CSI disk serial contradicts VM disk image identity")
+			require.Error(t, provider.DetachVolume(ctx, "volume-test", "node-old"))
+			history, _ := driver.volumeHistory.Get("volume-test")
+			require.True(t, history.LastSafeDetachTime.IsZero())
+			protocol.mu.Lock()
+			defer protocol.mu.Unlock()
+			require.Zero(t, protocol.detachAttempts)
+		})
+	}
+}
+
+func TestUnpublishRejectsProviderWithoutAttemptAuthorization(t *testing.T) {
+	ctx := context.Background()
+	pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
+	driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+	provider, protocol := nodeAttachmentProvider(t)
+	wrapped := struct {
+		opennebula.OpenNebulaVolumeProvider
+		opennebula.AttachmentBackendVerifier
+	}{provider, provider}
+	client := reviewControllerClient(t, NewControllerServer(driver, wrapped, nil))
+	reply, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: "node-old"})
+	require.Nil(t, reply)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.ErrorContains(t, err, "provider cannot authorize physical detach")
+	protocol.mu.Lock()
+	defer protocol.mu.Unlock()
+	require.Zero(t, protocol.detachAttempts)
+}

@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -102,7 +103,7 @@ func TestSupportBundleLocalRWOSnapshotMarksBootstrappedHistory(t *testing.T) {
 	client := fake.NewSimpleClientset(pv, pvc, newReadyNode("node-old", true))
 	cfg := config.LoadConfiguration()
 
-	history, _, _, _, _ := collectSupportBundleLocalRWOSnapshot(context.Background(), cfg, client, newInventoryFakeClient(t), []corev1.PersistentVolume{*pv})
+	history, _, _, _, _ := collectSupportBundleLocalRWOSnapshot(context.Background(), cfg, client, newInventoryFakeClient(t), []corev1.PersistentVolume{*pv}, &storagev1.VolumeAttachmentList{}, nil)
 	record, ok := history["vol-support-bootstrap"]
 	if !ok {
 		t.Fatalf("expected bootstrapped support history for volume")
@@ -158,7 +159,7 @@ func TestCollectVolumeHealthReportsFlagsLegacyLastAttachedNodeAnnotation(t *test
 	cfg := config.LoadConfiguration()
 	cfg.OverrideVal(config.OpenNebulaCredentialsVar, "")
 
-	reports, err := collectVolumeHealthReports(context.Background(), kubeClient, cfg, VolumeHealthOptions{VolumeID: "vol-legacy"})
+	reports, err := collectVolumeHealthReports(context.Background(), kubeClient, newInventoryFakeClient(t), cfg, VolumeHealthOptions{VolumeID: "vol-legacy"})
 	if err != nil {
 		t.Fatalf("collectVolumeHealthReports returned error: %v", err)
 	}
@@ -209,7 +210,7 @@ func TestCollectVolumeHealthReportsFlagsStaleLastAttachedNodeAnnotation(t *testi
 	cfg := config.LoadConfiguration()
 	cfg.OverrideVal(config.OpenNebulaCredentialsVar, "")
 
-	reports, err := collectVolumeHealthReports(context.Background(), kubeClient, cfg, VolumeHealthOptions{VolumeID: "vol-stale-last"})
+	reports, err := collectVolumeHealthReports(context.Background(), kubeClient, newInventoryFakeClient(t), cfg, VolumeHealthOptions{VolumeID: "vol-stale-last"})
 	if err != nil {
 		t.Fatalf("collectVolumeHealthReports returned error: %v", err)
 	}
@@ -252,7 +253,7 @@ func TestSupportBundleLocalRWOSnapshotIsReadOnly(t *testing.T) {
 					return true, nil, fmt.Errorf("diagnostics must be read-only")
 				}
 			})
-			history, _, _, demand, protection := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, newInventoryFakeClient(t), []corev1.PersistentVolume{*pv})
+			history, _, _, demand, protection := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, newInventoryFakeClient(t), []corev1.PersistentVolume{*pv}, &storagev1.VolumeAttachmentList{}, nil)
 			require.True(t, history["vol-diagnostics"].Bootstrapped)
 			require.Equal(t, "node-old", history["vol-diagnostics"].LastSuccessfulNodeName)
 			require.Contains(t, demand, "vol-diagnostics")
@@ -298,9 +299,20 @@ func TestSupportBundleProjectsLiveMaintenanceAttachmentWithoutWrites(t *testing.
 			Status:     inventoryv1alpha1.OpenNebulaDatastoreStatus{ID: 1, Backend: "local"},
 		},
 	)
-	history, _, _, demand, protection := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, inventory, []corev1.PersistentVolume{*pv, *secondPV})
+	cfg := config.LoadConfiguration()
+	cfg.OverrideVal(config.OpenNebulaCredentialsVar, "")
+	var output bytes.Buffer
+	require.NoError(t, writeSupportBundle(context.Background(), cfg, client, inventory, &output))
+	var bundle SupportBundle
+	require.NoError(t, json.Unmarshal(output.Bytes(), &bundle))
 	require.Equal(t, 1, censuses)
-	require.Len(t, demand, 2)
+	require.Len(t, bundle.VolumeDemand, 2)
+	require.Len(t, bundle.VolumeAttachments, 2)
+	require.Len(t, bundle.VolumeHealth, 2)
+	for _, report := range bundle.VolumeHealth {
+		require.Equal(t, node.Name, report.NodeName)
+	}
+	history, protection := bundle.VolumeHistory, bundle.LastNodeProtection
 	require.Equal(t, node.Name, history["vol-diagnostics-second"].LastSuccessfulNodeName)
 	require.Equal(t, node.Name, protection["vol-diagnostics-second"].RequiredNode)
 	require.Equal(t, node.Name, history["vol-live-diagnostics"].LastSuccessfulNodeName)
@@ -334,7 +346,14 @@ func TestSupportBundlePreservesPodDemandWhenAttachmentListFails(t *testing.T) {
 			return true, nil, fmt.Errorf("diagnostics must be read-only")
 		}
 	})
-	_, _, _, demand, _ := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, newInventoryFakeClient(t), []corev1.PersistentVolume{*pv, *idlePV})
+	cfg := config.LoadConfiguration()
+	cfg.OverrideVal(config.OpenNebulaCredentialsVar, "")
+	var output bytes.Buffer
+	require.NoError(t, writeSupportBundle(context.Background(), cfg, client, newInventoryFakeClient(t), &output))
+	var bundle SupportBundle
+	require.NoError(t, json.Unmarshal(output.Bytes(), &bundle))
+	require.Empty(t, bundle.VolumeAttachments)
+	demand := bundle.VolumeDemand
 	require.Equal(t, 1, attachmentLists)
 	require.Equal(t, "active_pod", demand["vol-active"].DemandSource)
 	require.Equal(t, "node-a", demand["vol-active"].NodeName)

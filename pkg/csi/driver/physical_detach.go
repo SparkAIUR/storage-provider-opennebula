@@ -315,27 +315,18 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 		}
 		return false, err
 	}
-	ctx = opennebula.WithExpectedImageID(ctx, identity.imageID)
-	var accepted bool
-	var err error
-	if provider, ok := s.volumeProvider.(opennebula.AuthorizedVolumeDetacher); ok {
-		var verifyOwner opennebula.DetachOwnerCheck
-		if identity.cephSingleWriter {
-			verifyOwner = func(ctx context.Context, imageID, vmID, diskID int) (string, error) {
-				return s.verifySoleDetachOwner(ctx, volume, node, imageID, vmID, diskID)
-			}
-		}
-		accepted, err = provider.DetachVolumeWithAuthority(ctx, volume, node, identity.vmID, identity.backend, verifyOwner, authorize)
-	} else {
-		if identity.cephSingleWriter {
-			return false, attachmentEvidenceUnavailable("provider cannot verify Ceph detach authority", nil)
-		}
-		if err := s.verifyProviderAttachmentBackend(ctx, volume, identity.imageID, identity.vmID, identity.backend); err != nil {
-			return false, err
-		}
-		err = s.volumeProvider.DetachVolume(ctx, volume, node)
-		accepted = err == nil
+	provider, ok := s.volumeProvider.(opennebula.AuthorizedVolumeDetacher)
+	if !ok {
+		return false, attachmentEvidenceUnavailable("provider cannot authorize physical detach", nil)
 	}
+	var verifyOwner opennebula.DetachOwnerCheck
+	if identity.cephSingleWriter {
+		verifyOwner = func(ctx context.Context, imageID, vmID, diskID int) (string, error) {
+			return s.verifySoleDetachOwner(ctx, volume, node, imageID, vmID, diskID)
+		}
+	}
+	ctx = opennebula.WithExpectedImageID(ctx, identity.imageID)
+	accepted, err := provider.DetachVolumeWithAuthority(ctx, volume, node, identity.vmID, identity.backend, verifyOwner, authorize)
 	if parentErr := ctx.Err(); parentErr != nil {
 		return false, parentErr
 	}

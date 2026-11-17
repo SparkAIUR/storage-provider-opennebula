@@ -991,7 +991,7 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 	}
 	diskID, sizeBytes, err := p.observeDetachDisk(ctx, volume, volumeID, nodeID, nil, "")
 	if errors.Is(err, ErrAttachmentNotFound) {
-		_, observedErr := p.GetVolumeInNode(ctx, volumeID, nodeID)
+		_, observedErr := p.getVolumeInNode(ctx, volumeID, nodeID, true)
 		if errors.Is(observedErr, ErrAttachmentNotFound) {
 			return false, nil
 		}
@@ -1023,7 +1023,7 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 		}
 		currentDisk, _, err := p.observeDetachDisk(ctx, volume, volumeID, nodeID, &expectedBackend, target)
 		if errors.Is(err, ErrAttachmentNotFound) {
-			_, observedErr := p.GetVolumeInNode(ctx, volumeID, nodeID)
+			_, observedErr := p.getVolumeInNode(ctx, volumeID, nodeID, true)
 			if errors.Is(observedErr, ErrAttachmentNotFound) {
 				return nil
 			}
@@ -1226,14 +1226,26 @@ func (p *PersistentDiskVolumeProvider) findAttachedVolumeDisk(ctx context.Contex
 
 func diskImageReference(disk shared.Disk, allowBlank bool) (int, bool, error) {
 	raw, err := disk.Get(shared.ImageID)
-	if err != nil || (allowBlank && strings.TrimSpace(raw) == "") {
-		return 0, false, nil
+	present := err == nil
+	var id int
+	if present && (!allowBlank || strings.TrimSpace(raw) != "") {
+		id, err = strconv.Atoi(raw)
+		if err != nil || id < 0 {
+			return 0, false, fmt.Errorf("malformed VM disk image identity")
+		}
+	} else {
+		present = false
 	}
-	id, err := strconv.Atoi(raw)
-	if err != nil || id < 0 {
-		return 0, false, fmt.Errorf("malformed VM disk image identity")
+	if !allowBlank {
+		serial, _ := disk.Get(shared.Serial)
+		if suffix, ok := strings.CutPrefix(strings.TrimSpace(serial), "onecsi-"); ok {
+			serialID, parseErr := strconv.Atoi(suffix)
+			if parseErr == nil && serialID >= 0 && (!present || serialID != id) {
+				return 0, false, fmt.Errorf("CSI disk serial contradicts VM disk image identity")
+			}
+		}
 	}
-	return id, true, nil
+	return id, present, nil
 }
 
 func (p *PersistentDiskVolumeProvider) volumeDiskInVM(ctx context.Context, imageID, vmID int) (int, int64, error) {
@@ -1756,16 +1768,11 @@ func (p *PersistentDiskVolumeProvider) getVolumeInNode(ctx context.Context, volu
 	}
 
 	var target string
-	var malformedReference error
-	for _, disk := range vmInfo.Template.GetDisks() {
-		diskImageID, present, err := diskImageReference(disk, false)
+	disks := vmInfo.Template.GetDisks()
+	for _, disk := range disks {
+		diskImageID, present, err := diskImageReference(disk, !requireCompleteImageReferences)
 		if err != nil {
-			raw, _ := disk.Get(shared.ImageID)
-			if requireCompleteImageReferences || strings.TrimSpace(raw) != "" {
-				return "", err
-			}
-			malformedReference = err
-			continue
+			return "", err
 		}
 		if present && diskImageID == volumeID {
 			if target != "" {
@@ -1777,11 +1784,15 @@ func (p *PersistentDiskVolumeProvider) getVolumeInNode(ctx context.Context, volu
 			}
 		}
 	}
-	if malformedReference != nil && target == "" {
-		return "", malformedReference
-	}
 	if target != "" {
 		return target, nil
+	}
+	if !requireCompleteImageReferences {
+		for _, disk := range disks {
+			if _, _, err := diskImageReference(disk, false); err != nil {
+				return "", err
+			}
+		}
 	}
 	info, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
 	if err != nil {

@@ -199,7 +199,9 @@ func TestStorageClassReconcileRenderContract(t *testing.T) {
 			job, input := jobs[0], inputs[0]
 			require.Equal(t, job.Namespace, input.Namespace)
 			require.Len(t, job.Spec.Template.Spec.Containers, 1)
-			args := job.Spec.Template.Spec.Containers[0].Args
+			container := job.Spec.Template.Spec.Containers[0]
+			require.Empty(t, container.Command, "the Job must use the CSI driver image entrypoint")
+			args := container.Args
 			flags := flag.NewFlagSet("storageclass-reconcile", flag.ContinueOnError)
 			runMode := flags.String("mode", "", "")
 			flags.Int("v", 0, "")

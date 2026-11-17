@@ -16,6 +16,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 )
@@ -141,7 +142,7 @@ func TestAttachmentReconcilerSkipsSharedFilesystemVolumeAttachments(t *testing.T
 	require.NoError(t, err)
 
 	sharedPrefixPV := &corev1.PersistentVolume{
-		ObjectMeta: metav1.ObjectMeta{Name: "pv-cephfs-prefix"},
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-cephfs-prefix", Annotations: map[string]string{annotationBackend: "local"}},
 		Spec: corev1.PersistentVolumeSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
 			ClaimRef: &corev1.ObjectReference{
@@ -244,22 +245,38 @@ func TestAttachmentReconcilerSkipsSharedFilesystemVolumeAttachments(t *testing.T
 		},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
-	driver := newAttachmentTestDriver(sharedPrefixPV, sharedPrefixPVC, metadataPV, metadataPVC, vaPrefixA, vaPrefixB, vaMetadata, pod)
+	for _, binding := range []struct {
+		pv  *corev1.PersistentVolume
+		pvc *corev1.PersistentVolumeClaim
+	}{{sharedPrefixPV, sharedPrefixPVC}, {metadataPV, metadataPVC}} {
+		binding.pv.UID = types.UID(binding.pv.Name)
+		binding.pv.ResourceVersion = "1"
+		binding.pvc.UID = types.UID(binding.pvc.Name)
+		binding.pvc.Spec.VolumeName = binding.pv.Name
+		binding.pv.Spec.ClaimRef.UID = binding.pvc.UID
+	}
+	vas := []*storagev1.VolumeAttachment{vaPrefixA, vaPrefixB, vaMetadata}
+	for _, va := range vas {
+		va.UID = types.UID(va.Name)
+		va.ResourceVersion = "1"
+	}
+	driver := newAttachmentTestDriver(sharedPrefixPV, sharedPrefixPVC, metadataPV, metadataPVC, vaPrefixA, vaPrefixB, vaMetadata, pod,
+		newReadyNode("node-a", true), newReadyNode("node-b", true), newReadyNode("node-c", true))
 	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
 	mockProvider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil, nil).Once()
 
 	server := NewControllerServer(driver, mockProvider, &MockSharedFilesystemProviderTestify{})
 	reconciler := NewAttachmentReconciler(server)
-	reconciler.staleVASeen["va-cephfs-prefix-a"] = time.Now().Add(-2 * reconciler.staleVAGrace)
-	reconciler.staleVASeen["va-cephfs-prefix-b"] = time.Now().Add(-2 * reconciler.staleVAGrace)
-	reconciler.staleVASeen["va-cephfs-metadata"] = time.Now().Add(-2 * reconciler.staleVAGrace)
+	for _, va := range vas {
+		reconciler.staleVASeen[string(va.UID)] = time.Now().Add(-2 * reconciler.staleVAGrace)
+	}
 
 	require.NoError(t, reconciler.ReconcileOnce(context.Background()))
 
-	for _, name := range []string{"va-cephfs-prefix-a", "va-cephfs-prefix-b", "va-cephfs-metadata"} {
-		_, err := driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(context.Background(), name, metav1.GetOptions{})
-		assert.NoError(t, err, "shared filesystem VolumeAttachment %s should not be deleted", name)
-		assert.NotContains(t, reconciler.staleVASeen, name, "shared filesystem VolumeAttachment %s should not be tracked as stale", name)
+	for _, va := range vas {
+		_, err := driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(context.Background(), va.Name, metav1.GetOptions{})
+		assert.NoError(t, err, "shared filesystem VolumeAttachment %s should not be deleted", va.Name)
+		assert.NotContains(t, reconciler.staleVASeen, string(va.UID), "shared filesystem VolumeAttachment %s should not be tracked as stale", va.Name)
 	}
 	mockProvider.AssertExpectations(t)
 }

@@ -1174,13 +1174,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		if !errors.Is(err, opennebula.ErrAttachmentNotFound) {
 			return nil, attachmentEvidenceUnavailable("attachment state is unknown", err)
 		}
-		if err := s.verifyDetachAbsenceTarget(ctx, req.VolumeId, req.NodeId, volumeID, nodeID, ""); err != nil {
-			return nil, err
-		}
-		s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
-		klog.V(1).InfoS("Volume does not exist in node, skipping unpublish",
-			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
-		return &csi.ControllerUnpublishVolumeResponse{}, nil
+		return s.confirmUnpublishAbsence(ctx, req, volumeID, nodeID)
 	}
 
 	var recoveryRuntimeCtx *VolumeRuntimeContext
@@ -1253,7 +1247,9 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		message := s.formatHotplugGuardMessage(cooldown)
 		return nil, status.Error(codes.Unavailable, message)
 	}
+	completed := false
 	queueErr := s.withQueuedHotplug(ctx, req.NodeId, "detach", req.VolumeId, hotplugQueuePriorityNormal, func(queueCtx context.Context) error {
+		completed = true
 		nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(req.NodeId))
 		defer nodeRelease()
 
@@ -1350,6 +1346,31 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		}
 		return nil, queueErr
 	}
+	if !completed {
+		return s.confirmUnpublishAbsence(ctx, req, volumeID, nodeID)
+	}
+	return &csi.ControllerUnpublishVolumeResponse{}, nil
+}
+
+func (s *ControllerServer) confirmUnpublishAbsence(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, imageID, vmID int) (*csi.ControllerUnpublishVolumeResponse, error) {
+	nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(req.NodeId))
+	defer nodeRelease()
+	volumeRelease := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
+	defer volumeRelease()
+
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	if _, err := s.volumeProvider.GetVolumeInNode(ctx, imageID, vmID); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
+		if err != nil {
+			return nil, attachmentEvidenceUnavailable("attachment state is unknown", err)
+		}
+		return nil, status.Error(codes.Aborted, "unpublish completion is unverified while the volume is attached; retry the request")
+	}
+	if err := s.verifyDetachAbsenceTarget(ctx, req.VolumeId, req.NodeId, imageID, vmID, ""); err != nil {
+		return nil, err
+	}
+	s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 

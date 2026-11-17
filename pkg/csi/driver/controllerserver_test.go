@@ -2769,6 +2769,23 @@ func (m *MockOpenNebulaVolumeProviderTestify) VerifyAttachmentBackend(ctx contex
 	return ctx.Err()
 }
 
+func (m *MockOpenNebulaVolumeProviderTestify) DetachVolumeWithAuthority(ctx context.Context, volume, node string, vmID int, _ string, verifyOwner opennebula.DetachOwnerCheck, authorize opennebula.DetachAuthorization) (bool, error) {
+	imageID, _, err := m.VolumeExists(ctx, volume)
+	if err != nil {
+		return false, err
+	}
+	if verifyOwner != nil {
+		if _, err := verifyOwner(ctx, imageID, vmID, 0); err != nil {
+			return false, err
+		}
+	}
+	if err := authorize(ctx, imageID, vmID, 0); err != nil {
+		return false, err
+	}
+	err = m.DetachVolume(ctx, volume, node)
+	return err == nil, err
+}
+
 func (m *MockOpenNebulaVolumeProviderTestify) DetachVolume(ctx context.Context, volume string, node string) error {
 	args := m.Called(ctx, volume, node)
 	return args.Error(0)
