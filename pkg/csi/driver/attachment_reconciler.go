@@ -136,6 +136,9 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 	activePVCUsers := make(map[string]map[string]bool)
 	for idx := range podList.Items {
 		pod := &podList.Items[idx]
+		if terminalPodMayBeReleased(pod) {
+			continue
+		}
 		for _, volume := range pod.Spec.Volumes {
 			if volume.PersistentVolumeClaim == nil {
 				continue
@@ -149,10 +152,21 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 	}
 
 	attachmentsByVolume := make(map[string][]opennebula.ObservedAttachment)
-	attachmentByVolumeNode := make(map[string]opennebula.ObservedAttachment)
+	attachmentByVolumeNode := make(map[string]struct{})
+	unresolvedVolume := make(map[string]bool)
+	nodesByVM := map[int]*corev1.Node{}
+	if len(attachments) > 0 {
+		nodesByVM = r.attachmentNodesByVM(ctx, nodeList.Items)
+	}
 	for _, attachment := range attachments {
+		node := nodesByVM[attachment.NodeID]
+		if node == nil {
+			unresolvedVolume[attachment.VolumeHandle] = true
+			continue
+		}
+		attachment.NodeName = node.Name
 		attachmentsByVolume[attachment.VolumeHandle] = append(attachmentsByVolume[attachment.VolumeHandle], attachment)
-		attachmentByVolumeNode[attachment.VolumeHandle+"@"+attachment.NodeName] = attachment
+		attachmentByVolumeNode[attachment.VolumeHandle+"@"+node.Name] = struct{}{}
 	}
 
 	vaByVolume := make(map[string][]storagev1.VolumeAttachment)
@@ -178,7 +192,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 		if pv == nil || pv.Spec.CSI == nil || ambiguousHandles[pv.Spec.CSI.VolumeHandle] {
 			continue
 		}
-		if r.skipDiskAttachmentReconcile(ctx, volumeHandle, pv) {
+		if unresolvedVolume[volumeHandle] || r.skipDiskAttachmentReconcile(ctx, volumeHandle, pv) {
 			continue
 		}
 		pvcKey := pvcKeyForPV(pv)
@@ -211,7 +225,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 				if !r.due(r.divergentSeen, key, now, r.orphanGrace) {
 					continue
 				}
-				if err := r.detachObservedAttachment(ctx, attachment, pv.UID, hotplugQueuePriorityCritical); err != nil {
+				if err := r.detachObservedAttachment(ctx, attachment, pv.UID, nodesByVM[attachment.NodeID].UID, hotplugQueuePriorityCritical); err != nil {
 					r.server.driver.metrics.RecordAttachmentReconciler("divergent_attachment", "detach", attachmentCleanupOutcome(err))
 					klog.V(2).InfoS("Failed to detach divergent attachment", "volume", volumeHandle, "node", attachment.NodeName, "err", err)
 				} else {
@@ -225,7 +239,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			if !r.due(r.orphanSeen, key, now, r.orphanGrace) {
 				continue
 			}
-			if err := r.detachObservedAttachment(ctx, attachment, pv.UID, hotplugQueuePriorityBackground); err != nil {
+			if err := r.detachObservedAttachment(ctx, attachment, pv.UID, nodesByVM[attachment.NodeID].UID, hotplugQueuePriorityBackground); err != nil {
 				r.server.driver.metrics.RecordAttachmentReconciler("orphan_attachment", "detach", attachmentCleanupOutcome(err))
 				klog.V(2).InfoS("Failed to detach orphan attachment", "volume", volumeHandle, "node", attachment.NodeName, "err", err)
 			} else {
@@ -245,7 +259,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			continue
 		}
 		volumeHandle := pv.Spec.CSI.VolumeHandle
-		if r.skipDiskAttachmentReconcile(ctx, volumeHandle, pv) {
+		if unresolvedVolume[volumeHandle] || r.skipDiskAttachmentReconcile(ctx, volumeHandle, pv) {
 			continue
 		}
 		if _, ok := attachmentByVolumeNode[volumeHandle+"@"+va.Spec.NodeName]; ok {
@@ -270,6 +284,36 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 	r.prune(r.divergentSeen, currentDivergent)
 	r.prune(r.multiAttachSeen, currentMultiAttach)
 	return nil
+}
+
+func (r *AttachmentReconciler) attachmentNodesByVM(ctx context.Context, nodes []corev1.Node) map[int]*corev1.Node {
+	byVM := make(map[int]*corev1.Node)
+	conflicts := make(map[int]bool)
+	for i := range nodes {
+		node := &nodes[i]
+		vmID, err := r.server.volumeProvider.NodeExists(ctx, node.Name)
+		var notFound *opennebula.VMNotFoundError
+		var ambiguous *opennebula.VMDuplicateNameError
+		switch {
+		case errors.As(err, &notFound):
+			continue
+		case errors.As(err, &ambiguous):
+			for _, id := range ambiguous.Match {
+				conflicts[id] = true
+			}
+			continue
+		case err != nil || vmID <= 0:
+			return nil
+		}
+		if byVM[vmID] != nil || node.UID == "" || node.DeletionTimestamp != nil {
+			conflicts[vmID] = true
+		}
+		byVM[vmID] = node
+	}
+	for vmID := range conflicts {
+		delete(byVM, vmID)
+	}
+	return byVM
 }
 
 func (r *AttachmentReconciler) cleanupStaleDriverState(ctx context.Context, pvByHandle map[string]*corev1.PersistentVolume, existingNodes map[string]struct{}) {
@@ -409,8 +453,8 @@ func (r *AttachmentReconciler) skipVolume(ctx context.Context, volumeHandle stri
 	return false
 }
 
-func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, attachment opennebula.ObservedAttachment, pvUID types.UID, priority HotplugQueuePriority) error {
-	if pvUID == "" {
+func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, attachment opennebula.ObservedAttachment, pvUID, nodeUID types.UID, priority HotplugQueuePriority) error {
+	if pvUID == "" || nodeUID == "" {
 		return errAttachmentSkipped
 	}
 	detached := false
@@ -456,7 +500,7 @@ func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, att
 		}
 		detachStarted := time.Now()
 		accepted, err := r.server.detachVolumeWithAuthority(queueCtx, attachment.VolumeHandle, attachment.NodeName,
-			physicalDetachIdentity{pvUID: pvUID, imageID: attachment.ImageID, vmID: attachment.NodeID, diskID: attachment.DiskID, background: true})
+			physicalDetachIdentity{pvUID: pvUID, nodeUID: nodeUID, imageID: attachment.ImageID, vmID: attachment.NodeID, diskID: attachment.DiskID, background: true})
 		if err != nil {
 			r.server.handleHotplugTimeout(queueCtx, attachment.NodeName, attachment.VolumeHandle, nil, "detach", observedAttachmentBackend(attachment), err)
 			return err

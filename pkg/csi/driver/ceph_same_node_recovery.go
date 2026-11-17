@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 )
 
 // cephRetentionAuthority contains only identity and authority facts that must
@@ -35,10 +37,7 @@ type cephRetentionAuthority struct {
 }
 
 func cephRetentionUnavailable(message string, err error) error {
-	if err != nil {
-		return status.Errorf(codes.Unavailable, "cannot safely retain Ceph attachment: %s: %v", message, err)
-	}
-	return status.Errorf(codes.Unavailable, "cannot safely retain Ceph attachment: %s", message)
+	return attachmentEvidenceUnavailable("cannot safely retain Ceph attachment: "+message, err)
 }
 
 // rescueCephSameNodeUnpublish completes only logical deletion of a stale VA.
@@ -92,7 +91,7 @@ func (s *ControllerServer) rescueCephSameNodeUnpublish(ctx context.Context, req 
 	if enabled, known := s.driver.PluginConfig.GetBool(config.StuckAttachmentReconcilerEnabledVar); known && !enabled {
 		return true, nil, status.Error(codes.FailedPrecondition, "Ceph same-node retention requires the attachment reconciler for durable orphan cleanup")
 	}
-	first, err := s.cephRetentionAuthority(ctx, req, runtimeCtx)
+	first, err := s.cephRetentionAuthority(ctx, req, runtimeCtx, nodeID, -1)
 	if err != nil {
 		return true, nil, err
 	}
@@ -127,7 +126,7 @@ func (s *ControllerServer) rescueCephSameNodeUnpublish(ctx context.Context, req 
 	if err != nil {
 		return true, nil, cephRetentionUnavailable("final volume runtime lookup failed", err)
 	}
-	last, err := s.cephRetentionAuthority(ctx, req, lastRuntime)
+	last, err := s.cephRetentionAuthority(ctx, req, lastRuntime, nodeID, lastDisk.DiskID)
 	if err != nil {
 		return true, nil, err
 	}
@@ -169,11 +168,6 @@ func validateCephRetentionDisk(req *csi.ControllerUnpublishVolumeRequest, imageI
 	if history.LastSuccessfulImageID != disk.ImageID || history.LastSuccessfulNodeName != req.NodeId || history.LastSuccessfulNodeUID != string(authority.NodeUID) {
 		return cephRetentionUnavailable("observed volume history does not match image and node identity", nil)
 	}
-	if (history.PVName != "" && history.PVName != authority.PVName) ||
-		(history.PVCName != "" && history.PVCName != authority.PVCName) ||
-		(history.PVCNamespace != "" && history.PVCNamespace != authority.PVCNamespace) {
-		return cephRetentionUnavailable("observed history contradicts the current PV or PVC binding", nil)
-	}
 	if (history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != disk.NodeID) || (history.LastSuccessfulDiskID > 0 && history.LastSuccessfulDiskID != disk.DiskID) || (history.LastSuccessfulTarget != "" && history.LastSuccessfulTarget != disk.Target) || (history.LastSuccessfulDeviceSerial != "" && history.LastSuccessfulDeviceSerial != disk.DeviceSerial) {
 		return cephRetentionUnavailable("current device identity contradicts observed history", nil)
 	}
@@ -183,7 +177,7 @@ func validateCephRetentionDisk(req *csi.ControllerUnpublishVolumeRequest, imageI
 	return nil
 }
 
-func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, runtimeCtx *VolumeRuntimeContext) (*cephRetentionAuthority, error) {
+func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, runtimeCtx *VolumeRuntimeContext, nodeID, diskID int) (*cephRetentionAuthority, error) {
 	if runtimeCtx == nil || !strings.EqualFold(strings.TrimSpace(runtimeCtx.Backend), "ceph") {
 		return nil, cephRetentionUnavailable("Ceph backend identity changed", nil)
 	}
@@ -276,27 +270,36 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if history.VolumeID != req.VolumeId || !cephHistoryHasObservedAuthority(history) {
 		return nil, cephRetentionUnavailable("observed volume history is unavailable", nil)
 	}
-	if err := s.attachmentProtectionChecks(ctx, req.VolumeId, currentRuntime, history.LastSuccessfulImageID); err != nil {
+	if err := s.attachmentProtectionChecks(ctx, req.VolumeId, currentRuntime, opennebula.HostArtifactAttachmentTarget{
+		NodeName: req.NodeId, VMID: nodeID, DiskID: diskID, ImageID: history.LastSuccessfulImageID,
+	}); err != nil {
 		return nil, err
 	}
 	authority.History = history
-	if err := ctx.Err(); err != nil {
-		return nil, status.FromContextError(err).Err()
+	if err := s.recheckAttachmentBinding(ctx, pv, pvc); err != nil {
+		return nil, err
 	}
 	return authority, nil
 }
 
-func (s *ControllerServer) attachmentProtectionChecks(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext, imageID int) error {
+func (s *ControllerServer) attachmentProtectionChecks(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext, target opennebula.HostArtifactAttachmentTarget) error {
 	if s.driver.volumeRepairState == nil || s.driver.volumeQuarantine == nil || s.driver.hostArtifactQuarantine == nil {
-		return cephRetentionUnavailable("protection state managers are unavailable", nil)
+		return attachmentEvidenceUnavailable("protection state managers are unavailable", nil)
 	}
-	if err := s.rejectIfActiveRepairState(ctx, volumeID, runtimeCtx); err != nil {
-		return err
+	repair, active, err := s.driver.volumeRepairState.GetCurrent(ctx, volumeID)
+	if err != nil {
+		return attachmentEvidenceUnavailable("cannot verify current volume repair state", err)
+	}
+	if active {
+		const message = "volume repair is required before attachment changes"
+		s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonVolumeRepairRequired, message)
+		s.driver.metrics.RecordVolumeRepairState(repair.Classification, "active")
+		return status.Error(codes.FailedPrecondition, message)
 	}
 	quarantine := s.driver.volumeQuarantine
 	volumeCM, err := quarantine.runtime.GetConfigMap(ctx, quarantine.namespace, volumeQuarantineStateConfigMapName)
 	if err != nil && !apierrors.IsNotFound(err) {
-		return cephRetentionUnavailable("volume quarantine lookup failed", err)
+		return attachmentEvidenceUnavailable("volume quarantine lookup failed", err)
 	}
 	var rawVolumeQuarantine string
 	var volumeQuarantinePresent bool
@@ -306,13 +309,13 @@ func (s *ControllerServer) attachmentProtectionChecks(ctx context.Context, volum
 	if volumeQuarantinePresent {
 		var state VolumeQuarantineState
 		if decodeErr := decodeCephRetentionProtection(rawVolumeQuarantine, &state); decodeErr != nil {
-			return cephRetentionUnavailable("volume quarantine is malformed", decodeErr)
+			return attachmentEvidenceUnavailable("volume quarantine is malformed", decodeErr)
 		}
-		if state.VolumeID != volumeID || (state.Reason == "" && state.Classification == "") || state.FailureCount <= 0 || state.ExpiresAt.IsZero() {
-			return cephRetentionUnavailable("volume quarantine identity or classification is unknown", nil)
+		if state.VolumeID != volumeID || (state.Reason == "" && state.Classification == "") || !validQuarantineObservation(state.FailureCount, state.FirstObservedAt, state.LastObservedAt, state.ExpiresAt) {
+			return attachmentEvidenceUnavailable("volume quarantine identity or classification is unknown", nil)
 		}
 		if state.ExpiresAt.After(time.Now().UTC()) {
-			return status.Error(codes.FailedPrecondition, "Ceph same-node retention is blocked by volume quarantine")
+			return status.Error(codes.FailedPrecondition, "attachment change is blocked by volume quarantine")
 		}
 	}
 	// RefreshVolume's legacy decoder skips malformed entries. Read and validate
@@ -320,29 +323,47 @@ func (s *ControllerServer) attachmentProtectionChecks(ctx context.Context, volum
 	manager := s.driver.hostArtifactQuarantine
 	cm, err := manager.runtime.GetConfigMap(ctx, manager.namespace, hostArtifactStateConfigMapName)
 	if err != nil && !apierrors.IsNotFound(err) {
-		return cephRetentionUnavailable("host artifact quarantine lookup failed", err)
+		return attachmentEvidenceUnavailable("host artifact quarantine lookup failed", err)
 	}
+	targetKeys := hostArtifactTargetQuarantineKeys(target)
 	if err == nil {
 		for key, raw := range cm.Data {
 			var state HostArtifactQuarantineState
 			if decodeErr := decodeCephRetentionProtection(raw, &state); decodeErr != nil {
-				return cephRetentionUnavailable("host artifact quarantine is malformed", decodeErr)
+				return attachmentEvidenceUnavailable("host artifact quarantine is malformed", decodeErr)
 			}
-			target := opennebula.HostArtifactAttachmentTarget{VMID: state.VMID, NodeName: state.NodeName, DiskID: state.DiskID}
-			expectedKey := firstNonEmpty(target.Key(), state.VolumeID)
+			recordTarget := opennebula.HostArtifactAttachmentTarget{VMID: state.VMID, NodeName: state.NodeName, DiskID: state.DiskID}
+			expectedKey := firstNonEmpty(recordTarget.Key(), state.VolumeID)
 			if state.Key != key || state.Key != expectedKey || strings.TrimSpace(state.VolumeID) == "" ||
-				state.ExpiresAt.IsZero() || state.FailureCount <= 0 {
-				return cephRetentionUnavailable("host artifact quarantine identity or expiry is unknown", nil)
+				!validQuarantineObservation(state.FailureCount, state.FirstObservedAt, state.LastObservedAt, state.ExpiresAt) {
+				return attachmentEvidenceUnavailable("host artifact quarantine identity or expiry is unknown", nil)
 			}
-			if state.ImageID > 0 && imageID > 0 && (state.VolumeID == volumeID) != (state.ImageID == imageID) {
-				return cephRetentionUnavailable("host artifact quarantine contradicts volume ownership", nil)
+			if state.ImageID > 0 && target.ImageID > 0 && (state.VolumeID == volumeID) != (state.ImageID == target.ImageID) {
+				return attachmentEvidenceUnavailable("host artifact quarantine contradicts volume ownership", nil)
 			}
-			if state.VolumeID == volumeID && state.ExpiresAt.After(time.Now().UTC()) {
-				return status.Error(codes.FailedPrecondition, "Ceph same-node retention is blocked by host artifact quarantine")
+			if state.ExpiresAt.After(time.Now().UTC()) && (state.VolumeID == volumeID || slices.Contains(targetKeys, key)) {
+				return status.Error(codes.FailedPrecondition, "attachment change is blocked by host artifact quarantine")
 			}
 		}
 	}
 	return nil
+}
+
+func attachmentEvidenceUnavailable(message string, err error) error {
+	if err != nil {
+		klog.V(2).InfoS("Attachment authority read failed", "check", message, "err", err)
+	}
+	return status.Error(codes.Unavailable, message)
+}
+
+func validQuarantineObservation(count int, first, last, expiry time.Time) bool {
+	if count <= 0 {
+		return false
+	}
+	if expiry.IsZero() {
+		return !first.IsZero() && !last.Before(first)
+	}
+	return true
 }
 
 // Unknown future fields are not evidence of an expired protection record.

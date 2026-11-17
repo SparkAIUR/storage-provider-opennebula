@@ -30,13 +30,29 @@ const cephRestartVolume = "pvc-ceph-restart"
 
 type cephRetentionTestProvider struct {
 	*MockOpenNebulaVolumeProviderTestify
-	observe     func(context.Context) (*opennebula.SameNodeRetentionEvidence, error)
-	inspections atomic.Int32
+	observe          func(context.Context) (*opennebula.SameNodeRetentionEvidence, error)
+	inspections      atomic.Int32
+	attachmentAbsent atomic.Bool
 }
 
 func (p *cephRetentionTestProvider) InspectSameNodeRetention(ctx context.Context, volume, node string) (*opennebula.SameNodeRetentionEvidence, error) {
 	p.inspections.Add(1)
 	return p.observe(ctx)
+}
+
+func (p *cephRetentionTestProvider) GetVolumeInNode(ctx context.Context, imageID, nodeID int) (string, error) {
+	if p.attachmentAbsent.Load() {
+		return "", opennebula.ErrAttachmentNotFound
+	}
+	return p.MockOpenNebulaVolumeProviderTestify.GetVolumeInNode(ctx, imageID, nodeID)
+}
+
+func (p *cephRetentionTestProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, authorize opennebula.DetachAuthorization) (bool, error) {
+	if err := authorize(ctx, 3137, 575, 1); err != nil {
+		return false, err
+	}
+	err := p.DetachVolume(ctx, volume, node)
+	return err == nil, err
 }
 
 type cephRestartTestFixture struct {
@@ -376,23 +392,36 @@ func TestControllerUnpublishCephRejectsUnknownProtectionReads(t *testing.T) {
 
 func TestControllerUnpublishCephOrdinaryDetachAfterDemandDisappears(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		t.Run(fmt.Sprintf("queued=%v", queued), func(t *testing.T) {
-			f := newCephRestartTestFixture(t, queued)
-			response, err := f.unpublish(t)
-			require.NoError(t, err)
-			require.NotNil(t, response)
-			f.requireNoProviderMutation(t)
-			// Losing demand must make ordinary detach eligible again; retention is not a
-			// sticky hold or a fabricated claim that the backend disk disappeared.
-			require.NoError(t, f.server.driver.kubeRuntime.client.CoreV1().Pods(f.pod.Namespace).Delete(context.Background(), f.pod.Name, metav1.DeleteOptions{}))
-			f.detach.Return(nil)
-			response, err = f.unpublish(t)
-			require.NoError(t, err)
-			require.NotNil(t, response)
-			f.provider.AssertNumberOfCalls(t, "DetachVolume", 1)
-			history, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
-			require.False(t, history.LastSafeDetachTime.IsZero(), "physical detach now has independent completion evidence")
-		})
+		for _, detach := range []bool{false, true} {
+			t.Run(fmt.Sprintf("queued=%v/confirmed=%v", queued, detach), func(t *testing.T) {
+				f := newCephRestartTestFixture(t, queued)
+				ctx := context.Background()
+				response, err := f.unpublish(t)
+				require.NoError(t, err)
+				require.NotNil(t, response)
+				f.requireNoProviderMutation(t)
+				f.pod.Status.Phase = corev1.PodSucceeded
+				_, err = f.server.driver.kubeRuntime.client.CoreV1().Pods(f.pod.Namespace).Update(ctx, f.pod, metav1.UpdateOptions{})
+				require.NoError(t, err)
+				f.detach.Return(nil).Run(func(mock.Arguments) {
+					if detach {
+						f.provider.attachmentAbsent.Store(true)
+					}
+				})
+				response, err = f.unpublish(t)
+				f.provider.AssertNumberOfCalls(t, "DetachVolume", 1)
+				history, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
+				if detach {
+					require.NoError(t, err)
+					require.NotNil(t, response)
+					require.False(t, history.LastSafeDetachTime.IsZero())
+				} else {
+					require.Equal(t, codes.Unavailable, status.Code(err))
+					require.Nil(t, response)
+					require.True(t, history.LastSafeDetachTime.IsZero())
+				}
+			})
+		}
 	}
 }
 
@@ -486,7 +515,7 @@ func TestCephRetentionSurvivesControllerRestartAndOrphanCleanup(t *testing.T) {
 			base.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{{VolumeHandle: cephRestartVolume, ImageID: 3137, NodeName: "node-a", NodeID: 575, DiskID: 1, Backend: "ceph"}}, nil).Twice()
 			base.On("VolumeExists", mock.Anything, cephRestartVolume).Return(3137, 1024*1024*1024, nil)
 			base.On("NodeExists", mock.Anything, "node-a").Return(575, nil)
-			physical := &cleanupReadbackProvider{MockOpenNebulaVolumeProviderTestify: base, attached: true}
+			physical := &cleanupReadbackProvider{MockOpenNebulaVolumeProviderTestify: base, attached: true, imageID: 3137, vmID: 575, diskID: 1}
 			base.On("DetachVolume", mock.Anything, cephRestartVolume, "node-a").Run(func(mock.Arguments) { physical.attached = false }).Return(nil).Once()
 			server := NewControllerServer(driver, physical, nil)
 			if queued {
@@ -591,11 +620,26 @@ func TestControllerUnpublishCephPreservesKnownExpiredQuarantine(t *testing.T) {
 
 func TestControllerUnpublishCephCurrentBindingRetainsPinnedSameImage(t *testing.T) {
 	f := newCephRestartTestFixture(t, true)
-	// History has an image/node pin and PV/PVC names, not a historical PV UID.
-	// A current intentional same-image static rebind is valid when all available
-	// claim/VA/provider assertions still agree; we do not invent former UID proof.
-	f.pv.UID = "current-same-name-pv"
-	f.syncObjects(t)
+	ctx := context.Background()
+	client := f.server.driver.kubeRuntime.client
+	require.NoError(t, client.CoreV1().PersistentVolumes().Delete(ctx, f.pv.Name, metav1.DeleteOptions{}))
+	require.NoError(t, client.CoreV1().PersistentVolumeClaims(f.pvc.Namespace).Delete(ctx, f.pvc.Name, metav1.DeleteOptions{}))
+	f.pv.Name, f.pv.UID = "rebound-pv", "rebound-pv-uid"
+	f.pvc.Name, f.pvc.UID = "rebound-pvc", "rebound-pvc-uid"
+	f.pv.Spec.ClaimRef.Name, f.pv.Spec.ClaimRef.UID = f.pvc.Name, f.pvc.UID
+	f.pvc.Spec.VolumeName = f.pv.Name
+	_, err := client.CoreV1().PersistentVolumes().Create(ctx, f.pv, metav1.CreateOptions{})
+	require.NoError(t, err)
+	_, err = client.CoreV1().PersistentVolumeClaims(f.pvc.Namespace).Create(ctx, f.pvc, metav1.CreateOptions{})
+	require.NoError(t, err)
+	f.pod.Spec.Volumes[0].PersistentVolumeClaim.ClaimName = f.pvc.Name
+	_, err = client.CoreV1().Pods(f.pod.Namespace).Update(ctx, f.pod, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	f.va.Status.AttachmentMetadata[paramPVName] = f.pv.Name
+	f.va.Status.AttachmentMetadata[paramPVCName] = f.pvc.Name
+	f.va.Spec.Source.PersistentVolumeName = &f.pv.Name
+	_, err = client.StorageV1().VolumeAttachments().Update(ctx, f.va, metav1.UpdateOptions{})
+	require.NoError(t, err)
 	response, err := f.unpublish(t)
 	require.NoError(t, err)
 	require.NotNil(t, response)

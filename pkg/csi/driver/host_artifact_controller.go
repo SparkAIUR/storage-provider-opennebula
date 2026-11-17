@@ -82,12 +82,11 @@ func (s *ControllerServer) activeHostArtifactQuarantineForTarget(ctx context.Con
 }
 
 func hostArtifactTargetQuarantineKeys(target opennebula.HostArtifactAttachmentTarget) []string {
-	candidates := []string{target.Key()}
-	if target.VMID > 0 && target.DiskID > 0 {
-		candidates = append(candidates, fmt.Sprintf("vm-%d", target.VMID))
-	}
-	if node := strings.TrimSpace(target.NodeName); node != "" && target.DiskID > 0 {
-		candidates = append(candidates, fmt.Sprintf("node-%s", node))
+	candidates := []string{
+		target.Key(),
+		(opennebula.HostArtifactAttachmentTarget{VMID: target.VMID}).Key(),
+		(opennebula.HostArtifactAttachmentTarget{NodeName: target.NodeName}).Key(),
+		(opennebula.HostArtifactAttachmentTarget{NodeName: target.NodeName, DiskID: target.DiskID}).Key(),
 	}
 	seen := map[string]struct{}{}
 	keys := make([]string, 0, len(candidates))

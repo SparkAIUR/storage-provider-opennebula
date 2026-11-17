@@ -57,7 +57,7 @@ func TestAttachmentReconcilerDetachesOrphanAttachment(t *testing.T) {
 	}}, nil).Once()
 	mockProvider.On("NodeExists", mock.Anything, "node-a").Return(101, nil)
 
-	physical := &cleanupReadbackProvider{MockOpenNebulaVolumeProviderTestify: mockProvider, attached: true}
+	physical := &cleanupReadbackProvider{MockOpenNebulaVolumeProviderTestify: mockProvider, attached: true, imageID: 1, vmID: 101, diskID: 0}
 	mockProvider.On("DetachVolume", mock.Anything, "vol-1", "node-a").Run(func(mock.Arguments) { physical.attached = false }).Return(nil).Once()
 	mockProvider.On("ResolveVolumeSizeBytes", mock.Anything, "vol-1").Return(int64(1024), nil).Once()
 

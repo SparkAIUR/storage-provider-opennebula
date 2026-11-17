@@ -281,7 +281,9 @@ func (s *ControllerServer) evaluateVolumeDetachDecision(ctx context.Context, dec
 		return decision.with(VolumeReconcilePause, queueReasonRecoveryModeObserve, codes.Unavailable, "physical detach is blocked by recovery controls")
 	}
 	if s.driver != nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
-		if err := s.attachmentProtectionChecks(ctx, evidence.VolumeID, evidence.RuntimeCtx, evidence.OpenNebulaImageID); err != nil {
+		if err := s.attachmentProtectionChecks(ctx, evidence.VolumeID, evidence.RuntimeCtx, opennebula.HostArtifactAttachmentTarget{
+			NodeName: evidence.NodeID, VMID: evidence.OpenNebulaNodeID, ImageID: evidence.OpenNebulaImageID,
+		}); err != nil {
 			return decision.with(VolumeReconcilePause, "detach_protection_blocked", status.Code(err), err.Error())
 		}
 		desiredState, desiredErr := s.driver.kubeRuntime.DesiredNodeForVolume(ctx, evidence.VolumeID)

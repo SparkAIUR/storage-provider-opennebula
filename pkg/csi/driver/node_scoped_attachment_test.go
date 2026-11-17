@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 type nodeAttachmentProtocol struct {
@@ -289,7 +290,7 @@ func TestProviderRequestedVMCapacityWaitsForCompletion(t *testing.T) {
 }
 
 func TestControllerDetachRechecksReleaseAtProviderAttempt(t *testing.T) {
-	for _, mode := range []string{"first-attempt", "retry", "released-retry", "remote-readers"} {
+	for _, mode := range []string{"first-attempt", "retry", "late-observe", "released-retry", "remote-readers"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			accessMode := corev1.ReadWriteOnce
@@ -312,6 +313,9 @@ func TestControllerDetachRechecksReleaseAtProviderAttempt(t *testing.T) {
 				case "one.image.info":
 					imageReads++
 					inject = mode == "first-attempt" && imageReads == 6
+					if mode == "late-observe" && imageReads == 6 {
+						enableObserveOnConfigMapRead(t, driver.kubeRuntime.client.(*fake.Clientset), pvc, 1)
+					}
 				case "one.vm.detach":
 					detachCalls++
 					inject = mode == "retry" && detachCalls == 1
@@ -331,7 +335,7 @@ func TestControllerDetachRechecksReleaseAtProviderAttempt(t *testing.T) {
 			state.mu.Lock()
 			defer state.mu.Unlock()
 			switch mode {
-			case "first-attempt", "retry":
+			case "first-attempt", "retry", "late-observe":
 				require.Error(t, err)
 				require.Nil(t, resp)
 				require.Equal(t, 256, state.disks[41])

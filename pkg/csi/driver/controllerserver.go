@@ -1181,6 +1181,17 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	if s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
 		recoveryRuntimeCtx, recoveryRuntimeErr = s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId)
 	}
+	ceph := isCephBackend(s.currentVolumeHistory(req.VolumeId).Backend) ||
+		isCephBackend(runtimeCtxField(recoveryRuntimeCtx, func(v *VolumeRuntimeContext) string { return v.Backend }))
+	if !ceph {
+		if rescued, response, rescueErr := s.rescueSameNodeUnpublish(ctx, req, volumeID, nodeID); rescued {
+			return response, rescueErr
+		}
+		if held, response, holdErr := s.startMaintenanceDetachHold(ctx, req); held {
+			return response, holdErr
+		}
+	}
+
 	recoveryControl, recoveryErr := s.recoveryControlState(ctx, req.VolumeId, recoveryRuntimeCtx)
 	if recoveryErr != nil {
 		return nil, recoveryErr
@@ -1197,18 +1208,9 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 
-	ceph := isCephBackend(s.currentVolumeHistory(req.VolumeId).Backend) ||
-		isCephBackend(runtimeCtxField(recoveryRuntimeCtx, func(v *VolumeRuntimeContext) string { return v.Backend }))
-	if rescued, response, rescueErr := s.rescueCephSameNodeUnpublish(ctx, req, volumeID, nodeID, recoveryRuntimeCtx, recoveryRuntimeErr); rescued {
-		return response, rescueErr
-	}
-
-	if !ceph {
-		if rescued, response, rescueErr := s.rescueSameNodeUnpublish(ctx, req, volumeID, nodeID); rescued {
+	if ceph {
+		if rescued, response, rescueErr := s.rescueCephSameNodeUnpublish(ctx, req, volumeID, nodeID, recoveryRuntimeCtx, recoveryRuntimeErr); rescued {
 			return response, rescueErr
-		}
-		if held, response, holdErr := s.startMaintenanceDetachHold(ctx, req); held {
-			return response, holdErr
 		}
 	}
 
@@ -1265,6 +1267,11 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 			klog.V(0).ErrorS(err, "Failed to detach volume",
 				"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId)
 			return status.Errorf(codes.Internal, "failed to detach volume: %v", err)
+		}
+		if ceph {
+			if _, err := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
+				return attachmentEvidenceUnavailable("Ceph detach completion is unverified", err)
+			}
 		}
 		s.clearHotplugGuardState(queueCtx, req.NodeId)
 		s.recordSafeDetach(queueCtx, req.VolumeId, req.NodeId)

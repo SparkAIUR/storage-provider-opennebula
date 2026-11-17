@@ -1275,20 +1275,11 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 		runtimeCtx, _ := runtime.ResolveVolumeRuntimeContext(ctx, pv.Spec.CSI.VolumeHandle)
 		if runtimeCtx != nil {
 			if attached != nil {
-				if _, conflict := conflicts[pv.Name]; !conflict {
-					projection := *runtimeCtx
-					projection.PVAnnotations = cloneStringMap(runtimeCtx.PVAnnotations)
-					delete(projection.PVAnnotations, annotationLastAttachedNode)
-					node := maintenanceLastNodeForVolume(ctx, driver, &projection, pv.Spec.CSI.VolumeHandle)
-					if node == "" {
-						node = validatedMaintenanceLastNodeCandidate(ctx, driver, runtimeCtx, attached[pv.Name], "attached-node")
+				if node, _ := driver.maintenanceMode.projectMaintenanceNode(ctx, &pv, runtimeCtx, attached, conflicts, nil); node != "" {
+					if runtimeCtx.PVAnnotations == nil {
+						runtimeCtx.PVAnnotations = map[string]string{}
 					}
-					if node != "" {
-						if runtimeCtx.PVAnnotations == nil {
-							runtimeCtx.PVAnnotations = map[string]string{}
-						}
-						runtimeCtx.PVAnnotations[annotationLastAttachedNode] = node
-					}
+					runtimeCtx.PVAnnotations[annotationLastAttachedNode] = node
 				}
 			}
 

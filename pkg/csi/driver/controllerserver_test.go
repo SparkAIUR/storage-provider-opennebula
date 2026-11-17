@@ -1850,7 +1850,7 @@ func TestControllerUnpublishVolumeStartsStickyDetachGraceForOptedInLocalPVC(t *t
 }
 
 func TestControllerUnpublishVolumeStartsMaintenanceHold(t *testing.T) {
-	pv, pvc := newLocalPVAndPVC("vol-maint-hold", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv, pvc := newLocalPVAndPVC("vol-maint-hold", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationRecoveryMode: recoveryModeManual})
 	driver := newStickyTestDriver(t, pv, pvc)
 	driver.PluginConfig.OverrideVal(config.MaintenanceReleaseMaxSecondsVar, 1200)
 	driver.maintenanceMode = NewMaintenanceModeManager(driver, "default")
@@ -1873,6 +1873,7 @@ func TestControllerUnpublishVolumeStartsMaintenanceHold(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, maintenanceStickyReason, state.Reason)
 	assert.Equal(t, "node-1", state.NodeID)
+	require.True(t, cs.currentVolumeHistory("vol-maint-hold").LastSafeDetachTime.IsZero())
 	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, "vol-maint-hold", "node-1")
 	mockProvider.AssertExpectations(t)
 }
@@ -2299,7 +2300,7 @@ func TestControllerPublishVolumeBlocksCrossNodeWhenOldNodeHotplugStuck(t *testin
 }
 
 func TestControllerUnpublishVolumeRescuesSameNodeDesiredVolume(t *testing.T) {
-	pv, pvc := newLocalPVAndPVC("vol-rescue", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv, pvc := newLocalPVAndPVC("vol-rescue", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationRecoveryMode: recoveryModeManual})
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "pod-rescue", Namespace: "default"},
 		Spec: corev1.PodSpec{
@@ -2327,6 +2328,7 @@ func TestControllerUnpublishVolumeRescuesSameNodeDesiredVolume(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NotNil(t, resp)
+	require.True(t, cs.currentVolumeHistory("vol-rescue").LastSafeDetachTime.IsZero())
 	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
 	mockProvider.AssertExpectations(t)
 }

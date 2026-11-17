@@ -271,7 +271,13 @@ func TestSupportBundleProjectsLiveMaintenanceAttachmentWithoutWrites(t *testing.
 	va := &storagev1.VolumeAttachment{ObjectMeta: metav1.ObjectMeta{Name: "va-live", UID: "va-live-uid"}, Spec: storagev1.VolumeAttachmentSpec{Attacher: DefaultDriverName, NodeName: node.Name, Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name}}, Status: storagev1.VolumeAttachmentStatus{Attached: true}}
 	maintenance := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: hotplugStateConfigMapName, Namespace: namespaceFromServiceAccount()}, Data: map[string]string{maintenanceModeKey: "true"}}
 	secondPV, secondPVC := newLocalPVAndPVC("vol-diagnostics-second", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
-	client := fake.NewSimpleClientset(pv, pvc, secondPV, secondPVC, node, va, maintenance)
+	secondPV.Annotations[annotationPreferredNode] = "invalid-explicit"
+	secondPV.Annotations[annotationPreferredLastNode] = "legacy-node"
+	legacy := newReadyNode("legacy-node", true)
+	secondVA := va.DeepCopy()
+	secondVA.Name = "va-second"
+	secondVA.Spec.Source.PersistentVolumeName = &secondPV.Name
+	client := fake.NewSimpleClientset(pv, pvc, secondPV, secondPVC, node, legacy, va, secondVA, maintenance)
 	censuses := 0
 	client.PrependReactor("list", "volumeattachments", func(ktesting.Action) (bool, kruntime.Object, error) {
 		censuses++
@@ -287,6 +293,8 @@ func TestSupportBundleProjectsLiveMaintenanceAttachmentWithoutWrites(t *testing.
 	history, _, _, demand, protection := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, []corev1.PersistentVolume{*pv, *secondPV})
 	require.Equal(t, 1, censuses)
 	require.Len(t, demand, 2)
+	require.Equal(t, legacy.Name, history["vol-diagnostics-second"].LastSuccessfulNodeName)
+	require.Equal(t, legacy.Name, protection["vol-diagnostics-second"].RequiredNode)
 	require.Equal(t, node.Name, history["vol-live-diagnostics"].LastSuccessfulNodeName)
 	require.True(t, history["vol-live-diagnostics"].Bootstrapped)
 	require.Equal(t, node.Name, protection["vol-live-diagnostics"].RequiredNode)

@@ -307,49 +307,54 @@ func (m *MaintenanceModeManager) preferredMaintenanceNode(ctx context.Context, p
 	if pv == nil {
 		return "", false
 	}
-	if _, ok := conflicts[pv.Name]; ok {
-		return "", true
-	}
 	var pvc *corev1.PersistentVolumeClaim
 	if m != nil && m.runtime != nil && m.runtime.enabled && pv.Spec.ClaimRef != nil && strings.TrimSpace(pv.Spec.ClaimRef.Namespace) != "" && strings.TrimSpace(pv.Spec.ClaimRef.Name) != "" {
 		if resolved, err := m.runtime.client.CoreV1().PersistentVolumeClaims(pv.Spec.ClaimRef.Namespace).Get(ctx, pv.Spec.ClaimRef.Name, metav1.GetOptions{}); err == nil {
 			pvc = resolved
 		}
 	}
-	runtimeCtx := volumeRuntimeContextFromPVAndPVC(pv, pvc)
+	return m.projectMaintenanceNode(ctx, pv, volumeRuntimeContextFromPVAndPVC(pv, pvc), attachedByPV, conflicts, func(message string) {
+		m.emitMaintenanceHintIgnored(ctx, pv, message)
+	})
+}
+
+func (m *MaintenanceModeManager) projectMaintenanceNode(ctx context.Context, pv *corev1.PersistentVolume, runtimeCtx *VolumeRuntimeContext, attachedByPV map[string]string, conflicts map[string]struct{}, warn func(string)) (string, bool) {
+	if _, conflict := conflicts[pv.Name]; conflict {
+		return "", true
+	}
 	explicitPlacement := explicitNodePlacementForRuntimeContext(runtimeCtx)
-	if explicitPlacement.RequiredNodeParseError != nil {
-		m.emitMaintenanceHintIgnored(ctx, pv, explicitPlacement.RequiredNodeParseError.Error())
+	if explicitPlacement.RequiredNodeParseError != nil && warn != nil {
+		warn(explicitPlacement.RequiredNodeParseError.Error())
 	}
 	if explicitPlacement.RequiredNodeParseError == nil && explicitPlacement.RequiredNode != "" && !explicitPlacement.RequiredNodeExpired {
-		if node := m.validatedMaintenanceCandidate(ctx, pv, runtimeCtx, explicitPlacement.RequiredNode, "required-node", explicitPlacement.RequiredNodeSource); node != "" {
+		if node := m.validatedMaintenanceCandidate(ctx, runtimeCtx, explicitPlacement.RequiredNode, "required-node", explicitPlacement.RequiredNodeSource, warn); node != "" {
 			return node, false
 		}
 	}
 	if explicitPlacement.PreferredNode != "" && explicitPlacement.PreferredNodeSource != placementSourceLegacyPreferredLastNode {
-		if node := m.validatedMaintenanceCandidate(ctx, pv, runtimeCtx, explicitPlacement.PreferredNode, "preferred-node", explicitPlacement.PreferredNodeSource); node != "" {
+		if node := m.validatedMaintenanceCandidate(ctx, runtimeCtx, explicitPlacement.PreferredNode, "preferred-node", explicitPlacement.PreferredNodeSource, warn); node != "" {
 			return node, false
 		}
 	}
-	if explicitPlacement.LegacyPreferredNode != "" {
-		if node := m.validatedMaintenanceCandidate(ctx, pv, runtimeCtx, explicitPlacement.LegacyPreferredNode, "preferred-last-node", placementSourceLegacyPreferredLastNode); node != "" {
+	if legacy := annotationValue(runtimeCtx, annotationPreferredLastNode, "pv"); legacy != "" {
+		if node := m.validatedMaintenanceCandidate(ctx, runtimeCtx, legacy, "preferred-last-node", placementSourceLegacyPreferredLastNode, warn); node != "" {
 			return node, false
 		}
 	}
 	if pv.Spec.CSI != nil && m != nil && m.driver != nil && m.driver.stickyAttachments != nil {
 		if state, ok := m.driver.stickyAttachments.Get(pv.Spec.CSI.VolumeHandle); ok && strings.TrimSpace(state.NodeID) != "" {
-			if node := m.validatedMaintenanceCandidate(ctx, pv, runtimeCtx, strings.TrimSpace(state.NodeID), "sticky-attachment-node", protectionSourceStickyReuse); node != "" {
+			if node := m.validatedMaintenanceCandidate(ctx, runtimeCtx, strings.TrimSpace(state.NodeID), "sticky-attachment-node", protectionSourceStickyReuse, warn); node != "" {
 				return node, false
 			}
 		}
 	}
 	if attached := strings.TrimSpace(attachedByPV[pv.Name]); attached != "" {
-		if node := m.validatedMaintenanceCandidate(ctx, pv, runtimeCtx, attached, "attached-node", "live_attachment"); node != "" {
+		if node := m.validatedMaintenanceCandidate(ctx, runtimeCtx, attached, "attached-node", "live_attachment", warn); node != "" {
 			return node, false
 		}
 	}
 	if pv.Annotations != nil {
-		if node := m.validatedMaintenanceCandidate(ctx, pv, runtimeCtx, strings.TrimSpace(pv.Annotations[annotationLastAttachedNode]), "last-attached-node", placementSourceLastAttachedNode); node != "" {
+		if node := m.validatedMaintenanceCandidate(ctx, runtimeCtx, strings.TrimSpace(pv.Annotations[annotationLastAttachedNode]), "last-attached-node", placementSourceLastAttachedNode, warn); node != "" {
 			return node, false
 		}
 	}
@@ -465,7 +470,7 @@ func maintenanceStickyGraceSeconds(cfg config.CSIPluginConfig) int {
 	return seconds
 }
 
-func (m *MaintenanceModeManager) validatedMaintenanceCandidate(ctx context.Context, pv *corev1.PersistentVolume, runtimeCtx *VolumeRuntimeContext, nodeName, targetKind, source string) string {
+func (m *MaintenanceModeManager) validatedMaintenanceCandidate(ctx context.Context, runtimeCtx *VolumeRuntimeContext, nodeName, targetKind, source string, warn func(string)) string {
 	nodeName = strings.TrimSpace(nodeName)
 	if nodeName == "" {
 		return ""
@@ -477,7 +482,9 @@ func (m *MaintenanceModeManager) validatedMaintenanceCandidate(ctx context.Conte
 	if validation.Valid() {
 		return nodeName
 	}
-	m.emitMaintenanceHintIgnored(ctx, pv, maintenanceHintWarning(source, validation))
+	if warn != nil {
+		warn(maintenanceHintWarning(source, validation))
+	}
 	return ""
 }
 
