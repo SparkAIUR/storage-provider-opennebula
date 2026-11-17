@@ -130,6 +130,24 @@ type VolumeLookupInspector interface {
 	InspectVolumeLookup(ctx context.Context, volume string, requestedNode string) (*VolumeLookupResult, error)
 }
 
+// SameNodeRetentionEvidence is a positive, read-only observation of one stable
+// persistent Ceph disk owned by the requested VM. Missing or uncertain facts do
+// not produce evidence. Kubernetes demand and identity must be checked by the
+// caller separately before retaining an attachment.
+type SameNodeRetentionEvidence struct {
+	VolumeID     string
+	ImageID      int
+	NodeID       int
+	DiskID       int
+	Target       string
+	DeviceSerial string
+	SizeBytes    int64
+}
+
+type SameNodeRetentionInspector interface {
+	InspectSameNodeRetention(ctx context.Context, volume string, node string) (*SameNodeRetentionEvidence, error)
+}
+
 type HotplugCooldownState struct {
 	Node                 string
 	Operation            string

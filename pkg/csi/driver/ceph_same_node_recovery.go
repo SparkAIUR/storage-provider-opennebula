@@ -1,0 +1,355 @@
+package driver
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+)
+
+// cephRetentionAuthority contains only identity and authority facts that must
+// remain unchanged across the two bounded provider/Kubernetes observations.
+// Resource versions and node heartbeats are deliberately not authority tokens.
+type cephRetentionAuthority struct {
+	PVName, PVCNamespace, PVCName, VAName string
+	PVUID, PVCUID, NodeUID, VAUID         types.UID
+	Capacity                              int64
+	ConsumerUIDs                          []string
+	History                               VolumeHistoryRecord
+	AttachmentMetadata                    map[string]string
+}
+
+func cephRetentionUnavailable(message string, err error) error {
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "cannot safely retain Ceph attachment: %s: %v", message, err)
+	}
+	return status.Errorf(codes.Unavailable, "cannot safely retain Ceph attachment: %s", message)
+}
+
+// rescueCephSameNodeUnpublish completes only logical deletion of a stale VA.
+// The disk stays owned by the same VM; no physical detach is asserted or recorded.
+// This is separate from local-only maintenance and sticky-grace eligibility.
+func (s *ControllerServer) rescueCephSameNodeUnpublish(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, imageID, nodeID int) (handled bool, response *csi.ControllerUnpublishVolumeResponse, resultErr error) {
+	defer func() {
+		if handled && ctx.Err() != nil {
+			response = nil
+			resultErr = status.FromContextError(ctx.Err()).Err()
+		}
+	}()
+	if s == nil || s.driver == nil || req == nil || s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
+		return false, nil, nil
+	}
+	runtimeCtx, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId)
+	if err != nil {
+		if strings.EqualFold(s.currentVolumeHistory(req.VolumeId).Backend, "ceph") {
+			return true, nil, cephRetentionUnavailable("volume runtime lookup failed", err)
+		}
+		return false, nil, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(runtimeCtx.Backend), "ceph") {
+		return false, nil, nil
+	}
+	if s.driver.operationLocks == nil {
+		return true, nil, cephRetentionUnavailable("operation locks are unavailable", nil)
+	}
+	nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(req.NodeId))
+	defer nodeRelease()
+	release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
+	defer release()
+	if err := ctx.Err(); err != nil {
+		return true, nil, status.FromContextError(err).Err()
+	}
+	desired, err := s.driver.kubeRuntime.DesiredNodeForVolume(ctx, req.VolumeId)
+	if err != nil {
+		return true, nil, cephRetentionUnavailable("desired-node lookup failed", err)
+	}
+	if desired.MultipleNodes {
+		return true, nil, cephRetentionUnavailable("volume has consumers on multiple nodes", nil)
+	}
+	if !desired.Desired || desired.NodeName != req.NodeId {
+		return false, nil, nil
+	}
+	if desired.DemandSource != volumeDemandSourceActivePod {
+		return true, nil, cephRetentionUnavailable("current active Pod demand is unverified", nil)
+	}
+	if enabled, known := s.driver.PluginConfig.GetBool(config.StuckAttachmentReconcilerEnabledVar); known && !enabled {
+		return true, nil, status.Error(codes.FailedPrecondition, "Ceph same-node retention requires the attachment reconciler for durable orphan cleanup")
+	}
+	first, err := s.cephRetentionAuthority(ctx, req, runtimeCtx)
+	if err != nil {
+		return true, nil, err
+	}
+	inspector, ok := s.volumeProvider.(opennebula.SameNodeRetentionInspector)
+	if !ok {
+		return true, nil, cephRetentionUnavailable("provider cannot verify stable same-node retention", nil)
+	}
+	firstDisk, err := inspector.InspectSameNodeRetention(ctx, req.VolumeId, req.NodeId)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return true, nil, status.FromContextError(ctxErr).Err()
+	}
+	if err != nil {
+		return true, nil, cephRetentionUnavailable("provider observation failed", err)
+	}
+	if err := validateCephRetentionDisk(req, imageID, nodeID, first, firstDisk); err != nil {
+		return true, nil, err
+	}
+	// A second owner census and fresh VM observation bounds external changes;
+	// controller locks serialize our own operations but are not provider fencing.
+	firstObservation := *firstDisk
+	lastDisk, err := inspector.InspectSameNodeRetention(ctx, req.VolumeId, req.NodeId)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return true, nil, status.FromContextError(ctxErr).Err()
+	}
+	if err != nil {
+		return true, nil, cephRetentionUnavailable("provider recheck failed", err)
+	}
+	if lastDisk == nil || firstObservation != *lastDisk {
+		return true, nil, cephRetentionUnavailable("provider identity or capacity changed during retention checks", nil)
+	}
+	lastRuntime, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId)
+	if err != nil {
+		return true, nil, cephRetentionUnavailable("final volume runtime lookup failed", err)
+	}
+	last, err := s.cephRetentionAuthority(ctx, req, lastRuntime)
+	if err != nil {
+		return true, nil, err
+	}
+	if !reflect.DeepEqual(first, last) {
+		return true, nil, cephRetentionUnavailable("Kubernetes identity or demand changed during retention checks", nil)
+	}
+	if err := ctx.Err(); err != nil {
+		return true, nil, status.FromContextError(err).Err()
+	}
+	s.driver.metrics.RecordSameNodeRestartReuse("disk")
+	s.recordPVCEventFromRuntimeContext(ctx, lastRuntime, eventReasonSameNodeDetachRescued, fmt.Sprintf("retained Ceph RWO volume %s on node %s while completing deletion of VolumeAttachment %s; two bounded ownership observations agree on image %d VM %d disk %d", req.VolumeId, req.NodeId, last.VAName, lastDisk.ImageID, lastDisk.NodeID, lastDisk.DiskID))
+	return true, &csi.ControllerUnpublishVolumeResponse{}, nil
+}
+
+func validateCephRetentionDisk(req *csi.ControllerUnpublishVolumeRequest, imageID, nodeID int, authority *cephRetentionAuthority, disk *opennebula.SameNodeRetentionEvidence) error {
+	if disk == nil || disk.VolumeID != req.VolumeId || disk.ImageID != imageID || disk.NodeID != nodeID || disk.DiskID < 0 || disk.Target == "" || disk.DeviceSerial == "" || disk.SizeBytes != authority.Capacity {
+		return cephRetentionUnavailable("provider proof does not match the bound volume, VM or capacity", nil)
+	}
+	if raw, present := authority.AttachmentMetadata[publishContextOpenNebulaImageID]; present {
+		attachedImageID, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || attachedImageID <= 0 || attachedImageID != disk.ImageID {
+			return cephRetentionUnavailable("VolumeAttachment image identity contradicts the pinned image", nil)
+		}
+	}
+	for key, expected := range map[string]string{
+		publishContextDeviceSerial: disk.DeviceSerial,
+		paramPVName:                authority.PVName,
+		paramPVCName:               authority.PVCName,
+		paramPVCNamespace:          authority.PVCNamespace,
+	} {
+		if observed, present := authority.AttachmentMetadata[key]; present && strings.TrimSpace(observed) != expected {
+			return cephRetentionUnavailable("VolumeAttachment metadata contradicts the current device or claim identity", nil)
+		}
+	}
+	if target, present := authority.AttachmentMetadata["volumeName"]; present && strings.TrimPrefix(strings.TrimSpace(target), "/dev/") != disk.Target {
+		return cephRetentionUnavailable("VolumeAttachment target contradicts the current device", nil)
+	}
+	history := authority.History
+	if history.LastSuccessfulImageID != disk.ImageID || history.LastSuccessfulNodeName != req.NodeId || history.LastSuccessfulNodeUID != string(authority.NodeUID) {
+		return cephRetentionUnavailable("observed volume history does not match image and node identity", nil)
+	}
+	if (history.PVName != "" && history.PVName != authority.PVName) ||
+		(history.PVCName != "" && history.PVCName != authority.PVCName) ||
+		(history.PVCNamespace != "" && history.PVCNamespace != authority.PVCNamespace) {
+		return cephRetentionUnavailable("observed history contradicts the current PV or PVC binding", nil)
+	}
+	if (history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != disk.NodeID) || (history.LastSuccessfulDiskID > 0 && history.LastSuccessfulDiskID != disk.DiskID) || (history.LastSuccessfulTarget != "" && history.LastSuccessfulTarget != disk.Target) || (history.LastSuccessfulDeviceSerial != "" && history.LastSuccessfulDeviceSerial != disk.DeviceSerial) {
+		return cephRetentionUnavailable("current device identity contradicts observed history", nil)
+	}
+	if disk.DeviceSerial != fmt.Sprintf("onecsi-%d", disk.ImageID) {
+		return cephRetentionUnavailable("device serial does not identify the pinned image", nil)
+	}
+	return nil
+}
+
+func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, runtimeCtx *VolumeRuntimeContext) (*cephRetentionAuthority, error) {
+	if runtimeCtx == nil || !strings.EqualFold(strings.TrimSpace(runtimeCtx.Backend), "ceph") {
+		return nil, cephRetentionUnavailable("Ceph backend identity changed", nil)
+	}
+	runtime := s.driver.kubeRuntime
+	pv, err := runtime.client.CoreV1().PersistentVolumes().Get(ctx, runtimeCtx.PVName, metav1.GetOptions{})
+	if err != nil {
+		return nil, cephRetentionUnavailable("PV lookup failed", err)
+	}
+	if pv.UID == "" || pv.DeletionTimestamp != nil || pv.Status.Phase != corev1.VolumeBound || pv.Spec.CSI == nil || pv.Spec.CSI.Driver != s.driver.name || pv.Spec.CSI.VolumeHandle != req.VolumeId || pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.UID == "" || !strings.EqualFold(strings.TrimSpace(pv.Annotations[annotationBackend]), "ceph") {
+		return nil, cephRetentionUnavailable("bound PV identity is incomplete or inconsistent", nil)
+	}
+	pvc, err := runtime.client.CoreV1().PersistentVolumeClaims(pv.Spec.ClaimRef.Namespace).Get(ctx, pv.Spec.ClaimRef.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, cephRetentionUnavailable("PVC lookup failed", err)
+	}
+	if pvc.UID != pv.Spec.ClaimRef.UID || pvc.UID == "" || pvc.DeletionTimestamp != nil || pvc.Status.Phase != corev1.ClaimBound || pvc.Spec.VolumeName != pv.Name {
+		return nil, cephRetentionUnavailable("bound PVC identity changed or is incomplete", nil)
+	}
+	if !hasSingleWriterAccessMode(pv.Spec.AccessModes) || !hasSingleWriterAccessMode(pvc.Spec.AccessModes) || len(pv.Spec.AccessModes) != 1 || len(pvc.Spec.AccessModes) != 1 || pv.Spec.AccessModes[0] != pvc.Spec.AccessModes[0] {
+		return nil, status.Error(codes.FailedPrecondition, "Ceph same-node retention requires matching RWO or RWOP access modes")
+	}
+	capacity := pv.Spec.Capacity.Storage().Value()
+	if capacity <= 0 || pvc.Status.Capacity.Storage().Value() != capacity || pvc.Spec.Resources.Requests.Storage().Value() != capacity || len(pvc.Status.Conditions) > 0 || len(pvc.Status.AllocatedResourceStatuses) > 0 {
+		return nil, cephRetentionUnavailable("PVC capacity is pending or inconsistent", nil)
+	}
+	identity, err := runtime.NodeIdentity(ctx, req.NodeId)
+	if err != nil {
+		return nil, cephRetentionUnavailable("node identity lookup failed", err)
+	}
+	if !identity.Exists || !identity.Ready || identity.UID == "" {
+		return nil, cephRetentionUnavailable("node identity is unknown or not Ready", nil)
+	}
+	authority := &cephRetentionAuthority{PVName: pv.Name, PVUID: pv.UID, PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVCUID: pvc.UID, NodeUID: types.UID(identity.UID), Capacity: capacity}
+	vas, err := runtime.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, cephRetentionUnavailable("VolumeAttachment lookup failed", err)
+	}
+	for _, va := range vas.Items {
+		if va.Spec.Source.PersistentVolumeName == nil || *va.Spec.Source.PersistentVolumeName != pv.Name {
+			continue
+		}
+		if authority.VAName != "" || va.Spec.Attacher != s.driver.name || va.Spec.NodeName != req.NodeId || va.UID == "" || va.DeletionTimestamp == nil || !va.Status.Attached {
+			return nil, cephRetentionUnavailable("deleting VolumeAttachment ownership is ambiguous or unverified", nil)
+		}
+		authority.VAName = va.Name
+		authority.VAUID = va.UID
+		authority.AttachmentMetadata = cloneStringMap(va.Status.AttachmentMetadata)
+	}
+	if authority.VAName == "" {
+		return nil, cephRetentionUnavailable("owned deleting VolumeAttachment was not observed", nil)
+	}
+	pods, err := runtime.client.CoreV1().Pods(pvc.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, cephRetentionUnavailable("current Pod demand lookup failed", err)
+	}
+	for _, pod := range pods.Items {
+		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		for _, volume := range pod.Spec.Volumes {
+			if volume.PersistentVolumeClaim == nil || volume.PersistentVolumeClaim.ClaimName != pvc.Name {
+				continue
+			}
+			if pod.UID == "" || pod.Spec.NodeName != req.NodeId {
+				return nil, cephRetentionUnavailable("current Pod demand is ambiguous or cross-node", nil)
+			}
+			authority.ConsumerUIDs = append(authority.ConsumerUIDs, string(pod.UID))
+			break
+		}
+	}
+	if len(authority.ConsumerUIDs) == 0 {
+		return nil, cephRetentionUnavailable("current same-node Pod demand disappeared", nil)
+	}
+	if pv.Spec.AccessModes[0] == corev1.ReadWriteOncePod && len(authority.ConsumerUIDs) != 1 {
+		return nil, cephRetentionUnavailable("RWOP volume has multiple consumers", nil)
+	}
+	sort.Strings(authority.ConsumerUIDs)
+	currentRuntime := &VolumeRuntimeContext{PVName: pv.Name, PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVAnnotations: cloneStringMap(pv.Annotations), PVCAnnotations: cloneStringMap(pvc.Annotations), Backend: "ceph", AccessModes: append([]corev1.PersistentVolumeAccessMode(nil), pv.Spec.AccessModes...)}
+	control := resolvedRecoveryControlState(req.VolumeId, currentRuntime, VolumeRecoveryControlState{})
+	if control.Invalid || control.Active() {
+		return nil, status.Error(codes.FailedPrecondition, "Ceph same-node retention is blocked by active or invalid recovery controls")
+	}
+	if err := s.cephRetentionProtectionChecks(ctx, req.VolumeId, currentRuntime); err != nil {
+		return nil, err
+	}
+	if s.driver.volumeHistory == nil {
+		return nil, cephRetentionUnavailable("volume history is unavailable", nil)
+	}
+	if err := s.driver.volumeHistory.RefreshEntry(ctx, req.VolumeId); err != nil {
+		return nil, cephRetentionUnavailable("volume history refresh failed", err)
+	}
+	history, ok := s.driver.volumeHistory.Get(req.VolumeId)
+	if !ok {
+		return nil, cephRetentionUnavailable("observed volume history is unavailable", nil)
+	}
+	authority.History = history
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	return authority, nil
+}
+
+func (s *ControllerServer) cephRetentionProtectionChecks(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext) error {
+	if s.driver.volumeRepairState == nil || s.driver.volumeQuarantine == nil || s.driver.hostArtifactQuarantine == nil {
+		return cephRetentionUnavailable("protection state managers are unavailable", nil)
+	}
+	if err := s.rejectIfActiveRepairState(ctx, volumeID, runtimeCtx); err != nil {
+		return err
+	}
+	quarantine := s.driver.volumeQuarantine
+	volumeCM, err := quarantine.runtime.GetConfigMap(ctx, quarantine.namespace, volumeQuarantineStateConfigMapName)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return cephRetentionUnavailable("volume quarantine lookup failed", err)
+	}
+	var rawVolumeQuarantine string
+	var volumeQuarantinePresent bool
+	if err == nil {
+		rawVolumeQuarantine, volumeQuarantinePresent = volumeCM.Data[volumeID]
+	}
+	if volumeQuarantinePresent {
+		var state VolumeQuarantineState
+		if decodeErr := decodeCephRetentionProtection(rawVolumeQuarantine, &state); decodeErr != nil {
+			return cephRetentionUnavailable("volume quarantine is malformed", decodeErr)
+		}
+		if state.VolumeID != volumeID || (state.Reason == "" && state.Classification == "") || state.FailureCount <= 0 || state.ExpiresAt.IsZero() {
+			return cephRetentionUnavailable("volume quarantine identity or classification is unknown", nil)
+		}
+		if state.ExpiresAt.After(time.Now().UTC()) {
+			return status.Error(codes.FailedPrecondition, "Ceph same-node retention is blocked by volume quarantine")
+		}
+	}
+	// RefreshVolume's legacy decoder skips malformed entries. Read and validate
+	// this safety boundary directly so corrupt or unreadable state cannot permit ACK.
+	manager := s.driver.hostArtifactQuarantine
+	cm, err := manager.runtime.GetConfigMap(ctx, manager.namespace, hostArtifactStateConfigMapName)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return cephRetentionUnavailable("host artifact quarantine lookup failed", err)
+	}
+	if err == nil {
+		for _, raw := range cm.Data {
+			var state HostArtifactQuarantineState
+			if decodeErr := decodeCephRetentionProtection(raw, &state); decodeErr != nil {
+				return cephRetentionUnavailable("host artifact quarantine is malformed", decodeErr)
+			}
+			if strings.TrimSpace(state.VolumeID) == "" || state.ExpiresAt.IsZero() {
+				return cephRetentionUnavailable("host artifact quarantine owner or expiry is unknown", nil)
+			}
+			if state.VolumeID == volumeID && (state.ExpiresAt.IsZero() || state.ExpiresAt.After(time.Now().UTC())) {
+				return status.Error(codes.FailedPrecondition, "Ceph same-node retention is blocked by host artifact quarantine")
+			}
+		}
+	}
+	return nil
+}
+
+// Unknown future fields are not evidence of an expired protection record.
+func decodeCephRetentionProtection(raw string, target any) error {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("protection record contains trailing JSON")
+	}
+	return nil
+}

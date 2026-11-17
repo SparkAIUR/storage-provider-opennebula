@@ -1206,6 +1206,10 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 
+	if rescued, response, rescueErr := s.rescueCephSameNodeUnpublish(ctx, req, volumeID, nodeID); rescued {
+		return response, rescueErr
+	}
+
 	if cooldown, ok := s.hotplugCooldownState(ctx, req.NodeId); ok {
 		s.driver.metrics.RecordHotplugGuard("detach", "vm_cooldown", "rejected")
 		message := s.formatHotplugGuardMessage(cooldown)

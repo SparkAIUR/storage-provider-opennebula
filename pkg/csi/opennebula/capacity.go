@@ -34,6 +34,12 @@ func (p *PersistentDiskVolumeProvider) completedDiskSize(ctx context.Context, vm
 	if err != nil {
 		return 0, err
 	}
+	return completedDiskSizeFromVM(info, diskID, imageID)
+}
+
+// completedDiskSizeFromVM keeps completion checks on the same VM observation
+// as the identity checks made by read-only attachment inspectors.
+func completedDiskSizeFromVM(info *vm.VM, diskID, imageID int) (int64, error) {
 	state, lcm, err := info.State()
 	if err != nil {
 		return 0, err
@@ -61,7 +67,7 @@ func (p *PersistentDiskVolumeProvider) completedDiskSize(ctx context.Context, vm
 		}
 		return diskSizeBytesFromTemplate(disk)
 	}
-	return 0, fmt.Errorf("resize identity changed: image %d vm %d disk %d", imageID, vmID, diskID)
+	return 0, fmt.Errorf("resize identity changed: image %d vm %d disk %d", imageID, info.ID, diskID)
 }
 
 func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, id int, size int64) error {

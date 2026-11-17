@@ -1,0 +1,625 @@
+package driver
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
+)
+
+const cephRestartVolume = "pvc-ceph-restart"
+
+type cephRetentionTestProvider struct {
+	*MockOpenNebulaVolumeProviderTestify
+	observe     func(context.Context) (*opennebula.SameNodeRetentionEvidence, error)
+	inspections atomic.Int32
+}
+
+func (p *cephRetentionTestProvider) InspectSameNodeRetention(ctx context.Context, volume, node string) (*opennebula.SameNodeRetentionEvidence, error) {
+	p.inspections.Add(1)
+	return p.observe(ctx)
+}
+
+type cephRestartTestFixture struct {
+	server   *ControllerServer
+	provider *cephRetentionTestProvider
+	pv       *corev1.PersistentVolume
+	pvc      *corev1.PersistentVolumeClaim
+	pod      *corev1.Pod
+	node     *corev1.Node
+	va       *storagev1.VolumeAttachment
+	detach   *mock.Call
+}
+
+func newCephRestartTestFixture(t *testing.T, queued bool) *cephRestartTestFixture {
+	t.Helper()
+	pv, pvc := newLocalPVAndPVC(cephRestartVolume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph", annotationDatastoreID: "124"})
+	pv.UID = types.UID("pv-owned")
+	pvc.UID = types.UID("pvc-owned")
+	pv.Spec.ClaimRef.UID = pvc.UID
+	pv.Spec.Capacity = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}
+	pv.Status.Phase = corev1.VolumeBound
+	pvc.Spec.VolumeName = pv.Name
+	pvc.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+	pvc.Spec.Resources.Requests = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}
+	pvc.Status.Phase = corev1.ClaimBound
+	pvc.Status.Capacity = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}
+	pod := activePodForPVC("replacement", pvc.Name, "node-a")
+	pod.UID = types.UID("replacement-owned")
+	pod.Status.Phase = corev1.PodPending
+	node := newReadyNode("node-a", true)
+	node.UID = types.UID("node-owned")
+	deletedAt := metav1.NewTime(time.Now().UTC().Add(-time.Minute))
+	va := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "va-ceph-restart", UID: types.UID("va-owned"), DeletionTimestamp: &deletedAt, Finalizers: []string{"external-attacher/" + DefaultDriverName}},
+		Spec:       storagev1.VolumeAttachmentSpec{Attacher: DefaultDriverName, NodeName: "node-a", Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name}},
+		Status:     storagev1.VolumeAttachmentStatus{Attached: true, AttachmentMetadata: map[string]string{publishContextOpenNebulaImageID: "3137", publishContextDeviceSerial: "onecsi-3137", "volumeName": "vdb", paramPVName: pv.Name, paramPVCName: pvc.Name, paramPVCNamespace: pvc.Namespace}},
+	}
+	driver := newStickyTestDriver(t, pv, pvc, pod, node, va)
+	_, err := driver.volumeHistory.Upsert(context.Background(), cephRestartVolume, func(record *VolumeHistoryRecord) {
+		record.Backend = "ceph"
+		record.PVName = pv.Name
+		record.PVCName = pvc.Name
+		record.PVCNamespace = pvc.Namespace
+		record.LastSuccessfulImageID = 3137
+		record.LastSuccessfulNodeName = node.Name
+		record.LastSuccessfulNodeUID = string(node.UID)
+		record.LastSuccessfulDeviceSerial = "onecsi-3137"
+	})
+	require.NoError(t, err)
+	base := new(MockOpenNebulaVolumeProviderTestify)
+	detach := base.On("DetachVolume", mock.Anything, mock.Anything, mock.Anything).Return(errors.New("unexpected physical detach")).Maybe()
+	base.On("VolumeExists", mock.Anything, cephRestartVolume).Return(3137, 1024*1024*1024, nil)
+	base.On("NodeExists", mock.Anything, "node-a").Return(575, nil)
+	base.On("GetVolumeInNode", mock.Anything, 3137, 575).Return("vdb", nil)
+	base.On("InspectVolumeLookup", mock.Anything, cephRestartVolume, "node-a").Return(&opennebula.VolumeLookupResult{
+		Status: opennebula.VolumeLookupPresent, VolumeHandle: cephRestartVolume, ImageID: 3137, SizeBytes: 1024 * 1024 * 1024, RequestedNode: "node-a", RequestedNodeID: 575,
+		AttachmentMetadata: &opennebula.VolumeAttachmentMetadata{VolumeHandle: cephRestartVolume, ImageID: 3137, ImageName: cephRestartVolume, ImageState: "USED_PERS", ImageRunningVMs: 1, ImageVMIDs: []int{575}, RequestedNode: "node-a", RequestedNodeID: 575, AttachedToRequestedNode: true, DiskRecords: []opennebula.VolumeDiskRecord{{NodeName: "node-a", NodeID: 575, DiskID: 1, Target: "vdb", Serial: "onecsi-3137"}}},
+	}, nil)
+	provider := &cephRetentionTestProvider{MockOpenNebulaVolumeProviderTestify: base, observe: func(context.Context) (*opennebula.SameNodeRetentionEvidence, error) {
+		return validCephRetentionTestEvidence(), nil
+	}}
+	server := NewControllerServer(driver, provider, nil)
+	if queued {
+		driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+		driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+	}
+	return &cephRestartTestFixture{server: server, provider: provider, pv: pv, pvc: pvc, pod: pod, node: node, va: va, detach: detach}
+}
+
+func validCephRetentionTestEvidence() *opennebula.SameNodeRetentionEvidence {
+	return &opennebula.SameNodeRetentionEvidence{VolumeID: cephRestartVolume, ImageID: 3137, NodeID: 575, DiskID: 1, Target: "vdb", DeviceSerial: "onecsi-3137", SizeBytes: 1024 * 1024 * 1024}
+}
+
+func (f *cephRestartTestFixture) syncObjects(t *testing.T) {
+	t.Helper()
+	client := f.server.driver.kubeRuntime.client
+	_, err := client.CoreV1().PersistentVolumes().Update(context.Background(), f.pv, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	_, err = client.CoreV1().PersistentVolumeClaims(f.pvc.Namespace).Update(context.Background(), f.pvc, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	_, err = client.CoreV1().Nodes().Update(context.Background(), f.node, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	_, err = client.StorageV1().VolumeAttachments().Update(context.Background(), f.va, metav1.UpdateOptions{})
+	require.NoError(t, err)
+}
+
+func (f *cephRestartTestFixture) unpublish(t *testing.T) (*csi.ControllerUnpublishVolumeResponse, error) {
+	t.Helper()
+	client := reviewControllerClient(t, f.server)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: cephRestartVolume, NodeId: "node-a"})
+}
+
+func (f *cephRestartTestFixture) requireNoProviderMutation(t *testing.T) {
+	t.Helper()
+	f.provider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+	f.provider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	f.provider.AssertNotCalled(t, "RestoreVolumeCapacity", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	f.provider.AssertNotCalled(t, "ExpandVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	f.provider.AssertNotCalled(t, "DeleteVolume", mock.Anything, mock.Anything)
+}
+
+// This reproduces the hplsvc overlap: Pending replacement, deleting attached VA,
+// and positive same-VM disk evidence. Pending is not proof that a disk is unmounted.
+func TestControllerUnpublishCephDeletingAttachmentSameNode(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queued=%v", queued), func(t *testing.T) {
+			f := newCephRestartTestFixture(t, queued)
+			before, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
+			response, err := f.unpublish(t)
+			require.NoError(t, err, "same-node deleting Ceph VA must complete logically without detaching the desired disk")
+			require.NotNil(t, response)
+			f.requireNoProviderMutation(t)
+			require.Positive(t, f.provider.inspections.Load(), "success must consume positive typed provider proof")
+			after, ok := f.server.driver.volumeHistory.Get(cephRestartVolume)
+			require.True(t, ok)
+			require.Equal(t, before, after, "physical retention must preserve history and LastSafeDetachTime")
+		})
+	}
+}
+
+func TestControllerUnpublishCephRejectsUnverifiedRetention(t *testing.T) {
+	cases := map[string]func(*testing.T, *cephRestartTestFixture){
+		"missing PV UID": func(t *testing.T, f *cephRestartTestFixture) { f.pv.UID = "" },
+		"VA image pin contradicts current PV": func(t *testing.T, f *cephRestartTestFixture) {
+			f.va.Status.AttachmentMetadata[publishContextOpenNebulaImageID] = "3138"
+		},
+		"VA serial contradicts current disk": func(t *testing.T, f *cephRestartTestFixture) {
+			f.va.Status.AttachmentMetadata[publishContextDeviceSerial] = "onecsi-3138"
+		},
+		"VA target contradicts current disk": func(t *testing.T, f *cephRestartTestFixture) { f.va.Status.AttachmentMetadata["volumeName"] = "vdc" },
+		"VA claim metadata contradicts current PVC": func(t *testing.T, f *cephRestartTestFixture) {
+			f.va.Status.AttachmentMetadata[paramPVCName] = "different-claim"
+		},
+		"same name replaced PV and contradictory VA pin": func(t *testing.T, f *cephRestartTestFixture) {
+			f.pv.UID = "replaced-before-first-read"
+			f.va.Status.AttachmentMetadata[publishContextOpenNebulaImageID] = "3138"
+		},
+		"durable cleanup disabled": func(t *testing.T, f *cephRestartTestFixture) {
+			f.server.driver.PluginConfig.OverrideVal(config.StuckAttachmentReconcilerEnabledVar, false)
+		},
+		"repair state active": func(t *testing.T, f *cephRestartTestFixture) {
+			_, err := f.server.driver.volumeRepairState.Mark(context.Background(), VolumeRepairState{VolumeID: cephRestartVolume, Classification: "metadata_drift"})
+			require.NoError(t, err)
+		},
+		"host quarantine active": func(t *testing.T, f *cephRestartTestFixture) {
+			_, active, err := f.server.driver.hostArtifactQuarantine.MarkFailure(context.Background(), HostArtifactQuarantineState{Key: cephRestartVolume + "@host", VolumeID: cephRestartVolume}, 1, time.Hour)
+			require.NoError(t, err)
+			require.True(t, active)
+		},
+		"multiple desired nodes": func(t *testing.T, f *cephRestartTestFixture) {
+			other := activePodForPVC("other", f.pvc.Name, "node-b")
+			other.UID = "other-consumer"
+			_, err := f.server.driver.kubeRuntime.client.CoreV1().Pods(f.pvc.Namespace).Create(context.Background(), other, metav1.CreateOptions{})
+			require.NoError(t, err)
+		},
+		"unknown provider": func(t *testing.T, f *cephRestartTestFixture) {
+			f.provider.observe = func(context.Context) (*opennebula.SameNodeRetentionEvidence, error) {
+				return nil, errors.New("owner census unavailable")
+			}
+		},
+		"missing provider proof": func(t *testing.T, f *cephRestartTestFixture) {
+			f.provider.observe = func(context.Context) (*opennebula.SameNodeRetentionEvidence, error) { return nil, nil }
+		},
+		"changed image identity": func(t *testing.T, f *cephRestartTestFixture) {
+			f.provider.observe = func(context.Context) (*opennebula.SameNodeRetentionEvidence, error) {
+				e := validCephRetentionTestEvidence()
+				e.ImageID++
+				return e, nil
+			}
+		},
+		"changed VM identity": func(t *testing.T, f *cephRestartTestFixture) {
+			f.provider.observe = func(context.Context) (*opennebula.SameNodeRetentionEvidence, error) {
+				e := validCephRetentionTestEvidence()
+				e.NodeID++
+				return e, nil
+			}
+		},
+		"changed device serial": func(t *testing.T, f *cephRestartTestFixture) {
+			f.provider.observe = func(context.Context) (*opennebula.SameNodeRetentionEvidence, error) {
+				e := validCephRetentionTestEvidence()
+				e.DeviceSerial = "other-device"
+				return e, nil
+			}
+		},
+		"capacity disagreement": func(t *testing.T, f *cephRestartTestFixture) {
+			f.provider.observe = func(context.Context) (*opennebula.SameNodeRetentionEvidence, error) {
+				e := validCephRetentionTestEvidence()
+				e.SizeBytes *= 2
+				return e, nil
+			}
+		},
+		"pending PVC expansion": func(t *testing.T, f *cephRestartTestFixture) {
+			f.pvc.Spec.Resources.Requests[corev1.ResourceStorage] = resource.MustParse("2Gi")
+		},
+		"PV claim UID changed": func(t *testing.T, f *cephRestartTestFixture) { f.pv.Spec.ClaimRef.UID = "other-pvc" },
+		"node UID changed":     func(t *testing.T, f *cephRestartTestFixture) { f.node.UID = "replacement-node" },
+		"node not Ready": func(t *testing.T, f *cephRestartTestFixture) {
+			f.node.Status.Conditions[0].Status = corev1.ConditionFalse
+		},
+		"unsupported multiwriter access": func(t *testing.T, f *cephRestartTestFixture) {
+			f.pv.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+			f.pvc.Spec.AccessModes = f.pv.Spec.AccessModes
+		},
+		"different attacher owns VA": func(t *testing.T, f *cephRestartTestFixture) { f.va.Spec.Attacher = "other.driver" },
+		"VA not deleting":            func(t *testing.T, f *cephRestartTestFixture) { f.va.DeletionTimestamp = nil },
+		"observe recovery active": func(t *testing.T, f *cephRestartTestFixture) {
+			f.pvc.Annotations[annotationRecoveryMode] = recoveryModeObserve
+		},
+		"volume quarantine active": func(t *testing.T, f *cephRestartTestFixture) {
+			_, active, err := f.server.driver.volumeQuarantine.MarkFailure(context.Background(), VolumeQuarantineState{VolumeID: cephRestartVolume, Reason: "metadata_drift", Classification: "metadata_drift"}, 1, time.Hour)
+			require.NoError(t, err)
+			require.True(t, active)
+		},
+		"API PV lookup unknown": func(t *testing.T, f *cephRestartTestFixture) {
+			f.server.driver.kubeRuntime.client.(*fake.Clientset).PrependReactor("get", "persistentvolumes", func(ktesting.Action) (bool, kruntime.Object, error) { return true, nil, errors.New("API unavailable") })
+		},
+	}
+	for _, queued := range []bool{false, true} {
+		for name, setup := range cases {
+			t.Run(fmt.Sprintf("queued=%v/%s", queued, name), func(t *testing.T) {
+				f := newCephRestartTestFixture(t, queued)
+				setup(t, f)
+				f.syncObjects(t)
+				response, err := f.unpublish(t)
+				require.Error(t, err, "uncertain/ineligible Ceph overlap must not fall through to permissive no-queue ACK")
+				require.Nil(t, response)
+				require.Contains(t, []codes.Code{codes.Unavailable, codes.FailedPrecondition}, status.Code(err))
+				f.requireNoProviderMutation(t)
+				history, ok := f.server.driver.volumeHistory.Get(cephRestartVolume)
+				require.True(t, ok)
+				require.True(t, history.LastSafeDetachTime.IsZero(), "denial cannot record physical detach")
+			})
+		}
+	}
+}
+
+func TestControllerUnpublishCephRechecksLateAuthorityChanges(t *testing.T) {
+	changes := map[string]func(context.Context, *cephRestartTestFixture) error{
+		"PV UID": func(ctx context.Context, f *cephRestartTestFixture) error {
+			f.pv.UID = "replaced-pv"
+			_, err := f.server.driver.kubeRuntime.client.CoreV1().PersistentVolumes().Update(ctx, f.pv, metav1.UpdateOptions{})
+			return err
+		},
+		"PVC UID": func(ctx context.Context, f *cephRestartTestFixture) error {
+			f.pvc.UID = "replaced-pvc"
+			_, err := f.server.driver.kubeRuntime.client.CoreV1().PersistentVolumeClaims(f.pvc.Namespace).Update(ctx, f.pvc, metav1.UpdateOptions{})
+			return err
+		},
+		"VA UID": func(ctx context.Context, f *cephRestartTestFixture) error {
+			f.va.UID = "replaced-va"
+			_, err := f.server.driver.kubeRuntime.client.StorageV1().VolumeAttachments().Update(ctx, f.va, metav1.UpdateOptions{})
+			return err
+		},
+		"Pod demand disappears": func(ctx context.Context, f *cephRestartTestFixture) error {
+			return f.server.driver.kubeRuntime.client.CoreV1().Pods(f.pod.Namespace).Delete(ctx, f.pod.Name, metav1.DeleteOptions{})
+		},
+		"recovery control": func(ctx context.Context, f *cephRestartTestFixture) error {
+			f.pvc.Annotations[annotationRecoveryMode] = recoveryModeManual
+			_, err := f.server.driver.kubeRuntime.client.CoreV1().PersistentVolumeClaims(f.pvc.Namespace).Update(ctx, f.pvc, metav1.UpdateOptions{})
+			return err
+		},
+		"quarantine": func(ctx context.Context, f *cephRestartTestFixture) error {
+			_, _, err := f.server.driver.volumeQuarantine.MarkFailure(ctx, VolumeQuarantineState{VolumeID: cephRestartVolume, Reason: "metadata_drift", Classification: "metadata_drift"}, 1, time.Hour)
+			return err
+		},
+	}
+	for _, queued := range []bool{false, true} {
+		for name, change := range changes {
+			t.Run(fmt.Sprintf("queued=%v/%s", queued, name), func(t *testing.T) {
+				f := newCephRestartTestFixture(t, queued)
+				f.provider.observe = func(ctx context.Context) (*opennebula.SameNodeRetentionEvidence, error) {
+					if f.provider.inspections.Load() == 1 {
+						if err := change(ctx, f); err != nil {
+							return nil, err
+						}
+					}
+					return validCephRetentionTestEvidence(), nil
+				}
+				response, err := f.unpublish(t)
+				require.Error(t, err)
+				require.Nil(t, response)
+				f.requireNoProviderMutation(t)
+				history, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
+				require.True(t, history.LastSafeDetachTime.IsZero())
+			})
+		}
+	}
+}
+
+func TestControllerUnpublishCephRejectsProviderRecheckDrift(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, unknown := range []bool{false, true} {
+			t.Run(fmt.Sprintf("queued=%v/unknown=%v", queued, unknown), func(t *testing.T) {
+				f := newCephRestartTestFixture(t, queued)
+				f.provider.observe = func(context.Context) (*opennebula.SameNodeRetentionEvidence, error) {
+					evidence := validCephRetentionTestEvidence()
+					if f.provider.inspections.Load() > 1 {
+						if unknown {
+							return nil, errors.New("ownership changed or unavailable")
+						}
+						evidence.DiskID++
+					}
+					return evidence, nil
+				}
+				response, err := f.unpublish(t)
+				require.Error(t, err)
+				require.Nil(t, response)
+				require.EqualValues(t, 2, f.provider.inspections.Load())
+				f.requireNoProviderMutation(t)
+			})
+		}
+	}
+}
+
+func TestControllerUnpublishCephRejectsUnknownProtectionReads(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, name := range []string{volumeQuarantineStateConfigMapName, hostArtifactStateConfigMapName, volumeRepairStateConfigMapName} {
+			t.Run(fmt.Sprintf("queued=%v/%s", queued, name), func(t *testing.T) {
+				f := newCephRestartTestFixture(t, queued)
+				f.server.driver.kubeRuntime.client.(*fake.Clientset).PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+					if action.(ktesting.GetAction).GetName() == name {
+						return true, nil, errors.New("protection read unavailable")
+					}
+					return false, nil, nil
+				})
+				response, err := f.unpublish(t)
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.Nil(t, response)
+				f.requireNoProviderMutation(t)
+			})
+		}
+	}
+}
+
+func TestControllerUnpublishCephOrdinaryDetachAfterDemandDisappears(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queued=%v", queued), func(t *testing.T) {
+			f := newCephRestartTestFixture(t, queued)
+			response, err := f.unpublish(t)
+			require.NoError(t, err)
+			require.NotNil(t, response)
+			f.requireNoProviderMutation(t)
+			// Losing demand must make ordinary detach eligible again; retention is not a
+			// sticky hold or a fabricated claim that the backend disk disappeared.
+			require.NoError(t, f.server.driver.kubeRuntime.client.CoreV1().Pods(f.pod.Namespace).Delete(context.Background(), f.pod.Name, metav1.DeleteOptions{}))
+			f.detach.Return(nil)
+			response, err = f.unpublish(t)
+			require.NoError(t, err)
+			require.NotNil(t, response)
+			f.provider.AssertNumberOfCalls(t, "DetachVolume", 1)
+			history, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
+			require.False(t, history.LastSafeDetachTime.IsZero(), "physical detach now has independent completion evidence")
+		})
+	}
+}
+
+func TestControllerUnpublishCephCancellationAfterLockWait(t *testing.T) {
+	f := newCephRestartTestFixture(t, true)
+	release := f.server.driver.operationLocks.Acquire(controllerVolumeLockKey(cephRestartVolume))
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		_, err := f.server.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: cephRestartVolume, NodeId: "node-a"})
+		done <- err
+	}()
+	<-started
+	// Wait for the request to register as a second holder of the volume lock,
+	// proving cancellation happens during the lock wait rather than before RPC.
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	waiting := false
+	for !waiting {
+		locks := f.server.driver.operationLocks
+		locks.mu.Lock()
+		ref := locks.locks[controllerVolumeLockKey(cephRestartVolume)]
+		waiting = ref != nil && ref.refs == 2
+		locks.mu.Unlock()
+		if waiting {
+			break
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline:
+			cancel()
+			release()
+			t.Fatal("request did not reach volume-lock wait")
+		}
+	}
+	cancel()
+	release()
+	select {
+	case err := <-done:
+		require.Equal(t, codes.Canceled, status.Code(err))
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled request did not leave operation lock")
+	}
+	require.Zero(t, f.provider.inspections.Load())
+	f.requireNoProviderMutation(t)
+}
+
+// The explicit operator recovery contract precedes automatic Ceph retention.
+// Its existing bookkeeping is intentionally not redefined by this correction.
+func TestControllerUnpublishCephPreservesExplicitManualRecovery(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queued=%v", queued), func(t *testing.T) {
+			f := newCephRestartTestFixture(t, queued)
+			f.pvc.Annotations[annotationRecoveryMode] = recoveryModeManual
+			f.syncObjects(t)
+			response, err := f.unpublish(t)
+			require.NoError(t, err)
+			require.NotNil(t, response)
+			require.Zero(t, f.provider.inspections.Load(), "explicit manual contract must not invoke automatic retention")
+			f.requireNoProviderMutation(t)
+		})
+	}
+}
+
+func TestCephRetentionSurvivesControllerRestartAndOrphanCleanup(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queued=%v", queued), func(t *testing.T) {
+			f := newCephRestartTestFixture(t, queued)
+			response, err := f.unpublish(t)
+			require.NoError(t, err)
+			require.NotNil(t, response)
+			f.requireNoProviderMutation(t)
+			// External-attacher has consumed the ACK and removed its VA. The replacement
+			// never publishes and its consumer disappears before a new VA is created.
+			oldClient := f.server.driver.kubeRuntime.client
+			require.NoError(t, oldClient.StorageV1().VolumeAttachments().Delete(context.Background(), f.va.Name, metav1.DeleteOptions{}))
+			require.NoError(t, oldClient.CoreV1().Pods(f.pod.Namespace).Delete(context.Background(), f.pod.Name, metav1.DeleteOptions{}))
+			persisted, err := oldClient.CoreV1().ConfigMaps("default").List(context.Background(), metav1.ListOptions{})
+			require.NoError(t, err)
+			objects := []kruntime.Object{f.pv.DeepCopy(), f.pvc.DeepCopy(), f.node.DeepCopy()}
+			for i := range persisted.Items {
+				objects = append(objects, persisted.Items[i].DeepCopy())
+			}
+			// A new runtime/client/managers/controller receives only durable API state;
+			// no in-memory retention record or another Unpublish call is available.
+			driver := newStickyTestDriver(t, objects...)
+			base := new(MockOpenNebulaVolumeProviderTestify)
+			base.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{{VolumeHandle: cephRestartVolume, ImageID: 3137, NodeName: "node-a", NodeID: 575, DiskID: 1, Backend: "ceph"}}, nil).Twice()
+			base.On("VolumeExists", mock.Anything, cephRestartVolume).Return(3137, 1024*1024*1024, nil)
+			base.On("NodeExists", mock.Anything, "node-a").Return(575, nil)
+			base.On("GetVolumeInNode", mock.Anything, 3137, 575).Return("vdb", nil)
+			base.On("DetachVolume", mock.Anything, cephRestartVolume, "node-a").Return(nil).Once()
+			server := NewControllerServer(driver, base, nil)
+			if queued {
+				driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+				driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+			}
+			reconciler := NewAttachmentReconciler(server)
+			reconciler.orphanGrace = time.Nanosecond
+			require.NoError(t, reconciler.ReconcileOnce(context.Background()))
+			base.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+			require.NoError(t, reconciler.ReconcileOnce(context.Background()))
+			base.AssertNumberOfCalls(t, "DetachVolume", 1)
+			base.AssertNotCalled(t, "DeleteVolume", mock.Anything, mock.Anything)
+			base.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+			base.AssertExpectations(t)
+		})
+	}
+}
+
+func TestControllerUnpublishCephDelayedRPCProtectsNewAttachment(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queued=%v", queued), func(t *testing.T) {
+			f := newCephRestartTestFixture(t, queued)
+			response, err := f.unpublish(t)
+			require.NoError(t, err)
+			require.NotNil(t, response)
+			initialInspections := f.provider.inspections.Load()
+			// A new VA is published on the same node. An old RPC must not inherit that
+			// new object's authority merely because image/node names still match.
+			f.va.UID = "new-published-va"
+			f.va.DeletionTimestamp = nil
+			f.syncObjects(t)
+			response, err = f.unpublish(t)
+			require.Equal(t, codes.Unavailable, status.Code(err))
+			require.Nil(t, response)
+			require.Equal(t, initialInspections, f.provider.inspections.Load())
+			f.requireNoProviderMutation(t)
+			history, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
+			require.True(t, history.LastSafeDetachTime.IsZero())
+		})
+	}
+}
+
+func TestControllerUnpublishCephRejectsMalformedProtectionState(t *testing.T) {
+	for _, name := range []string{volumeQuarantineStateConfigMapName, hostArtifactStateConfigMapName} {
+		for _, raw := range []string{"broken", "{}", "", " ", `{"volumeID":"pvc-ceph-restart","classification":"metadata_drift","failureCount":1}`, `{"volumeID":"pvc-ceph-restart","classification":"metadata_drift","failureCount":1,"expiresAt":"2000-01-01T00:00:00Z","futureSchema":true}`} {
+			t.Run(name+"/"+raw, func(t *testing.T) {
+				f := newCephRestartTestFixture(t, true)
+				_, err := f.server.driver.kubeRuntime.client.CoreV1().ConfigMaps("default").Create(context.Background(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"}, Data: map[string]string{cephRestartVolume: raw}}, metav1.CreateOptions{})
+				require.NoError(t, err)
+				response, err := f.unpublish(t)
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.Nil(t, response)
+				f.requireNoProviderMutation(t)
+			})
+		}
+	}
+}
+
+func TestControllerUnpublishCephCancellationDuringFinalAuthorityRead(t *testing.T) {
+	f := newCephRestartTestFixture(t, true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.provider.observe = func(context.Context) (*opennebula.SameNodeRetentionEvidence, error) {
+		if f.provider.inspections.Load() == 2 {
+			f.server.driver.kubeRuntime.client.(*fake.Clientset).PrependReactor("get", "nodes", func(ktesting.Action) (bool, kruntime.Object, error) { cancel(); return true, nil, context.Canceled })
+		}
+		return validCephRetentionTestEvidence(), nil
+	}
+	response, err := f.server.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: cephRestartVolume, NodeId: "node-a"})
+	require.Equal(t, codes.Canceled, status.Code(err))
+	require.Nil(t, response)
+	require.EqualValues(t, 2, f.provider.inspections.Load())
+	f.requireNoProviderMutation(t)
+}
+
+func TestControllerUnpublishCephPreservesKnownExpiredQuarantine(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queued=%v", queued), func(t *testing.T) {
+			f := newCephRestartTestFixture(t, queued)
+			state, _, err := f.server.driver.volumeQuarantine.MarkFailure(context.Background(), VolumeQuarantineState{VolumeID: cephRestartVolume, Reason: "metadata_drift", Classification: "metadata_drift"}, 1, time.Hour)
+			require.NoError(t, err)
+			state.ExpiresAt = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+			raw, err := json.Marshal(state)
+			require.NoError(t, err)
+			client := f.server.driver.kubeRuntime.client
+			cm, err := client.CoreV1().ConfigMaps("default").Get(context.Background(), volumeQuarantineStateConfigMapName, metav1.GetOptions{})
+			require.NoError(t, err)
+			cm.Data[cephRestartVolume] = string(raw)
+			_, err = client.CoreV1().ConfigMaps("default").Update(context.Background(), cm, metav1.UpdateOptions{})
+			require.NoError(t, err)
+			response, err := f.unpublish(t)
+			require.NoError(t, err)
+			require.NotNil(t, response)
+			f.requireNoProviderMutation(t)
+			after, err := client.CoreV1().ConfigMaps("default").Get(context.Background(), volumeQuarantineStateConfigMapName, metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, string(raw), after.Data[cephRestartVolume], "expired receipt is read, never cleared or rewritten")
+		})
+	}
+}
+
+func TestControllerUnpublishCephCurrentBindingRetainsPinnedSameImage(t *testing.T) {
+	f := newCephRestartTestFixture(t, true)
+	// History has an image/node pin and PV/PVC names, not a historical PV UID.
+	// A current intentional same-image static rebind is valid when all available
+	// claim/VA/provider assertions still agree; we do not invent former UID proof.
+	f.pv.UID = "current-same-name-pv"
+	f.syncObjects(t)
+	response, err := f.unpublish(t)
+	require.NoError(t, err)
+	require.NotNil(t, response)
+	f.requireNoProviderMutation(t)
+}
+
+func TestControllerUnpublishCephLegacyVAMetadataNeedsHistoryPin(t *testing.T) {
+	for _, known := range []bool{false, true} {
+		t.Run(fmt.Sprintf("knownHistoryImage=%v", known), func(t *testing.T) {
+			f := newCephRestartTestFixture(t, true)
+			f.va.Status.AttachmentMetadata = nil
+			f.syncObjects(t)
+			if !known {
+				_, err := f.server.driver.volumeHistory.Upsert(context.Background(), cephRestartVolume, func(record *VolumeHistoryRecord) { record.LastSuccessfulImageID = 0 })
+				require.NoError(t, err)
+			}
+			response, err := f.unpublish(t)
+			if known {
+				require.NoError(t, err)
+				require.NotNil(t, response)
+			} else {
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.Nil(t, response)
+			}
+			f.requireNoProviderMutation(t)
+		})
+	}
+}
