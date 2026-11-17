@@ -239,23 +239,32 @@ func TestVerifyAttachmentBackendRequiresPositiveDatastoreAndDiskFacts(t *testing
 	}
 }
 
-func TestDiskInventoryRejectsMalformedImageReference(t *testing.T) {
-	p, mutations := retentionProtocolFixture(t, func(c *retentionProtocolCase) {
-		c.extraDisk = `<DISK><IMAGE_ID>unknown</IMAGE_ID><DISK_ID>3</DISK_ID></DISK>`
-	})
-	ctx := context.Background()
-	disk, err := p.GetVolumeInNode(ctx, 7, 11)
-	require.NoError(t, err)
-	require.Equal(t, "vdb", disk)
-	disk, err = p.GetVolumeInNode(ctx, 8, 11)
-	require.ErrorContains(t, err, "malformed VM disk image identity")
-	require.NotErrorIs(t, err, ErrAttachmentNotFound)
-	require.Empty(t, disk)
-	attachments, _, err := p.ListCurrentAttachments(ctx)
-	require.ErrorContains(t, err, "malformed VM disk image identity")
-	require.Empty(t, attachments)
-	size, err := p.completedDiskSize(ctx, 11, 2, 7)
-	require.NoError(t, err)
-	require.EqualValues(t, 1_073_741_824, size)
-	require.Zero(t, mutations.Load())
+func TestDiskLookupDistinguishesBlankAndMalformedImageReferences(t *testing.T) {
+	for _, imageID := range []string{"", "unknown"} {
+		t.Run(fmt.Sprintf("image-reference=%q", imageID), func(t *testing.T) {
+			p, mutations := retentionProtocolFixture(t, func(c *retentionProtocolCase) {
+				c.extraDisk = fmt.Sprintf(`<DISK><IMAGE_ID>%s</IMAGE_ID><DISK_ID>3</DISK_ID></DISK>`, imageID)
+			})
+			ctx := context.Background()
+			disk, err := p.GetVolumeInNode(ctx, 7, 11)
+			if imageID == "" {
+				require.NoError(t, err)
+				require.Equal(t, "vdb", disk)
+			} else {
+				require.ErrorContains(t, err, "malformed VM disk image identity")
+				require.Empty(t, disk)
+			}
+			disk, err = p.GetVolumeInNode(ctx, 8, 11)
+			require.ErrorContains(t, err, "malformed VM disk image identity")
+			require.NotErrorIs(t, err, ErrAttachmentNotFound)
+			require.Empty(t, disk)
+			attachments, _, err := p.ListCurrentAttachments(ctx)
+			require.ErrorContains(t, err, "malformed VM disk image identity")
+			require.Empty(t, attachments)
+			size, err := p.completedDiskSize(ctx, 11, 2, 7)
+			require.NoError(t, err)
+			require.EqualValues(t, 1_073_741_824, size)
+			require.Zero(t, mutations.Load())
+		})
+	}
 }

@@ -102,7 +102,7 @@ func TestSupportBundleLocalRWOSnapshotMarksBootstrappedHistory(t *testing.T) {
 	client := fake.NewSimpleClientset(pv, pvc, newReadyNode("node-old", true))
 	cfg := config.LoadConfiguration()
 
-	history, _, _, _, _ := collectSupportBundleLocalRWOSnapshot(context.Background(), cfg, client, []corev1.PersistentVolume{*pv})
+	history, _, _, _, _ := collectSupportBundleLocalRWOSnapshot(context.Background(), cfg, client, newInventoryFakeClient(t), []corev1.PersistentVolume{*pv})
 	record, ok := history["vol-support-bootstrap"]
 	if !ok {
 		t.Fatalf("expected bootstrapped support history for volume")
@@ -252,7 +252,7 @@ func TestSupportBundleLocalRWOSnapshotIsReadOnly(t *testing.T) {
 					return true, nil, fmt.Errorf("diagnostics must be read-only")
 				}
 			})
-			history, _, _, demand, protection := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, []corev1.PersistentVolume{*pv})
+			history, _, _, demand, protection := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, newInventoryFakeClient(t), []corev1.PersistentVolume{*pv})
 			require.True(t, history["vol-diagnostics"].Bootstrapped)
 			require.Equal(t, "node-old", history["vol-diagnostics"].LastSuccessfulNodeName)
 			require.Contains(t, demand, "vol-diagnostics")
@@ -290,7 +290,15 @@ func TestSupportBundleProjectsLiveMaintenanceAttachmentWithoutWrites(t *testing.
 		t.Errorf("diagnostics attempted %s %s", action.GetVerb(), action.GetResource().Resource)
 		return true, nil, fmt.Errorf("unexpected diagnostic write")
 	})
-	history, _, _, demand, protection := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, []corev1.PersistentVolume{*pv, *secondPV})
+	inventory := newInventoryFakeClient(t,
+		&inventoryv1alpha1.OpenNebulaNode{ObjectMeta: metav1.ObjectMeta{Name: node.Name}},
+		&inventoryv1alpha1.OpenNebulaNode{ObjectMeta: metav1.ObjectMeta{Name: legacy.Name}},
+		&inventoryv1alpha1.OpenNebulaDatastore{
+			ObjectMeta: metav1.ObjectMeta{Name: "image-datastore"},
+			Status:     inventoryv1alpha1.OpenNebulaDatastoreStatus{ID: 1, Backend: "local"},
+		},
+	)
+	history, _, _, demand, protection := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, inventory, []corev1.PersistentVolume{*pv, *secondPV})
 	require.Equal(t, 1, censuses)
 	require.Len(t, demand, 2)
 	require.Equal(t, node.Name, history["vol-diagnostics-second"].LastSuccessfulNodeName)
@@ -326,7 +334,7 @@ func TestSupportBundlePreservesPodDemandWhenAttachmentListFails(t *testing.T) {
 			return true, nil, fmt.Errorf("diagnostics must be read-only")
 		}
 	})
-	_, _, _, demand, _ := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, []corev1.PersistentVolume{*pv, *idlePV})
+	_, _, _, demand, _ := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, newInventoryFakeClient(t), []corev1.PersistentVolume{*pv, *idlePV})
 	require.Equal(t, 1, attachmentLists)
 	require.Equal(t, "active_pod", demand["vol-active"].DemandSource)
 	require.Equal(t, "node-a", demand["vol-active"].NodeName)

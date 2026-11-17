@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -163,25 +164,28 @@ func TestStorageClassReconcileRenderContract(t *testing.T) {
 					if len(bytes.TrimSpace(raw)) == 0 {
 						continue
 					}
-					var meta struct {
-						metav1.TypeMeta `json:",inline"`
-						Metadata        metav1.ObjectMeta `json:"metadata"`
-					}
+					var meta metav1.TypeMeta
 					require.NoError(t, json.Unmarshal(raw, &meta))
-					if meta.Metadata.Labels["app.kubernetes.io/component"] != "storageclass-reconcile" {
-						continue
-					}
 					switch meta.Kind {
 					case "Job":
 						var job batchv1.Job
 						require.NoError(t, json.Unmarshal(raw, &job))
-						jobs = append(jobs, job)
+						for _, container := range job.Spec.Template.Spec.Containers {
+							argv := append(append([]string(nil), container.Command...), container.Args...)
+							for i, arg := range argv {
+								flag := strings.TrimLeft(arg, "-")
+								if flag == "mode=storageclass-reconcile" || (flag == "mode" && i+1 < len(argv) && argv[i+1] == "storageclass-reconcile") {
+									jobs = append(jobs, job)
+									break
+								}
+							}
+						}
 					case "ConfigMap":
 						var cm corev1.ConfigMap
 						require.NoError(t, json.Unmarshal(raw, &cm))
-						inputs = append(inputs, cm)
-					default:
-						t.Fatalf("unexpected reconcile resource kind %s", meta.Kind)
+						if _, ok := cm.Data["storageclasses.json"]; ok {
+							inputs = append(inputs, cm)
+						}
 					}
 				}
 			}
@@ -209,6 +213,13 @@ func TestStorageClassReconcileRenderContract(t *testing.T) {
 			require.Equal(t, "storageclass-reconcile", *runMode)
 			require.Equal(t, input.Name, opts.ConfigMapName)
 			require.Equal(t, input.Namespace, opts.Namespace)
+			require.Equal(t, "pre-upgrade", job.Annotations["helm.sh/hook"])
+			require.Equal(t, "pre-upgrade", input.Annotations["helm.sh/hook"])
+			jobWeight, err := strconv.Atoi(job.Annotations["helm.sh/hook-weight"])
+			require.NoError(t, err)
+			inputWeight, err := strconv.Atoi(input.Annotations["helm.sh/hook-weight"])
+			require.NoError(t, err)
+			require.Less(t, inputWeight, jobWeight)
 			client := fake.NewSimpleClientset(&input)
 			var result bytes.Buffer
 			require.NoError(t, RunStorageClassReconcile(context.Background(), client, opts, &result))

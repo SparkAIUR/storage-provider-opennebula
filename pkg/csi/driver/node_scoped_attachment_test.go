@@ -37,6 +37,7 @@ type nodeAttachmentProtocol struct {
 	disks             map[int]int
 	vmNames           map[int]string
 	diskSlot          string
+	extraDiskBefore   string
 	marker            int64
 	mutations         []string
 	failMethod        string
@@ -96,7 +97,7 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 					disk = strings.NewReplacer("<LN_TARGET>SYSTEM</LN_TARGET>", "<LN_TARGET>NONE</LN_TARGET>", "<TM_MAD>ssh</TM_MAD>", "<TM_MAD>ceph</TM_MAD>", "<TM_MAD_SYSTEM>ssh</TM_MAD_SYSTEM>", "<TM_MAD_SYSTEM>ceph</TM_MAD_SYSTEM>").Replace(disk)
 				}
 			}
-			return fmt.Sprintf(`<VM><ID>%d</ID><NAME>%s</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE>%s</TEMPLATE><HISTORY_RECORDS><HISTORY><SEQ>0</SEQ><DS_ID>200</DS_ID></HISTORY></HISTORY_RECORDS></VM>`, id, name, disk)
+			return fmt.Sprintf(`<VM><ID>%d</ID><NAME>%s</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE>%s</TEMPLATE><HISTORY_RECORDS><HISTORY><SEQ>0</SEQ><DS_ID>200</DS_ID></HISTORY></HISTORY_RECORDS></VM>`, id, name, state.extraDiskBefore+disk)
 		}
 		imageXML := func() string {
 			ids := ""
@@ -550,13 +551,13 @@ func (p *detachCensusProbe) InspectVolumeAttachment(ctx context.Context, volume,
 	return p.PersistentDiskVolumeProvider.InspectVolumeAttachment(ctx, volume, node)
 }
 
-func (p *detachCensusProbe) DetachVolumeWithAuthority(ctx context.Context, volume, node, expectedBackend string, verifyOwner opennebula.DetachOwnerCheck, authorize opennebula.DetachAuthorization) (bool, error) {
+func (p *detachCensusProbe) DetachVolumeWithAuthority(ctx context.Context, volume, node string, expectedVMID int, expectedBackend string, verifyOwner opennebula.DetachOwnerCheck, authorize opennebula.DetachAuthorization) (bool, error) {
 	if p.beforeDetach != nil {
 		p.beforeDetach()
 	}
 	p.inDetach.Store(true)
 	defer p.inDetach.Store(false)
-	return p.PersistentDiskVolumeProvider.DetachVolumeWithAuthority(ctx, volume, node, expectedBackend, verifyOwner, authorize)
+	return p.PersistentDiskVolumeProvider.DetachVolumeWithAuthority(ctx, volume, node, expectedVMID, expectedBackend, verifyOwner, authorize)
 }
 
 func TestCephBackgroundDetachUsesFreshSoleOwnerAndRelease(t *testing.T) {
@@ -713,9 +714,9 @@ type disappearingDetachProvider struct {
 	disappear func()
 }
 
-func (p disappearingDetachProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node, expectedBackend string, verifyOwner opennebula.DetachOwnerCheck, authorize opennebula.DetachAuthorization) (bool, error) {
+func (p disappearingDetachProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, expectedVMID int, expectedBackend string, verifyOwner opennebula.DetachOwnerCheck, authorize opennebula.DetachAuthorization) (bool, error) {
 	p.disappear()
-	return p.PersistentDiskVolumeProvider.DetachVolumeWithAuthority(ctx, volume, node, expectedBackend, verifyOwner, authorize)
+	return p.PersistentDiskVolumeProvider.DetachVolumeWithAuthority(ctx, volume, node, expectedVMID, expectedBackend, verifyOwner, authorize)
 }
 
 func TestAttachmentReconcilerDistinguishesProviderNoOp(t *testing.T) {
@@ -794,7 +795,7 @@ func TestProviderDetachRetryRespectsHotplugDeadline(t *testing.T) {
 	protocol.rejectFirstDetach = true
 	protocol.mu.Unlock()
 	authorizations := 0
-	accepted, err := provider.DetachVolumeWithAuthority(ctx, "volume-test", "node-old", "", nil, func(attempt context.Context, _, _, _ int) error {
+	accepted, err := provider.DetachVolumeWithAuthority(ctx, "volume-test", "node-old", 41, "", nil, func(attempt context.Context, _, _, _ int) error {
 		authorizations++
 		if authorizations == 2 {
 			select {
@@ -1136,7 +1137,7 @@ func TestProviderDetachPreservesParentCancellationDuringPollAndRetry(t *testing.
 			protocol.rejectFirstDetach = true
 			protocol.mu.Unlock()
 			authorizations := 0
-			accepted, err := provider.DetachVolumeWithAuthority(ctx, "volume-test", "node-old", "", nil, func(attempt context.Context, _, _, _ int) error {
+			accepted, err := provider.DetachVolumeWithAuthority(ctx, "volume-test", "node-old", 41, "", nil, func(attempt context.Context, _, _, _ int) error {
 				authorizations++
 				if phase == "retry" && authorizations == 2 {
 					cancel()
@@ -1321,6 +1322,147 @@ func TestControllerQueuedUnpublishDistinguishesCallerAndActiveDeadlines(t *testi
 			defer protocol.mu.Unlock()
 			require.Equal(t, 1, protocol.detachAttempts)
 			require.Empty(t, protocol.mutations)
+		})
+	}
+}
+
+func TestControllerPublishDistinguishesBlankAndMalformedImageReferences(t *testing.T) {
+	for _, imageID := range []string{"", "invalid"} {
+		t.Run(fmt.Sprintf("image-reference=%q", imageID), func(t *testing.T) {
+			ctx := context.Background()
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
+			provider, protocol := nodeAttachmentProvider(t)
+			protocol.mu.Lock()
+			protocol.extraDiskBefore = fmt.Sprintf(`<DISK><DISK_ID>4</DISK_ID><IMAGE_ID>%s</IMAGE_ID></DISK>`, imageID)
+			protocol.mu.Unlock()
+			client := reviewControllerClient(t, NewControllerServer(driver, provider, nil))
+			reply, err := client.ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-old"))
+			history, _ := driver.volumeHistory.Get("volume-test")
+			if imageID == "" {
+				require.NoError(t, err)
+				require.Equal(t, "vdb", reply.PublishContext["volumeName"])
+				require.False(t, history.LastSuccessfulPublishTime.IsZero())
+			} else {
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.ErrorContains(t, err, "malformed VM disk image identity")
+				require.Nil(t, reply)
+				require.True(t, history.LastSuccessfulPublishTime.IsZero())
+			}
+			protocol.mu.Lock()
+			defer protocol.mu.Unlock()
+			require.Empty(t, protocol.mutations)
+		})
+	}
+}
+
+func TestDetachNoOpRejectsReplacementVMWithoutHistory(t *testing.T) {
+	for _, action := range []string{"unpublish", "queued-unpublish", "expiry", "transfer", "orphan-decision"} {
+		t.Run(action, func(t *testing.T) {
+			ctx := context.Background()
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			pv.Annotations[annotationAllowCrossNodeUntil] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+			node := newReadyNode("node-old", true)
+			driver := newStickyTestDriver(t, pv, pvc, node, newReadyNode("node-new", true))
+			provider, protocol := nodeAttachmentProvider(t)
+			remap := func() {
+				protocol.mu.Lock()
+				defer protocol.mu.Unlock()
+				protocol.vmNames = map[int]string{41: "retired-vm", 42: "node-old"}
+			}
+			server := NewControllerServer(driver, disappearingDetachProvider{provider, remap}, nil)
+			if action == "queued-unpublish" {
+				driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, time.Second, 0)
+				driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+			}
+			client := reviewControllerClient(t, server)
+			sticky := StickyAttachmentState{VolumeID: "volume-test", NodeID: node.Name, Backend: "local", PVCName: pvc.Name, PVCNamespace: pvc.Namespace, PVCUID: pvc.UID,
+				StartedAt: time.Now().Add(-2 * time.Minute), ExpiresAt: time.Now().Add(time.Minute), GraceSeconds: 60}
+			if action == "expiry" || action == "transfer" {
+				if action == "expiry" {
+					sticky.ExpiresAt = time.Now().Add(-time.Minute)
+				}
+				require.NoError(t, driver.stickyAttachments.StartGrace(sticky))
+			}
+			switch action {
+			case "expiry":
+				server.expireStickyDetach(ctx, sticky)
+			case "transfer":
+				reply, err := client.ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-new"))
+				require.Nil(t, reply)
+				require.Equal(t, codes.Unavailable, status.Code(err))
+			case "orphan-decision":
+				remap()
+				err := NewAttachmentReconciler(server).detachObservedAttachment(ctx, opennebula.ObservedAttachment{
+					VolumeHandle: "volume-test", ImageID: 7, NodeName: node.Name, NodeID: 41, DiskID: 2,
+				}, pv.UID, node.UID, "local", false, hotplugQueuePriorityBackground)
+				require.ErrorContains(t, err, "provider attachment identity changed since inventory")
+				require.NotErrorIs(t, err, errAttachmentAbsent)
+			default:
+				reply, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: node.Name})
+				require.Nil(t, reply)
+				require.Equal(t, codes.Unavailable, status.Code(err))
+			}
+			history, _ := driver.volumeHistory.Get("volume-test")
+			require.True(t, history.LastSafeDetachTime.IsZero())
+			_, held := driver.stickyAttachments.Get("volume-test")
+			require.Equal(t, action == "expiry" || action == "transfer", held)
+			events, err := driver.kubeRuntime.client.CoreV1().Events(pvc.Namespace).List(ctx, metav1.ListOptions{})
+			require.NoError(t, err)
+			for _, event := range events.Items {
+				require.NotContains(t, []string{eventReasonStuckAttachmentDetached, eventReasonDetachGraceExpired, eventReasonDetachGraceCancelled}, event.Reason)
+			}
+			protocol.mu.Lock()
+			defer protocol.mu.Unlock()
+			require.Equal(t, "node-old", protocol.vmNames[42], "test must reach the replacement VM lookup")
+			require.Contains(t, protocol.disks, 41)
+			require.Empty(t, protocol.mutations)
+			require.Zero(t, protocol.detachAttempts)
+		})
+	}
+}
+
+func TestDetachRechecksNodeMountUseAfterBindingReads(t *testing.T) {
+	for _, lateMount := range []bool{false, true} {
+		t.Run(fmt.Sprintf("late-mount=%t", lateMount), func(t *testing.T) {
+			ctx := context.Background()
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			node := newReadyNode("node-old", true)
+			donePod := activePodForPVC("terminated", pvc.Name, node.Name)
+			donePod.Status.Phase = corev1.PodSucceeded
+			driver := newStickyTestDriver(t, pv, pvc, node, donePod)
+			driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+			provider, protocol := nodeAttachmentProvider(t)
+			probe := &detachCensusProbe{PersistentDiskVolumeProvider: provider}
+			kube := driver.kubeRuntime.client.(*fake.Clientset)
+			pvReads := 0
+			kube.PrependReactor("get", "persistentvolumes", func(ktesting.Action) (bool, kruntime.Object, error) {
+				if probe.inDetach.Load() {
+					pvReads++
+					if pvReads == 2 && lateMount {
+						mounted := node.DeepCopy()
+						mounted.Status.VolumesInUse = []corev1.UniqueVolumeName{"kubernetes.io/csi/" + DefaultDriverName + "^volume-test"}
+						require.NoError(t, kube.Tracker().Update(corev1.SchemeGroupVersion.WithResource("nodes"), mounted, ""))
+					}
+				}
+				return false, nil, nil
+			})
+			client := reviewControllerClient(t, NewControllerServer(driver, probe, nil))
+			reply, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: node.Name})
+			require.GreaterOrEqual(t, pvReads, 2)
+			protocol.mu.Lock()
+			defer protocol.mu.Unlock()
+			if lateMount {
+				require.Nil(t, reply)
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.ErrorContains(t, err, "detach node still reports the volume in use")
+				require.Contains(t, protocol.disks, 41)
+				require.Zero(t, protocol.detachAttempts)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, reply)
+				require.Equal(t, []string{"detach:41"}, protocol.mutations)
+			}
 		})
 	}
 }

@@ -258,11 +258,11 @@ func (m *HotplugQueueManager) Run(ctx context.Context, node, operation, volume s
 		defer cancel()
 	}
 
-	waitError := func() (error, string) {
+	waitError := func() (string, error) {
 		if err := ctx.Err(); err != nil {
-			return err, "caller_done"
+			return "caller_done", err
 		}
-		return &HotplugQueueTimeoutError{Node: node, Operation: operation, Volume: volume, Timeout: waitLimit}, "timeout"
+		return "timeout", &HotplugQueueTimeoutError{Node: node, Operation: operation, Volume: volume, Timeout: waitLimit}
 	}
 	if coalesced {
 		select {
@@ -278,7 +278,7 @@ func (m *HotplugQueueManager) Run(ctx context.Context, node, operation, volume s
 			m.metrics.RecordHotplugQueueDispatch(operation, string(priority), outcome)
 			return req.err
 		case <-waitCtx.Done():
-			err, outcome := waitError()
+			outcome, err := waitError()
 			m.metrics.RecordHotplugQueueWait(operation, "coalesced_"+outcome, time.Since(req.enqueuedAt))
 			m.metrics.RecordHotplugQueueDispatch(operation, string(priority), "coalesced_"+outcome)
 			return err
@@ -289,7 +289,7 @@ func (m *HotplugQueueManager) Run(ctx context.Context, node, operation, volume s
 	case <-req.started:
 	case <-req.done:
 	case <-waitCtx.Done():
-		err, outcome := waitError()
+		outcome, err := waitError()
 		if m.cancel(req.id, node, err) {
 			m.metrics.RecordHotplugQueueWait(operation, outcome, time.Since(req.enqueuedAt))
 			m.metrics.RecordHotplugQueueDispatch(operation, string(priority), outcome)

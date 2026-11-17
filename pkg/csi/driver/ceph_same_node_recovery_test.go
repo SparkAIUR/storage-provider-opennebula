@@ -47,7 +47,7 @@ func (p *cephRetentionTestProvider) GetVolumeInNode(ctx context.Context, imageID
 	return p.MockOpenNebulaVolumeProviderTestify.GetVolumeInNode(ctx, imageID, nodeID)
 }
 
-func (p *cephRetentionTestProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node, expectedBackend string, verifyOwner opennebula.DetachOwnerCheck, authorize opennebula.DetachAuthorization) (bool, error) {
+func (p *cephRetentionTestProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, expectedVMID int, expectedBackend string, verifyOwner opennebula.DetachOwnerCheck, authorize opennebula.DetachAuthorization) (bool, error) {
 	if verifyOwner != nil {
 		if _, err := verifyOwner(ctx, 3137, 575, 1); err != nil {
 			return false, err

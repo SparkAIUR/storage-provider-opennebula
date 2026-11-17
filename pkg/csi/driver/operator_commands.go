@@ -442,7 +442,7 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 	hotplugDiagnostics := hotplugDiagnosticSnapshot(ctx, kubeClient, cfg)
 	adaptiveSnapshot := configMapJSONSnapshot(ctx, kubeClient, adaptiveTimeoutObservationsConfigMapName)
 	adaptiveRecommendations := adaptiveRecommendationSnapshot(cfg, adaptiveSnapshot)
-	volumeHistorySnapshot, volumeRepairSnapshot, volumeRecoverySnapshot, volumeDemandSnapshot, protectionSnapshot := collectSupportBundleLocalRWOSnapshot(ctx, cfg, kubeClient, pvList.Items)
+	volumeHistorySnapshot, volumeRepairSnapshot, volumeRecoverySnapshot, volumeDemandSnapshot, protectionSnapshot := collectSupportBundleLocalRWOSnapshot(ctx, cfg, kubeClient, invClient, pvList.Items)
 	nodeLocalDiskSessions, nodeLocalSessionReference := supportBundleLocalDiskSessionDiagnostics(ctx, kubeClient)
 	volumeRecoverySnapshot = enrichRecoveryControlSupportSnapshot(volumeRecoverySnapshot, volumeDemandSnapshot, nodeLocalDiskSessions, volumeQuarantineSnapshot, hostArtifactSnapshot)
 
@@ -1218,11 +1218,8 @@ func typedHotplugQueueSnapshot(ctx context.Context, kubeClient kubernetes.Interf
 	return snapshot
 }
 
-func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPluginConfig, kubeClient kubernetes.Interface, pvs []corev1.PersistentVolume) (map[string]VolumeHistoryRecord, map[string]VolumeRepairState, map[string]VolumeRecoveryControlState, map[string]VolumeDesiredState, map[string]LocalRWOProtectionDecision) {
-	runtime := &KubeRuntime{client: kubeClient, enabled: true, staleVAGrace: loadStaleVolumeAttachmentGrace(cfg)}
-	if restConfig, err := loadKubeRestConfig(); err == nil {
-		runtime.inventoryClient = newInventoryRuntimeClient(restConfig)
-	}
+func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPluginConfig, kubeClient kubernetes.Interface, invClient ctrlclient.Client, pvs []corev1.PersistentVolume) (map[string]VolumeHistoryRecord, map[string]VolumeRepairState, map[string]VolumeRecoveryControlState, map[string]VolumeDesiredState, map[string]LocalRWOProtectionDecision) {
+	runtime := &KubeRuntime{client: kubeClient, inventoryClient: invClient, enabled: true, staleVAGrace: loadStaleVolumeAttachmentGrace(cfg)}
 	driver := &Driver{
 		PluginConfig: cfg,
 		kubeRuntime:  runtime,

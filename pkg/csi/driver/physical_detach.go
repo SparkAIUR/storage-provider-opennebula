@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -106,28 +107,6 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if protection.Protected && protection.RequiredNode == nodeName && !bypassProtectionForOrphanTeardown(protection, orphan) && !override.After(time.Now().UTC()) {
 		return status.Error(codes.Unavailable, "physical detach is blocked by local volume protection")
 	}
-	node, err := runtime.client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
-	if err != nil || node == nil || node.UID != identity.nodeUID || node.DeletionTimestamp != nil {
-		return attachmentEvidenceUnavailable("detach node identity is unverified", err)
-	}
-	if history.LastSuccessfulNodeName == nodeName && history.LastSuccessfulNodeUID != "" && history.LastSuccessfulNodeUID != string(node.UID) {
-		return status.Error(codes.Unavailable, "detach node identity differs from observed history")
-	}
-	ready := false
-	for _, condition := range node.Status.Conditions {
-		if condition.Type == corev1.NodeReady {
-			ready = condition.Status == corev1.ConditionTrue
-		}
-	}
-	if !ready && (identity.background || isCephBackend(backend)) {
-		return status.Error(codes.Unavailable, "detach node release observation is unavailable")
-	}
-	uniqueName := corev1.UniqueVolumeName(fmt.Sprintf("kubernetes.io/csi/%s^%s", s.driver.name, volume))
-	for _, inUse := range node.Status.VolumesInUse {
-		if inUse == uniqueName {
-			return status.Error(codes.Unavailable, "detach node still reports the volume in use")
-		}
-	}
 	vas, err := runtime.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return attachmentEvidenceUnavailable("cannot verify attachment deletion authority", err)
@@ -145,6 +124,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, replacement); err != nil {
 		return err
 	}
+	terminalOnNode := false
 	if claim := pv.Spec.ClaimRef; claim != nil && !replacement {
 		pods, err := runtime.client.CoreV1().Pods(claim.Namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
@@ -157,9 +137,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 					continue
 				}
 				if terminalPodMayBeReleased(&pod) {
-					if pod.Spec.NodeName == nodeName && !ready {
-						return attachmentEvidenceUnavailable("detach node release observation is unavailable", nil)
-					}
+					terminalOnNode = terminalOnNode || pod.Spec.NodeName == nodeName
 					break
 				}
 				if pod.Spec.NodeName == "" || pod.Spec.NodeName == nodeName {
@@ -177,6 +155,28 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	}
 	if desired.desiresNode(nodeName) {
 		return attachmentEvidenceUnavailable("current volume release is unverified", nil)
+	}
+	node, err := runtime.client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil || node == nil || node.UID != identity.nodeUID || node.DeletionTimestamp != nil {
+		return attachmentEvidenceUnavailable("detach node identity is unverified", err)
+	}
+	if history.LastSuccessfulNodeName == nodeName && history.LastSuccessfulNodeUID != "" && history.LastSuccessfulNodeUID != string(node.UID) {
+		return status.Error(codes.Unavailable, "detach node identity differs from observed history")
+	}
+	ready := false
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady {
+			ready = condition.Status == corev1.ConditionTrue
+		}
+	}
+	if !ready && (identity.background || isCephBackend(backend) || terminalOnNode) {
+		return status.Error(codes.Unavailable, "detach node release observation is unavailable")
+	}
+	uniqueName := corev1.UniqueVolumeName(fmt.Sprintf("kubernetes.io/csi/%s^%s", s.driver.name, volume))
+	for _, inUse := range node.Status.VolumesInUse {
+		if inUse == uniqueName {
+			return status.Error(codes.Unavailable, "detach node still reports the volume in use")
+		}
 	}
 	return status.FromContextError(ctx.Err()).Err()
 }
@@ -225,35 +225,39 @@ func (s *ControllerServer) verifyProviderAttachmentBackend(ctx context.Context, 
 	return nil
 }
 
-func (s *ControllerServer) verifyDetachAbsenceTarget(ctx context.Context, volume, node string, imageID, vmID int) error {
+func (s *ControllerServer) verifyDetachAbsenceTarget(ctx context.Context, volume, node string, imageID, vmID int, nodeUID types.UID) error {
 	runtime := s.driver.kubeRuntime
-	if runtime == nil || !runtime.enabled {
-		return nil
-	}
-	history, err := s.readAttachmentHistory(ctx, volume)
-	if err != nil {
-		return attachmentEvidenceUnavailable("cannot verify detach absence history", err)
-	}
-	if history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != imageID {
-		return attachmentEvidenceUnavailable("detach absence image differs from history", nil)
-	}
-	if history.LastSuccessfulNodeName != node || (history.LastSuccessfulNodeUID == "" && history.LastSuccessfulOpenNebulaVMID <= 0) {
-		return nil
-	}
-	if history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != vmID {
-		return attachmentEvidenceUnavailable("detach absence VM differs from history", nil)
-	}
-	currentVM, err := s.volumeProvider.NodeExists(ctx, node)
-	if err != nil || currentVM != vmID {
-		return attachmentEvidenceUnavailable("detach absence VM identity changed", err)
-	}
-	if history.LastSuccessfulNodeUID != "" {
-		current, err := runtime.NodeIdentity(ctx, node)
-		if err != nil || !current.Exists || current.UID != history.LastSuccessfulNodeUID {
-			return attachmentEvidenceUnavailable("detach absence node differs from history", err)
+	if runtime != nil && runtime.enabled {
+		history, err := s.readAttachmentHistory(ctx, volume)
+		if err != nil {
+			return attachmentEvidenceUnavailable("cannot verify detach absence history", err)
+		}
+		if history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != imageID {
+			return attachmentEvidenceUnavailable("detach absence image differs from history", nil)
+		}
+		if history.LastSuccessfulNodeName == node {
+			if history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != vmID {
+				return attachmentEvidenceUnavailable("detach absence VM differs from history", nil)
+			}
+			if history.LastSuccessfulNodeUID != "" {
+				if nodeUID != "" && string(nodeUID) != history.LastSuccessfulNodeUID {
+					return attachmentEvidenceUnavailable("detach absence node differs from history", nil)
+				}
+				nodeUID = types.UID(history.LastSuccessfulNodeUID)
+			}
+		}
+		if nodeUID != "" {
+			current, err := runtime.NodeIdentity(ctx, node)
+			if err != nil || !current.Exists || current.Deleting || current.UID != string(nodeUID) {
+				return attachmentEvidenceUnavailable("detach absence node identity changed", err)
+			}
 		}
 	}
-	return nil
+	currentVM, err := s.volumeProvider.NodeExists(ctx, node)
+	if err != nil || vmID <= 0 || currentVM != vmID {
+		return attachmentEvidenceUnavailable("detach absence VM identity changed", err)
+	}
+	return status.FromContextError(ctx.Err()).Err()
 }
 
 func (s *ControllerServer) verifySoleDetachOwner(ctx context.Context, volume, node string, imageID, vmID, diskID int) (string, error) {
@@ -312,6 +316,8 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 		return false, err
 	}
 	ctx = opennebula.WithExpectedImageID(ctx, identity.imageID)
+	var accepted bool
+	var err error
 	if provider, ok := s.volumeProvider.(opennebula.AuthorizedVolumeDetacher); ok {
 		var verifyOwner opennebula.DetachOwnerCheck
 		if identity.cephSingleWriter {
@@ -319,18 +325,30 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 				return s.verifySoleDetachOwner(ctx, volume, node, imageID, vmID, diskID)
 			}
 		}
-		accepted, err := provider.DetachVolumeWithAuthority(ctx, volume, node, identity.backend, verifyOwner, authorize)
-		if parentErr := ctx.Err(); parentErr != nil {
-			return false, parentErr
+		accepted, err = provider.DetachVolumeWithAuthority(ctx, volume, node, identity.vmID, identity.backend, verifyOwner, authorize)
+	} else {
+		if identity.cephSingleWriter {
+			return false, attachmentEvidenceUnavailable("provider cannot verify Ceph detach authority", nil)
 		}
-		return accepted, err
+		if err := s.verifyProviderAttachmentBackend(ctx, volume, identity.imageID, identity.vmID, identity.backend); err != nil {
+			return false, err
+		}
+		err = s.volumeProvider.DetachVolume(ctx, volume, node)
+		accepted = err == nil
 	}
-	if identity.cephSingleWriter {
-		return false, attachmentEvidenceUnavailable("provider cannot verify Ceph detach authority", nil)
+	if parentErr := ctx.Err(); parentErr != nil {
+		return false, parentErr
 	}
-	if err := s.verifyProviderAttachmentBackend(ctx, volume, identity.imageID, identity.vmID, identity.backend); err != nil {
+	if err != nil {
 		return false, err
 	}
-	err := s.volumeProvider.DetachVolume(ctx, volume, node)
-	return err == nil, err
+	if identity.ceph || identity.background {
+		if _, err := s.volumeProvider.GetVolumeInNode(ctx, identity.imageID, identity.vmID); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
+			return false, attachmentEvidenceUnavailable("detach readback did not establish absence", err)
+		}
+	}
+	if err := s.verifyDetachAbsenceTarget(ctx, volume, node, identity.imageID, identity.vmID, identity.nodeUID); err != nil {
+		return false, err
+	}
+	return accepted, nil
 }

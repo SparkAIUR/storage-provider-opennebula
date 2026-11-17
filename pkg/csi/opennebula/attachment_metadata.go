@@ -88,7 +88,7 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 	}
 	var selected *shared.Disk
 	for _, disk := range info.Template.GetDisks() {
-		imageID, present, imageErr := diskImageReference(disk)
+		imageID, present, imageErr := diskImageReference(disk, false)
 		if imageErr != nil {
 			return deny(imageErr.Error())
 		}

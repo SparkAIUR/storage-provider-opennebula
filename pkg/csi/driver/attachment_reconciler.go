@@ -481,6 +481,12 @@ func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, att
 	if pvUID == "" || nodeUID == "" {
 		return errAttachmentSkipped
 	}
+	confirmedAbsent := func(ctx context.Context) error {
+		if err := r.server.verifyDetachAbsenceTarget(ctx, attachment.VolumeHandle, attachment.NodeName, attachment.ImageID, attachment.NodeID, nodeUID); err != nil {
+			return err
+		}
+		return errAttachmentAbsent
+	}
 	detached := false
 	err := r.server.withQueuedHotplug(ctx, attachment.NodeName, "detach", attachment.VolumeHandle, priority, func(queueCtx context.Context) error {
 		nodeRelease := r.server.driver.operationLocks.Acquire(controllerNodeLockKey(attachment.NodeName))
@@ -490,9 +496,14 @@ func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, att
 		defer volumeRelease()
 
 		decision := r.server.evaluateVolumeReconcile(queueCtx, attachment.NodeName, "detach", attachment.VolumeHandle)
+		if decision.Action == VolumeReconcileProceed || decision.Action == VolumeReconcileComplete {
+			if decision.Evidence.OpenNebulaImageID != attachment.ImageID || decision.Evidence.OpenNebulaNodeID != attachment.NodeID {
+				return fmt.Errorf("provider attachment identity changed since inventory")
+			}
+		}
 		if decision.Action != VolumeReconcileProceed {
 			if decision.Action == VolumeReconcileComplete && errors.Is(decision.Evidence.AttachedErr, opennebula.ErrAttachmentNotFound) {
-				return errAttachmentAbsent
+				return confirmedAbsent(queueCtx)
 			}
 			if err := decision.Err(); err != nil {
 				if decision.Reason == queueReasonSameNodeReuseRequired || decision.Reason == queueReasonRecoveryModeManual || strings.HasPrefix(decision.Reason, "local_") {
@@ -515,12 +526,9 @@ func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, att
 		}
 		if _, err := r.server.volumeProvider.GetVolumeInNode(queueCtx, attachment.ImageID, attachment.NodeID); err != nil {
 			if errors.Is(err, opennebula.ErrAttachmentNotFound) {
-				return errAttachmentAbsent
+				return confirmedAbsent(queueCtx)
 			}
 			return err
-		}
-		if decision.Evidence.OpenNebulaImageID != attachment.ImageID || decision.Evidence.OpenNebulaNodeID != attachment.NodeID {
-			return fmt.Errorf("provider attachment identity changed since inventory")
 		}
 		detachStarted := time.Now()
 		accepted, err := r.server.detachVolumeWithAuthority(queueCtx, attachment.VolumeHandle, attachment.NodeName,
@@ -528,9 +536,6 @@ func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, att
 		if err != nil {
 			r.server.handleHotplugTimeout(queueCtx, attachment.NodeName, attachment.VolumeHandle, nil, "detach", observedAttachmentBackend(attachment), err)
 			return err
-		}
-		if _, err := r.server.volumeProvider.GetVolumeInNode(queueCtx, attachment.ImageID, attachment.NodeID); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
-			return fmt.Errorf("detach readback did not establish absence: %v", err)
 		}
 		if !accepted {
 			return errAttachmentAbsent
@@ -545,7 +550,7 @@ func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, att
 	if err == nil && !detached {
 		if _, observedErr := r.server.volumeProvider.GetVolumeInNode(ctx, attachment.ImageID, attachment.NodeID); observedErr != nil {
 			if errors.Is(observedErr, opennebula.ErrAttachmentNotFound) {
-				return errAttachmentAbsent
+				return confirmedAbsent(ctx)
 			}
 			return observedErr
 		}
@@ -667,14 +672,10 @@ func (r *AttachmentReconciler) deleteStaleVolumeAttachment(ctx context.Context, 
 	if _, err := r.server.volumeProvider.GetVolumeInNode(ctx, imageID, nodeID); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
 		return fmt.Errorf("stale attachment absence is unverified: %v", err)
 	}
-	if err := r.server.verifyDetachAbsenceTarget(ctx, volume, va.Spec.NodeName, imageID, nodeID); err != nil {
+	if err := checkIdentity(); err != nil {
 		return err
 	}
-	currentNode, err := r.server.driver.kubeRuntime.NodeIdentity(ctx, va.Spec.NodeName)
-	if err != nil || !currentNode.Exists || currentNode.UID != identity.UID {
-		return fmt.Errorf("stale attachment node identity changed: %v", err)
-	}
-	if err := checkIdentity(); err != nil {
+	if err := r.server.verifyDetachAbsenceTarget(ctx, volume, va.Spec.NodeName, imageID, nodeID, types.UID(identity.UID)); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {

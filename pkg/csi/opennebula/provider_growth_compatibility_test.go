@@ -223,6 +223,17 @@ func TestProviderGrowthAndRestorationIgnoreUnrelatedBlankImageReference(t *testi
 	}
 }
 
+func TestProviderRestorationRejectsNonblankMalformedImageReference(t *testing.T) {
+	p, st := growthCompatibilityFixture(t, "7.4.1", true, func(c *growthFixtureConfig) {
+		c.extraDisk = `<DISK><IMAGE_ID>invalid</IMAGE_ID><DISK_ID>3</DISK_ID></DISK>`
+	})
+	err := p.RestoreVolumeCapacity(context.Background(), "volume-test", 11, 7)
+	require.ErrorContains(t, err, "malformed VM disk image identity")
+	require.Zero(t, st.resizeCalls.Load())
+	require.Zero(t, st.metadataWrites.Load())
+	require.Zero(t, st.otherMutations.Load())
+}
+
 func TestProviderGrowthCompatibilityUnknownIdentity(t *testing.T) {
 	for _, tc := range []struct{ name, facts, persistence string }{
 		{"missing disk persistence", strings.ReplaceAll(persistentSystemDiskFacts, "<PERSISTENT>YES</PERSISTENT>", ""), "1"},

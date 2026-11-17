@@ -46,7 +46,7 @@ func (p *cleanupReadbackProvider) GetVolumeInNode(context.Context, int, int) (st
 	return "vdb", nil
 }
 
-func (p *cleanupReadbackProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node, expectedBackend string, verifyOwner opennebula.DetachOwnerCheck, authorize opennebula.DetachAuthorization) (bool, error) {
+func (p *cleanupReadbackProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, expectedVMID int, expectedBackend string, verifyOwner opennebula.DetachOwnerCheck, authorize opennebula.DetachAuthorization) (bool, error) {
 	if verifyOwner != nil {
 		if _, err := verifyOwner(ctx, p.imageID, p.vmID, p.diskID); err != nil {
 			return false, err
@@ -68,7 +68,7 @@ func TestControllerUnpublishCephObservedHistoryAuthority(t *testing.T) {
 			t.Run(fmt.Sprintf("%v/%s", queued, mode), func(t *testing.T) {
 				f := newCephRestartTestFixture(t, queued)
 				record, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
-				if mode != "publish" && mode != "bootstrap-with-timestamp" {
+				if mode != "publish" && mode != "bootstrap-with-timestamp" && mode != "bootstrap-source" {
 					record.LastSuccessfulPublishTime = time.Time{}
 				}
 				if mode == "stage-only" {

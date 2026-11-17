@@ -127,7 +127,7 @@ type DetachAuthorization func(ctx context.Context, imageID, vmID, diskID int) er
 type DetachOwnerCheck func(ctx context.Context, imageID, vmID, diskID int) (target string, err error)
 
 type AuthorizedVolumeDetacher interface {
-	DetachVolumeWithAuthority(ctx context.Context, volume, node, expectedBackend string, verifyOwner DetachOwnerCheck, authorize DetachAuthorization) (accepted bool, err error)
+	DetachVolumeWithAuthority(ctx context.Context, volume, node string, expectedVMID int, expectedBackend string, verifyOwner DetachOwnerCheck, authorize DetachAuthorization) (accepted bool, err error)
 }
 
 type AttachmentBackendVerifier interface {
