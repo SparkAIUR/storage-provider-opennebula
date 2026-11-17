@@ -1237,8 +1237,9 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 	_ = driver.volumeRepairState.LoadFromConfigMap(ctx)
 	_ = driver.volumeRecoveryControl.LoadFromConfigMap(ctx)
 	driver.maintenanceMode = NewMaintenanceModeManager(driver, "")
-	if driver.maintenanceMode != nil {
-		_ = driver.maintenanceMode.Reconcile(ctx)
+	if cm, err := runtime.GetConfigMap(ctx, namespaceFromServiceAccount(), hotplugStateConfigMapName); err == nil && driver.maintenanceMode != nil {
+		active, alias := maintenanceModeActive(cm.Data)
+		driver.maintenanceMode.setState(active, parseMaintenanceBool(cm.Data[maintenanceReadyKey]), alias)
 	}
 
 	historySnapshot := map[string]VolumeHistoryRecord{}
@@ -1261,6 +1262,33 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 		}
 		runtimeCtx, _ := runtime.ResolveVolumeRuntimeContext(ctx, pv.Spec.CSI.VolumeHandle)
 		if runtimeCtx != nil {
+			if driver.maintenanceMode != nil && driver.maintenanceMode.Active() {
+				if vas, err := kubeClient.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{}); err == nil {
+					owned := []storagev1.VolumeAttachment{}
+					for _, va := range vas.Items {
+						if va.Spec.Attacher == DefaultDriverName && matchesVolumeAttachment(pv.Name, &va) {
+							owned = append(owned, va)
+						}
+					}
+					attached, conflicts := maintenanceAttachedNodesByPV(owned)
+					if _, conflict := conflicts[pv.Name]; !conflict {
+						projection := *runtimeCtx
+						projection.PVAnnotations = cloneStringMap(runtimeCtx.PVAnnotations)
+						delete(projection.PVAnnotations, annotationLastAttachedNode)
+						node := maintenanceLastNodeForVolume(ctx, driver, &projection, pv.Spec.CSI.VolumeHandle)
+						if node == "" {
+							node = validatedMaintenanceLastNodeCandidate(ctx, driver, runtimeCtx, attached[pv.Name], "attached-node")
+						}
+						if node != "" {
+							if runtimeCtx.PVAnnotations == nil {
+								runtimeCtx.PVAnnotations = map[string]string{}
+							}
+							runtimeCtx.PVAnnotations[annotationLastAttachedNode] = node
+						}
+					}
+				}
+			}
+
 			existingHistory := historySnapshot[pv.Spec.CSI.VolumeHandle]
 			if !volumeHistoryHasObservedSuccess(existingHistory) {
 				if seed, ok := buildVolumeHistoryBootstrapEvidence(ctx, runtime, pv.Spec.CSI.VolumeHandle, runtimeCtx); ok {
@@ -1278,7 +1306,7 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 		if desiredState, err := runtime.DesiredNodeForVolume(ctx, pv.Spec.CSI.VolumeHandle); err == nil {
 			demandSnapshot[pv.Spec.CSI.VolumeHandle] = desiredState
 		}
-		decision, err := localRWOProtectionDecisionForDriver(ctx, driver, pv.Spec.CSI.VolumeHandle, "")
+		decision, err := (&ControllerServer{driver: driver}).localRWOProtectionProjection(ctx, pv.Spec.CSI.VolumeHandle, "", runtimeCtx, false)
 		if err != nil {
 			protectionSnapshot[pv.Spec.CSI.VolumeHandle] = LocalRWOProtectionDecision{
 				Reason:  "evaluation_error",

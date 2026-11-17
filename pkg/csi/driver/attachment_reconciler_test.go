@@ -33,12 +33,20 @@ func newAttachmentTestDriver(objects ...runtime.Object) *Driver {
 	driver.stickyAttachments = NewStickyAttachmentManager(runtime, "default")
 	driver.volumeHistory = NewVolumeHistoryManager(runtime, "default")
 	driver.volumeRepairState = NewVolumeRepairStateManager(runtime, "default")
+	driver.volumeQuarantine = NewVolumeQuarantineManager(runtime, "default")
+	driver.hostArtifactQuarantine = NewHostArtifactQuarantineManager(runtime, "default")
 	return driver
 }
 
 func TestAttachmentReconcilerDetachesOrphanAttachment(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-1", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
-	driver := newAttachmentTestDriver(pv, pvc)
+	pv.UID = "pv-owned"
+	pvc.UID = "pvc-owned"
+	pv.Spec.ClaimRef.UID = pvc.UID
+	pvc.Spec.VolumeName = pv.Name
+	node := newReadyNode("node-a", true)
+	node.UID = "node-owned"
+	driver := newAttachmentTestDriver(pv, pvc, node)
 	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
 	mockProvider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{{
 		VolumeHandle: "vol-1",
@@ -47,14 +55,15 @@ func TestAttachmentReconcilerDetachesOrphanAttachment(t *testing.T) {
 		NodeID:       101,
 		Backend:      "local",
 	}}, nil).Once()
-	mockProvider.On("NodeExists", mock.Anything, "node-a").Return(101, nil).Once()
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 101).Return("vdb", nil).Twice()
-	mockProvider.On("DetachVolume", mock.Anything, "vol-1", "node-a").Return(nil).Once()
+	mockProvider.On("NodeExists", mock.Anything, "node-a").Return(101, nil)
+
+	physical := &cleanupReadbackProvider{MockOpenNebulaVolumeProviderTestify: mockProvider, attached: true}
+	mockProvider.On("DetachVolume", mock.Anything, "vol-1", "node-a").Run(func(mock.Arguments) { physical.attached = false }).Return(nil).Once()
 	mockProvider.On("ResolveVolumeSizeBytes", mock.Anything, "vol-1").Return(int64(1024), nil).Once()
 
-	server := NewControllerServer(driver, mockProvider, &MockSharedFilesystemProviderTestify{})
+	server := NewControllerServer(driver, physical, &MockSharedFilesystemProviderTestify{})
 	reconciler := NewAttachmentReconciler(server)
-	reconciler.orphanSeen["vol-1@node-a"] = time.Now().Add(-2 * reconciler.orphanGrace)
+	reconciler.orphanSeen["vol-1@node-a@pv-owned"] = time.Now().Add(-2 * reconciler.orphanGrace)
 
 	require.NoError(t, reconciler.ReconcileOnce(context.Background()))
 	mockProvider.AssertExpectations(t)
@@ -63,7 +72,7 @@ func TestAttachmentReconcilerDetachesOrphanAttachment(t *testing.T) {
 func TestAttachmentReconcilerDeletesStaleVolumeAttachment(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-1", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 	va := &storagev1.VolumeAttachment{
-		ObjectMeta: metav1.ObjectMeta{Name: "va-1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "va-1", UID: "va-owned", ResourceVersion: "1"},
 		Spec: storagev1.VolumeAttachmentSpec{
 			Attacher: DefaultDriverName,
 			NodeName: "node-a",
@@ -73,13 +82,20 @@ func TestAttachmentReconcilerDeletesStaleVolumeAttachment(t *testing.T) {
 		},
 		Status: storagev1.VolumeAttachmentStatus{Attached: true},
 	}
-	driver := newAttachmentTestDriver(pv, pvc, va)
+	pv.UID = "pv-owned"
+	pv.ResourceVersion = "1"
+	node := newReadyNode("node-a", true)
+	node.UID = "node-owned"
+	driver := newAttachmentTestDriver(pv, pvc, va, node)
 	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	mockProvider.On("VolumeExists", mock.Anything, "vol-1").Return(1, 1024, nil)
+	mockProvider.On("NodeExists", mock.Anything, "node-a").Return(101, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 101).Return("", opennebula.ErrAttachmentNotFound)
 	mockProvider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil).Once()
 
 	server := NewControllerServer(driver, mockProvider, &MockSharedFilesystemProviderTestify{})
 	reconciler := NewAttachmentReconciler(server)
-	reconciler.staleVASeen["va-1"] = time.Now().Add(-2 * reconciler.staleVAGrace)
+	reconciler.staleVASeen["va-owned"] = time.Now().Add(-2 * reconciler.staleVAGrace)
 
 	require.NoError(t, reconciler.ReconcileOnce(context.Background()))
 

@@ -126,3 +126,9 @@ The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI i
 - HUMAN: Proceed with validation for hpldb. OpenNebula 7.4.0 remains the target, with no direct OpenNebula host actions and no hplsvc/bravo activation.
 - AI: Prepare the unused v0.6.0-rc.3 candidate by aligning chart version, appVersion and the default driver image tag. Package the reviewed merged source without changing code, dependencies, runtime configuration or Helm behavior beyond those version defaults. Preserve all earlier candidate artifacts and receipts.
 - AI: Bind later build metadata to the exact frozen source commit and tree. Local packaging checks do not claim publication, deployment or native acceptance. Protected publication, artifact freeze, reviewed hpldb-only GitOps and fresh node UID approvals remain later gates; affected LVM growth/reattach and the 24-hour observation remain open, with no feature waiver.
+
+## 2026-11-17, RC4 attachment recovery corrections
+
+- HUMAN: Include the approved attachment safety, repair evidence and read-only diagnostics corrections in RC4, retaining the v0.5.x integration target and frozen RC3 ancestry.
+- AI: Centralize physical-detach authority, bind cleanup grace to PV/VA identities, condition stale-VA deletion on fresh provider absence, and require successful detach readback. Diagnostics use in-memory projections without running maintenance operations or persisting bootstrap history.
+- AI: Bound orphan cleanup to the owned PV identity lifetime. Public DeleteVolume must refuse retained or unknown provider ownership until ordinary deletion can establish absence. Local behavioral and XML-RPC tests do not grant publication or native acceptance.

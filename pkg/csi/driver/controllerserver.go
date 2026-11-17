@@ -1176,14 +1176,6 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 
-	if rescued, response, rescueErr := s.rescueSameNodeUnpublish(ctx, req, volumeID, nodeID); rescued {
-		return response, rescueErr
-	}
-
-	if held, response, holdErr := s.startMaintenanceDetachHold(ctx, req); held {
-		return response, holdErr
-	}
-
 	var recoveryRuntimeCtx *VolumeRuntimeContext
 	if s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
 		if resolved, runtimeErr := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId); runtimeErr == nil {
@@ -1208,6 +1200,14 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 
 	if rescued, response, rescueErr := s.rescueCephSameNodeUnpublish(ctx, req, volumeID, nodeID); rescued {
 		return response, rescueErr
+	}
+
+	if rescued, response, rescueErr := s.rescueSameNodeUnpublish(ctx, req, volumeID, nodeID); rescued {
+		return response, rescueErr
+	}
+
+	if held, response, holdErr := s.startMaintenanceDetachHold(ctx, req); held {
+		return response, holdErr
 	}
 
 	if cooldown, ok := s.hotplugCooldownState(ctx, req.NodeId); ok {
@@ -1251,8 +1251,11 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 			"method", "ControllerUnpublishVolume", "volumeID", volumeID, "nodeID", nodeID)
 
 		detachStarted := time.Now()
-		err = s.volumeProvider.DetachVolume(queueCtx, req.VolumeId, req.NodeId)
+		err = s.detachVolumeWithAuthority(queueCtx, req.VolumeId, req.NodeId)
 		if err != nil {
+			if status.Code(err) != codes.Unknown {
+				return err
+			}
 			s.handleHotplugTimeout(queueCtx, req.NodeId, req.VolumeId, nil, "detach", "disk", err)
 			if driftErr := s.detachMetadataDriftError(queueCtx, req.VolumeId, req.NodeId, err); driftErr != nil {
 				return driftErr
@@ -2592,7 +2595,10 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 		return false, nil, nil
 	}
 
-	if err := s.volumeProvider.DetachVolume(ctx, req.VolumeId, state.NodeID); err != nil {
+	if err := s.detachVolumeWithAuthority(ctx, req.VolumeId, state.NodeID); err != nil {
+		if status.Code(err) != codes.Unknown {
+			return true, nil, err
+		}
 		if driftErr := s.detachMetadataDriftError(ctx, req.VolumeId, state.NodeID, err); driftErr != nil {
 			return true, nil, driftErr
 		}
@@ -2677,7 +2683,7 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 		}
 
 		detachStarted := time.Now()
-		if err := s.volumeProvider.DetachVolume(queueCtx, confirmed.VolumeID, confirmed.NodeID); err != nil {
+		if err := s.detachVolumeWithAuthority(queueCtx, confirmed.VolumeID, confirmed.NodeID); err != nil {
 			if driftErr := s.detachMetadataDriftError(queueCtx, confirmed.VolumeID, confirmed.NodeID, err); driftErr != nil {
 				klog.V(2).InfoS("Classified sticky detach failure as OpenNebula metadata drift", "volumeID", confirmed.VolumeID, "nodeID", confirmed.NodeID, "err", driftErr)
 				return driftErr

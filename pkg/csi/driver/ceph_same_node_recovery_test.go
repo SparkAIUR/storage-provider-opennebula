@@ -77,6 +77,7 @@ func newCephRestartTestFixture(t *testing.T, queued bool) *cephRestartTestFixtur
 	driver := newStickyTestDriver(t, pv, pvc, pod, node, va)
 	_, err := driver.volumeHistory.Upsert(context.Background(), cephRestartVolume, func(record *VolumeHistoryRecord) {
 		record.Backend = "ceph"
+		record.LastSuccessfulPublishTime = time.Date(2026, 11, 17, 0, 0, 0, 0, time.UTC)
 		record.PVName = pv.Name
 		record.PVCName = pvc.Name
 		record.PVCNamespace = pvc.Namespace
@@ -485,9 +486,9 @@ func TestCephRetentionSurvivesControllerRestartAndOrphanCleanup(t *testing.T) {
 			base.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{{VolumeHandle: cephRestartVolume, ImageID: 3137, NodeName: "node-a", NodeID: 575, DiskID: 1, Backend: "ceph"}}, nil).Twice()
 			base.On("VolumeExists", mock.Anything, cephRestartVolume).Return(3137, 1024*1024*1024, nil)
 			base.On("NodeExists", mock.Anything, "node-a").Return(575, nil)
-			base.On("GetVolumeInNode", mock.Anything, 3137, 575).Return("vdb", nil)
-			base.On("DetachVolume", mock.Anything, cephRestartVolume, "node-a").Return(nil).Once()
-			server := NewControllerServer(driver, base, nil)
+			physical := &cleanupReadbackProvider{MockOpenNebulaVolumeProviderTestify: base, attached: true}
+			base.On("DetachVolume", mock.Anything, cephRestartVolume, "node-a").Run(func(mock.Arguments) { physical.attached = false }).Return(nil).Once()
+			server := NewControllerServer(driver, physical, nil)
 			if queued {
 				driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
 				driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)

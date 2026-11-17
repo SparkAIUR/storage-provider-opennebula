@@ -69,7 +69,7 @@ func TestControllerLegacyDetachBoundaries(t *testing.T) {
 			state.mu.Unlock()
 			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 			pv.Annotations[annotationAllowCrossNodeUntil] = time.Now().UTC().Add(time.Minute).Format(time.RFC3339)
-			driver := newStickyTestDriver(t, pv, pvc)
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
 			driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
 			_, err := driver.volumeHistory.Upsert(context.Background(), "volume-test", func(record *VolumeHistoryRecord) { record.Backend = "local" })
 			require.NoError(t, err)

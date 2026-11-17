@@ -38,6 +38,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -155,6 +156,7 @@ func newLocalPVAndPVC(volumeHandle string, accessModes []corev1.PersistentVolume
 	pv := &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        "pv-" + volumeHandle,
+			UID:         types.UID("pv-" + volumeHandle + "-uid"),
 			Annotations: pvAnnotations,
 		},
 		Spec: corev1.PersistentVolumeSpec{
@@ -162,6 +164,7 @@ func newLocalPVAndPVC(volumeHandle string, accessModes []corev1.PersistentVolume
 			ClaimRef: &corev1.ObjectReference{
 				Namespace: "default",
 				Name:      "pvc-" + volumeHandle,
+				UID:       types.UID("pvc-" + volumeHandle + "-uid"),
 			},
 			PersistentVolumeSource: corev1.PersistentVolumeSource{
 				CSI: &corev1.CSIPersistentVolumeSource{
@@ -175,9 +178,11 @@ func newLocalPVAndPVC(volumeHandle string, accessModes []corev1.PersistentVolume
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:   "default",
 			Name:        "pvc-" + volumeHandle,
+			UID:         types.UID("pvc-" + volumeHandle + "-uid"),
 			Annotations: pvcAnnotationCopy,
 		},
 	}
+	pvc.Spec.VolumeName = pv.Name
 	return pv, pvc
 }
 
@@ -187,7 +192,7 @@ func newReadyNode(name string, ready bool) *corev1.Node {
 		conditionStatus = corev1.ConditionTrue
 	}
 	return &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{Name: name},
+		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name + "-uid")},
 		Status: corev1.NodeStatus{
 			Conditions: []corev1.NodeCondition{{
 				Type:   corev1.NodeReady,
@@ -2027,7 +2032,7 @@ func TestControllerPublishVolumeBlocksActiveHostArtifactQuarantine(t *testing.T)
 func TestControllerUnpublishVolumeClassifiesDetachMetadataDrift(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-detach-drift", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 	pvc.Spec.VolumeName = pv.Name
-	driver := newStickyTestDriver(t, pv, pvc)
+	driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
 	driver.PluginConfig.OverrideVal(config.MetadataDriftQuarantineFailureThresholdVar, 1)
 
 	provider := new(MockOpenNebulaVolumeProviderTestify)
@@ -2180,7 +2185,7 @@ func TestControllerPublishVolumeAllowsOverrideForProtectedCrossNodeAttach(t *tes
 		annotationRestartOpt: restartOptimizationAnnotationValue,
 	})
 	pv.Annotations[annotationAllowCrossNodeUntil] = time.Now().UTC().Add(5 * time.Minute).Format(time.RFC3339)
-	driver := newStickyTestDriver(t, pv, pvc)
+	driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
 	require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
 		VolumeID:     "vol-move-override",
 		NodeID:       "node-old",
@@ -2373,7 +2378,7 @@ func TestMaintenanceAttachedNodesIgnoresDeletingVolumeAttachments(t *testing.T) 
 	assert.Empty(t, conflicts)
 }
 
-func TestControllerUnpublishVolumeBypassesStickyDetachWhenNodeNotReady(t *testing.T) {
+func TestControllerUnpublishVolumeDeniesDetachWhenNodeNotReady(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-bypass", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
 		annotationRestartOpt: restartOptimizationAnnotationValue,
 	})
@@ -2385,23 +2390,24 @@ func TestControllerUnpublishVolumeBypassesStickyDetachWhenNodeNotReady(t *testin
 	mockProvider.On("VolumeExists", mock.Anything, "vol-bypass").Return(1, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdb", nil).Twice()
-	mockProvider.On("DetachVolume", mock.Anything, "vol-bypass", "node-1").Return(nil).Once()
 
 	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
 	resp, err := cs.ControllerUnpublishVolume(context.Background(), &csi.ControllerUnpublishVolumeRequest{
 		VolumeId: "vol-bypass",
 		NodeId:   "node-1",
 	})
-	require.NoError(t, err)
-	require.NotNil(t, resp)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.Nil(t, resp)
 	_, ok := driver.stickyAttachments.Get("vol-bypass")
 	assert.False(t, ok)
+	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
 	mockProvider.AssertExpectations(t)
 }
 
 func TestControllerUnpublishVolumePausesHotplugAfterUnhealthyNodeFailures(t *testing.T) {
-	node := newReadyNode("node-1", false)
-	driver := newStickyTestDriver(t, node)
+	node := newReadyNode("node-1", true)
+	pv, pvc := newLocalPVAndPVC("vol-pause", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	driver := newStickyTestDriver(t, pv, pvc, node)
 	driver.PluginConfig.OverrideVal(config.NodeHotplugGuardEnabledVar, true)
 	driver.PluginConfig.OverrideVal(config.NodeHotplugGuardFailureThresholdVar, 2)
 	driver.PluginConfig.OverrideVal(config.NodeHotplugGuardRequireKubernetesReadyVar, true)

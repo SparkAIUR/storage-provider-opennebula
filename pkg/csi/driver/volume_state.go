@@ -441,9 +441,16 @@ func (m *VolumeRepairStateManager) GetCurrent(ctx context.Context, volumeID stri
 		return VolumeRepairState{}, false, err
 	}
 	var state VolumeRepairState
-	if err == nil && cm.Data[volumeID] != "" {
-		if err := json.Unmarshal([]byte(cm.Data[volumeID]), &state); err != nil {
+	raw, present := "", false
+	if err == nil {
+		raw, present = cm.Data[volumeID]
+	}
+	if present {
+		if err := decodeCephRetentionProtection(raw, &state); err != nil {
 			return state, false, err
+		}
+		if state.VolumeID != volumeID || state.Version != stateObjectVersion || strings.TrimSpace(state.Classification) == "" {
+			return state, false, fmt.Errorf("repair record identity or schema is invalid for %s", volumeID)
 		}
 		if state.Classification != repairClassificationRuntimeAttachUnconfirmed {
 			return state, true, nil

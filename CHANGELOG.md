@@ -2,6 +2,12 @@
 
 Current source target is OpenNebula 7.4.0, with no direct OpenNebula host actions. This integration grants no native acceptance or feature waiver; affected persistent growth/reattach and the 24-hour observation remain open.
 
+## v0.6.0-rc.4, unreleased
+
+- Require observed Ceph publish or stage history for same-node logical retention, reject unknown backend and repair evidence, and preserve explicit manual recovery behavior.
+- Restrict attachment cleanup to owned resources, condition stale-VA deletion on fresh identity and provider absence, and block physical detach until current consumers, node use and protection controls permit it. Report cleanup only after provider readback.
+- Keep support-bundle collection read-only and validate the StorageClass reconciliation render through typed resources and its executable consumer. RC3 artifacts remain frozen; publication and native qualification remain separate gates.
+
 ## v0.6.0-rc.3, unreleased
 
 - Prepare a new qualification candidate containing the reviewed node expansion contract, mounted-device binding, operation-specific provider growth prerequisite and deadline fixture correction. Align chart, application and default driver image versions without changing runtime behavior.

@@ -277,12 +277,21 @@ func (s *ControllerServer) evaluateVolumeDetachDecision(ctx context.Context, dec
 		return decision.with(VolumeReconcileComplete, "already_detached", codes.OK,
 			fmt.Sprintf("volume %s is already detached from node %s", evidence.VolumeID, evidence.NodeID))
 	}
-	if s.driver != nil && s.driver.kubeRuntime != nil {
+	if recoveryControl.Invalid || recoveryControl.ObserveActive() {
+		return decision.with(VolumeReconcilePause, queueReasonRecoveryModeObserve, codes.Unavailable, "physical detach is blocked by recovery controls")
+	}
+	if s.driver != nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
+		if err := s.attachmentProtectionChecks(ctx, evidence.VolumeID, evidence.RuntimeCtx); err != nil {
+			return decision.with(VolumeReconcilePause, "detach_protection_blocked", status.Code(err), err.Error())
+		}
 		desiredState, desiredErr := s.driver.kubeRuntime.DesiredNodeForVolume(ctx, evidence.VolumeID)
 		evidence.DesiredState = desiredState
 		evidence.DesiredErr = desiredErr
 		decision = decision.withEvidence(evidence)
-		if desiredErr == nil && desiredState.Desired && !desiredState.MultipleNodes && strings.TrimSpace(desiredState.NodeName) == strings.TrimSpace(evidence.NodeID) {
+		if desiredErr != nil || desiredState.MultipleNodes {
+			return decision.with(VolumeReconcilePause, "desired_state_unknown", codes.Unavailable, fmt.Sprintf("cannot verify volume release: %v", desiredErr))
+		}
+		if desiredState.Desired && !desiredState.MultipleNodes && strings.TrimSpace(desiredState.NodeName) == strings.TrimSpace(evidence.NodeID) {
 			return decision.with(VolumeReconcilePause, queueReasonSameNodeReuseRequired, codes.Unavailable,
 				fmt.Sprintf("queued detach for volume %s on node %s is paused because Kubernetes still desires the volume there (%s)", evidence.VolumeID, evidence.NodeID, desiredState.Reason))
 		}
@@ -299,6 +308,9 @@ func (s *ControllerServer) evaluateVolumeDetachDecision(ctx context.Context, dec
 	if protectionErr == nil && protection.Protected && strings.TrimSpace(protection.RequiredNode) == strings.TrimSpace(evidence.NodeID) && !bypassProtectionForOrphanTeardown(protection, orphanTeardown) {
 		return decision.with(VolumeReconcilePause, protection.Reason, codes.Unavailable,
 			fmt.Sprintf("queued detach for volume %s on node %s is paused while local RWO protection is active (%s)", evidence.VolumeID, evidence.NodeID, protection.Reason))
+	}
+	if protectionErr != nil || protection.Invalid {
+		return decision.with(VolumeReconcilePause, "detach_protection_unknown", codes.Unavailable, fmt.Sprintf("cannot verify detach protection: %v", protectionErr))
 	}
 	return decision
 }
@@ -323,18 +335,4 @@ func (d VolumeReconcileDecision) withAttachment(action VolumeReconcileAction, re
 	d = d.with(action, reason, code, message)
 	d.AttachmentTarget = strings.TrimSpace(target)
 	return d
-}
-
-func (s *ControllerServer) backgroundDetachAllowedByDecision(ctx context.Context, volume, node string) (bool, string) {
-	decision := s.evaluateVolumeReconcile(ctx, node, string(VolumeReconcileDetach), volume)
-	switch decision.Action {
-	case VolumeReconcileProceed:
-		return true, ""
-	case VolumeReconcileComplete, VolumeReconcileStale:
-		return false, decision.Reason
-	case VolumeReconcilePause, VolumeReconcileReject:
-		return false, firstNonEmpty(decision.Message, decision.Reason)
-	default:
-		return false, decision.Reason
-	}
 }

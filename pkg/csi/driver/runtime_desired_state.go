@@ -132,7 +132,7 @@ func (r *KubeRuntime) DesiredNodeForVolume(ctx context.Context, volumeHandle str
 	}
 	for idx := range pods.Items {
 		pod := &pods.Items[idx]
-		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
 		referencesPVC := false
@@ -184,7 +184,7 @@ func (r *KubeRuntime) DesiredNodeForVolume(ctx context.Context, volumeHandle str
 	now := time.Now().UTC()
 	for idx := range vas.Items {
 		va := &vas.Items[idx]
-		if !matchesVolumeAttachment(runtimeCtx.PVName, va) {
+		if pv.Spec.CSI == nil || va.Spec.Attacher != pv.Spec.CSI.Driver || !matchesVolumeAttachment(runtimeCtx.PVName, va) {
 			continue
 		}
 		if strings.TrimSpace(va.Spec.NodeName) == "" || !va.DeletionTimestamp.IsZero() {

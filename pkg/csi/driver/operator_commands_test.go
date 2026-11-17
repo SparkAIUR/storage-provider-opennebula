@@ -2,8 +2,14 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"github.com/stretchr/testify/require"
+	kruntime "k8s.io/apimachinery/pkg/runtime"
+	ktesting "k8s.io/client-go/testing"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	inventoryv1alpha1 "github.com/SparkAIUR/storage-provider-opennebula/pkg/inventory/apis/storageprovider/v1alpha1"
@@ -222,4 +228,62 @@ func TestCollectVolumeHealthReportsFlagsStaleLastAttachedNodeAnnotation(t *testi
 	if !found {
 		t.Fatalf("expected stale last-attached-node audit finding, got %#v", reports[0].AnnotationAudit)
 	}
+}
+
+func TestSupportBundleLocalRWOSnapshotIsReadOnly(t *testing.T) {
+	for _, active := range []bool{false, true} {
+		t.Run(fmt.Sprintf("maintenance=%v", active), func(t *testing.T) {
+			pv, pvc := newLocalPVAndPVC("vol-diagnostics", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			pv.Annotations[annotationLastAttachedNode] = "node-old"
+			node := newReadyNode("node-old", true)
+			node.UID = "node-owned"
+			state := StickyAttachmentState{VolumeID: "vol-diagnostics", NodeID: "node-old", Backend: "local", Reason: maintenanceStickyReason, StartedAt: time.Now().UTC(), ExpiresAt: time.Now().Add(time.Hour)}
+			payload, err := json.Marshal(state)
+			require.NoError(t, err)
+			held := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: stickyAttachmentStateConfigMapName, Namespace: namespaceFromServiceAccount()}, Data: map[string]string{"vol-diagnostics": string(payload)}}
+			maintenance := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: hotplugStateConfigMapName, Namespace: namespaceFromServiceAccount()}, Data: map[string]string{maintenanceModeKey: fmt.Sprint(active), maintenanceReadyKey: "true"}}
+			client := fake.NewSimpleClientset(pv, pvc, node, held, maintenance)
+			client.PrependReactor("*", "*", func(action ktesting.Action) (bool, kruntime.Object, error) {
+				switch action.GetVerb() {
+				case "get", "list":
+					return false, nil, nil
+				default:
+					t.Errorf("diagnostic collection attempted %s %s", action.GetVerb(), action.GetResource().Resource)
+					return true, nil, fmt.Errorf("diagnostics must be read-only")
+				}
+			})
+			history, _, _, demand, protection := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, []corev1.PersistentVolume{*pv})
+			require.True(t, history["vol-diagnostics"].Bootstrapped)
+			require.Equal(t, "node-old", history["vol-diagnostics"].LastSuccessfulNodeName)
+			require.Contains(t, demand, "vol-diagnostics")
+			require.True(t, protection["vol-diagnostics"].Protected)
+			require.Equal(t, "node-old", protection["vol-diagnostics"].RequiredNode)
+			current, err := client.CoreV1().ConfigMaps(held.Namespace).Get(context.Background(), held.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, held.Data, current.Data)
+		})
+	}
+}
+
+func TestSupportBundleProjectsLiveMaintenanceAttachmentWithoutWrites(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-live-diagnostics", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	node := newReadyNode("node-old", true)
+	va := &storagev1.VolumeAttachment{ObjectMeta: metav1.ObjectMeta{Name: "va-live", UID: "va-live-uid"}, Spec: storagev1.VolumeAttachmentSpec{Attacher: DefaultDriverName, NodeName: node.Name, Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name}}, Status: storagev1.VolumeAttachmentStatus{Attached: true}}
+	maintenance := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: hotplugStateConfigMapName, Namespace: namespaceFromServiceAccount()}, Data: map[string]string{maintenanceModeKey: "true"}}
+	client := fake.NewSimpleClientset(pv, pvc, node, va, maintenance)
+	client.PrependReactor("*", "*", func(action ktesting.Action) (bool, kruntime.Object, error) {
+		if action.GetVerb() == "get" || action.GetVerb() == "list" {
+			return false, nil, nil
+		}
+		t.Errorf("diagnostics attempted %s %s", action.GetVerb(), action.GetResource().Resource)
+		return true, nil, fmt.Errorf("unexpected diagnostic write")
+	})
+	history, _, _, _, protection := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, []corev1.PersistentVolume{*pv})
+	require.Equal(t, node.Name, history["vol-live-diagnostics"].LastSuccessfulNodeName)
+	require.True(t, history["vol-live-diagnostics"].Bootstrapped)
+	require.Equal(t, node.Name, protection["vol-live-diagnostics"].RequiredNode)
+	require.True(t, protection["vol-live-diagnostics"].Protected)
+	current, err := client.CoreV1().PersistentVolumes().Get(context.Background(), pv.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, pv.Annotations, current.Annotations)
 }

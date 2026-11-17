@@ -279,6 +279,7 @@ func TestValidateHotplugQueueRequestAllowsOrphanDetachAfterHistoryRefresh(t *tes
 	va := &storagev1.VolumeAttachment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "va-orphan",
+			UID:               "va-orphan-uid",
 			DeletionTimestamp: &now,
 		},
 		Spec: storagev1.VolumeAttachmentSpec{

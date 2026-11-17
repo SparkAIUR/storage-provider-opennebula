@@ -1,8 +1,12 @@
 package driver
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -15,6 +19,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/kubernetes/fake"
 	"sigs.k8s.io/yaml"
 )
 
@@ -131,5 +136,91 @@ func TestChartPreservesExplicitBooleanSettings(t *testing.T) {
 				require.Equal(t, metrics, foundMonitor)
 			})
 		}
+	}
+}
+
+func TestStorageClassReconcileRenderContract(t *testing.T) {
+	for _, mode := range []string{"unset", "disabled", "enabled", "no-classes"} {
+		t.Run(mode, func(t *testing.T) {
+			chartDir := os.Getenv("STORAGECLASS_RECONCILE_CHART_DIR")
+			if chartDir == "" {
+				chartDir = "../../../helm/opennebula-csi"
+			}
+			chart, err := loader.Load(chartDir)
+			require.NoError(t, err)
+			settings := chart.Values["storageClassReconcile"].(map[string]interface{})
+			delete(settings, "enabled")
+			if mode != "unset" {
+				settings["enabled"] = mode != "disabled"
+			}
+			overrides := map[string]interface{}{
+				"credentials":    map[string]interface{}{"existingSecret": map[string]interface{}{"name": "dummy", "userKey": "user", "passwordKey": "pass"}},
+				"storageClasses": []interface{}{map[string]interface{}{"name": "opennebula-local", "parameters": map[string]interface{}{"datastoreIDs": "100"}}},
+			}
+			if mode == "no-classes" {
+				overrides["storageClasses"] = []interface{}{}
+			}
+			values, err := chartutil.ToRenderValues(chart, overrides, chartutil.ReleaseOptions{Name: "reconcile", Namespace: "default", Revision: 1, IsUpgrade: true}, chartutil.DefaultCapabilities)
+			require.NoError(t, err)
+			rendered, err := engine.Render(chart, values)
+			require.NoError(t, err)
+			var jobs []batchv1.Job
+			var inputs []corev1.ConfigMap
+			for _, output := range rendered {
+				decoder := k8syaml.NewYAMLOrJSONDecoder(strings.NewReader(output), 4096)
+				for {
+					var raw json.RawMessage
+					err := decoder.Decode(&raw)
+					if err == io.EOF {
+						break
+					}
+					require.NoError(t, err)
+					if len(bytes.TrimSpace(raw)) == 0 {
+						continue
+					}
+					var meta struct {
+						metav1.TypeMeta `json:",inline"`
+						Metadata        metav1.ObjectMeta `json:"metadata"`
+					}
+					require.NoError(t, json.Unmarshal(raw, &meta))
+					if meta.Metadata.Labels["app.kubernetes.io/component"] != "storageclass-reconcile" {
+						continue
+					}
+					switch meta.Kind {
+					case "Job":
+						var job batchv1.Job
+						require.NoError(t, json.Unmarshal(raw, &job))
+						jobs = append(jobs, job)
+					case "ConfigMap":
+						var cm corev1.ConfigMap
+						require.NoError(t, json.Unmarshal(raw, &cm))
+						inputs = append(inputs, cm)
+					default:
+						t.Fatalf("unexpected reconcile resource kind %s", meta.Kind)
+					}
+				}
+			}
+			if mode != "enabled" {
+				require.Empty(t, jobs)
+				require.Empty(t, inputs)
+				return
+			}
+			require.Len(t, jobs, 1)
+			require.Len(t, inputs, 1)
+			job, input := jobs[0], inputs[0]
+			require.Equal(t, job.Namespace, input.Namespace)
+			require.Len(t, job.Spec.Template.Spec.Containers, 1)
+			args := job.Spec.Template.Spec.Containers[0].Args
+			require.Contains(t, args, "--mode=storageclass-reconcile")
+			require.Contains(t, args, "--storageclass-reconcile-configmap="+input.Name)
+			require.Contains(t, args, "--storageclass-reconcile-namespace="+input.Namespace)
+			client := fake.NewSimpleClientset(&input)
+			var result bytes.Buffer
+			require.NoError(t, RunStorageClassReconcile(context.Background(), client, StorageClassReconcileOptions{Namespace: input.Namespace, ConfigMapName: input.Name, AdoptUnannotated: true}, &result))
+			class, err := client.StorageV1().StorageClasses().Get(context.Background(), "opennebula-local", metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, DefaultDriverName, class.Provisioner)
+			require.Equal(t, "100", class.Parameters["datastoreIDs"])
+		})
 	}
 }

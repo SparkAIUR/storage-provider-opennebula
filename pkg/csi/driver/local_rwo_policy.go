@@ -87,13 +87,16 @@ func localRWOProtectionDecisionForDriver(ctx context.Context, driver *Driver, vo
 }
 
 func (s *ControllerServer) localRWOProtectionDecision(ctx context.Context, volumeID, requestedNode string) (LocalRWOProtectionDecision, error) {
+	return s.localRWOProtectionProjection(ctx, volumeID, requestedNode, nil, true)
+}
+
+func (s *ControllerServer) localRWOProtectionProjection(ctx context.Context, volumeID, requestedNode string, runtimeCtx *VolumeRuntimeContext, persist bool) (LocalRWOProtectionDecision, error) {
 	decision := LocalRWOProtectionDecision{}
 	if s == nil || s.driver == nil {
 		return decision, nil
 	}
 
-	var runtimeCtx *VolumeRuntimeContext
-	if s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
+	if runtimeCtx == nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
 		if resolved, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeID); err == nil {
 			runtimeCtx = resolved
 		}
@@ -105,7 +108,12 @@ func (s *ControllerServer) localRWOProtectionDecision(ctx context.Context, volum
 		history = s.refreshVolumeHistory(ctx, volumeID)
 	}
 	if !volumeHistoryHasObservedSuccess(history) {
-		history = s.bootstrapVolumeHistoryEvidence(ctx, volumeID, runtimeCtx, history)
+		if persist {
+			history = s.bootstrapVolumeHistoryEvidence(ctx, volumeID, runtimeCtx, history)
+		} else if seed, ok := buildVolumeHistoryBootstrapEvidence(ctx, s.driver.kubeRuntime, volumeID, runtimeCtx); ok {
+			mergeVolumeHistoryBootstrap(&history, seed)
+			normalizeVolumeHistoryRecord(&history)
+		}
 	}
 	decision.History = history
 
@@ -362,7 +370,8 @@ func (s *ControllerServer) activeStickyAttachment(volumeID string) (StickyAttach
 	if s == nil || s.driver == nil || s.driver.stickyAttachments == nil {
 		return StickyAttachmentState{}, false
 	}
-	return s.driver.stickyAttachments.Get(volumeID)
+	state, ok := s.driver.stickyAttachments.Get(volumeID)
+	return state, ok && (state.ExpiresAt.IsZero() || state.ExpiresAt.After(time.Now().UTC()))
 }
 
 func (s *ControllerServer) latestLocalDeviceReport(ctx context.Context, volumeID string) (LocalDeviceMissingReport, bool) {

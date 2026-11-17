@@ -62,6 +62,9 @@ func (s *ControllerServer) rescueCephSameNodeUnpublish(ctx context.Context, req 
 		return false, nil, nil
 	}
 	if !strings.EqualFold(strings.TrimSpace(runtimeCtx.Backend), "ceph") {
+		if strings.EqualFold(strings.TrimSpace(s.currentVolumeHistory(req.VolumeId).Backend), "ceph") {
+			return true, nil, cephRetentionUnavailable("current backend contradicts pinned Ceph history", nil)
+		}
 		return false, nil, nil
 	}
 	if s.driver.operationLocks == nil {
@@ -164,6 +167,9 @@ func validateCephRetentionDisk(req *csi.ControllerUnpublishVolumeRequest, imageI
 		return cephRetentionUnavailable("VolumeAttachment target contradicts the current device", nil)
 	}
 	history := authority.History
+	if !cephHistoryHasObservedAuthority(history) {
+		return cephRetentionUnavailable("history has no observed success authority", nil)
+	}
 	if history.LastSuccessfulImageID != disk.ImageID || history.LastSuccessfulNodeName != req.NodeId || history.LastSuccessfulNodeUID != string(authority.NodeUID) {
 		return cephRetentionUnavailable("observed volume history does not match image and node identity", nil)
 	}
@@ -264,17 +270,21 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if control.Invalid || control.Active() {
 		return nil, status.Error(codes.FailedPrecondition, "Ceph same-node retention is blocked by active or invalid recovery controls")
 	}
-	if err := s.cephRetentionProtectionChecks(ctx, req.VolumeId, currentRuntime); err != nil {
+	if err := s.attachmentProtectionChecks(ctx, req.VolumeId, currentRuntime); err != nil {
 		return nil, err
 	}
 	if s.driver.volumeHistory == nil {
 		return nil, cephRetentionUnavailable("volume history is unavailable", nil)
 	}
-	if err := s.driver.volumeHistory.RefreshEntry(ctx, req.VolumeId); err != nil {
-		return nil, cephRetentionUnavailable("volume history refresh failed", err)
+	cm, err := runtime.GetConfigMap(ctx, s.driver.volumeHistory.namespace, volumeHistoryStateConfigMapName)
+	if err != nil {
+		return nil, cephRetentionUnavailable("volume history read failed", err)
 	}
-	history, ok := s.driver.volumeHistory.Get(req.VolumeId)
-	if !ok {
+	var history VolumeHistoryRecord
+	if err := decodeCephRetentionProtection(cm.Data[req.VolumeId], &history); err != nil {
+		return nil, cephRetentionUnavailable("volume history is malformed", err)
+	}
+	if history.VolumeID != req.VolumeId || !cephHistoryHasObservedAuthority(history) {
 		return nil, cephRetentionUnavailable("observed volume history is unavailable", nil)
 	}
 	authority.History = history
@@ -284,7 +294,7 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	return authority, nil
 }
 
-func (s *ControllerServer) cephRetentionProtectionChecks(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext) error {
+func (s *ControllerServer) attachmentProtectionChecks(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext) error {
 	if s.driver.volumeRepairState == nil || s.driver.volumeQuarantine == nil || s.driver.hostArtifactQuarantine == nil {
 		return cephRetentionUnavailable("protection state managers are unavailable", nil)
 	}
@@ -352,4 +362,9 @@ func decodeCephRetentionProtection(raw string, target any) error {
 		return fmt.Errorf("protection record contains trailing JSON")
 	}
 	return nil
+}
+
+func cephHistoryHasObservedAuthority(history VolumeHistoryRecord) bool {
+	return volumeHistoryHasObservedSuccess(history) && !history.Bootstrapped &&
+		(history.EvidenceSource == "" || history.EvidenceSource == volumeHistoryEvidenceSourceObserved)
 }

@@ -101,6 +101,7 @@ type VolumeRuntimeContext struct {
 }
 
 type KubeRuntime struct {
+	driverName      string
 	client          kubernetes.Interface
 	inventoryClient ctrlclient.Client
 	recorder        record.EventRecorder
@@ -144,6 +145,7 @@ func NewKubeRuntime(component string, pluginConfig config.CSIPluginConfig) *Kube
 	recorder := broadcaster.NewRecorder(clientgoscheme.Scheme, corev1.EventSource{Component: component})
 
 	return &KubeRuntime{
+		driverName:      component,
 		client:          client,
 		inventoryClient: inventoryClient,
 		recorder:        recorder,
@@ -406,9 +408,19 @@ func (r *KubeRuntime) ResolveVolumeRuntimeContext(ctx context.Context, volumeHan
 		return nil, err
 	}
 
+	driverName := firstNonEmpty(r.driverName, DefaultDriverName)
+	matches := 0
+	for _, pv := range pvs.Items {
+		if pv.Spec.CSI != nil && pv.Spec.CSI.Driver == driverName && pv.Spec.CSI.VolumeHandle == volumeHandle {
+			matches++
+		}
+	}
+	if matches > 1 {
+		return nil, fmt.Errorf("multiple owned persistent volumes for handle %s", volumeHandle)
+	}
 	for i := range pvs.Items {
 		pv := &pvs.Items[i]
-		if pv.Spec.CSI == nil || pv.Spec.CSI.VolumeHandle != volumeHandle {
+		if pv.Spec.CSI == nil || pv.Spec.CSI.Driver != driverName || pv.Spec.CSI.VolumeHandle != volumeHandle {
 			continue
 		}
 
