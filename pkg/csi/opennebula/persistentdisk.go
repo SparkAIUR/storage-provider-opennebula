@@ -22,6 +22,7 @@ import (
 	"fmt"
 	gocaerrors "github.com/OpenNebula/one/src/oca/go/src/goca/errors"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -1224,6 +1225,15 @@ func (p *PersistentDiskVolumeProvider) findAttachedVolumeDisk(ctx context.Contex
 	return attachedVMID, attachedDiskID, true, attachedSizeBytes, nil
 }
 
+type diskImageConflict struct {
+	imageID  int
+	serialID int
+}
+
+func (*diskImageConflict) Error() string {
+	return "CSI disk serial contradicts VM disk image identity"
+}
+
 func diskImageReference(disk shared.Disk, allowBlank bool) (int, bool, error) {
 	raw, err := disk.Get(shared.ImageID)
 	present := err == nil
@@ -1241,11 +1251,36 @@ func diskImageReference(disk shared.Disk, allowBlank bool) (int, bool, error) {
 		if suffix, ok := strings.CutPrefix(strings.TrimSpace(serial), "onecsi-"); ok {
 			serialID, parseErr := strconv.Atoi(suffix)
 			if parseErr == nil && serialID >= 0 && (!present || serialID != id) {
-				return 0, false, fmt.Errorf("CSI disk serial contradicts VM disk image identity")
+				if !present {
+					id = -1
+				}
+				return 0, false, &diskImageConflict{imageID: id, serialID: serialID}
 			}
 		}
 	}
 	return id, present, nil
+}
+
+func diskImageReferenceForVolume(disk shared.Disk, volumeID int, requireComplete bool) (int, bool, error) {
+	id, present, err := diskImageReference(disk, !requireComplete)
+	var conflict *diskImageConflict
+	if errors.As(err, &conflict) && conflict.imageID != volumeID && conflict.serialID != volumeID {
+		return 0, false, nil
+	}
+	return id, present, err
+}
+
+func validateUniqueVMDiskSlot(disks []shared.Disk, diskID int) error {
+	found := false
+	for _, disk := range disks {
+		if slot, err := disk.GetI(shared.DiskID); err == nil && slot == diskID {
+			if found {
+				return fmt.Errorf("selected VM disk slot is claimed by multiple records")
+			}
+			found = true
+		}
+	}
+	return nil
 }
 
 func (p *PersistentDiskVolumeProvider) volumeDiskInVM(ctx context.Context, imageID, vmID int) (int, int64, error) {
@@ -1267,8 +1302,9 @@ func volumeDiskFromVM(info *vm.VM, imageID, vmID int, requireCompleteImageRefere
 	}
 	var selected *shared.Disk
 	var diskID int
-	for _, disk := range info.Template.GetDisks() {
-		id, present, err := diskImageReference(disk, !requireCompleteImageReferences)
+	disks := info.Template.GetDisks()
+	for _, disk := range disks {
+		id, present, err := diskImageReferenceForVolume(disk, imageID, requireCompleteImageReferences)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -1286,6 +1322,11 @@ func volumeDiskFromVM(info *vm.VM, imageID, vmID int, requireCompleteImageRefere
 	}
 	if selected == nil {
 		return 0, nil, fmt.Errorf("%w: image %d VM %d", ErrAttachmentNotFound, imageID, vmID)
+	}
+	if requireCompleteImageReferences {
+		if err := validateUniqueVMDiskSlot(disks, diskID); err != nil {
+			return 0, nil, err
+		}
 	}
 	return diskID, selected, nil
 }
@@ -1770,13 +1811,22 @@ func (p *PersistentDiskVolumeProvider) getVolumeInNode(ctx context.Context, volu
 	var target string
 	disks := vmInfo.Template.GetDisks()
 	for _, disk := range disks {
-		diskImageID, present, err := diskImageReference(disk, !requireCompleteImageReferences)
+		diskImageID, present, err := diskImageReferenceForVolume(disk, volumeID, requireCompleteImageReferences)
 		if err != nil {
 			return "", err
 		}
 		if present && diskImageID == volumeID {
 			if target != "" {
 				return "", fmt.Errorf("image %d has multiple disks on VM %d", volumeID, nodeID)
+			}
+			if requireCompleteImageReferences {
+				diskID, err := disk.GetI(shared.DiskID)
+				if err != nil || diskID < 0 {
+					return "", fmt.Errorf("attachment disk slot is unverified")
+				}
+				if err := validateUniqueVMDiskSlot(disks, diskID); err != nil {
+					return "", err
+				}
 			}
 			target, err = disk.Get("TARGET")
 			if err != nil || strings.TrimSpace(target) == "" {
@@ -1789,7 +1839,7 @@ func (p *PersistentDiskVolumeProvider) getVolumeInNode(ctx context.Context, volu
 	}
 	if !requireCompleteImageReferences {
 		for _, disk := range disks {
-			if _, _, err := diskImageReference(disk, false); err != nil {
+			if _, _, err := diskImageReferenceForVolume(disk, volumeID, true); err != nil {
 				return "", err
 			}
 		}
@@ -1906,8 +1956,9 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Conte
 		if vmInfo.ID == requestedNodeID {
 			requestedNodeSeen = true
 		}
-		for _, disk := range vmInfo.Template.GetDisks() {
-			diskImageID, present, diskErr := diskImageReference(disk, false)
+		disks := vmInfo.Template.GetDisks()
+		for _, disk := range disks {
+			diskImageID, present, diskErr := diskImageReferenceForVolume(disk, volumeID, true)
 			if diskErr != nil {
 				return nil, diskErr
 			}
@@ -1920,6 +1971,9 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Conte
 				DiskID:   -1,
 			}
 			if diskID, diskIDErr := disk.GetI(shared.DiskID); diskIDErr == nil {
+				if err := validateUniqueVMDiskSlot(disks, diskID); err != nil {
+					return nil, err
+				}
 				record.DiskID = diskID
 			}
 			if target, targetErr := disk.Get(shared.TargetDisk); targetErr == nil {
@@ -1949,14 +2003,17 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 
 	attachments := make([]ObservedAttachment, 0)
 	vmNames := make(VMNameInventory, len(vmPool.VMs))
-	imageCache := map[int]struct {
-		name    string
-		backend string
-	}{}
+	conflictedImages := make(map[int]bool)
 	for _, vmInfo := range vmPool.VMs {
 		vmNames[vmInfo.Name] = append(vmNames[vmInfo.Name], vmInfo.ID)
 		for _, disk := range vmInfo.Template.GetDisks() {
 			diskImageID, present, diskErr := diskImageReference(disk, false)
+			var conflict *diskImageConflict
+			if errors.As(diskErr, &conflict) {
+				conflictedImages[conflict.imageID] = true
+				conflictedImages[conflict.serialID] = true
+				continue
+			}
 			if diskErr != nil {
 				return nil, nil, diskErr
 			}
@@ -1967,38 +2024,37 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 			if diskIDErr != nil {
 				continue
 			}
-			imageMeta, ok := imageCache[diskImageID]
-			if !ok {
-				imageInfo, imageErr := p.ctrl.Image(diskImageID).InfoContext(ctx, true)
-				if imageErr != nil {
-					return nil, nil, fmt.Errorf("failed to inspect image %d while listing attachments: %w", diskImageID, imageErr)
-				}
-				backend := ""
-				if imageInfo.DatastoreID != nil {
-					var backendErr error
-					backend, backendErr = p.attachmentImageBackend(ctx, *imageInfo.DatastoreID)
-					if backendErr != nil {
-						klog.V(2).InfoS("Attachment inventory backend is unknown", "imageID", diskImageID, "err", backendErr)
-					}
-				}
-				imageMeta = struct {
-					name    string
-					backend string
-				}{
-					name:    imageInfo.Name,
-					backend: backend,
-				}
-				imageCache[diskImageID] = imageMeta
-			}
 			attachments = append(attachments, ObservedAttachment{
-				VolumeHandle: imageMeta.name,
-				ImageID:      diskImageID,
-				NodeName:     vmInfo.Name,
-				NodeID:       vmInfo.ID,
-				DiskID:       diskID,
-				Backend:      imageMeta.backend,
+				ImageID: diskImageID, NodeName: vmInfo.Name, NodeID: vmInfo.ID, DiskID: diskID,
 			})
 		}
+	}
+	attachments = slices.DeleteFunc(attachments, func(a ObservedAttachment) bool { return conflictedImages[a.ImageID] })
+	imageCache := map[int]struct {
+		name    string
+		backend string
+	}{}
+	for i := range attachments {
+		attachment := &attachments[i]
+		imageID := attachment.ImageID
+		imageMeta, ok := imageCache[imageID]
+		if !ok {
+			imageInfo, imageErr := p.ctrl.Image(imageID).InfoContext(ctx, true)
+			if imageErr != nil {
+				return nil, nil, fmt.Errorf("failed to inspect image %d while listing attachments: %w", imageID, imageErr)
+			}
+			imageMeta.name = imageInfo.Name
+			if imageInfo.DatastoreID != nil {
+				var backendErr error
+				imageMeta.backend, backendErr = p.attachmentImageBackend(ctx, *imageInfo.DatastoreID)
+				if backendErr != nil {
+					klog.V(2).InfoS("Attachment inventory backend is unknown", "imageID", imageID, "err", backendErr)
+				}
+			}
+			imageCache[imageID] = imageMeta
+		}
+		attachment.VolumeHandle = imageMeta.name
+		attachment.Backend = imageMeta.backend
 	}
 	return attachments, vmNames, nil
 }

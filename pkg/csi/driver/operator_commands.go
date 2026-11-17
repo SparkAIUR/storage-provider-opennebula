@@ -415,12 +415,11 @@ func writeSupportBundle(ctx context.Context, cfg config.CSIPluginConfig, kubeCli
 	if err != nil {
 		return err
 	}
-	vaList, vaErr := kubeClient.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
-	var attachments []storagev1.VolumeAttachment
-	if vaErr == nil {
-		attachments = vaList.Items
+	vaList, err := kubeClient.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return err
 	}
-	volumeHealth := projectVolumeHealthReports(ctx, kubeClient, invClient, cfg, VolumeHealthOptions{}, pvList.Items, attachments)
+	volumeHealth := projectVolumeHealthReports(ctx, kubeClient, invClient, cfg, VolumeHealthOptions{}, pvList.Items, vaList.Items)
 	eventList, err := kubeClient.CoreV1().Events("").List(ctx, metav1.ListOptions{Limit: 50})
 	if err != nil {
 		return err
@@ -451,7 +450,7 @@ func writeSupportBundle(ctx context.Context, cfg config.CSIPluginConfig, kubeCli
 	hotplugDiagnostics := hotplugDiagnosticSnapshot(ctx, kubeClient, cfg)
 	adaptiveSnapshot := configMapJSONSnapshot(ctx, kubeClient, adaptiveTimeoutObservationsConfigMapName)
 	adaptiveRecommendations := adaptiveRecommendationSnapshot(cfg, adaptiveSnapshot)
-	volumeHistorySnapshot, volumeRepairSnapshot, volumeRecoverySnapshot, volumeDemandSnapshot, protectionSnapshot := collectSupportBundleLocalRWOSnapshot(ctx, cfg, kubeClient, invClient, pvList.Items, vaList, vaErr)
+	volumeHistorySnapshot, volumeRepairSnapshot, volumeRecoverySnapshot, volumeDemandSnapshot, protectionSnapshot := collectSupportBundleLocalRWOSnapshot(ctx, cfg, kubeClient, invClient, pvList.Items, vaList, nil)
 	nodeLocalDiskSessions, nodeLocalSessionReference := supportBundleLocalDiskSessionDiagnostics(ctx, kubeClient)
 	volumeRecoverySnapshot = enrichRecoveryControlSupportSnapshot(volumeRecoverySnapshot, volumeDemandSnapshot, nodeLocalDiskSessions, volumeQuarantineSnapshot, hostArtifactSnapshot)
 
@@ -492,7 +491,7 @@ func writeSupportBundle(ctx context.Context, cfg config.CSIPluginConfig, kubeCli
 		StorageClassAudit:         flattenStorageClassDetails(dsList.Items, scList.Items),
 		StorageClassImmutables:    storageClassImmutableFieldSnapshots(scList.Items),
 		VolumeHealth:              volumeHealth,
-		VolumeAttachments:         attachments,
+		VolumeAttachments:         vaList.Items,
 		Events:                    eventList.Items,
 	}
 

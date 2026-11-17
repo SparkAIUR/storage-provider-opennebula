@@ -149,6 +149,16 @@ func TestSameNodeRetentionRejectsUncertainOrUnsafeEvidence(t *testing.T) {
 		"duplicate disk": func(c *retentionProtocolCase) {
 			c.extraDisk = `<DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>3</DISK_ID><TARGET>vdc</TARGET><SERIAL>onecsi-7</SERIAL><SIZE>1024</SIZE></DISK>`
 		},
+		"slot collision in census": func(c *retentionProtocolCase) {
+			c.extraDisk = `<DISK><IMAGE_ID>8</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdc</TARGET></DISK>`
+		},
+		"slot collision in fresh VM with image-less disk": func(c *retentionProtocolCase) {
+			c.beforeReply = func(method string) {
+				if method == "one.vm.info" {
+					c.extraDisk = `<DISK><DISK_ID>2</DISK_ID><TYPE>CDROM</TYPE></DISK>`
+				}
+			}
+		},
 		"missing serial": func(c *retentionProtocolCase) { c.serial = "" },
 		"missing target": func(c *retentionProtocolCase) { c.target = "" },
 		"CSI serial in census lacks image ID": func(c *retentionProtocolCase) {
@@ -277,6 +287,36 @@ func TestDiskLookupDistinguishesBlankAndMalformedImageReferences(t *testing.T) {
 			size, err := p.completedDiskSize(ctx, 11, 2, 7)
 			require.NoError(t, err)
 			require.EqualValues(t, 1_073_741_824, size)
+			require.Zero(t, mutations.Load())
+		})
+	}
+}
+
+func TestSameNodeRetentionScopesCSIImageConflict(t *testing.T) {
+	for _, imageID := range []int{7, 8, 9} {
+		t.Run(fmt.Sprint(imageID), func(t *testing.T) {
+			p, mutations := retentionProtocolFixture(t, func(c *retentionProtocolCase) {
+				c.imageID = imageID
+				c.extraVM = `<VM><ID>12</ID><NAME>other</NAME><TEMPLATE>
+<DISK><IMAGE_ID>8</IMAGE_ID><DISK_ID>3</DISK_ID><SERIAL>onecsi-9</SERIAL></DISK>
+<DISK><IMAGE_ID>8</IMAGE_ID><DISK_ID>4</DISK_ID><SERIAL>onecsi-8</SERIAL></DISK>
+<DISK><IMAGE_ID>9</IMAGE_ID><DISK_ID>5</DISK_ID><SERIAL>onecsi-9</SERIAL></DISK>
+</TEMPLATE></VM>`
+			})
+			ctx := context.Background()
+			evidence, err := p.InspectSameNodeRetention(ctx, "volume-test", "node-test")
+			if imageID == 7 {
+				require.NoError(t, err)
+				require.Equal(t, 7, evidence.ImageID)
+				attachments, nodes, err := p.ListCurrentAttachments(ctx)
+				require.NoError(t, err)
+				require.Len(t, attachments, 1)
+				require.Equal(t, 7, attachments[0].ImageID)
+				require.Equal(t, []int{12}, nodes["other"])
+			} else {
+				require.ErrorContains(t, err, "CSI disk serial contradicts VM disk image identity")
+				require.Nil(t, evidence)
+			}
 			require.Zero(t, mutations.Load())
 		})
 	}

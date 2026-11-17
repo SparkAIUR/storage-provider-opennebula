@@ -86,28 +86,13 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 	if err != nil || state != vm.Active || lcm != vm.Running {
 		return deny("VM is not stably running")
 	}
-	var selected *shared.Disk
-	for _, disk := range info.Template.GetDisks() {
-		imageID, present, imageErr := diskImageReference(disk, false)
-		if imageErr != nil {
-			return deny(imageErr.Error())
-		}
-		if !present || imageID != metadata.ImageID {
-			continue
-		}
-		if selected != nil {
-			return deny("fresh VM has multiple disks for this image")
-		}
-		diskCopy := disk
-		selected = &diskCopy
+	diskID, selected, err := volumeDiskFromVM(info, metadata.ImageID, metadata.RequestedNodeID, true)
+	if err != nil {
+		return deny(err.Error())
 	}
-	if selected == nil {
-		return deny("fresh VM attachment is absent")
-	}
-	diskID, diskErr := selected.GetI(shared.DiskID)
 	target, targetErr := selected.Get(shared.TargetDisk)
 	serial, serialErr := selected.Get(shared.Serial)
-	if diskErr != nil || targetErr != nil || serialErr != nil || diskID != record.DiskID || target != record.Target || serial != record.Serial {
+	if targetErr != nil || serialErr != nil || diskID != record.DiskID || target != record.Target || serial != record.Serial {
 		return deny("fresh disk identity differs from the owner census")
 	}
 	persistent, _ := selected.Get("PERSISTENT")

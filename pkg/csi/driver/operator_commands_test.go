@@ -9,6 +9,7 @@ import (
 	kruntime "k8s.io/apimachinery/pkg/runtime"
 	ktesting "k8s.io/client-go/testing"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -232,18 +233,43 @@ func TestCollectVolumeHealthReportsFlagsStaleLastAttachedNodeAnnotation(t *testi
 }
 
 func TestSupportBundleLocalRWOSnapshotIsReadOnly(t *testing.T) {
-	for _, active := range []bool{false, true} {
-		t.Run(fmt.Sprintf("maintenance=%v", active), func(t *testing.T) {
-			pv, pvc := newLocalPVAndPVC("vol-diagnostics", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	for _, tc := range []struct {
+		name               string
+		active, hasHistory bool
+	}{
+		{name: "maintenance-active", active: true, hasHistory: true},
+		{name: "maintenance-inactive", hasHistory: true},
+		{name: "missing-history", active: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 			pv.Annotations[annotationLastAttachedNode] = "node-old"
 			node := newReadyNode("node-old", true)
 			node.UID = "node-owned"
-			state := StickyAttachmentState{VolumeID: "vol-diagnostics", NodeID: "node-old", Backend: "local", Reason: maintenanceStickyReason, StartedAt: time.Now().UTC(), ExpiresAt: time.Now().Add(time.Hour)}
+			state := StickyAttachmentState{VolumeID: "volume-test", NodeID: "node-old", Backend: "local", Reason: maintenanceStickyReason, StartedAt: time.Now().UTC(), ExpiresAt: time.Now().Add(time.Hour)}
 			payload, err := json.Marshal(state)
 			require.NoError(t, err)
-			held := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: stickyAttachmentStateConfigMapName, Namespace: namespaceFromServiceAccount()}, Data: map[string]string{"vol-diagnostics": string(payload)}}
-			maintenance := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: hotplugStateConfigMapName, Namespace: namespaceFromServiceAccount()}, Data: map[string]string{maintenanceModeKey: fmt.Sprint(active), maintenanceReadyKey: "true"}}
-			client := fake.NewSimpleClientset(pv, pvc, node, held, maintenance)
+			held := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: stickyAttachmentStateConfigMapName, Namespace: namespaceFromServiceAccount()}, Data: map[string]string{"volume-test": string(payload)}}
+			maintenance := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: hotplugStateConfigMapName, Namespace: namespaceFromServiceAccount()}, Data: map[string]string{maintenanceModeKey: fmt.Sprint(tc.active), maintenanceReadyKey: "true"}}
+			va := &storagev1.VolumeAttachment{
+				ObjectMeta: metav1.ObjectMeta{Name: "fixture-va", UID: "fixture-va"},
+				Spec: storagev1.VolumeAttachmentSpec{Attacher: DefaultDriverName, NodeName: node.Name,
+					Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name}},
+				Status: storagev1.VolumeAttachmentStatus{Attached: true},
+			}
+			objects := []kruntime.Object{pv, pvc, node, held, maintenance, va}
+			if tc.hasHistory {
+				record := VolumeHistoryRecord{VolumeID: "volume-test", Version: stateObjectVersion, Backend: "local",
+					LastSuccessfulNodeName: node.Name, LastSuccessfulPublishTime: time.Now().Add(-time.Hour).UTC(),
+					EvidenceSource: volumeHistoryEvidenceSourceObserved}
+				data, err := json.Marshal(record)
+				require.NoError(t, err)
+				objects = append(objects, &corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{Name: volumeHistoryStateConfigMapName, Namespace: held.Namespace},
+					Data:       map[string]string{"volume-test": string(data)},
+				})
+			}
+			client := fake.NewSimpleClientset(objects...)
 			client.PrependReactor("*", "*", func(action ktesting.Action) (bool, kruntime.Object, error) {
 				switch action.GetVerb() {
 				case "get", "list":
@@ -253,12 +279,43 @@ func TestSupportBundleLocalRWOSnapshotIsReadOnly(t *testing.T) {
 					return true, nil, fmt.Errorf("diagnostics must be read-only")
 				}
 			})
-			history, _, _, demand, protection := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, newInventoryFakeClient(t), []corev1.PersistentVolume{*pv}, &storagev1.VolumeAttachmentList{}, nil)
-			require.True(t, history["vol-diagnostics"].Bootstrapped)
-			require.Equal(t, "node-old", history["vol-diagnostics"].LastSuccessfulNodeName)
-			require.Contains(t, demand, "vol-diagnostics")
-			require.True(t, protection["vol-diagnostics"].Protected)
-			require.Equal(t, "node-old", protection["vol-diagnostics"].RequiredNode)
+			var imageReads, vmReads, unexpectedRPCs atomic.Int32
+			_, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+				switch method {
+				case "one.imagepool.info", "one.image.info":
+					imageReads.Add(1)
+				case "one.vmpool.info":
+					vmReads.Add(1)
+				default:
+					unexpectedRPCs.Add(1)
+				}
+			})
+			cfg := config.LoadConfiguration()
+			cfg.OverrideVal(config.OpenNebulaRPCEndpointVar, wire.endpoint)
+			cfg.OverrideVal(config.OpenNebulaCredentialsVar, "fixture:fixture")
+			inventory := newInventoryFakeClient(t,
+				&inventoryv1alpha1.OpenNebulaNode{ObjectMeta: metav1.ObjectMeta{Name: node.Name}},
+				&inventoryv1alpha1.OpenNebulaDatastore{ObjectMeta: metav1.ObjectMeta{Name: "image-datastore"},
+					Status: inventoryv1alpha1.OpenNebulaDatastoreStatus{ID: 1, Backend: "local"}},
+			)
+			var output bytes.Buffer
+			require.NoError(t, writeSupportBundle(context.Background(), cfg, client, inventory, &output))
+			var bundle SupportBundle
+			require.NoError(t, json.Unmarshal(output.Bytes(), &bundle))
+			require.Greater(t, imageReads.Load(), int32(0))
+			require.Greater(t, vmReads.Load(), int32(0))
+			require.Zero(t, unexpectedRPCs.Load())
+			require.Len(t, bundle.VolumeHealth, 1)
+			attachment := bundle.VolumeHealth[0].OpenNebulaAttachment
+			require.NotNil(t, attachment)
+			require.True(t, attachment.AttachedToRequestedNode)
+			require.Equal(t, 41, attachment.RequestedNodeID)
+			history, demand, protection := bundle.VolumeHistory, bundle.VolumeDemand, bundle.LastNodeProtection
+			require.Equal(t, !tc.hasHistory, history["volume-test"].Bootstrapped)
+			require.Equal(t, "node-old", history["volume-test"].LastSuccessfulNodeName)
+			require.Contains(t, demand, "volume-test")
+			require.True(t, protection["volume-test"].Protected)
+			require.Equal(t, "node-old", protection["volume-test"].RequiredNode)
 			current, err := client.CoreV1().ConfigMaps(held.Namespace).Get(context.Background(), held.Name, metav1.GetOptions{})
 			require.NoError(t, err)
 			require.Equal(t, held.Data, current.Data)
@@ -333,12 +390,13 @@ func TestSupportBundlePreservesPodDemandWhenAttachmentListFails(t *testing.T) {
 	pod := activePodForPVC("consumer", pvc.Name, "node-a")
 	client := fake.NewSimpleClientset(pv, pvc, idlePV, idlePVC, pod)
 	attachmentLists := 0
+	listErr := fmt.Errorf("VolumeAttachment census denied")
 	client.PrependReactor("*", "*", func(action ktesting.Action) (bool, kruntime.Object, error) {
 		switch action.GetVerb() {
 		case "list", "get":
 			if action.GetResource().Resource == "volumeattachments" {
 				attachmentLists++
-				return true, nil, fmt.Errorf("collector may not list VolumeAttachments")
+				return true, nil, listErr
 			}
 			return false, nil, nil
 		default:
@@ -349,11 +407,11 @@ func TestSupportBundlePreservesPodDemandWhenAttachmentListFails(t *testing.T) {
 	cfg := config.LoadConfiguration()
 	cfg.OverrideVal(config.OpenNebulaCredentialsVar, "")
 	var output bytes.Buffer
-	require.NoError(t, writeSupportBundle(context.Background(), cfg, client, newInventoryFakeClient(t), &output))
-	var bundle SupportBundle
-	require.NoError(t, json.Unmarshal(output.Bytes(), &bundle))
-	require.Empty(t, bundle.VolumeAttachments)
-	demand := bundle.VolumeDemand
+	inventory := newInventoryFakeClient(t)
+	require.ErrorIs(t, writeSupportBundle(context.Background(), cfg, client, inventory, &output), listErr)
+	require.Empty(t, output.Bytes())
+	_, _, _, demand, _ := collectSupportBundleLocalRWOSnapshot(context.Background(), cfg, client, inventory,
+		[]corev1.PersistentVolume{*pv, *idlePV}, nil, listErr)
 	require.Equal(t, 1, attachmentLists)
 	require.Equal(t, "active_pod", demand["vol-active"].DemandSource)
 	require.Equal(t, "node-a", demand["vol-active"].NodeName)

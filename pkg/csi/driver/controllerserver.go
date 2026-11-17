@@ -2637,7 +2637,10 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 		}, nil
 	}
 
-	oldNodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(state.NodeID))
+	oldNodeRelease, acquired := s.driver.operationLocks.TryAcquire(controllerNodeLockKey(state.NodeID))
+	if !acquired {
+		return true, nil, status.Error(codes.Aborted, "old attachment node is busy; retry publish")
+	}
 	defer oldNodeRelease()
 
 	if cooldown, ok := s.hotplugCooldownState(ctx, state.NodeID); ok {

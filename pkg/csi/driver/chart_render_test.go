@@ -142,6 +142,11 @@ func TestChartPreservesExplicitBooleanSettings(t *testing.T) {
 	}
 }
 
+const (
+	reconcileTestDriverRepository = "registry.example.test/fixture/csi-driver"
+	reconcileTestDriverTag        = "fixture-tag"
+)
+
 func TestStorageClassReconcileRenderContract(t *testing.T) {
 	for _, mode := range []string{"default", "disabled", "enabled", "no-classes"} {
 		t.Run(mode, func(t *testing.T) {
@@ -170,20 +175,26 @@ func TestStorageClassReconcileRenderContract(t *testing.T) {
 					case "Job":
 						var job batchv1.Job
 						require.NoError(t, json.Unmarshal(raw, &job))
+						reconcile := job.Labels["app.kubernetes.io/component"] == "storageclass-reconcile" ||
+							job.Spec.Template.Labels["app.kubernetes.io/component"] == "storageclass-reconcile"
 						for _, container := range job.Spec.Template.Spec.Containers {
 							argv := append(append([]string(nil), container.Command...), container.Args...)
 							for i, arg := range argv {
 								flag := strings.TrimLeft(arg, "-")
 								if flag == "mode=storageclass-reconcile" || (flag == "mode" && i+1 < len(argv) && argv[i+1] == "storageclass-reconcile") {
-									jobs = append(jobs, job)
+									reconcile = true
 									break
 								}
 							}
 						}
+						if reconcile {
+							jobs = append(jobs, job)
+						}
 					case "ConfigMap":
 						var cm corev1.ConfigMap
 						require.NoError(t, json.Unmarshal(raw, &cm))
-						if _, ok := cm.Data["storageclasses.json"]; ok {
+						_, hasInput := cm.Data["storageclasses.json"]
+						if hasInput || cm.Labels["app.kubernetes.io/component"] == "storageclass-reconcile" {
 							inputs = append(inputs, cm)
 						}
 					}
@@ -200,6 +211,7 @@ func TestStorageClassReconcileRenderContract(t *testing.T) {
 			require.Equal(t, job.Namespace, input.Namespace)
 			require.Len(t, job.Spec.Template.Spec.Containers, 1)
 			container := job.Spec.Template.Spec.Containers[0]
+			require.Equal(t, reconcileTestDriverRepository+":"+reconcileTestDriverTag, container.Image)
 			require.Empty(t, container.Command, "the Job must use the CSI driver image entrypoint")
 			args := container.Args
 			flags := flag.NewFlagSet("storageclass-reconcile", flag.ContinueOnError)
@@ -240,7 +252,8 @@ func renderStorageClassReconcileContract(t *testing.T, chartDir, mode string) ma
 		require.NoError(t, err)
 		require.Equal(t, "v3.21.4", strings.TrimSpace(string(version)))
 		args := []string{"template", "reconcile", chartDir, "--namespace", "default", "--is-upgrade",
-			"--set", "credentials.existingSecret.name=dummy,credentials.existingSecret.userKey=user,credentials.existingSecret.passwordKey=pass"}
+			"--set", "credentials.existingSecret.name=dummy,credentials.existingSecret.userKey=user,credentials.existingSecret.passwordKey=pass",
+			"--set-string", "image.repository=" + reconcileTestDriverRepository + ",image.tag=" + reconcileTestDriverTag + ",image.digest="}
 		if mode != "no-classes" {
 			args = append(args, "--set", "storageClasses[0].name=opennebula-local,storageClasses[0].parameters.datastoreIDs=100")
 		} else {
@@ -256,6 +269,7 @@ func renderStorageClassReconcileContract(t *testing.T, chartDir, mode string) ma
 	chart, err := loader.Load(chartDir)
 	require.NoError(t, err)
 	overrides := map[string]interface{}{
+		"image":          map[string]interface{}{"repository": reconcileTestDriverRepository, "tag": reconcileTestDriverTag, "digest": ""},
 		"credentials":    map[string]interface{}{"existingSecret": map[string]interface{}{"name": "dummy", "userKey": "user", "passwordKey": "pass"}},
 		"storageClasses": []interface{}{map[string]interface{}{"name": "opennebula-local", "parameters": map[string]interface{}{"datastoreIDs": "100"}}},
 	}
