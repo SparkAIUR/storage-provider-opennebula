@@ -413,7 +413,7 @@ func (r *AttachmentReconciler) cleanupLocalDeviceReports(ctx context.Context, pv
 		return
 	}
 	for key, raw := range cm.Data {
-		report, err := decodeLocalDeviceReport(key, raw)
+		report, err := decodeLocalDeviceReport(key, raw, "")
 		if err != nil {
 			continue
 		}

@@ -487,7 +487,7 @@ func TestControllerUnpublishCephLateDemandCannotAcknowledge(t *testing.T) {
 
 func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"null", "identity-only", "missing-count", "missing-last-observation", "reversed-observation", "wrong-report-key", "unknown-confirmation", "unknown-failure", "host-key", "host-owner"} {
+		for _, mode := range []string{"null", "identity-only", "missing-count", "missing-last-observation", "reversed-observation", "unrelated-reversed-observation", "unrelated-invalid-schema", "wrong-report-key", "unknown-confirmation", "unknown-failure", "host-key", "host-owner"} {
 			t.Run(fmt.Sprintf("%v/%s", queued, mode), func(t *testing.T) {
 				f := newCephRestartTestFixture(t, queued)
 				key := localDeviceReportKey(f.node.Name, cephRestartVolume)
@@ -498,7 +498,10 @@ func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T
 					raw = "null"
 				case "identity-only":
 					raw = fmt.Sprintf(`{"node":%q,"volumeID":%q}`, f.node.Name, cephRestartVolume)
-				case "missing-count", "missing-last-observation", "reversed-observation", "wrong-report-key", "unknown-confirmation", "unknown-failure":
+				case "unrelated-invalid-schema":
+					key = localDeviceReportKey(f.node.Name, "other-volume")
+					raw = fmt.Sprintf(`{"node":%q,"volumeID":"other-volume","firstObservedAt":17}`, f.node.Name)
+				case "missing-count", "missing-last-observation", "reversed-observation", "unrelated-reversed-observation", "wrong-report-key", "unknown-confirmation", "unknown-failure":
 					now := time.Now().UTC()
 					report := LocalDeviceMissingReport{Node: f.node.Name, VolumeID: cephRestartVolume, FailureClass: localDeviceFailureClassMissingDevice,
 						FirstObservedAt: now, LastObservedAt: now, Attempts: 1}
@@ -509,6 +512,10 @@ func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T
 						report.LastObservedAt = time.Time{}
 					case "reversed-observation":
 						report.FirstObservedAt = now.Add(time.Minute)
+					case "unrelated-reversed-observation":
+						report.FirstObservedAt = now.Add(time.Minute)
+						report.VolumeID = "other-volume"
+						key = localDeviceReportKey(report.Node, report.VolumeID)
 					case "wrong-report-key":
 						report.VolumeID = "another-volume"
 					case "unknown-confirmation":
@@ -535,9 +542,15 @@ func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T
 				}
 				require.NoError(t, f.server.driver.kubeRuntime.UpsertConfigMapData(context.Background(), "default", cm, map[string]string{key: raw}))
 				reply, err := f.unpublish(t)
-				require.Error(t, err)
-				require.Nil(t, reply)
-				require.Zero(t, f.provider.inspections.Load())
+				if strings.HasPrefix(mode, "unrelated-") {
+					require.NoError(t, err)
+					require.NotNil(t, reply)
+					require.EqualValues(t, 2, f.provider.inspections.Load())
+				} else {
+					require.Error(t, err)
+					require.Nil(t, reply)
+					require.Zero(t, f.provider.inspections.Load())
+				}
 				f.requireNoProviderMutation(t)
 				persisted, err := f.server.driver.kubeRuntime.GetConfigMap(context.Background(), "default", cm)
 				require.NoError(t, err)
@@ -552,6 +565,7 @@ func TestControllerUnpublishCephEventUsesVerifiedClaimWithoutLateReads(t *testin
 		t.Run(fmt.Sprint(queued), func(t *testing.T) {
 			f := newCephRestartTestFixture(t, queued)
 			client := f.server.driver.kubeRuntime.client.(*fake.Clientset)
+			var finalPodRead atomic.Bool
 			var finalAuthorityRead atomic.Bool
 			var lateActions atomic.Int32
 			client.PrependReactor("*", "*", func(action ktesting.Action) (bool, kruntime.Object, error) {
@@ -559,6 +573,9 @@ func TestControllerUnpublishCephEventUsesVerifiedClaimWithoutLateReads(t *testin
 					lateActions.Add(1)
 				}
 				if action.Matches("list", "pods") && f.provider.inspections.Load() == 2 {
+					finalPodRead.Store(true)
+				}
+				if action.Matches("list", "volumeattachments") && finalPodRead.Load() {
 					finalAuthorityRead.Store(true)
 				}
 				return false, nil, nil
@@ -915,6 +932,45 @@ func TestControllerUnpublishHidesStoredRepairDetails(t *testing.T) {
 			for _, event := range events.Items {
 				require.NotContains(t, event.Message, privateDetail)
 			}
+			f.requireNoProviderMutation(t)
+		})
+	}
+}
+
+func replaceDeletingVolumeAttachment(t *testing.T, kube *fake.Clientset, va *storagev1.VolumeAttachment) {
+	t.Helper()
+	resource := storagev1.SchemeGroupVersion.WithResource("volumeattachments")
+	replacement := va.DeepCopy()
+	replacement.UID = "replacement-attachment-uid"
+	require.NoError(t, kube.Tracker().Delete(resource, "", va.Name))
+	require.NoError(t, kube.Tracker().Create(resource, replacement, ""))
+}
+
+func TestControllerUnpublishCephRejectsVAReplacementDuringFinalProtectionRead(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(fmt.Sprint(queued), func(t *testing.T) {
+			f := newCephRestartTestFixture(t, queued)
+			first, err := f.unpublish(t)
+			require.NoError(t, err)
+			require.NotNil(t, first)
+
+			kube := f.server.driver.kubeRuntime.client.(*fake.Clientset)
+			f.provider.inspections.Store(0)
+			var replaced atomic.Bool
+			kube.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+				if action.(ktesting.GetAction).GetName() == hostArtifactStateConfigMapName &&
+					f.provider.inspections.Load() == 2 && replaced.CompareAndSwap(false, true) {
+					replaceDeletingVolumeAttachment(t, kube, f.va)
+				}
+				return false, nil, nil
+			})
+			reply, err := f.unpublish(t)
+			require.True(t, replaced.Load())
+			require.Equal(t, codes.Unavailable, status.Code(err))
+			require.ErrorContains(t, err, "VolumeAttachment deletion authority changed")
+			require.Nil(t, reply)
+			history, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
+			require.True(t, history.LastSafeDetachTime.IsZero())
 			f.requireNoProviderMutation(t)
 		})
 	}

@@ -22,9 +22,47 @@ type physicalDetachIdentity struct {
 	background, ceph      bool
 	cephSingleWriter      bool
 	backend               string
+	attachments           map[string]detachAttachmentAuthority
 }
 
-func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, volume, nodeName string, identity physicalDetachIdentity) error {
+type detachAttachmentAuthority struct {
+	uid            types.UID
+	attacher, node string
+	deleting       bool
+	attached       bool
+	metadata       map[string]string
+}
+
+func (s *ControllerServer) detachVolumeAttachments(ctx context.Context, pvName, nodeName string) (map[string]detachAttachmentAuthority, error) {
+	vas, err := s.driver.kubeRuntime.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, attachmentEvidenceUnavailable("cannot verify attachment deletion authority", err)
+	}
+	attachments := make(map[string]detachAttachmentAuthority)
+	for _, va := range vas.Items {
+		if matchesVolumeAttachment(pvName, &va) && (nodeName == "" || strings.TrimSpace(va.Spec.NodeName) == nodeName) {
+			attachments[va.Name] = detachAttachmentAuthority{
+				uid: va.UID, attacher: va.Spec.Attacher, node: va.Spec.NodeName,
+				deleting: !va.DeletionTimestamp.IsZero(), attached: va.Status.Attached,
+				metadata: cloneStringMap(va.Status.AttachmentMetadata),
+			}
+		}
+	}
+	return attachments, nil
+}
+
+func (s *ControllerServer) recheckDetachVolumeAttachments(ctx context.Context, pvName, nodeName string, expected map[string]detachAttachmentAuthority) error {
+	current, err := s.detachVolumeAttachments(ctx, pvName, nodeName)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(expected, current) {
+		return attachmentEvidenceUnavailable("VolumeAttachment deletion authority changed during attachment checks", nil)
+	}
+	return status.FromContextError(ctx.Err()).Err()
+}
+
+func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, volume, nodeName string, identity *physicalDetachIdentity) error {
 	if err := ctx.Err(); err != nil {
 		return status.FromContextError(err).Err()
 	}
@@ -54,6 +92,21 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	}
 	if identity.background && identity.cephSingleWriter != (isCephBackend(backend) && hasSingleWriterAccessMode(pv.Spec.AccessModes)) {
 		return attachmentEvidenceUnavailable("background detach scope changed", nil)
+	}
+	attachments, err := s.detachVolumeAttachments(ctx, pv.Name, nodeName)
+	if err != nil {
+		return err
+	}
+	if identity.attachments != nil && !reflect.DeepEqual(identity.attachments, attachments) {
+		return attachmentEvidenceUnavailable("VolumeAttachment deletion authority changed before detach attempt", nil)
+	}
+	for _, va := range attachments {
+		if va.attacher != s.driver.name || va.uid == "" || !va.deleting {
+			return status.Error(codes.Unavailable, "current VolumeAttachment does not authorize physical detach")
+		}
+		if err := validateAttachmentImageAssertions(va.metadata, identity.imageID); err != nil {
+			return status.Error(codes.Unavailable, err.Error())
+		}
 	}
 	pvc, replacement, err := runtime.attachmentClaim(ctx, pv)
 	if err != nil {
@@ -106,20 +159,6 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	override, _ := crossNodeOverrideDeadline(runtimeCtx)
 	if protection.Protected && protection.RequiredNode == nodeName && !bypassProtectionForOrphanTeardown(protection, orphan) && !override.After(time.Now().UTC()) {
 		return status.Error(codes.Unavailable, "physical detach is blocked by local volume protection")
-	}
-	vas, err := runtime.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return attachmentEvidenceUnavailable("cannot verify attachment deletion authority", err)
-	}
-	for _, va := range vas.Items {
-		if matchesVolumeAttachment(pv.Name, &va) && strings.TrimSpace(va.Spec.NodeName) == nodeName {
-			if va.Spec.Attacher != s.driver.name || va.UID == "" || va.DeletionTimestamp.IsZero() {
-				return status.Error(codes.Unavailable, "current VolumeAttachment does not authorize physical detach")
-			}
-			if err := validateAttachmentImageAssertions(va.Status.AttachmentMetadata, identity.imageID); err != nil {
-				return status.Error(codes.Unavailable, err.Error())
-			}
-		}
 	}
 	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, replacement); err != nil {
 		return err
@@ -178,7 +217,11 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			return status.Error(codes.Unavailable, "detach node still reports the volume in use")
 		}
 	}
-	return status.FromContextError(ctx.Err()).Err()
+	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, nodeName, attachments); err != nil {
+		return err
+	}
+	identity.attachments = attachments
+	return nil
 }
 
 func terminalPodMayBeReleased(pod *corev1.Pod) bool {
@@ -307,9 +350,9 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 		}
 		attempt := identity
 		attempt.diskID = diskID
-		return s.checkPhysicalDetachAuthority(ctx, volume, node, attempt)
+		return s.checkPhysicalDetachAuthority(ctx, volume, node, &attempt)
 	}
-	if err := s.checkPhysicalDetachAuthority(ctx, volume, node, identity); err != nil {
+	if err := s.checkPhysicalDetachAuthority(ctx, volume, node, &identity); err != nil {
 		if parentErr := ctx.Err(); parentErr != nil {
 			return false, parentErr
 		}

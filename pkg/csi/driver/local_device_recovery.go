@@ -79,6 +79,16 @@ type LocalDeviceMissingReport struct {
 	MetadataTarget         string             `json:"metadataTarget,omitempty"`
 }
 
+func (report *LocalDeviceMissingReport) recordFailureObservation(observedAt time.Time) {
+	if report.FirstObservedAt.IsZero() || observedAt.Before(report.FirstObservedAt) {
+		report.FirstObservedAt = observedAt
+	}
+	if observedAt.After(report.LastObservedAt) {
+		report.LastObservedAt = observedAt
+	}
+	report.Attempts++
+}
+
 type localDeviceRecoveryAttempt struct {
 	Method           string
 	ExpectedTarget   string
@@ -122,9 +132,6 @@ func (ns *NodeServer) recordLocalDeviceMissing(ctx context.Context, volumeID, vo
 		if report.ConfirmationState == localDeviceConfirmationStateConfirmed && report.LastRecoveryOutcome == localDeviceConfirmationStateConfirmed {
 			*report = LocalDeviceMissingReport{}
 		}
-		if report.FirstObservedAt.IsZero() {
-			report.FirstObservedAt = now
-		}
 		report.Node = node
 		report.VolumeID = volumeID
 		report.VolumeName = strings.TrimSpace(volumeName)
@@ -139,8 +146,7 @@ func (ns *NodeServer) recordLocalDeviceMissing(ctx context.Context, volumeID, vo
 		report.PVCName = identity.PVCName
 		report.PVName = identity.PVName
 		report.StagingTargetPath = strings.TrimSpace(stagingTargetPath)
-		report.LastObservedAt = now
-		report.Attempts++
+		report.recordFailureObservation(now)
 		attempts = report.Attempts
 		if report.ConfirmationState == "" {
 			report.AttachmentState = localDeviceAttachmentStateRuntimeUnconfirmed
@@ -192,9 +198,6 @@ func (ns *NodeServer) recordLocalDeviceMountFailure(ctx context.Context, volumeI
 		if localDeviceFailureClass(*report) == localDeviceFailureClassWrongIdentity || report.ConfirmationState == localDeviceConfirmationStateRepairRequired || report.ConfirmationState == localDeviceConfirmationStateInProgress {
 			return
 		}
-		if report.FirstObservedAt.IsZero() {
-			report.FirstObservedAt = now
-		}
 		report.Node = node
 		report.VolumeID = volumeID
 		report.VolumeName = strings.TrimSpace(volumeName)
@@ -209,8 +212,7 @@ func (ns *NodeServer) recordLocalDeviceMountFailure(ctx context.Context, volumeI
 		report.PVCName = identity.PVCName
 		report.PVName = identity.PVName
 		report.StagingTargetPath = strings.TrimSpace(stagingTargetPath)
-		report.LastObservedAt = now
-		report.Attempts++
+		report.recordFailureObservation(now)
 		attempts = report.Attempts
 		report.AttachmentState = localDeviceAttachmentStateRuntimeConfirmedByNode
 		report.ConfirmationState = ""
@@ -251,9 +253,6 @@ func (ns *NodeServer) recordWrongDeviceIdentityReport(ctx context.Context, sessi
 	key := localDeviceReportKey(node, volumeID)
 	namespace := namespaceFromServiceAccount()
 	err := updateLocalDeviceReport(ctx, ns.Driver.kubeRuntime, namespace, key, func(report *LocalDeviceMissingReport) {
-		if report.FirstObservedAt.IsZero() {
-			report.FirstObservedAt = now
-		}
 		report.Node = node
 		report.VolumeID = volumeID
 		report.VolumeName = strings.TrimSpace(session.VolumeName)
@@ -269,8 +268,7 @@ func (ns *NodeServer) recordWrongDeviceIdentityReport(ctx context.Context, sessi
 		report.StagingTargetPath = strings.TrimSpace(session.StagingTargetPath)
 		report.ExpectedIdentity = session.Identity
 		report.ObservedIdentity = observed
-		report.LastObservedAt = now
-		report.Attempts++
+		report.recordFailureObservation(now)
 		if report.RecoveryToken == "" && report.ConfirmationState != localDeviceConfirmationStateInProgress && report.ConfirmationState != localDeviceConfirmationStateRepairRequired {
 			report.AttachmentState = localDeviceAttachmentStateRuntimeConfirmedByNode
 			report.ConfirmationState = localDeviceConfirmationStateConfirmed
@@ -409,7 +407,9 @@ func (ns *NodeServer) confirmLocalDeviceRecovery(ctx context.Context, report *Lo
 		current.ConfirmationDeadline = nil
 		current.MetadataAttachedToNode = true
 		current.MetadataNode = node
-		current.LastObservedAt = now
+		if now.After(current.LastObservedAt) {
+			current.LastObservedAt = now
+		}
 		current.LastRecoveryOutcome = localDeviceConfirmationStateConfirmed
 		current.LastRecoveryError = ""
 		current.ConfirmationObservedAt = &now

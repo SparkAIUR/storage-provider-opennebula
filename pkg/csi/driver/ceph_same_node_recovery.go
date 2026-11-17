@@ -208,20 +208,17 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 		return nil, cephRetentionUnavailable("node identity is unknown or not Ready", nil)
 	}
 	authority := &cephRetentionAuthority{PVName: pv.Name, PVUID: pv.UID, PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVCUID: pvc.UID, NodeUID: types.UID(identity.UID), Capacity: capacity, RequestedCapacity: requestedCapacity.String()}
-	vas, err := runtime.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
+	attachments, err := s.detachVolumeAttachments(ctx, pv.Name, "")
 	if err != nil {
 		return nil, cephRetentionUnavailable("VolumeAttachment lookup failed", err)
 	}
-	for _, va := range vas.Items {
-		if va.Spec.Source.PersistentVolumeName == nil || *va.Spec.Source.PersistentVolumeName != pv.Name {
-			continue
-		}
-		if authority.VAName != "" || va.Spec.Attacher != s.driver.name || va.Spec.NodeName != req.NodeId || va.UID == "" || va.DeletionTimestamp == nil || !va.Status.Attached {
+	for name, va := range attachments {
+		if authority.VAUID != "" || va.attacher != s.driver.name || va.node != req.NodeId || va.uid == "" || !va.deleting || !va.attached {
 			return nil, cephRetentionUnavailable("deleting VolumeAttachment ownership is ambiguous or unverified", nil)
 		}
-		authority.VAName = va.Name
-		authority.VAUID = va.UID
-		authority.AttachmentMetadata = cloneStringMap(va.Status.AttachmentMetadata)
+		authority.VAName = name
+		authority.VAUID = va.uid
+		authority.AttachmentMetadata = va.metadata
 	}
 	if authority.VAName == "" {
 		return nil, cephRetentionUnavailable("owned deleting VolumeAttachment was not observed", nil)
@@ -277,6 +274,9 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 		return nil, cephRetentionUnavailable("RWOP volume has multiple consumers", nil)
 	}
 	sort.Strings(authority.ConsumerUIDs)
+	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
+		return nil, err
+	}
 	return authority, nil
 }
 

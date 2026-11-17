@@ -393,9 +393,10 @@ func TestAttachmentReconcilerPreservesMalformedAndReplacedDeviceReports(t *testi
 			payload, err := json.Marshal(report)
 			require.NoError(t, err)
 			raw := string(payload)
-			if mode == "null" {
+			switch mode {
+			case "null":
 				raw = "null"
-			} else if mode == "incomplete-stale" {
+			case "incomplete-stale":
 				raw = `{"node":"gone-node","volumeID":"pvc-ceph-restart"}`
 			}
 			current := raw

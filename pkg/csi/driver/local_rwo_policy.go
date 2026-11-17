@@ -497,18 +497,7 @@ func (state *VolumeHistoryRecord) observeSuccessfulAttachment(observation succes
 	state.LastSuccessfulDeviceSerial = firstNonEmpty(observation.serial, state.LastSuccessfulDeviceSerial)
 }
 
-func (state *VolumeHistoryRecord) observeSuccessfulBackend(runtimeCtx *VolumeRuntimeContext, contextBackend string) {
-	if runtimeCtx != nil && (runtimeCtx.Backend != "" || strings.TrimSpace(runtimeCtx.backendAttribute) != "") {
-		if backend, err := runtimeCtx.verifiedAttachmentBackend(); err == nil {
-			state.Backend = backend
-		}
-		return
-	}
-	backend, _ := verifiedAttachmentBackend("", contextBackend)
-	state.Backend = firstNonEmpty(state.Backend, backend, "local")
-}
-
-func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target string, sourceContext map[string]string, protection *LocalRWOProtectionDecision, metadata *opennebula.VolumeAttachmentMetadata) {
+func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target string, sourceContext map[string]string, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision, metadata *opennebula.VolumeAttachmentMetadata) {
 	if s == nil || s.driver == nil || s.driver.volumeHistory == nil || strings.TrimSpace(volumeID) == "" {
 		return
 	}
@@ -519,10 +508,8 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 			}
 		}
 	}
-	var runtimeCtx *VolumeRuntimeContext
 	nodeUID := ""
 	if s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
-		runtimeCtx, _ = s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeID)
 		if identity, err := s.driver.kubeRuntime.NodeIdentity(ctx, requestedNode); err == nil {
 			nodeUID = identity.UID
 		}
@@ -546,7 +533,9 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 		state.PVName = firstNonEmpty(state.PVName, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVName }), strings.TrimSpace(sourceContext[paramPVName]))
 		state.PVCNamespace = firstNonEmpty(state.PVCNamespace, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVCNamespace }), strings.TrimSpace(sourceContext[paramPVCNamespace]))
 		state.PVCName = firstNonEmpty(state.PVCName, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVCName }), strings.TrimSpace(sourceContext[paramPVCName]))
-		state.observeSuccessfulBackend(runtimeCtx, sourceContext[annotationBackend])
+		if backend, err := runtimeCtx.verifiedAttachmentBackend(); err == nil {
+			state.Backend = backend
+		}
 		if runtimeCtx != nil {
 			if runtimeCtx.DatastoreID > 0 {
 				state.DatastoreID = runtimeCtx.DatastoreID
@@ -565,7 +554,8 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 	})
 	if err == nil {
 		s.driver.metrics.RecordVolumeHistory("publish", "persisted")
-		if protection != nil && protection.OverrideUsed && runtimeCtx != nil {
+		if protection != nil && protection.OverrideUsed && protection.RuntimeContext != nil {
+			runtimeCtx := protection.RuntimeContext
 			_ = s.driver.kubeRuntime.DeletePVAnnotation(ctx, runtimeCtx.PVName, annotationAllowCrossNodeUntil)
 			s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonCrossNodeOverrideUsed, protection.Message)
 		}
@@ -591,13 +581,9 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 	}
 	normalizeLocalDiskIdentity(identity)
 	observation := successfulAttachmentObservation{nodeName: strings.TrimSpace(ns.Driver.nodeID), diskID: -1}
-	var runtimeCtx *VolumeRuntimeContext
-	if ns.Driver.kubeRuntime != nil && ns.Driver.kubeRuntime.enabled {
-		runtimeCtx, _ = ns.Driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeID)
-		if observation.nodeName != "" {
-			if node, err := ns.Driver.kubeRuntime.NodeIdentity(ctx, observation.nodeName); err == nil && node.Exists {
-				observation.nodeUID = strings.TrimSpace(node.UID)
-			}
+	if observation.nodeName != "" && ns.Driver.kubeRuntime != nil && ns.Driver.kubeRuntime.enabled {
+		if node, err := ns.Driver.kubeRuntime.NodeIdentity(ctx, observation.nodeName); err == nil && node.Exists {
+			observation.nodeUID = strings.TrimSpace(node.UID)
 		}
 	}
 	if identity != nil {
@@ -608,7 +594,9 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 		state.PVName = firstNonEmpty(state.PVName, strings.TrimSpace(publishContext[paramPVName]))
 		state.PVCNamespace = firstNonEmpty(state.PVCNamespace, strings.TrimSpace(publishContext[paramPVCNamespace]))
 		state.PVCName = firstNonEmpty(state.PVCName, strings.TrimSpace(publishContext[paramPVCName]))
-		state.observeSuccessfulBackend(runtimeCtx, publishContext[annotationBackend])
+		if backend, err := verifiedAttachmentBackend("", publishContext[annotationBackend]); state.Backend == "" && err == nil {
+			state.Backend = backend
+		}
 		state.EvidenceSource = volumeHistoryEvidenceSourceObserved
 		state.Bootstrapped = false
 		state.BootstrappedAt = time.Time{}

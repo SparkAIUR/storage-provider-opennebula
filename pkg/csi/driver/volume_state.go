@@ -428,13 +428,26 @@ func (m *VolumeRepairStateManager) Get(volumeID string) (VolumeRepairState, bool
 	return state, ok
 }
 
-func decodeLocalDeviceReport(key, raw string) (LocalDeviceMissingReport, error) {
+func decodeLocalDeviceReport(key, raw, volumeID string) (LocalDeviceMissingReport, error) {
 	var report LocalDeviceMissingReport
-	if err := decodeCephRetentionProtection(raw, &report); err != nil {
+	var identity struct {
+		Node     string `json:"node"`
+		VolumeID string `json:"volumeID"`
+	}
+	if err := json.Unmarshal([]byte(raw), &identity); err != nil {
 		return report, err
 	}
-	if strings.TrimSpace(report.Node) == "" || strings.TrimSpace(report.VolumeID) == "" || key != localDeviceReportKey(report.Node, report.VolumeID) {
+	if strings.TrimSpace(identity.Node) == "" || strings.TrimSpace(identity.VolumeID) == "" || key != localDeviceReportKey(identity.Node, identity.VolumeID) {
 		return report, fmt.Errorf("node device report identity is invalid")
+	}
+	if volumeID != "" && identity.VolumeID != volumeID {
+		if key == localDeviceReportKey(identity.Node, volumeID) {
+			return report, fmt.Errorf("node device report key is ambiguous")
+		}
+		return report, nil
+	}
+	if err := decodeCephRetentionProtection(raw, &report); err != nil {
+		return report, err
 	}
 	if report.Attempts <= 0 || report.RecoveryAttempts < 0 || report.FirstObservedAt.IsZero() ||
 		report.LastObservedAt.IsZero() || report.LastObservedAt.Before(report.FirstObservedAt) {
@@ -494,7 +507,7 @@ func (m *VolumeRepairStateManager) GetCurrent(ctx context.Context, volumeID stri
 		return VolumeRepairState{}, false, err
 	}
 	for key, raw := range cm.Data {
-		report, err := decodeLocalDeviceReport(key, raw)
+		report, err := decodeLocalDeviceReport(key, raw, volumeID)
 		if err != nil {
 			return VolumeRepairState{}, false, err
 		}
