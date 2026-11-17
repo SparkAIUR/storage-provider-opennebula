@@ -359,6 +359,25 @@ func (r *KubeRuntime) DeleteConfigMapKey(ctx context.Context, namespace, name, k
 	return err
 }
 
+func (r *KubeRuntime) deleteConfigMapKeyIfCurrent(ctx context.Context, observed *corev1.ConfigMap, key, value string) error {
+	client := r.client.CoreV1().ConfigMaps(observed.Namespace)
+	return retryOnConflict(retry.DefaultRetry, func() error {
+		current, err := client.Get(ctx, observed.Name, metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if raw, present := current.Data[key]; current.UID != observed.UID || !present || raw != value {
+			return nil
+		}
+		delete(current.Data, key)
+		_, err = client.Update(ctx, current, metav1.UpdateOptions{})
+		return err
+	})
+}
+
 func (r *KubeRuntime) DeletePVAnnotation(ctx context.Context, pvName, key string) error {
 	if r == nil || !r.enabled {
 		return fmt.Errorf("kubernetes runtime is not enabled")

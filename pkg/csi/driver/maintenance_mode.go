@@ -336,7 +336,7 @@ func (m *MaintenanceModeManager) projectMaintenanceNode(ctx context.Context, pv 
 			return node, false
 		}
 	}
-	if legacy := annotationValue(runtimeCtx, annotationPreferredLastNode, "pv"); legacy != "" {
+	if legacy := explicitPlacement.LegacyPreferredNode; legacy != "" {
 		if node := m.validatedMaintenanceCandidate(ctx, runtimeCtx, legacy, "preferred-last-node", placementSourceLegacyPreferredLastNode, warn); node != "" {
 			return node, false
 		}

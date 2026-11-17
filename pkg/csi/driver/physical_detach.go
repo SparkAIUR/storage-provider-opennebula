@@ -21,6 +21,7 @@ type physicalDetachIdentity struct {
 	imageID, vmID, diskID int
 	background, ceph      bool
 	cephSingleWriter      bool
+	backend               string
 }
 
 func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, volume, nodeName string, identity physicalDetachIdentity) error {
@@ -48,7 +49,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if identity.ceph && !isCephBackend(backend) {
 		return status.Error(codes.Unavailable, "Ceph backend changed before detach")
 	}
-	if identity.background && identity.cephSingleWriter != (isCephBackend(backend) && hasSingleWriterAccessMode(pv.Spec.AccessModes)) {
+	if identity.background && (identity.backend != backend || identity.cephSingleWriter != (isCephBackend(backend) && hasSingleWriterAccessMode(pv.Spec.AccessModes))) {
 		return attachmentEvidenceUnavailable("background detach scope changed", nil)
 	}
 	var pvc *corev1.PersistentVolumeClaim
@@ -210,19 +211,50 @@ func (s *ControllerServer) recheckAttachmentAuthority(ctx context.Context, volum
 	return nil
 }
 
-func (s *ControllerServer) verifySoleDetachOwner(ctx context.Context, volume, node string, imageID, vmID, diskID int) error {
+func (s *ControllerServer) verifyDetachAbsenceTarget(ctx context.Context, volume, node string, imageID, vmID int) error {
+	runtime := s.driver.kubeRuntime
+	if runtime == nil || !runtime.enabled {
+		return nil
+	}
+	history, err := s.readAttachmentHistory(ctx, volume)
+	if err != nil {
+		return attachmentEvidenceUnavailable("cannot verify detach absence history", err)
+	}
+	if history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != imageID {
+		return attachmentEvidenceUnavailable("detach absence image differs from history", nil)
+	}
+	if history.LastSuccessfulNodeName != node || (history.LastSuccessfulNodeUID == "" && history.LastSuccessfulOpenNebulaVMID <= 0) {
+		return nil
+	}
+	if history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != vmID {
+		return attachmentEvidenceUnavailable("detach absence VM differs from history", nil)
+	}
+	currentVM, err := s.volumeProvider.NodeExists(ctx, node)
+	if err != nil || currentVM != vmID {
+		return attachmentEvidenceUnavailable("detach absence VM identity changed", err)
+	}
+	if history.LastSuccessfulNodeUID != "" {
+		current, err := runtime.NodeIdentity(ctx, node)
+		if err != nil || !current.Exists || current.UID != history.LastSuccessfulNodeUID {
+			return attachmentEvidenceUnavailable("detach absence node differs from history", err)
+		}
+	}
+	return nil
+}
+
+func (s *ControllerServer) verifySoleDetachOwner(ctx context.Context, volume, node string, imageID, vmID, diskID int) (string, error) {
 	inspector, ok := s.volumeProvider.(opennebula.VolumeAttachmentInspector)
 	if !ok {
-		return attachmentEvidenceUnavailable("cannot verify sole Ceph attachment for cleanup", nil)
+		return "", attachmentEvidenceUnavailable("cannot verify sole Ceph attachment for cleanup", nil)
 	}
 	metadata, err := inspector.InspectVolumeAttachment(ctx, volume, node)
 	if err != nil || metadata == nil || metadata.ImageID != imageID || metadata.ImageName != volume ||
 		metadata.RequestedNodeID != vmID || !metadata.AttachedToRequestedNode ||
 		metadata.ImageRunningVMs != 1 || len(metadata.ImageVMIDs) != 1 || metadata.ImageVMIDs[0] != vmID ||
 		len(metadata.DiskRecords) != 1 || metadata.DiskRecords[0].NodeID != vmID || metadata.DiskRecords[0].DiskID != diskID || strings.TrimSpace(metadata.DiskRecords[0].Target) == "" {
-		return attachmentEvidenceUnavailable("cannot verify sole Ceph attachment for cleanup", err)
+		return "", attachmentEvidenceUnavailable("cannot verify sole Ceph attachment for cleanup", err)
 	}
-	return nil
+	return strings.TrimSpace(metadata.DiskRecords[0].Target), nil
 }
 
 func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume, node string, identity physicalDetachIdentity) (bool, error) {
@@ -258,16 +290,17 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 	}
 	ctx = opennebula.WithExpectedImageID(ctx, identity.imageID)
 	if provider, ok := s.volumeProvider.(opennebula.AuthorizedVolumeDetacher); ok {
-		var verifyOwner opennebula.DetachAuthorization
+		var verifyOwner opennebula.DetachOwnerCheck
 		if identity.cephSingleWriter {
-			verifyOwner = func(ctx context.Context, imageID, vmID, diskID int) error {
+			verifyOwner = func(ctx context.Context, imageID, vmID, diskID int) (string, error) {
 				return s.verifySoleDetachOwner(ctx, volume, node, imageID, vmID, diskID)
 			}
 		}
-		return provider.DetachVolumeWithAuthority(ctx, volume, node, verifyOwner, authorize)
+		return provider.DetachVolumeWithAuthority(ctx, volume, node, identity.backend, verifyOwner, authorize)
 	}
 	if identity.cephSingleWriter {
 		return false, attachmentEvidenceUnavailable("provider cannot verify Ceph detach authority", nil)
 	}
-	return false, s.volumeProvider.DetachVolume(ctx, volume, node)
+	err := s.volumeProvider.DetachVolume(ctx, volume, node)
+	return err == nil, err
 }

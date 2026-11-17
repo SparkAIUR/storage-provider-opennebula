@@ -64,7 +64,7 @@ func TestSameNodeRetentionReadOnlyEvidence(t *testing.T) {
 	})
 	evidence, err := p.InspectSameNodeRetention(context.Background(), "volume-test", "node-test")
 	require.NoError(t, err)
-	require.Equal(t, &SameNodeRetentionEvidence{VolumeID: "volume-test", ImageID: 7, NodeID: 11, DiskID: 2, Target: "vdb", DeviceSerial: "onecsi-7", SizeBytes: 1024 * sizeConversion}, evidence)
+	require.Equal(t, &SameNodeRetentionEvidence{VolumeID: "volume-test", ImageID: 7, NodeID: 11, DiskID: 2, Target: "vdb", DeviceSerial: "onecsi-7", SizeBytes: 1_073_741_824}, evidence)
 	require.Zero(t, mutations.Load())
 }
 
@@ -111,6 +111,16 @@ func TestSameNodeRetentionRejectsUncertainOrUnsafeEvidence(t *testing.T) {
 		"missing image owner":    func(c *retentionProtocolCase) { c.imageOwners = "" },
 		"other VM owner": func(c *retentionProtocolCase) {
 			c.extraVM = `<VM><ID>12</ID><NAME>other</NAME><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>4</DISK_ID></DISK></TEMPLATE></VM>`
+		},
+		"blank census image reference": func(c *retentionProtocolCase) {
+			c.extraVM = `<VM><ID>12</ID><NAME>other</NAME><TEMPLATE><DISK><IMAGE_ID></IMAGE_ID><DISK_ID>4</DISK_ID></DISK></TEMPLATE></VM>`
+		},
+		"blank fresh image reference": func(c *retentionProtocolCase) {
+			c.beforeReply = func(method string) {
+				if method == "one.vm.info" {
+					c.extraDisk = `<DISK><IMAGE_ID></IMAGE_ID><DISK_ID>3</DISK_ID></DISK>`
+				}
+			}
 		},
 		"malformed census image reference": func(c *retentionProtocolCase) {
 			c.extraVM = `<VM><ID>12</ID><NAME>other</NAME><TEMPLATE><DISK><IMAGE_ID>unknown</IMAGE_ID><DISK_ID>4</DISK_ID></DISK></TEMPLATE></VM>`

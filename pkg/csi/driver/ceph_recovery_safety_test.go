@@ -46,9 +46,9 @@ func (p *cleanupReadbackProvider) GetVolumeInNode(context.Context, int, int) (st
 	return "vdb", nil
 }
 
-func (p *cleanupReadbackProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, verifyOwner, authorize opennebula.DetachAuthorization) (bool, error) {
+func (p *cleanupReadbackProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node, expectedBackend string, verifyOwner opennebula.DetachOwnerCheck, authorize opennebula.DetachAuthorization) (bool, error) {
 	if verifyOwner != nil {
-		if err := verifyOwner(ctx, p.imageID, p.vmID, p.diskID); err != nil {
+		if _, err := verifyOwner(ctx, p.imageID, p.vmID, p.diskID); err != nil {
 			return false, err
 		}
 	}

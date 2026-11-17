@@ -22,7 +22,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 type nodeAttachmentProtocol struct {
@@ -38,6 +40,10 @@ type nodeAttachmentProtocol struct {
 	mutations         []string
 	failMethod        string
 	claimNew          bool
+	ceph              bool
+	imageName         string
+	diskTarget        string
+	ownerCount        int
 	ready             bool
 	pending           bool
 	version           string
@@ -84,7 +90,10 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 					marker = "<RESIZE>YES</RESIZE><SIZE_PREV>128</SIZE_PREV>"
 				}
 				slot := firstNonEmpty(state.diskSlot, "2")
-				disk = fmt.Sprintf(`<DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><SAVE>YES</SAVE><SHAREABLE>YES</SHAREABLE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>ssh</TM_MAD><TM_MAD_SYSTEM>ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>%s</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE><SERIAL>onecsi-7</SERIAL>%s</DISK>`, slot, size, marker)
+				disk = fmt.Sprintf(`<DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><SAVE>YES</SAVE><SHAREABLE>YES</SHAREABLE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>ssh</TM_MAD><TM_MAD_SYSTEM>ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>%s</DISK_ID><TARGET>%s</TARGET><SIZE>%d</SIZE><SERIAL>onecsi-7</SERIAL>%s</DISK>`, slot, firstNonEmpty(state.diskTarget, "vdb"), size, marker)
+				if state.ceph {
+					disk = strings.NewReplacer("<LN_TARGET>SYSTEM</LN_TARGET>", "<LN_TARGET>NONE</LN_TARGET>", "<TM_MAD>ssh</TM_MAD>", "<TM_MAD>ceph</TM_MAD>", "<TM_MAD_SYSTEM>ssh</TM_MAD_SYSTEM>", "<TM_MAD_SYSTEM>ceph</TM_MAD_SYSTEM>").Replace(disk)
+				}
 			}
 			return fmt.Sprintf(`<VM><ID>%d</ID><NAME>%s</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE>%s</TEMPLATE><HISTORY_RECORDS><HISTORY><SEQ>0</SEQ><DS_ID>200</DS_ID></HISTORY></HISTORY_RECORDS></VM>`, id, name, disk)
 		}
@@ -105,7 +114,10 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 			if state.marker > 0 {
 				tag = fmt.Sprintf("<CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES>", state.marker)
 			}
-			return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>%d</STATE><SIZE>128</SIZE><DATASTORE_ID>100</DATASTORE_ID><SOURCE>/fixture/disk</SOURCE><PERSISTENT>1</PERSISTENT><FORMAT>raw</FORMAT><RUNNING_VMS>%d</RUNNING_VMS><VMS>%s</VMS><TEMPLATE><PERSISTENT_TYPE>SHAREABLE</PERSISTENT_TYPE>%s</TEMPLATE></IMAGE>`, imageState, count, ids, tag)
+			if state.ownerCount > 0 {
+				count = state.ownerCount
+			}
+			return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>%s</NAME><STATE>%d</STATE><SIZE>128</SIZE><DATASTORE_ID>100</DATASTORE_ID><SOURCE>/fixture/disk</SOURCE><PERSISTENT>1</PERSISTENT><FORMAT>raw</FORMAT><RUNNING_VMS>%d</RUNNING_VMS><VMS>%s</VMS><TEMPLATE><PERSISTENT_TYPE>SHAREABLE</PERSISTENT_TYPE>%s</TEMPLATE></IMAGE>`, firstNonEmpty(state.imageName, "volume-test"), imageState, count, ids, tag)
 		}
 		ok, body, code := 1, "", 0
 		if call.Method == state.failMethod {
@@ -122,6 +134,9 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				body = vmXML(number(1), true)
 			case "one.datastorepool.info":
 				body = `<DATASTORE_POOL><DATASTORE><ID>100</ID><NAME>images</NAME><TYPE>IMAGE</TYPE><DS_MAD>fs</DS_MAD><TM_MAD>ssh</TM_MAD><STATE>0</STATE><TOTAL_MB>20000</TOTAL_MB><FREE_MB>10000</FREE_MB></DATASTORE><DATASTORE><ID>200</ID><NAME>system</NAME><TYPE>SYSTEM</TYPE><TM_MAD>ssh</TM_MAD><STATE>0</STATE></DATASTORE></DATASTORE_POOL>`
+				if state.ceph {
+					body = strings.NewReplacer("<DS_MAD>fs</DS_MAD>", "<DS_MAD>ceph</DS_MAD>", "<TM_MAD>ssh</TM_MAD>", "<TM_MAD>ceph</TM_MAD>").Replace(body)
+				}
 			case "one.vm.attach":
 				id := number(1)
 				require.Contains(t, call.Params[2].Value.String, `IMAGE_ID="7"`)
@@ -479,6 +494,7 @@ func TestCephRestartCleanupUsesVerifiedVMMapping(t *testing.T) {
 			})
 			protocol = state
 			state.mu.Lock()
+			state.ceph = true
 			state.vmNames = map[int]string{}
 			switch mode {
 			case "mixed-case", "dissent":
@@ -533,17 +549,17 @@ func (p *detachCensusProbe) InspectVolumeAttachment(ctx context.Context, volume,
 	return p.PersistentDiskVolumeProvider.InspectVolumeAttachment(ctx, volume, node)
 }
 
-func (p *detachCensusProbe) DetachVolumeWithAuthority(ctx context.Context, volume, node string, verifyOwner, authorize opennebula.DetachAuthorization) (bool, error) {
+func (p *detachCensusProbe) DetachVolumeWithAuthority(ctx context.Context, volume, node, expectedBackend string, verifyOwner opennebula.DetachOwnerCheck, authorize opennebula.DetachAuthorization) (bool, error) {
 	if p.beforeDetach != nil {
 		p.beforeDetach()
 	}
 	p.inDetach.Store(true)
 	defer p.inDetach.Store(false)
-	return p.PersistentDiskVolumeProvider.DetachVolumeWithAuthority(ctx, volume, node, verifyOwner, authorize)
+	return p.PersistentDiskVolumeProvider.DetachVolumeWithAuthority(ctx, volume, node, expectedBackend, verifyOwner, authorize)
 }
 
 func TestCephBackgroundDetachUsesFreshSoleOwnerAndRelease(t *testing.T) {
-	for _, mode := range []string{"remote-released", "late-pod", "resize", "retry-resize", "parked-contradictory", "demand-disappeared"} {
+	for _, mode := range []string{"remote-released", "late-pod", "resize", "retry-resize", "late-owner-list", "late-owner-count", "late-name", "late-target", "retry-owner-list", "parked-contradictory", "demand-disappeared"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
@@ -566,9 +582,34 @@ func TestCephBackgroundDetachUsesFreshSoleOwnerAndRelease(t *testing.T) {
 
 			var probe *detachCensusProbe
 			var protocol *nodeAttachmentProtocol
-			var censusImageRead, injected atomic.Bool
+			var censusImageRead, injected, censusFinished atomic.Bool
 			provider, state := nodeAttachmentProvider(t, func(method string, _ context.Context) {
-				if !probe.inDetach.Load() || !probe.inCensus.Load() {
+				if !probe.inDetach.Load() {
+					return
+				}
+				if !probe.inCensus.Load() {
+					if !censusFinished.Load() {
+						return
+					}
+					protocol.mu.Lock()
+					defer protocol.mu.Unlock()
+					if method == "one.image.info" {
+						switch {
+						case mode == "late-owner-list" || (mode == "retry-owner-list" && protocol.detachAttempts == 1):
+							protocol.claimNew = true
+							injected.Store(true)
+						case mode == "late-owner-count":
+							protocol.ownerCount = 2
+							injected.Store(true)
+						case mode == "late-name":
+							protocol.imageName = "replacement-image-name"
+							injected.Store(true)
+						}
+					}
+					if method == "one.vm.info" && mode == "late-target" {
+						protocol.diskTarget = "vdc"
+						injected.Store(true)
+					}
 					return
 				}
 				if method == "one.image.info" {
@@ -577,6 +618,7 @@ func TestCephBackgroundDetachUsesFreshSoleOwnerAndRelease(t *testing.T) {
 				if method != "one.vmpool.info" || !censusImageRead.Swap(false) {
 					return
 				}
+				censusFinished.Store(true)
 				protocol.mu.Lock()
 				defer protocol.mu.Unlock()
 				switch {
@@ -599,7 +641,8 @@ func TestCephBackgroundDetachUsesFreshSoleOwnerAndRelease(t *testing.T) {
 				}
 			}
 			state.mu.Lock()
-			state.rejectFirstDetach = mode == "retry-resize"
+			state.ceph = true
+			state.rejectFirstDetach = strings.HasPrefix(mode, "retry-")
 			state.claimNew = mode == "parked-contradictory"
 			state.mu.Unlock()
 
@@ -622,10 +665,10 @@ func TestCephBackgroundDetachUsesFreshSoleOwnerAndRelease(t *testing.T) {
 			require.Contains(t, state.disks, 41)
 			require.Empty(t, events.Items)
 			switch mode {
-			case "late-pod", "resize":
+			case "late-pod", "resize", "late-owner-list", "late-owner-count", "late-name", "late-target":
 				require.True(t, injected.Load())
 				require.Zero(t, state.detachAttempts)
-			case "retry-resize":
+			case "retry-resize", "retry-owner-list":
 				require.True(t, injected.Load())
 				require.Equal(t, 1, state.detachAttempts)
 			default:
@@ -669,9 +712,9 @@ type disappearingDetachProvider struct {
 	disappear func()
 }
 
-func (p disappearingDetachProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, verifyOwner, authorize opennebula.DetachAuthorization) (bool, error) {
+func (p disappearingDetachProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node, expectedBackend string, verifyOwner opennebula.DetachOwnerCheck, authorize opennebula.DetachAuthorization) (bool, error) {
 	p.disappear()
-	return p.PersistentDiskVolumeProvider.DetachVolumeWithAuthority(ctx, volume, node, verifyOwner, authorize)
+	return p.PersistentDiskVolumeProvider.DetachVolumeWithAuthority(ctx, volume, node, expectedBackend, verifyOwner, authorize)
 }
 
 func TestAttachmentReconcilerDistinguishesProviderNoOp(t *testing.T) {
@@ -704,6 +747,203 @@ func TestAttachmentReconcilerDistinguishesProviderNoOp(t *testing.T) {
 				require.Len(t, events.Items, 1)
 				require.Equal(t, eventReasonStuckAttachmentDetached, events.Items[0].Reason)
 			}
+		})
+	}
+}
+
+func TestBackgroundDetachRejectsProviderBackendConflict(t *testing.T) {
+	for _, mode := range []string{"census-conflict", "attempt-conflict"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true), newReadyNode("node-new", true))
+			provider, protocol := nodeAttachmentProvider(t)
+			probe := &detachCensusProbe{PersistentDiskVolumeProvider: provider}
+			if mode == "census-conflict" {
+				protocol.mu.Lock()
+				protocol.ceph = true
+				protocol.disks[42] = 256
+				protocol.mu.Unlock()
+			} else {
+				probe.beforeDetach = func() {
+					protocol.mu.Lock()
+					defer protocol.mu.Unlock()
+					protocol.ceph = true
+				}
+			}
+			r := NewAttachmentReconciler(NewControllerServer(driver, probe, nil))
+			r.orphanGrace = time.Nanosecond
+			require.NoError(t, r.ReconcileOnce(ctx))
+			if mode == "census-conflict" {
+				require.Empty(t, r.orphanSeen)
+			}
+			require.NoError(t, r.ReconcileOnce(ctx))
+			protocol.mu.Lock()
+			defer protocol.mu.Unlock()
+			require.Zero(t, protocol.detachAttempts)
+			require.Contains(t, protocol.disks, 41)
+		})
+	}
+}
+
+func TestProviderDetachRetryRespectsHotplugDeadline(t *testing.T) {
+	ctx := context.Background()
+	provider, protocol := nodeAttachmentProvider(t)
+	protocol.mu.Lock()
+	protocol.rejectFirstDetach = true
+	protocol.mu.Unlock()
+	authorizations := 0
+	accepted, err := provider.DetachVolumeWithAuthority(ctx, "volume-test", "node-old", "", nil, func(attempt context.Context, _, _, _ int) error {
+		authorizations++
+		if authorizations == 2 {
+			select {
+			case <-attempt.Done():
+			case <-time.After(2 * time.Second):
+				t.Error("retry authorization missed the hotplug deadline")
+			}
+		}
+		return nil
+	})
+	var timeout *opennebula.HotplugTimeoutError
+	require.ErrorAs(t, err, &timeout)
+	require.False(t, accepted)
+	require.Equal(t, 2, authorizations)
+	protocol.mu.Lock()
+	defer protocol.mu.Unlock()
+	require.Equal(t, 1, protocol.detachAttempts)
+	require.Contains(t, protocol.disks, 41)
+}
+
+func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, mode := range []string{"same-node", "replacement-uid", "replacement-vm", "vm-changed-before-dispatch"} {
+			t.Run(fmt.Sprintf("queued=%v/%s", queued, mode), func(t *testing.T) {
+				ctx := context.Background()
+				pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+				node := newReadyNode("node-old", true)
+				historicalUID := node.UID
+				if mode == "replacement-uid" {
+					node.UID = "replacement-uid"
+				}
+				driver := newStickyTestDriver(t, pv, pvc, node, newReadyNode("node-new", true))
+				_, err := driver.volumeHistory.Upsert(ctx, "volume-test", func(record *VolumeHistoryRecord) {
+					record.Backend = "ceph"
+					record.LastSuccessfulPublishTime = time.Now().UTC().Add(-time.Hour)
+					record.LastSuccessfulImageID = 7
+					record.LastSuccessfulNodeName = node.Name
+					record.LastSuccessfulNodeUID = string(historicalUID)
+					record.LastSuccessfulOpenNebulaVMID = 41
+				})
+				require.NoError(t, err)
+				var protocol *nodeAttachmentProtocol
+				var imageReads atomic.Int32
+				provider, state := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+					if mode == "vm-changed-before-dispatch" && method == "one.image.info" && imageReads.Add(1) == 2 {
+						protocol.mu.Lock()
+						defer protocol.mu.Unlock()
+						protocol.vmNames = map[int]string{41: "retired-vm", 42: "node-old"}
+					}
+				})
+				protocol = state
+				state.mu.Lock()
+				state.ceph = true
+				switch mode {
+				case "replacement-vm":
+					state.vmNames = map[int]string{41: "retired-vm", 42: "node-old"}
+				case "same-node", "replacement-uid":
+					delete(state.disks, 41)
+				}
+				state.mu.Unlock()
+				controller := NewControllerServer(driver, provider, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, controller.validateHotplugQueueRequest)
+				}
+				client := reviewControllerClient(t, controller)
+				response, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: "node-old"})
+				history, _ := driver.volumeHistory.Get("volume-test")
+				if mode == "same-node" {
+					require.NoError(t, err)
+					require.NotNil(t, response)
+					require.False(t, history.LastSafeDetachTime.IsZero())
+				} else {
+					require.Equal(t, codes.Unavailable, status.Code(err))
+					require.Nil(t, response)
+					require.True(t, history.LastSafeDetachTime.IsZero())
+				}
+				state.mu.Lock()
+				defer state.mu.Unlock()
+				require.Empty(t, state.mutations)
+				if strings.Contains(mode, "vm") {
+					require.Contains(t, state.disks, 41)
+				}
+			})
+		}
+	}
+}
+
+func TestForegroundAndStickyDetachPreserveProviderNoOpOutcome(t *testing.T) {
+	for _, action := range []string{"unpublish", "expiry", "transfer"} {
+		t.Run(action, func(t *testing.T) {
+			ctx := context.Background()
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			pv.Annotations[annotationAllowCrossNodeUntil] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true), newReadyNode("node-new", true))
+			eventSequence := 0
+			driver.kubeRuntime.client.(*fake.Clientset).PrependReactor("create", "events", func(action ktesting.Action) (bool, kruntime.Object, error) {
+				event := action.(ktesting.CreateAction).GetObject().(*corev1.Event)
+				eventSequence++
+				event.Name = fmt.Sprintf("%s%d", event.GenerateName, eventSequence)
+				return false, nil, nil
+			})
+			driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, action == "transfer")
+			tracker := opennebula.NewAdaptiveTimeoutTracker(opennebula.AdaptiveTimeoutConfig{Enabled: true})
+			driver.adaptiveTimeouts = tracker
+			sticky := StickyAttachmentState{VolumeID: "volume-test", NodeID: "node-old", Backend: "local", PVCName: pvc.Name, PVCNamespace: pvc.Namespace, StartedAt: time.Now().Add(-2 * time.Minute), ExpiresAt: time.Now().Add(time.Minute), GraceSeconds: 60}
+			if action == "expiry" {
+				sticky.ExpiresAt = time.Now().Add(-time.Minute)
+			}
+			if action != "unpublish" {
+				require.NoError(t, driver.stickyAttachments.StartGrace(sticky))
+			}
+			provider, protocol := nodeAttachmentProvider(t)
+			wrapped := disappearingDetachProvider{provider, func() {
+				protocol.mu.Lock()
+				defer protocol.mu.Unlock()
+				delete(protocol.disks, 41)
+			}}
+			controller := NewControllerServer(driver, wrapped, nil)
+			client := reviewControllerClient(t, controller)
+			switch action {
+			case "unpublish":
+				_, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: "node-old"})
+				require.NoError(t, err)
+			case "expiry":
+				controller.expireStickyDetach(ctx, sticky)
+			case "transfer":
+				_, err := client.ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-new"))
+				require.NoError(t, err)
+			}
+			events, err := driver.kubeRuntime.client.CoreV1().Events(pvc.Namespace).List(ctx, metav1.ListOptions{})
+			require.NoError(t, err)
+			sawAbsence := false
+			for _, event := range events.Items {
+				if event.Reason == eventReasonDetachGraceCancelled || event.Reason == eventReasonDetachGraceExpired {
+					require.Contains(t, event.Message, "already absent")
+					sawAbsence = true
+				}
+			}
+			if action != "unpublish" {
+				require.True(t, sawAbsence)
+				_, held := driver.stickyAttachments.Get("volume-test")
+				require.False(t, held)
+			}
+			for _, recommendation := range tracker.Snapshot() {
+				require.NotEqual(t, "detach", recommendation.Key.Operation)
+			}
+			protocol.mu.Lock()
+			defer protocol.mu.Unlock()
+			require.Zero(t, protocol.detachAttempts)
 		})
 	}
 }

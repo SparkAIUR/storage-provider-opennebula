@@ -129,6 +129,7 @@ func TestMaintenanceModePrepareIgnoresInvalidExplicitPreferredNode(t *testing.T)
 	})
 	pvc.Spec.VolumeName = pv.Name
 	pv.Annotations[annotationPreferredNode] = "node-missing"
+	pv.Annotations[annotationPreferredLastNode] = "node-b"
 	pvName := pv.Name
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
 		Name: "node-a",
@@ -150,7 +151,10 @@ func TestMaintenanceModePrepareIgnoresInvalidExplicitPreferredNode(t *testing.T)
 		ObjectMeta: metav1.ObjectMeta{Name: hotplugStateConfigMapName, Namespace: "default"},
 		Data:       map[string]string{maintenanceModeKey: "true"},
 	}
-	driver := newMaintenanceTestDriver(t, pv, pvc, node, va, cm)
+	legacyNode := node.DeepCopy()
+	legacyNode.Name = "node-b"
+	legacyNode.Labels[corev1.LabelHostname] = hostLabel("b")
+	driver := newMaintenanceTestDriver(t, pv, pvc, node, legacyNode, va, cm)
 	driver.kubeRuntime.inventoryClient = newInventoryFakeClient(t,
 		&inventoryv1alpha1.OpenNebulaDatastore{
 			ObjectMeta: metav1.ObjectMeta{Name: "ds-111"},
@@ -164,6 +168,7 @@ func TestMaintenanceModePrepareIgnoresInvalidExplicitPreferredNode(t *testing.T)
 			},
 		},
 		&inventoryv1alpha1.OpenNebulaNode{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}, Status: inventoryv1alpha1.OpenNebulaNodeStatus{Phase: inventoryv1alpha1.NodePhaseReady, OpenNebula: inventoryv1alpha1.OpenNebulaNodeOpenNebulaStatus{SystemDatastoreID: 104}}},
+		&inventoryv1alpha1.OpenNebulaNode{ObjectMeta: metav1.ObjectMeta{Name: "node-b"}, Status: inventoryv1alpha1.OpenNebulaNodeStatus{Phase: inventoryv1alpha1.NodePhaseReady, OpenNebula: inventoryv1alpha1.OpenNebulaNodeOpenNebulaStatus{SystemDatastoreID: 104}}},
 	)
 
 	require.NoError(t, driver.maintenanceMode.Reconcile(context.Background()))

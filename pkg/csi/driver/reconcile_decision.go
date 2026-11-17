@@ -291,6 +291,9 @@ func (s *ControllerServer) evaluateVolumeDetachDecision(ctx context.Context, dec
 			recoveryControl.QueueBlockMessage(evidence.VolumeID, evidence.NodeID, string(evidence.Operation)))
 	}
 	if !evidence.Attached {
+		if err := s.verifyDetachAbsenceTarget(ctx, evidence.VolumeID, evidence.NodeID, evidence.OpenNebulaImageID, evidence.OpenNebulaNodeID); err != nil {
+			return decision.with(VolumeReconcilePause, "attachment_absence_unverified", status.Code(err), status.Convert(err).Message())
+		}
 		return decision.with(VolumeReconcileComplete, "already_detached", codes.OK,
 			fmt.Sprintf("volume %s is already detached from node %s", evidence.VolumeID, evidence.NodeID))
 	}

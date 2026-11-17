@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 func newAttachmentTestDriver(objects ...runtime.Object) *Driver {
@@ -299,4 +300,64 @@ func TestAttachmentReconcilerPrunesDeletedVolumeState(t *testing.T) {
 	require.NoError(t, getErr)
 	assert.Empty(t, cm.Data)
 	mockProvider.AssertExpectations(t)
+}
+
+func TestAttachmentReconcilerPreservesMalformedAndReplacedDeviceReports(t *testing.T) {
+	for _, mode := range []string{"null", "wrong-volume", "unknown-state", "replaced"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			pv, pvc := newLocalPVAndPVC(cephRestartVolume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+			node := newReadyNode("node-a", true)
+			key := localDeviceReportKey(node.Name, cephRestartVolume)
+			current := `{"node":"node-a","volumeID":"pvc-ceph-restart","failureClass":"wrong_device_identity"}`
+			raw := current
+			switch mode {
+			case "null":
+				raw = "null"
+			case "wrong-volume":
+				raw = `{"node":"node-a","volumeID":"gone","failureClass":"wrong_device_identity"}`
+			case "unknown-state":
+				raw = `{"node":"node-a","volumeID":"pvc-ceph-restart","confirmationState":"unknown"}`
+			case "replaced":
+				key = localDeviceReportKey("gone-node", cephRestartVolume)
+				raw = `{"node":"gone-node","volumeID":"pvc-ceph-restart","failureClass":"missing_device"}`
+				current = "null"
+			}
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: localDeviceStateConfigMapName, UID: "report-map", ResourceVersion: "1"},
+				Data:       map[string]string{key: raw},
+			}
+			driver := newAttachmentTestDriver(pv, pvc, node, cm)
+			client := driver.kubeRuntime.client.(*fake.Clientset)
+			if mode == "replaced" {
+				swapped := false
+				client.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+					if swapped || action.(ktesting.GetAction).GetName() != cm.Name {
+						return false, nil, nil
+					}
+					swapped = true
+					replaced := cm.DeepCopy()
+					replaced.ResourceVersion = "2"
+					replaced.Data[key] = current
+					err := client.Tracker().Update(corev1.SchemeGroupVersion.WithResource("configmaps"), replaced, cm.Namespace)
+					return true, cm.DeepCopy(), err
+				})
+			} else {
+				current = raw
+			}
+			base := new(MockOpenNebulaVolumeProviderTestify)
+			base.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{{VolumeHandle: cephRestartVolume, ImageID: 3137, NodeName: node.Name, NodeID: 575, DiskID: 1, Backend: "ceph"}}, opennebula.VMNameInventory{node.Name: {575}}, nil)
+			base.On("NodeExists", mock.Anything, node.Name).Return(575, nil)
+			base.On("VolumeExists", mock.Anything, cephRestartVolume).Return(3137, 1_073_741_824, nil)
+			physical := &cleanupReadbackProvider{MockOpenNebulaVolumeProviderTestify: base, attached: true, imageID: 3137, vmID: 575, diskID: 1}
+			r := NewAttachmentReconciler(NewControllerServer(driver, physical, nil))
+			r.orphanGrace = time.Nanosecond
+			require.NoError(t, r.ReconcileOnce(ctx))
+			require.NoError(t, r.ReconcileOnce(ctx))
+			after, err := client.CoreV1().ConfigMaps(cm.Namespace).Get(ctx, cm.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, current, after.Data[key])
+			base.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+		})
+	}
 }

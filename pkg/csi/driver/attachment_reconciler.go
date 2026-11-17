@@ -2,10 +2,10 @@ package driver
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -196,6 +196,13 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 		if unresolvedVolume[volumeHandle] || backendErr != nil || strings.EqualFold(backend, "cephfs") || opennebula.IsSharedFilesystemVolumeID(volumeHandle) {
 			continue
 		}
+		if slices.ContainsFunc(observed, func(attachment opennebula.ObservedAttachment) bool {
+			providerBackend, err := verifiedAttachmentBackend("", attachment.Backend)
+			return err == nil && providerBackend != backend
+		}) {
+			continue
+		}
+
 		pvcKey := pvcKeyForPV(pv)
 		users := activePVCUsers[pvcKey]
 		vas := vaByVolume[volumeHandle]
@@ -239,7 +246,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 				if !r.due(r.divergentSeen, key, now, r.orphanGrace) {
 					continue
 				}
-				if err := r.detachObservedAttachment(ctx, attachment, pv.UID, nodesByVM[attachment.NodeID].UID, cephSingleWriter, hotplugQueuePriorityCritical); err != nil {
+				if err := r.detachObservedAttachment(ctx, attachment, pv.UID, nodesByVM[attachment.NodeID].UID, backend, cephSingleWriter, hotplugQueuePriorityCritical); err != nil {
 					r.server.driver.metrics.RecordAttachmentReconciler("divergent_attachment", "detach", attachmentCleanupOutcome(err))
 					klog.V(2).InfoS("Failed to detach divergent attachment", "volume", volumeHandle, "node", attachment.NodeName, "err", err)
 				} else {
@@ -253,7 +260,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			if !r.due(r.orphanSeen, key, now, r.orphanGrace) {
 				continue
 			}
-			if err := r.detachObservedAttachment(ctx, attachment, pv.UID, nodesByVM[attachment.NodeID].UID, cephSingleWriter, hotplugQueuePriorityBackground); err != nil {
+			if err := r.detachObservedAttachment(ctx, attachment, pv.UID, nodesByVM[attachment.NodeID].UID, backend, cephSingleWriter, hotplugQueuePriorityBackground); err != nil {
 				r.server.driver.metrics.RecordAttachmentReconciler("orphan_attachment", "detach", attachmentCleanupOutcome(err))
 				klog.V(2).InfoS("Failed to detach orphan attachment", "volume", volumeHandle, "node", attachment.NodeName, "err", err)
 			} else {
@@ -399,12 +406,12 @@ func (r *AttachmentReconciler) cleanupLocalDeviceReports(ctx context.Context, pv
 		return
 	}
 	for key, raw := range cm.Data {
-		var report LocalDeviceMissingReport
-		if err := json.Unmarshal([]byte(raw), &report); err != nil {
+		report, err := decodeLocalDeviceReport(key, raw)
+		if err != nil {
 			continue
 		}
 		if pvByHandle[strings.TrimSpace(report.VolumeID)] == nil || nodeMissing(existingNodes, report.Node) {
-			_ = r.server.driver.kubeRuntime.DeleteConfigMapKey(ctx, namespace, localDeviceStateConfigMapName, key)
+			_ = r.server.driver.kubeRuntime.deleteConfigMapKeyIfCurrent(ctx, cm, key, raw)
 		}
 	}
 }
@@ -463,7 +470,7 @@ func (r *AttachmentReconciler) skipVolume(ctx context.Context, volumeHandle, cle
 	return false
 }
 
-func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, attachment opennebula.ObservedAttachment, pvUID, nodeUID types.UID, cephSingleWriter bool, priority HotplugQueuePriority) error {
+func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, attachment opennebula.ObservedAttachment, pvUID, nodeUID types.UID, backend string, cephSingleWriter bool, priority HotplugQueuePriority) error {
 	if pvUID == "" || nodeUID == "" {
 		return errAttachmentSkipped
 	}
@@ -510,7 +517,7 @@ func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, att
 		}
 		detachStarted := time.Now()
 		accepted, err := r.server.detachVolumeWithAuthority(queueCtx, attachment.VolumeHandle, attachment.NodeName,
-			physicalDetachIdentity{pvUID: pvUID, nodeUID: nodeUID, imageID: attachment.ImageID, vmID: attachment.NodeID, diskID: attachment.DiskID, background: true, cephSingleWriter: cephSingleWriter})
+			physicalDetachIdentity{pvUID: pvUID, nodeUID: nodeUID, imageID: attachment.ImageID, vmID: attachment.NodeID, diskID: attachment.DiskID, background: true, backend: backend, cephSingleWriter: cephSingleWriter})
 		if err != nil {
 			r.server.handleHotplugTimeout(queueCtx, attachment.NodeName, attachment.VolumeHandle, nil, "detach", observedAttachmentBackend(attachment), err)
 			return err
@@ -663,6 +670,9 @@ func (r *AttachmentReconciler) deleteStaleVolumeAttachment(ctx context.Context, 
 	}
 	if _, err := r.server.volumeProvider.GetVolumeInNode(ctx, imageID, nodeID); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
 		return fmt.Errorf("stale attachment absence is unverified: %v", err)
+	}
+	if err := r.server.verifyDetachAbsenceTarget(ctx, volume, va.Spec.NodeName, imageID, nodeID); err != nil {
+		return err
 	}
 	currentNode, err := r.server.driver.kubeRuntime.NodeIdentity(ctx, va.Spec.NodeName)
 	if err != nil || !currentNode.Exists || currentNode.UID != identity.UID {

@@ -323,7 +323,7 @@ func TestWaitForAttachStateReturnsHotplugTimeoutError(t *testing.T) {
 func TestWaitForDetachStateReturnsHotplugTimeoutError(t *testing.T) {
 	provider := &PersistentDiskVolumeProvider{}
 
-	err := provider.waitForDetachState(context.Background(), 5*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForDetachState(context.Background(), 5*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		return true, false, nil
 	}, nil, "vol-a", "node-a")
 
@@ -338,7 +338,7 @@ func TestWaitForDetachStateReturnsHotplugTimeoutError(t *testing.T) {
 func TestWaitForDetachStateSucceedsWhenVolumeAbsentAndNodeNotReady(t *testing.T) {
 	provider := &PersistentDiskVolumeProvider{}
 
-	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		return false, false, nil
 	}, nil, "vol-a", "node-a")
 
@@ -407,7 +407,7 @@ func TestWaitForDetachStateRetriesAfterNodeBecomesReady(t *testing.T) {
 	retryCount := 0
 	attached := true
 
-	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		if retryCount == 0 {
 			return true, true, nil
 		}
@@ -415,7 +415,7 @@ func TestWaitForDetachStateRetriesAfterNodeBecomesReady(t *testing.T) {
 			return false, true, nil
 		}
 		return true, false, nil
-	}, func() error {
+	}, func(context.Context) error {
 		retryCount++
 		attached = false
 		return nil
@@ -429,12 +429,12 @@ func TestWaitForDetachStateRetriesHotplugUntilSuccess(t *testing.T) {
 	provider := &PersistentDiskVolumeProvider{}
 	retryCount := 0
 
-	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		if retryCount >= 2 {
 			return false, true, nil
 		}
 		return true, true, nil
-	}, func() error {
+	}, func(context.Context) error {
 		retryCount++
 		if retryCount == 1 {
 			return fmt.Errorf("wrong state HOTPLUG")
@@ -449,9 +449,9 @@ func TestWaitForDetachStateRetriesHotplugUntilSuccess(t *testing.T) {
 func TestWaitForDetachStateFailsOnNonHotplugRetryError(t *testing.T) {
 	provider := &PersistentDiskVolumeProvider{}
 
-	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		return true, true, nil
-	}, func() error {
+	}, func(context.Context) error {
 		return fmt.Errorf("permission denied")
 	}, "vol-a", "node-a")
 

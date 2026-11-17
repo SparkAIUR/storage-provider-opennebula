@@ -26,11 +26,11 @@ type growthProtocolState struct {
 }
 
 type growthFixtureConfig struct {
-	diskFacts, imagePersistent string
-	initialMB                  int64
-	versionReply               func() (bool, string, int)
-	pendingReads               int32
-	beforeObservation          func(string)
+	diskFacts, imagePersistent, extraDisk string
+	initialMB                             int64
+	versionReply                          func() (bool, string, int)
+	pendingReads                          int32
+	beforeObservation                     func(string)
 }
 
 func growthCompatibilityFixture(t *testing.T, version string, restoring bool, options ...func(*growthFixtureConfig)) (*PersistentDiskVolumeProvider, *growthProtocolState) {
@@ -59,7 +59,7 @@ func growthCompatibilityFixture(t *testing.T, version string, restoring bool, op
 				markers = "<RESIZE>YES</RESIZE><SIZE_PREV>128</SIZE_PREV>"
 			}
 		}
-		return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE><ORIGINAL_SIZE>128</ORIGINAL_SIZE>%s%s</DISK></TEMPLATE></VM>`, st.sizeMB.Load(), cfg.diskFacts, markers)
+		return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE><ORIGINAL_SIZE>128</ORIGINAL_SIZE>%s%s</DISK>%s</TEMPLATE></VM>`, st.sizeMB.Load(), cfg.diskFacts, markers, cfg.extraDisk)
 	}
 	p := lifecycleFixture(t, func(method string) (bool, string, int) {
 		if cfg.beforeObservation != nil {
@@ -161,6 +161,28 @@ func TestProviderGrowthCompatibilityVersions(t *testing.T) {
 			require.Zero(t, st.otherMutations.Load())
 		})
 	}
+}
+
+func TestProviderGrowthCompatibilityUsesSelectedDiskForAdmission(t *testing.T) {
+	provider, state := growthCompatibilityFixture(t, "7.4.1", false, func(config *growthFixtureConfig) {
+		vmReads := 0
+		config.beforeObservation = func(method string) {
+			if method == "one.vm.info" {
+				vmReads++
+			}
+			config.extraDisk = ""
+			if method == "one.vm.info" && vmReads == 2 {
+				config.extraDisk = `<DISK><IMAGE_ID>invalid</IMAGE_ID><DISK_ID>3</DISK_ID></DISK>`
+			}
+		}
+	})
+	size, err := provider.ExpandVolume(context.Background(), "volume-test", 268_435_456, false)
+	require.NoError(t, err)
+	require.EqualValues(t, 268_435_456, size)
+	require.EqualValues(t, 1, state.versionCalls.Load())
+	require.EqualValues(t, 1, state.resizeCalls.Load())
+	require.EqualValues(t, 1, state.metadataWrites.Load())
+	require.Zero(t, state.otherMutations.Load())
 }
 
 func TestProviderGrowthCompatibilityUnknownIdentity(t *testing.T) {
