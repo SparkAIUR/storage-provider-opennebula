@@ -1177,10 +1177,9 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	}
 
 	var recoveryRuntimeCtx *VolumeRuntimeContext
+	var recoveryRuntimeErr error
 	if s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
-		if resolved, runtimeErr := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId); runtimeErr == nil {
-			recoveryRuntimeCtx = resolved
-		}
+		recoveryRuntimeCtx, recoveryRuntimeErr = s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId)
 	}
 	recoveryControl, recoveryErr := s.recoveryControlState(ctx, req.VolumeId, recoveryRuntimeCtx)
 	if recoveryErr != nil {
@@ -1198,16 +1197,19 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 
-	if rescued, response, rescueErr := s.rescueCephSameNodeUnpublish(ctx, req, volumeID, nodeID); rescued {
+	ceph := isCephBackend(s.currentVolumeHistory(req.VolumeId).Backend) ||
+		isCephBackend(runtimeCtxField(recoveryRuntimeCtx, func(v *VolumeRuntimeContext) string { return v.Backend }))
+	if rescued, response, rescueErr := s.rescueCephSameNodeUnpublish(ctx, req, volumeID, nodeID, recoveryRuntimeCtx, recoveryRuntimeErr); rescued {
 		return response, rescueErr
 	}
 
-	if rescued, response, rescueErr := s.rescueSameNodeUnpublish(ctx, req, volumeID, nodeID); rescued {
-		return response, rescueErr
-	}
-
-	if held, response, holdErr := s.startMaintenanceDetachHold(ctx, req); held {
-		return response, holdErr
+	if !ceph {
+		if rescued, response, rescueErr := s.rescueSameNodeUnpublish(ctx, req, volumeID, nodeID); rescued {
+			return response, rescueErr
+		}
+		if held, response, holdErr := s.startMaintenanceDetachHold(ctx, req); held {
+			return response, holdErr
+		}
 	}
 
 	if cooldown, ok := s.hotplugCooldownState(ctx, req.NodeId); ok {
@@ -1222,12 +1224,12 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
 		defer release()
 
-		if handled, _, freshErr := s.precheckUnpublishHotplug(queueCtx, req); handled {
+		if handled, _, freshErr := s.precheckUnpublishHotplug(queueCtx, req, ceph); handled {
 			return freshErr
 		}
 
 		runtimeCtx, stickyState, stickyEligible, stickyReason := s.shouldDelayDetach(queueCtx, req)
-		if stickyEligible {
+		if !ceph && stickyEligible {
 			if err := s.startDetachGrace(queueCtx, runtimeCtx, stickyState); err != nil {
 				klog.V(2).InfoS("Sticky detach grace start failed, falling back to immediate detach",
 					"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId, "err", err)
@@ -1251,7 +1253,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 			"method", "ControllerUnpublishVolume", "volumeID", volumeID, "nodeID", nodeID)
 
 		detachStarted := time.Now()
-		err = s.detachVolumeWithAuthority(queueCtx, req.VolumeId, req.NodeId)
+		_, err = s.detachVolumeWithAuthority(queueCtx, req.VolumeId, req.NodeId, physicalDetachIdentity{imageID: volumeID, vmID: nodeID, diskID: -1, ceph: ceph})
 		if err != nil {
 			if status.Code(err) != codes.Unknown {
 				return err
@@ -1973,7 +1975,7 @@ func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.
 	}
 }
 
-func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (bool, *csi.ControllerUnpublishVolumeResponse, error) {
+func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, ceph bool) (bool, *csi.ControllerUnpublishVolumeResponse, error) {
 	if s == nil || req == nil {
 		return false, nil, nil
 	}
@@ -1988,7 +1990,9 @@ func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *cs
 	case VolumeReconcileReject, VolumeReconcileStale:
 		return true, nil, decision.Err()
 	case VolumeReconcilePause:
-		if detachPauseCanReturnSuccess(decision.Reason) {
+		if !ceph && detachPauseCanReturnSuccess(decision.Reason) && !isCephBackend(decision.Evidence.History.Backend) &&
+			!isCephBackend(runtimeCtxField(decision.Evidence.RuntimeCtx, func(v *VolumeRuntimeContext) string { return v.Backend })) &&
+			!isCephBackend(s.currentVolumeHistory(req.VolumeId).Backend) {
 			s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
 			return true, &csi.ControllerUnpublishVolumeResponse{}, nil
 		}
@@ -2595,7 +2599,7 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 		return false, nil, nil
 	}
 
-	if err := s.detachVolumeWithAuthority(ctx, req.VolumeId, state.NodeID); err != nil {
+	if _, err := s.detachVolumeWithAuthority(ctx, req.VolumeId, state.NodeID, physicalDetachIdentity{imageID: volumeID, vmID: oldNodeID, diskID: -1}); err != nil {
 		if status.Code(err) != codes.Unknown {
 			return true, nil, err
 		}
@@ -2683,7 +2687,7 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 		}
 
 		detachStarted := time.Now()
-		if err := s.detachVolumeWithAuthority(queueCtx, confirmed.VolumeID, confirmed.NodeID); err != nil {
+		if _, err := s.detachVolumeWithAuthority(queueCtx, confirmed.VolumeID, confirmed.NodeID, physicalDetachIdentity{imageID: volumeID, vmID: nodeID, diskID: -1}); err != nil {
 			if driftErr := s.detachMetadataDriftError(queueCtx, confirmed.VolumeID, confirmed.NodeID, err); driftErr != nil {
 				klog.V(2).InfoS("Classified sticky detach failure as OpenNebula metadata drift", "volumeID", confirmed.VolumeID, "nodeID", confirmed.NodeID, "err", driftErr)
 				return driftErr

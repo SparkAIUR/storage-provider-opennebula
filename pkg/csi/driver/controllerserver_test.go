@@ -2378,7 +2378,7 @@ func TestMaintenanceAttachedNodesIgnoresDeletingVolumeAttachments(t *testing.T) 
 	assert.Empty(t, conflicts)
 }
 
-func TestControllerUnpublishVolumeDeniesDetachWhenNodeNotReady(t *testing.T) {
+func TestControllerUnpublishVolumeBypassesStickyDetachWhenNodeNotReady(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-bypass", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
 		annotationRestartOpt: restartOptimizationAnnotationValue,
 	})
@@ -2390,17 +2390,17 @@ func TestControllerUnpublishVolumeDeniesDetachWhenNodeNotReady(t *testing.T) {
 	mockProvider.On("VolumeExists", mock.Anything, "vol-bypass").Return(1, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdb", nil).Twice()
+	mockProvider.On("DetachVolume", mock.Anything, "vol-bypass", "node-1").Return(nil).Once()
 
 	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
 	resp, err := cs.ControllerUnpublishVolume(context.Background(), &csi.ControllerUnpublishVolumeRequest{
 		VolumeId: "vol-bypass",
 		NodeId:   "node-1",
 	})
-	require.Equal(t, codes.Unavailable, status.Code(err))
-	require.Nil(t, resp)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
 	_, ok := driver.stickyAttachments.Get("vol-bypass")
 	assert.False(t, ok)
-	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
 	mockProvider.AssertExpectations(t)
 }
 

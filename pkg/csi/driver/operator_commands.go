@@ -1254,6 +1254,18 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 	if driver.volumeRecoveryControl != nil {
 		recoverySnapshot = driver.volumeRecoveryControl.Snapshot()
 	}
+	vaSnapshot, vaErr := kubeClient.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
+	var attached map[string]string
+	var conflicts map[string]struct{}
+	if vaErr == nil && driver.maintenanceMode.Active() {
+		var owned []storagev1.VolumeAttachment
+		for _, va := range vaSnapshot.Items {
+			if va.Spec.Attacher == DefaultDriverName {
+				owned = append(owned, va)
+			}
+		}
+		attached, conflicts = maintenanceAttachedNodesByPV(owned)
+	}
 	demandSnapshot := map[string]VolumeDesiredState{}
 	protectionSnapshot := map[string]LocalRWOProtectionDecision{}
 	for _, pv := range pvs {
@@ -1262,29 +1274,20 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 		}
 		runtimeCtx, _ := runtime.ResolveVolumeRuntimeContext(ctx, pv.Spec.CSI.VolumeHandle)
 		if runtimeCtx != nil {
-			if driver.maintenanceMode != nil && driver.maintenanceMode.Active() {
-				if vas, err := kubeClient.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{}); err == nil {
-					owned := []storagev1.VolumeAttachment{}
-					for _, va := range vas.Items {
-						if va.Spec.Attacher == DefaultDriverName && matchesVolumeAttachment(pv.Name, &va) {
-							owned = append(owned, va)
-						}
+			if attached != nil {
+				if _, conflict := conflicts[pv.Name]; !conflict {
+					projection := *runtimeCtx
+					projection.PVAnnotations = cloneStringMap(runtimeCtx.PVAnnotations)
+					delete(projection.PVAnnotations, annotationLastAttachedNode)
+					node := maintenanceLastNodeForVolume(ctx, driver, &projection, pv.Spec.CSI.VolumeHandle)
+					if node == "" {
+						node = validatedMaintenanceLastNodeCandidate(ctx, driver, runtimeCtx, attached[pv.Name], "attached-node")
 					}
-					attached, conflicts := maintenanceAttachedNodesByPV(owned)
-					if _, conflict := conflicts[pv.Name]; !conflict {
-						projection := *runtimeCtx
-						projection.PVAnnotations = cloneStringMap(runtimeCtx.PVAnnotations)
-						delete(projection.PVAnnotations, annotationLastAttachedNode)
-						node := maintenanceLastNodeForVolume(ctx, driver, &projection, pv.Spec.CSI.VolumeHandle)
-						if node == "" {
-							node = validatedMaintenanceLastNodeCandidate(ctx, driver, runtimeCtx, attached[pv.Name], "attached-node")
+					if node != "" {
+						if runtimeCtx.PVAnnotations == nil {
+							runtimeCtx.PVAnnotations = map[string]string{}
 						}
-						if node != "" {
-							if runtimeCtx.PVAnnotations == nil {
-								runtimeCtx.PVAnnotations = map[string]string{}
-							}
-							runtimeCtx.PVAnnotations[annotationLastAttachedNode] = node
-						}
+						runtimeCtx.PVAnnotations[annotationLastAttachedNode] = node
 					}
 				}
 			}
@@ -1303,10 +1306,12 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 		if recoveryState.Active() || recoveryState.Expired || recoveryState.Invalid || recoveryState.Adopted || strings.TrimSpace(recoveryState.Mode) != "" || strings.TrimSpace(recoveryState.Warning) != "" || strings.TrimSpace(recoveryState.Message) != "" {
 			recoverySnapshot[pv.Spec.CSI.VolumeHandle] = recoveryState
 		}
-		if desiredState, err := runtime.DesiredNodeForVolume(ctx, pv.Spec.CSI.VolumeHandle); err == nil {
-			demandSnapshot[pv.Spec.CSI.VolumeHandle] = desiredState
+		if vaErr == nil {
+			if desiredState, err := runtime.desiredNodeForVolume(ctx, pv.Spec.CSI.VolumeHandle, vaSnapshot); err == nil {
+				demandSnapshot[pv.Spec.CSI.VolumeHandle] = desiredState
+			}
 		}
-		decision, err := (&ControllerServer{driver: driver}).localRWOProtectionProjection(ctx, pv.Spec.CSI.VolumeHandle, "", runtimeCtx, false)
+		decision, err := (&ControllerServer{driver: driver}).localRWOProtectionProjection(ctx, pv.Spec.CSI.VolumeHandle, "", runtimeCtx, false, false)
 		if err != nil {
 			protectionSnapshot[pv.Spec.CSI.VolumeHandle] = LocalRWOProtectionDecision{
 				Reason:  "evaluation_error",

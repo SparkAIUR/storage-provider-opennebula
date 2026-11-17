@@ -41,9 +41,13 @@ func (p *cleanupReadbackProvider) GetVolumeInNode(context.Context, int, int) (st
 	return "vdb", nil
 }
 
+func (p *cleanupReadbackProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, _ opennebula.DetachAuthorization) (bool, error) {
+	return true, p.DetachVolume(ctx, volume, node)
+}
+
 func TestControllerUnpublishCephObservedHistoryAuthority(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"publish", "stage-only", "no-success", "bootstrap", "bootstrap-source", "bootstrap-with-timestamp"} {
+		for _, mode := range []string{"publish", "stage-only", "no-success", "bootstrap", "bootstrap-source", "bootstrap-with-timestamp", "history-backend", "history-schema", "history-vm", "history-disk", "va-backend"} {
 			t.Run(fmt.Sprintf("%v/%s", queued, mode), func(t *testing.T) {
 				f := newCephRestartTestFixture(t, queued)
 				record, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
@@ -58,6 +62,23 @@ func TestControllerUnpublishCephObservedHistoryAuthority(t *testing.T) {
 				}
 				if mode == "bootstrap-source" {
 					record.EvidenceSource = volumeHistoryEvidenceSourceBootstrap
+				}
+				switch mode {
+				case "history-backend", "history-schema", "history-vm", "history-disk", "va-backend":
+					record.LastSuccessfulPublishTime = time.Now().UTC()
+				}
+				switch mode {
+				case "history-backend":
+					record.Backend = "local"
+				case "history-schema":
+					record.Version = 42
+				case "history-vm":
+					record.LastSuccessfulOpenNebulaVMID = -1
+				case "history-disk":
+					record.LastSuccessfulDiskID = -1
+				case "va-backend":
+					f.va.Status.AttachmentMetadata[annotationBackend] = "local"
+					f.syncObjects(t)
 				}
 				payload, err := json.Marshal(record)
 				require.NoError(t, err)
@@ -147,7 +168,7 @@ func TestControllerUnpublishCephDelayedRPCWithoutActiveDemand(t *testing.T) {
 
 func TestCephRestartCleanupReleaseGuards(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"released", "claim-removed", "terminating", "node-in-use", "repair", "volume-quarantine", "host-quarantine", "observe", "desired-unknown", "provider-unknown", "late-pod", "node-replaced", "already-absent", "readback-unknown", "readback-attached"} {
+		for _, mode := range []string{"released", "claim-removed", "terminating", "node-in-use", "repair", "volume-quarantine", "host-quarantine", "observe", "desired-unknown", "provider-unknown", "late-pod", "pv-replaced-after-grace", "node-replaced", "already-absent", "readback-unknown", "readback-attached"} {
 			t.Run(fmt.Sprintf("%v/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				f := newCephRestartTestFixture(t, queued)
@@ -203,7 +224,7 @@ func TestCephRestartCleanupReleaseGuards(t *testing.T) {
 					_, _, err := driver.volumeQuarantine.MarkFailure(ctx, VolumeQuarantineState{VolumeID: cephRestartVolume, Reason: "metadata_drift"}, 1, time.Hour)
 					require.NoError(t, err)
 				case "host-quarantine":
-					_, _, err := driver.hostArtifactQuarantine.MarkFailure(ctx, HostArtifactQuarantineState{Key: cephRestartVolume + "@host", VolumeID: cephRestartVolume}, 1, time.Hour)
+					_, _, err := driver.hostArtifactQuarantine.MarkFailure(ctx, HostArtifactQuarantineState{Key: "vm-575", VMID: 575, ImageID: 3137, VolumeID: cephRestartVolume}, 1, time.Hour)
 					require.NoError(t, err)
 				case "observe":
 					pvc := f.pvc.DeepCopy()
@@ -219,6 +240,14 @@ func TestCephRestartCleanupReleaseGuards(t *testing.T) {
 					})
 				case "provider-unknown":
 					physical.readError = errors.New("provider observation unavailable")
+				case "pv-replaced-after-grace":
+					physical.beforeRead = func() {
+						physical.beforeRead = nil
+						pv := f.pv.DeepCopy()
+						pv.UID = "replacement-pv"
+						_, err := driver.kubeRuntime.client.CoreV1().PersistentVolumes().Update(ctx, pv, metav1.UpdateOptions{})
+						require.NoError(t, err)
+					}
 				case "late-pod":
 					physical.beforeRead = func() {
 						physical.beforeRead = nil
@@ -259,7 +288,7 @@ func TestCephRestartCleanupReleaseGuards(t *testing.T) {
 }
 
 func TestAttachmentReconcilerStaleIdentityAndAbsence(t *testing.T) {
-	for _, mode := range []string{"absent", "foreign-driver", "foreign-attacher", "replacement-before-read", "replacement-before-list", "replacement-at-delete", "replaced-pv", "unknown", "reattached"} {
+	for _, mode := range []string{"absent", "foreign-driver", "foreign-attacher", "replacement-before-read", "replacement-before-list", "replacement-at-delete", "replaced-pv", "unknown", "reattached", "replacement-vm", "va-image", "va-serial"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			f := newCephRestartTestFixture(t, false)
@@ -270,12 +299,25 @@ func TestAttachmentReconcilerStaleIdentityAndAbsence(t *testing.T) {
 			if mode == "foreign-attacher" {
 				f.va.Spec.Attacher = "foreign.csi.example"
 			}
+			vmID := 575
+			switch mode {
+			case "replacement-vm":
+				vmID = 576
+				_, err := f.server.driver.volumeHistory.Upsert(ctx, cephRestartVolume, func(h *VolumeHistoryRecord) {
+					h.LastSuccessfulOpenNebulaVMID = 575
+				})
+				require.NoError(t, err)
+			case "va-image":
+				f.va.Status.AttachmentMetadata[publishContextOpenNebulaImageID] = "3138"
+			case "va-serial":
+				f.va.Status.AttachmentMetadata[publishContextDeviceSerial] = "onecsi-3138"
+			}
 			f.syncObjects(t)
 			client := f.server.driver.kubeRuntime.client.(*fake.Clientset)
 			base := new(MockOpenNebulaVolumeProviderTestify)
 			base.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil)
 			base.On("VolumeExists", mock.Anything, cephRestartVolume).Return(3137, 1024, nil)
-			base.On("NodeExists", mock.Anything, "node-a").Return(575, nil)
+			base.On("NodeExists", mock.Anything, "node-a").Return(vmID, nil)
 			physical := &cleanupReadbackProvider{MockOpenNebulaVolumeProviderTestify: base}
 			if mode == "unknown" {
 				physical.readError = errors.New("lookup unavailable")
@@ -369,4 +411,99 @@ func TestAttachmentReconcilerDoesNotCombineForeignHandleOwnership(t *testing.T) 
 	require.NoError(t, err)
 	require.Equal(t, foreignVA.UID, observed.UID)
 	base.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+}
+
+func TestControllerUnpublishCephLateDemandCannotAcknowledge(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(fmt.Sprint(queued), func(t *testing.T) {
+			f := newCephRestartTestFixture(t, queued)
+			ctx := context.Background()
+			client := f.server.driver.kubeRuntime.client
+			require.NoError(t, client.CoreV1().Pods(f.pod.Namespace).Delete(ctx, f.pod.Name, metav1.DeleteOptions{}))
+			var calls int
+			for _, expectation := range f.provider.ExpectedCalls {
+				if expectation.Method == "InspectVolumeLookup" {
+					expectation.Run(func(mock.Arguments) {
+						calls++
+						if calls == 1 {
+							_, err := client.CoreV1().Pods(f.pod.Namespace).Create(ctx, f.pod, metav1.CreateOptions{})
+							require.NoError(t, err)
+						}
+					})
+				}
+			}
+			response, err := f.unpublish(t)
+			require.Error(t, err)
+			require.Nil(t, response)
+			require.Positive(t, calls)
+			require.Zero(t, f.provider.inspections.Load())
+			history, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
+			require.True(t, history.LastSafeDetachTime.IsZero())
+			f.requireNoProviderMutation(t)
+		})
+	}
+}
+
+func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, mode := range []string{"null", "wrong-report-key", "unknown-confirmation", "unknown-failure", "host-key", "host-owner"} {
+			t.Run(fmt.Sprintf("%v/%s", queued, mode), func(t *testing.T) {
+				f := newCephRestartTestFixture(t, queued)
+				key := localDeviceReportKey(f.node.Name, cephRestartVolume)
+				cm := localDeviceStateConfigMapName
+				var raw string
+				switch mode {
+				case "null":
+					raw = "null"
+				case "wrong-report-key", "unknown-confirmation", "unknown-failure":
+					report := LocalDeviceMissingReport{Node: f.node.Name, VolumeID: cephRestartVolume, FailureClass: localDeviceFailureClassMissingDevice}
+					switch mode {
+					case "wrong-report-key":
+						report.VolumeID = "another-volume"
+					case "unknown-confirmation":
+						report.ConfirmationState = "future"
+					case "unknown-failure":
+						report.FailureClass = "future"
+					}
+					payload, err := json.Marshal(report)
+					require.NoError(t, err)
+					raw = string(payload)
+				case "host-key", "host-owner":
+					cm = hostArtifactStateConfigMapName
+					key = "vm-575"
+					state := HostArtifactQuarantineState{Key: key, VMID: 575, ImageID: 3137, VolumeID: cephRestartVolume, FailureCount: 1, ExpiresAt: time.Now().Add(time.Hour)}
+					if mode == "host-key" {
+						state.Key = "vm-576"
+					} else {
+						state.VolumeID = "another-volume"
+					}
+					payload, err := json.Marshal(state)
+					require.NoError(t, err)
+					raw = string(payload)
+				}
+				require.NoError(t, f.server.driver.kubeRuntime.UpsertConfigMapData(context.Background(), "default", cm, map[string]string{key: raw}))
+				reply, err := f.unpublish(t)
+				require.Error(t, err)
+				require.Nil(t, reply)
+				require.Zero(t, f.provider.inspections.Load())
+				f.requireNoProviderMutation(t)
+			})
+		}
+	}
+}
+
+func TestControllerUnpublishCephEventOmitsProviderIDs(t *testing.T) {
+	f := newCephRestartTestFixture(t, false)
+	reply, err := f.unpublish(t)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+	events, err := f.server.driver.kubeRuntime.client.CoreV1().Events(f.pvc.Namespace).List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, events.Items, 1)
+	event := events.Items[0]
+	require.Equal(t, eventReasonSameNodeDetachRescued, event.Reason)
+	require.Contains(t, event.Message, "logical attachment deletion")
+	require.NotContains(t, event.Message, "3137")
+	require.NotContains(t, event.Message, "575")
+	require.NotContains(t, event.Message, "disk 1")
 }

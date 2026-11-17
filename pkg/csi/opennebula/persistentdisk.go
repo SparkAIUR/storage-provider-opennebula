@@ -969,18 +969,23 @@ func addDiskParams(disk *shared.Disk, params map[string]string) {
 }
 
 func (p *PersistentDiskVolumeProvider) DetachVolume(ctx context.Context, volume, node string) error {
+	_, err := p.DetachVolumeWithAuthority(ctx, volume, node, nil)
+	return err
+}
+
+func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, authorize DetachAuthorization) (bool, error) {
 	nodeID, err := p.NodeExists(ctx, node)
 	if err != nil || nodeID == -1 {
-		return fmt.Errorf("failed to check if node exists: %w", err)
+		return false, fmt.Errorf("failed to check if node exists: %w", err)
 	}
 
 	volumeID, _, err := p.VolumeExists(ctx, volume)
 	if err != nil || volumeID == -1 {
-		return fmt.Errorf("failed to check if volume exists: %w", err)
+		return false, fmt.Errorf("failed to check if volume exists: %w", err)
 	}
 	sizeBytes, err := p.resolveDetachVolumeSizeBytes(ctx, volumeID, nodeID)
 	if err != nil {
-		return fmt.Errorf("failed to resolve volume size for detach of %s: %w", volume, err)
+		return false, fmt.Errorf("failed to resolve volume size for detach of %s: %w", volume, err)
 	}
 	hotplugTimeout := p.ComputeHotplugTimeout(sizeBytes)
 	klog.V(1).InfoS("Computed dynamic hotplug timeout for detach",
@@ -992,7 +997,7 @@ func (p *PersistentDiskVolumeProvider) DetachVolume(ctx context.Context, volume,
 	vmController := p.ctrl.VM(nodeID)
 	vmInfo, err := vmController.InfoContext(ctx, true)
 	if err != nil {
-		return fmt.Errorf("failed to get VM info: %w", err)
+		return false, fmt.Errorf("failed to get VM info: %w", err)
 	}
 
 	for _, disk := range vmInfo.Template.GetDisks() {
@@ -1000,23 +1005,48 @@ func (p *PersistentDiskVolumeProvider) DetachVolume(ctx context.Context, volume,
 		if err == nil && diskImageID == volumeID {
 			diskID, err := disk.Get(shared.DiskID)
 			if err != nil {
-				return fmt.Errorf(
+				return false, fmt.Errorf(
 					"failed to get disk ID from volume %s on node %s: %w",
 					volume, node, err)
 			}
 			diskIDInt, err := strconv.Atoi(diskID)
 			if err != nil {
-				return fmt.Errorf("invalid disk ID format: %w", err)
+				return false, fmt.Errorf("invalid disk ID format: %w", err)
 			}
+			accepted := false
 			detachDisk := func() error {
 				if _, err := p.resolveDetachVolumeSizeBytes(ctx, volumeID, nodeID); err != nil {
 					return err
 				}
-				return vmController.Disk(diskIDInt).DetachContext(ctx)
+				currentNode, err := p.NodeExists(ctx, node)
+				if err != nil || currentNode != nodeID {
+					return fmt.Errorf("detach VM identity changed: %v", err)
+				}
+				currentDisk, _, err := p.volumeDiskInVM(ctx, volumeID, nodeID)
+				if errors.Is(err, ErrAttachmentNotFound) {
+					if _, observedErr := p.GetVolumeInNode(ctx, volumeID, nodeID); errors.Is(observedErr, ErrAttachmentNotFound) {
+						return nil
+					}
+					return fmt.Errorf("detach attachment absence is unverified")
+				}
+				if err != nil || currentDisk != diskIDInt {
+					return fmt.Errorf("detach disk identity changed: %v", err)
+				}
+				if authorize != nil {
+					if err := authorize(ctx, volumeID, nodeID, diskIDInt); err != nil {
+						return err
+					}
+				}
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				err = vmController.Disk(diskIDInt).DetachContext(ctx)
+				accepted = err == nil
+				return err
 			}
 			detachErr := detachDisk()
 			if detachErr != nil && !isHotplugStateError(detachErr) {
-				return fmt.Errorf("failed to detach volume %s from node %s: %w",
+				return false, fmt.Errorf("failed to detach volume %s from node %s: %w",
 					diskID, node, detachErr)
 			}
 
@@ -1039,19 +1069,19 @@ func (p *PersistentDiskVolumeProvider) DetachVolume(ctx context.Context, volume,
 				return attached, ready, nil
 			}, retryDetach, volume, node); err != nil {
 				if detachErr != nil {
-					return fmt.Errorf("%w (initial detach error: %v)", err, detachErr)
+					return false, fmt.Errorf("%w (initial detach error: %v)", err, detachErr)
 				}
-				return err
+				return false, err
 			}
-			return nil
+			return accepted, nil
 		}
 	}
 	if _, err := p.GetVolumeInNode(ctx, volumeID, nodeID); !errors.Is(err, ErrAttachmentNotFound) {
-		return fmt.Errorf("attachment absence could not be verified before detach completion: %v", err)
+		return false, fmt.Errorf("attachment absence could not be verified before detach completion: %v", err)
 	}
 	klog.V(1).InfoS("Volume already absent from node, treating detach as successful",
 		"method", "DetachVolume", "volumeID", volumeID, "volumeHandle", volume, "nodeID", nodeID, "node", node)
-	return nil
+	return false, nil
 }
 
 func (p *PersistentDiskVolumeProvider) ListVolumes(ctx context.Context, owner string, maxEntries int32, startingToken string) ([]string, error) {

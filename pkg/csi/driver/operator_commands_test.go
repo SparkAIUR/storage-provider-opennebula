@@ -270,7 +270,13 @@ func TestSupportBundleProjectsLiveMaintenanceAttachmentWithoutWrites(t *testing.
 	node := newReadyNode("node-old", true)
 	va := &storagev1.VolumeAttachment{ObjectMeta: metav1.ObjectMeta{Name: "va-live", UID: "va-live-uid"}, Spec: storagev1.VolumeAttachmentSpec{Attacher: DefaultDriverName, NodeName: node.Name, Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name}}, Status: storagev1.VolumeAttachmentStatus{Attached: true}}
 	maintenance := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: hotplugStateConfigMapName, Namespace: namespaceFromServiceAccount()}, Data: map[string]string{maintenanceModeKey: "true"}}
-	client := fake.NewSimpleClientset(pv, pvc, node, va, maintenance)
+	secondPV, secondPVC := newLocalPVAndPVC("vol-diagnostics-second", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	client := fake.NewSimpleClientset(pv, pvc, secondPV, secondPVC, node, va, maintenance)
+	censuses := 0
+	client.PrependReactor("list", "volumeattachments", func(ktesting.Action) (bool, kruntime.Object, error) {
+		censuses++
+		return false, nil, nil
+	})
 	client.PrependReactor("*", "*", func(action ktesting.Action) (bool, kruntime.Object, error) {
 		if action.GetVerb() == "get" || action.GetVerb() == "list" {
 			return false, nil, nil
@@ -278,7 +284,9 @@ func TestSupportBundleProjectsLiveMaintenanceAttachmentWithoutWrites(t *testing.
 		t.Errorf("diagnostics attempted %s %s", action.GetVerb(), action.GetResource().Resource)
 		return true, nil, fmt.Errorf("unexpected diagnostic write")
 	})
-	history, _, _, _, protection := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, []corev1.PersistentVolume{*pv})
+	history, _, _, demand, protection := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, []corev1.PersistentVolume{*pv, *secondPV})
+	require.Equal(t, 1, censuses)
+	require.Len(t, demand, 2)
 	require.Equal(t, node.Name, history["vol-live-diagnostics"].LastSuccessfulNodeName)
 	require.True(t, history["vol-live-diagnostics"].Bootstrapped)
 	require.Equal(t, node.Name, protection["vol-live-diagnostics"].RequiredNode)

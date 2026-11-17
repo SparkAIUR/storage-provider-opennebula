@@ -87,10 +87,10 @@ func localRWOProtectionDecisionForDriver(ctx context.Context, driver *Driver, vo
 }
 
 func (s *ControllerServer) localRWOProtectionDecision(ctx context.Context, volumeID, requestedNode string) (LocalRWOProtectionDecision, error) {
-	return s.localRWOProtectionProjection(ctx, volumeID, requestedNode, nil, true)
+	return s.localRWOProtectionProjection(ctx, volumeID, requestedNode, nil, true, false)
 }
 
-func (s *ControllerServer) localRWOProtectionProjection(ctx context.Context, volumeID, requestedNode string, runtimeCtx *VolumeRuntimeContext, persist bool) (LocalRWOProtectionDecision, error) {
+func (s *ControllerServer) localRWOProtectionProjection(ctx context.Context, volumeID, requestedNode string, runtimeCtx *VolumeRuntimeContext, persist, ignoreExpiredSticky bool) (LocalRWOProtectionDecision, error) {
 	decision := LocalRWOProtectionDecision{}
 	if s == nil || s.driver == nil {
 		return decision, nil
@@ -135,7 +135,7 @@ func (s *ControllerServer) localRWOProtectionProjection(ctx context.Context, vol
 		return decision, nil
 	}
 
-	inferredRequiredNode, inferredReason, inferredSource, automaticTrigger := s.inferredLocalRWORequiredNode(ctx, volumeID, runtimeCtx, history)
+	inferredRequiredNode, inferredReason, inferredSource, automaticTrigger := s.inferredLocalRWORequiredNode(ctx, volumeID, runtimeCtx, history, ignoreExpiredSticky)
 	decision.InferredRequiredNode = inferredRequiredNode
 	decision.InferredReason = inferredReason
 	decision.InferredSource = inferredSource
@@ -272,12 +272,12 @@ func localRWOHistoryRuntimeContextDegraded(runtimeCtx *VolumeRuntimeContext) boo
 	return false
 }
 
-func (s *ControllerServer) inferredLocalRWORequiredNode(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext, history VolumeHistoryRecord) (string, string, string, string) {
+func (s *ControllerServer) inferredLocalRWORequiredNode(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext, history VolumeHistoryRecord, ignoreExpiredSticky bool) (string, string, string, string) {
 	requiredNode := ""
 	reason := ""
 	source := ""
 	automaticTrigger := ""
-	if state, ok := s.activeStickyAttachment(volumeID); ok && strings.TrimSpace(state.NodeID) != "" {
+	if state, ok := s.activeStickyAttachment(volumeID); ok && strings.TrimSpace(state.NodeID) != "" && (!ignoreExpiredSticky || state.ExpiresAt.IsZero() || state.ExpiresAt.After(time.Now().UTC())) {
 		requiredNode = strings.TrimSpace(state.NodeID)
 		reason = protectionReasonSticky
 		source = protectionSourceStickyReuse
@@ -370,8 +370,7 @@ func (s *ControllerServer) activeStickyAttachment(volumeID string) (StickyAttach
 	if s == nil || s.driver == nil || s.driver.stickyAttachments == nil {
 		return StickyAttachmentState{}, false
 	}
-	state, ok := s.driver.stickyAttachments.Get(volumeID)
-	return state, ok && (state.ExpiresAt.IsZero() || state.ExpiresAt.After(time.Now().UTC()))
+	return s.driver.stickyAttachments.Get(volumeID)
 }
 
 func (s *ControllerServer) latestLocalDeviceReport(ctx context.Context, volumeID string) (LocalDeviceMissingReport, bool) {

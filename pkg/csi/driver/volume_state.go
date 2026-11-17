@@ -449,13 +449,15 @@ func (m *VolumeRepairStateManager) GetCurrent(ctx context.Context, volumeID stri
 		if err := decodeCephRetentionProtection(raw, &state); err != nil {
 			return state, false, err
 		}
-		if state.VolumeID != volumeID || state.Version != stateObjectVersion || strings.TrimSpace(state.Classification) == "" {
+		legacyRuntime := state.Version == 0 && state.Classification == repairClassificationRuntimeAttachUnconfirmed &&
+			strings.TrimSpace(state.RequestedNode) != ""
+		if state.VolumeID != volumeID || (state.Version != stateObjectVersion && !legacyRuntime) || strings.TrimSpace(state.Classification) == "" {
 			return state, false, fmt.Errorf("repair record identity or schema is invalid for %s", volumeID)
 		}
 		if state.Classification != repairClassificationRuntimeAttachUnconfirmed {
 			return state, true, nil
 		}
-		state.persistedRuntimeMarker = cm.Data[volumeID]
+		state.persistedRuntimeMarker = raw
 	}
 	cm, err = m.runtime.GetConfigMap(ctx, m.namespace, localDeviceStateConfigMapName)
 	if errors.IsNotFound(err) {
@@ -464,10 +466,25 @@ func (m *VolumeRepairStateManager) GetCurrent(ctx context.Context, volumeID stri
 	if err != nil {
 		return VolumeRepairState{}, false, err
 	}
-	for _, raw := range cm.Data {
+	for key, raw := range cm.Data {
 		var report LocalDeviceMissingReport
-		if err := json.Unmarshal([]byte(raw), &report); err != nil {
+		if err := decodeCephRetentionProtection(raw, &report); err != nil {
 			return VolumeRepairState{}, false, err
+		}
+		if strings.TrimSpace(report.Node) == "" || strings.TrimSpace(report.VolumeID) == "" || key != localDeviceReportKey(report.Node, report.VolumeID) {
+			return VolumeRepairState{}, false, fmt.Errorf("node device report identity is invalid")
+		}
+		switch report.ConfirmationState {
+		case "", localDeviceConfirmationStateInProgress, localDeviceConfirmationStatePending, localDeviceConfirmationStateConfirmed,
+			localDeviceConfirmationStateTimedOut, localDeviceConfirmationStateRepairRequired:
+		default:
+			return VolumeRepairState{}, false, fmt.Errorf("node device confirmation state is invalid")
+		}
+		switch report.FailureClass {
+		case "", localDeviceFailureClassMissingDevice, localDeviceFailureClassRuntimeAttachmentMissing,
+			localDeviceFailureClassMountFailed, localDeviceFailureClassWrongIdentity:
+		default:
+			return VolumeRepairState{}, false, fmt.Errorf("node device failure class is invalid")
 		}
 		if report.VolumeID != volumeID || (report.ConfirmationState != localDeviceConfirmationStateRepairRequired && localDeviceFailureClass(report) != localDeviceFailureClassWrongIdentity) {
 			continue

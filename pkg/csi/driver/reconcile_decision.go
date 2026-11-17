@@ -281,17 +281,17 @@ func (s *ControllerServer) evaluateVolumeDetachDecision(ctx context.Context, dec
 		return decision.with(VolumeReconcilePause, queueReasonRecoveryModeObserve, codes.Unavailable, "physical detach is blocked by recovery controls")
 	}
 	if s.driver != nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
-		if err := s.attachmentProtectionChecks(ctx, evidence.VolumeID, evidence.RuntimeCtx); err != nil {
+		if err := s.attachmentProtectionChecks(ctx, evidence.VolumeID, evidence.RuntimeCtx, evidence.OpenNebulaImageID); err != nil {
 			return decision.with(VolumeReconcilePause, "detach_protection_blocked", status.Code(err), err.Error())
 		}
 		desiredState, desiredErr := s.driver.kubeRuntime.DesiredNodeForVolume(ctx, evidence.VolumeID)
 		evidence.DesiredState = desiredState
 		evidence.DesiredErr = desiredErr
 		decision = decision.withEvidence(evidence)
-		if desiredErr != nil || desiredState.MultipleNodes {
+		if desiredErr != nil {
 			return decision.with(VolumeReconcilePause, "desired_state_unknown", codes.Unavailable, fmt.Sprintf("cannot verify volume release: %v", desiredErr))
 		}
-		if desiredState.Desired && !desiredState.MultipleNodes && strings.TrimSpace(desiredState.NodeName) == strings.TrimSpace(evidence.NodeID) {
+		if desiredState.desiresNode(evidence.NodeID) {
 			return decision.with(VolumeReconcilePause, queueReasonSameNodeReuseRequired, codes.Unavailable,
 				fmt.Sprintf("queued detach for volume %s on node %s is paused because Kubernetes still desires the volume there (%s)", evidence.VolumeID, evidence.NodeID, desiredState.Reason))
 		}
@@ -301,7 +301,7 @@ func (s *ControllerServer) evaluateVolumeDetachDecision(ctx context.Context, dec
 	if orphanTeardown {
 		evidence.History = s.refreshVolumeHistory(ctx, evidence.VolumeID)
 	}
-	protection, protectionErr := s.localRWOProtectionDecision(ctx, evidence.VolumeID, evidence.NodeID)
+	protection, protectionErr := s.localRWOProtectionProjection(ctx, evidence.VolumeID, evidence.NodeID, evidence.RuntimeCtx, true, true)
 	evidence.Protection = protection
 	evidence.ProtectionErr = protectionErr
 	decision = decision.withEvidence(evidence)

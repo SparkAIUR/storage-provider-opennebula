@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/require"
@@ -21,6 +22,8 @@ import (
 
 type nodeAttachmentProtocol struct {
 	hideDiskInfo      bool
+	rejectFirstDetach bool
+	detachAttempts    int
 	ignoreMarkerWrite bool
 	mu                sync.Mutex
 	disks             map[int]int
@@ -117,6 +120,11 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 			case "one.vm.detach":
 				id := number(1)
 				require.Equal(t, 2, number(2))
+				state.detachAttempts++
+				if state.rejectFirstDetach && state.detachAttempts == 1 {
+					ok, body, code = 0, "wrong state HOTPLUG", 0x800
+					break
+				}
 				delete(state.disks, id)
 				state.mutations = append(state.mutations, fmt.Sprintf("detach:%d", id))
 				body = strconv.Itoa(id)
@@ -228,7 +236,7 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 			}
 			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{mode}, nil)
 			pv.Annotations[annotationAllowCrossNodeUntil] = time.Now().UTC().Add(time.Minute).Format(time.RFC3339)
-			driver := newStickyTestDriver(t, pv, pvc)
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
 			if !shared {
 				require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{VolumeID: "volume-test", NodeID: "node-old", Backend: "local", StartedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Minute), GraceSeconds: 60}))
 			}
@@ -278,4 +286,112 @@ func TestProviderRequestedVMCapacityWaitsForCompletion(t *testing.T) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	require.Empty(t, state.mutations)
+}
+
+func TestControllerDetachRechecksReleaseAtProviderAttempt(t *testing.T) {
+	for _, mode := range []string{"first-attempt", "retry", "released-retry", "remote-readers"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			accessMode := corev1.ReadWriteOnce
+			if mode == "remote-readers" {
+				accessMode = corev1.ReadOnlyMany
+			}
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{accessMode}, nil)
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
+			driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+			for _, node := range []string{"node-new", "node-other"} {
+				if mode == "remote-readers" {
+					_, err := driver.kubeRuntime.client.CoreV1().Pods(pvc.Namespace).Create(ctx, activePodForPVC(node, pvc.Name, node), metav1.CreateOptions{})
+					require.NoError(t, err)
+				}
+			}
+			imageReads, detachCalls := 0, 0
+			provider, state := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+				inject := false
+				switch method {
+				case "one.image.info":
+					imageReads++
+					inject = mode == "first-attempt" && imageReads == 6
+				case "one.vm.detach":
+					detachCalls++
+					inject = mode == "retry" && detachCalls == 1
+				}
+				if inject {
+					_, err := driver.kubeRuntime.client.CoreV1().Pods(pvc.Namespace).Create(ctx,
+						activePodForPVC("late-consumer", pvc.Name, "node-old"), metav1.CreateOptions{})
+					require.NoError(t, err)
+				}
+			})
+			state.mu.Lock()
+			state.rejectFirstDetach = mode == "retry" || mode == "released-retry"
+			state.mu.Unlock()
+
+			client := reviewControllerClient(t, NewControllerServer(driver, provider, nil))
+			resp, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: "node-old"})
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			switch mode {
+			case "first-attempt", "retry":
+				require.Error(t, err)
+				require.Nil(t, resp)
+				require.Equal(t, 256, state.disks[41])
+				require.Empty(t, state.mutations)
+				want := 0
+				if mode == "retry" {
+					want = 1
+				}
+				require.Equal(t, want, state.detachAttempts)
+				require.True(t, driver.volumeHistory.Snapshot()["volume-test"].LastSafeDetachTime.IsZero())
+			default:
+				require.NoError(t, err)
+				require.NotNil(t, resp)
+				require.NotContains(t, state.disks, 41)
+				require.Equal(t, []string{"detach:41"}, state.mutations)
+			}
+		})
+	}
+}
+
+type disappearingDetachProvider struct {
+	*opennebula.PersistentDiskVolumeProvider
+	disappear func()
+}
+
+func (p disappearingDetachProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, authorize opennebula.DetachAuthorization) (bool, error) {
+	p.disappear()
+	return p.PersistentDiskVolumeProvider.DetachVolumeWithAuthority(ctx, volume, node, authorize)
+}
+
+func TestAttachmentReconcilerDistinguishesProviderNoOp(t *testing.T) {
+	for _, disappear := range []bool{false, true} {
+		t.Run(fmt.Sprint(disappear), func(t *testing.T) {
+			ctx := context.Background()
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
+			provider, state := nodeAttachmentProvider(t)
+			r := NewAttachmentReconciler(NewControllerServer(driver, disappearingDetachProvider{provider, func() {
+				if disappear {
+					state.mu.Lock()
+					defer state.mu.Unlock()
+					delete(state.disks, 41)
+				}
+			}}, nil))
+			r.orphanGrace = time.Nanosecond
+			require.NoError(t, r.ReconcileOnce(ctx))
+			require.NoError(t, r.ReconcileOnce(ctx))
+			events, err := driver.kubeRuntime.client.CoreV1().Events(pvc.Namespace).List(ctx, metav1.ListOptions{})
+			require.NoError(t, err)
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			require.NotContains(t, state.disks, 41)
+			if disappear {
+				require.Zero(t, state.detachAttempts)
+				require.Empty(t, events.Items)
+			} else {
+				require.Equal(t, 1, state.detachAttempts)
+				require.Len(t, events.Items, 1)
+				require.Equal(t, eventReasonStuckAttachmentDetached, events.Items[0].Reason)
+			}
+		})
+	}
 }

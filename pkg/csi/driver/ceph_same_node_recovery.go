@@ -44,7 +44,7 @@ func cephRetentionUnavailable(message string, err error) error {
 // rescueCephSameNodeUnpublish completes only logical deletion of a stale VA.
 // The disk stays owned by the same VM; no physical detach is asserted or recorded.
 // This is separate from local-only maintenance and sticky-grace eligibility.
-func (s *ControllerServer) rescueCephSameNodeUnpublish(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, imageID, nodeID int) (handled bool, response *csi.ControllerUnpublishVolumeResponse, resultErr error) {
+func (s *ControllerServer) rescueCephSameNodeUnpublish(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, imageID, nodeID int, runtimeCtx *VolumeRuntimeContext, runtimeErr error) (handled bool, response *csi.ControllerUnpublishVolumeResponse, resultErr error) {
 	defer func() {
 		if handled && ctx.Err() != nil {
 			response = nil
@@ -54,14 +54,13 @@ func (s *ControllerServer) rescueCephSameNodeUnpublish(ctx context.Context, req 
 	if s == nil || s.driver == nil || req == nil || s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
 		return false, nil, nil
 	}
-	runtimeCtx, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId)
-	if err != nil {
+	if runtimeErr != nil {
 		if strings.EqualFold(s.currentVolumeHistory(req.VolumeId).Backend, "ceph") {
-			return true, nil, cephRetentionUnavailable("volume runtime lookup failed", err)
+			return true, nil, cephRetentionUnavailable("volume runtime lookup failed", runtimeErr)
 		}
 		return false, nil, nil
 	}
-	if !strings.EqualFold(strings.TrimSpace(runtimeCtx.Backend), "ceph") {
+	if runtimeCtx == nil || !isCephBackend(runtimeCtx.Backend) {
 		if strings.EqualFold(strings.TrimSpace(s.currentVolumeHistory(req.VolumeId).Backend), "ceph") {
 			return true, nil, cephRetentionUnavailable("current backend contradicts pinned Ceph history", nil)
 		}
@@ -139,7 +138,7 @@ func (s *ControllerServer) rescueCephSameNodeUnpublish(ctx context.Context, req 
 		return true, nil, status.FromContextError(err).Err()
 	}
 	s.driver.metrics.RecordSameNodeRestartReuse("disk")
-	s.recordPVCEventFromRuntimeContext(ctx, lastRuntime, eventReasonSameNodeDetachRescued, fmt.Sprintf("retained Ceph RWO volume %s on node %s while completing deletion of VolumeAttachment %s; two bounded ownership observations agree on image %d VM %d disk %d", req.VolumeId, req.NodeId, last.VAName, lastDisk.ImageID, lastDisk.NodeID, lastDisk.DiskID))
+	s.recordPVCEventFromRuntimeContext(ctx, lastRuntime, eventReasonSameNodeDetachRescued, "retained the Ceph disk on the same node while completing logical attachment deletion")
 	return true, &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
@@ -147,11 +146,8 @@ func validateCephRetentionDisk(req *csi.ControllerUnpublishVolumeRequest, imageI
 	if disk == nil || disk.VolumeID != req.VolumeId || disk.ImageID != imageID || disk.NodeID != nodeID || disk.DiskID < 0 || disk.Target == "" || disk.DeviceSerial == "" || disk.SizeBytes != authority.Capacity {
 		return cephRetentionUnavailable("provider proof does not match the bound volume, VM or capacity", nil)
 	}
-	if raw, present := authority.AttachmentMetadata[publishContextOpenNebulaImageID]; present {
-		attachedImageID, err := strconv.Atoi(strings.TrimSpace(raw))
-		if err != nil || attachedImageID <= 0 || attachedImageID != disk.ImageID {
-			return cephRetentionUnavailable("VolumeAttachment image identity contradicts the pinned image", nil)
-		}
+	if err := validateAttachmentImageAssertions(authority.AttachmentMetadata, disk.ImageID); err != nil {
+		return cephRetentionUnavailable("VolumeAttachment device identity contradicts the pinned image", err)
 	}
 	for key, expected := range map[string]string{
 		publishContextDeviceSerial: disk.DeviceSerial,
@@ -239,6 +235,9 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if authority.VAName == "" {
 		return nil, cephRetentionUnavailable("owned deleting VolumeAttachment was not observed", nil)
 	}
+	if backend, present := authority.AttachmentMetadata[annotationBackend]; present && !isCephBackend(backend) {
+		return nil, cephRetentionUnavailable("VolumeAttachment backend contradicts Ceph binding", nil)
+	}
 	pods, err := runtime.client.CoreV1().Pods(pvc.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, cephRetentionUnavailable("current Pod demand lookup failed", err)
@@ -270,22 +269,15 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if control.Invalid || control.Active() {
 		return nil, status.Error(codes.FailedPrecondition, "Ceph same-node retention is blocked by active or invalid recovery controls")
 	}
-	if err := s.attachmentProtectionChecks(ctx, req.VolumeId, currentRuntime); err != nil {
-		return nil, err
-	}
-	if s.driver.volumeHistory == nil {
-		return nil, cephRetentionUnavailable("volume history is unavailable", nil)
-	}
-	cm, err := runtime.GetConfigMap(ctx, s.driver.volumeHistory.namespace, volumeHistoryStateConfigMapName)
+	history, err := s.readAttachmentHistory(ctx, req.VolumeId)
 	if err != nil {
 		return nil, cephRetentionUnavailable("volume history read failed", err)
 	}
-	var history VolumeHistoryRecord
-	if err := decodeCephRetentionProtection(cm.Data[req.VolumeId], &history); err != nil {
-		return nil, cephRetentionUnavailable("volume history is malformed", err)
-	}
 	if history.VolumeID != req.VolumeId || !cephHistoryHasObservedAuthority(history) {
 		return nil, cephRetentionUnavailable("observed volume history is unavailable", nil)
+	}
+	if err := s.attachmentProtectionChecks(ctx, req.VolumeId, currentRuntime, history.LastSuccessfulImageID); err != nil {
+		return nil, err
 	}
 	authority.History = history
 	if err := ctx.Err(); err != nil {
@@ -294,7 +286,7 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	return authority, nil
 }
 
-func (s *ControllerServer) attachmentProtectionChecks(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext) error {
+func (s *ControllerServer) attachmentProtectionChecks(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext, imageID int) error {
 	if s.driver.volumeRepairState == nil || s.driver.volumeQuarantine == nil || s.driver.hostArtifactQuarantine == nil {
 		return cephRetentionUnavailable("protection state managers are unavailable", nil)
 	}
@@ -331,15 +323,21 @@ func (s *ControllerServer) attachmentProtectionChecks(ctx context.Context, volum
 		return cephRetentionUnavailable("host artifact quarantine lookup failed", err)
 	}
 	if err == nil {
-		for _, raw := range cm.Data {
+		for key, raw := range cm.Data {
 			var state HostArtifactQuarantineState
 			if decodeErr := decodeCephRetentionProtection(raw, &state); decodeErr != nil {
 				return cephRetentionUnavailable("host artifact quarantine is malformed", decodeErr)
 			}
-			if strings.TrimSpace(state.VolumeID) == "" || state.ExpiresAt.IsZero() {
-				return cephRetentionUnavailable("host artifact quarantine owner or expiry is unknown", nil)
+			target := opennebula.HostArtifactAttachmentTarget{VMID: state.VMID, NodeName: state.NodeName, DiskID: state.DiskID}
+			expectedKey := firstNonEmpty(target.Key(), state.VolumeID)
+			if state.Key != key || state.Key != expectedKey || strings.TrimSpace(state.VolumeID) == "" ||
+				state.ExpiresAt.IsZero() || state.FailureCount <= 0 {
+				return cephRetentionUnavailable("host artifact quarantine identity or expiry is unknown", nil)
 			}
-			if state.VolumeID == volumeID && (state.ExpiresAt.IsZero() || state.ExpiresAt.After(time.Now().UTC())) {
+			if state.ImageID > 0 && imageID > 0 && (state.VolumeID == volumeID) != (state.ImageID == imageID) {
+				return cephRetentionUnavailable("host artifact quarantine contradicts volume ownership", nil)
+			}
+			if state.VolumeID == volumeID && state.ExpiresAt.After(time.Now().UTC()) {
 				return status.Error(codes.FailedPrecondition, "Ceph same-node retention is blocked by host artifact quarantine")
 			}
 		}
@@ -349,6 +347,9 @@ func (s *ControllerServer) attachmentProtectionChecks(ctx context.Context, volum
 
 // Unknown future fields are not evidence of an expired protection record.
 func decodeCephRetentionProtection(raw string, target any) error {
+	if strings.TrimSpace(raw) == "null" {
+		return fmt.Errorf("protection record must be an object")
+	}
 	decoder := json.NewDecoder(strings.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
@@ -365,6 +366,51 @@ func decodeCephRetentionProtection(raw string, target any) error {
 }
 
 func cephHistoryHasObservedAuthority(history VolumeHistoryRecord) bool {
-	return volumeHistoryHasObservedSuccess(history) && !history.Bootstrapped &&
+	return history.Version == stateObjectVersion && isCephBackend(history.Backend) &&
+		volumeHistoryHasObservedSuccess(history) && !history.Bootstrapped &&
 		(history.EvidenceSource == "" || history.EvidenceSource == volumeHistoryEvidenceSourceObserved)
+}
+
+func isCephBackend(backend string) bool {
+	return strings.EqualFold(strings.TrimSpace(backend), "ceph")
+}
+
+func validateAttachmentImageAssertions(metadata map[string]string, imageID int) error {
+	if raw, present := metadata[publishContextOpenNebulaImageID]; present {
+		observed, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || observed <= 0 || observed != imageID {
+			return fmt.Errorf("VolumeAttachment image identity does not match")
+		}
+	}
+	if raw, present := metadata[publishContextDeviceSerial]; present && strings.TrimSpace(raw) != fmt.Sprintf("onecsi-%d", imageID) {
+		return fmt.Errorf("VolumeAttachment device serial does not match the image")
+	}
+	return nil
+}
+
+func (s *ControllerServer) readAttachmentHistory(ctx context.Context, volumeID string) (VolumeHistoryRecord, error) {
+	manager := s.driver.volumeHistory
+	if manager == nil {
+		return VolumeHistoryRecord{}, fmt.Errorf("volume history manager is unavailable")
+	}
+	cm, err := manager.runtime.GetConfigMap(ctx, manager.namespace, volumeHistoryStateConfigMapName)
+	if apierrors.IsNotFound(err) {
+		return VolumeHistoryRecord{}, nil
+	}
+	if err != nil {
+		return VolumeHistoryRecord{}, err
+	}
+	raw, present := cm.Data[volumeID]
+	if !present {
+		return VolumeHistoryRecord{}, nil
+	}
+	var history VolumeHistoryRecord
+	if err := decodeCephRetentionProtection(raw, &history); err != nil {
+		return VolumeHistoryRecord{}, err
+	}
+	if history.VolumeID != volumeID || (history.Version != stateObjectVersion && (history.Version != 0 || isCephBackend(history.Backend))) ||
+		history.LastSuccessfulImageID < 0 || history.LastSuccessfulOpenNebulaVMID < 0 || history.LastSuccessfulDiskID < 0 {
+		return VolumeHistoryRecord{}, fmt.Errorf("volume history identity or schema is invalid")
+	}
+	return history, nil
 }

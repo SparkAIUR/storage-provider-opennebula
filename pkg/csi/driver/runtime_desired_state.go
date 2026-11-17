@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -79,6 +80,10 @@ func (r *KubeRuntime) NodeIdentity(ctx context.Context, nodeName string) (Kubern
 }
 
 func (r *KubeRuntime) DesiredNodeForVolume(ctx context.Context, volumeHandle string) (VolumeDesiredState, error) {
+	return r.desiredNodeForVolume(ctx, volumeHandle, nil)
+}
+
+func (r *KubeRuntime) desiredNodeForVolume(ctx context.Context, volumeHandle string, attachmentSnapshot *storagev1.VolumeAttachmentList) (VolumeDesiredState, error) {
 	if r == nil || !r.enabled {
 		return VolumeDesiredState{}, fmt.Errorf("kubernetes runtime is not enabled")
 	}
@@ -132,7 +137,7 @@ func (r *KubeRuntime) DesiredNodeForVolume(ctx context.Context, volumeHandle str
 	}
 	for idx := range pods.Items {
 		pod := &pods.Items[idx]
-		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
 		referencesPVC := false
@@ -174,9 +179,12 @@ func (r *KubeRuntime) DesiredNodeForVolume(ctx context.Context, volumeHandle str
 		return state, nil
 	}
 
-	vas, err := r.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return state, err
+	vas := attachmentSnapshot
+	if vas == nil {
+		vas, err = r.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return state, err
+		}
 	}
 	attachmentNames := []string{}
 	attachmentNodes := []string{}
@@ -269,4 +277,8 @@ func volumeAttachmentIsTransitional(va *storagev1.VolumeAttachment, now time.Tim
 		return false
 	}
 	return now.Sub(createdAt) < grace
+}
+
+func (s VolumeDesiredState) desiresNode(node string) bool {
+	return s.Desired && (s.NodeName == node || slices.Contains(s.ReferencedNodes, node))
 }

@@ -15,6 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 )
 
@@ -132,14 +133,18 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 	}
 	r.cleanupStaleDriverState(ctx, presentHandles, existingNodes)
 
-	activePVCUsers := make(map[string]bool)
+	activePVCUsers := make(map[string]map[string]bool)
 	for idx := range podList.Items {
 		pod := &podList.Items[idx]
 		for _, volume := range pod.Spec.Volumes {
 			if volume.PersistentVolumeClaim == nil {
 				continue
 			}
-			activePVCUsers[pod.Namespace+"/"+volume.PersistentVolumeClaim.ClaimName] = true
+			key := pod.Namespace + "/" + volume.PersistentVolumeClaim.ClaimName
+			if activePVCUsers[key] == nil {
+				activePVCUsers[key] = make(map[string]bool)
+			}
+			activePVCUsers[key][pod.Spec.NodeName] = true
 		}
 	}
 
@@ -177,13 +182,13 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			continue
 		}
 		pvcKey := pvcKeyForPV(pv)
-		activePodUsingPVC := pvcKey != "" && activePVCUsers[pvcKey]
+		users := activePVCUsers[pvcKey]
 		vas := vaByVolume[volumeHandle]
 		singleWriter := hasSingleWriterAccessMode(pv.Spec.AccessModes)
 		if singleWriter && len(observed) > 1 {
 			currentMultiAttach[volumeHandle] = struct{}{}
 			r.server.driver.metrics.RecordAttachmentReconciler("multi_attach", "warn", "observed")
-			r.recordPVCEventForVolume(ctx, volumeHandle, eventReasonStuckAttachmentDetached, fmt.Sprintf("detected multiple attachments for single-writer volume %s", volumeHandle))
+			r.recordPVCEventForVolume(ctx, volumeHandle, eventReasonStuckAttachmentMultiple, fmt.Sprintf("detected multiple attachments for single-writer volume %s", volumeHandle))
 		}
 
 		for _, attachment := range observed {
@@ -198,7 +203,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			if matchingVA != nil {
 				continue
 			}
-			if activePodUsingPVC {
+			if users[""] || users[attachment.NodeName] || (singleWriter && len(users) > 0) {
 				continue
 			}
 			if len(vas) > 0 {
@@ -206,7 +211,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 				if !r.due(r.divergentSeen, key, now, r.orphanGrace) {
 					continue
 				}
-				if err := r.detachObservedAttachment(ctx, attachment, hotplugQueuePriorityCritical); err != nil {
+				if err := r.detachObservedAttachment(ctx, attachment, pv.UID, hotplugQueuePriorityCritical); err != nil {
 					r.server.driver.metrics.RecordAttachmentReconciler("divergent_attachment", "detach", attachmentCleanupOutcome(err))
 					klog.V(2).InfoS("Failed to detach divergent attachment", "volume", volumeHandle, "node", attachment.NodeName, "err", err)
 				} else {
@@ -220,7 +225,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			if !r.due(r.orphanSeen, key, now, r.orphanGrace) {
 				continue
 			}
-			if err := r.detachObservedAttachment(ctx, attachment, hotplugQueuePriorityBackground); err != nil {
+			if err := r.detachObservedAttachment(ctx, attachment, pv.UID, hotplugQueuePriorityBackground); err != nil {
 				r.server.driver.metrics.RecordAttachmentReconciler("orphan_attachment", "detach", attachmentCleanupOutcome(err))
 				klog.V(2).InfoS("Failed to detach orphan attachment", "volume", volumeHandle, "node", attachment.NodeName, "err", err)
 			} else {
@@ -404,7 +409,10 @@ func (r *AttachmentReconciler) skipVolume(ctx context.Context, volumeHandle stri
 	return false
 }
 
-func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, attachment opennebula.ObservedAttachment, priority HotplugQueuePriority) error {
+func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, attachment opennebula.ObservedAttachment, pvUID types.UID, priority HotplugQueuePriority) error {
+	if pvUID == "" {
+		return errAttachmentSkipped
+	}
 	detached := false
 	err := r.server.withQueuedHotplug(ctx, attachment.NodeName, "detach", attachment.VolumeHandle, priority, func(queueCtx context.Context) error {
 		nodeRelease := r.server.driver.operationLocks.Acquire(controllerNodeLockKey(attachment.NodeName))
@@ -447,12 +455,17 @@ func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, att
 			return fmt.Errorf("provider attachment identity changed since inventory")
 		}
 		detachStarted := time.Now()
-		if err := r.server.detachVolumeWithAuthority(queueCtx, attachment.VolumeHandle, attachment.NodeName); err != nil {
+		accepted, err := r.server.detachVolumeWithAuthority(queueCtx, attachment.VolumeHandle, attachment.NodeName,
+			physicalDetachIdentity{pvUID: pvUID, imageID: attachment.ImageID, vmID: attachment.NodeID, diskID: attachment.DiskID, background: true})
+		if err != nil {
 			r.server.handleHotplugTimeout(queueCtx, attachment.NodeName, attachment.VolumeHandle, nil, "detach", observedAttachmentBackend(attachment), err)
 			return err
 		}
 		if _, err := r.server.volumeProvider.GetVolumeInNode(queueCtx, attachment.ImageID, attachment.NodeID); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
 			return fmt.Errorf("detach readback did not establish absence: %v", err)
+		}
+		if !accepted {
+			return errAttachmentAbsent
 		}
 		detached = true
 		r.server.clearHotplugGuardState(queueCtx, attachment.NodeName)
@@ -563,31 +576,43 @@ func (r *AttachmentReconciler) deleteStaleVolumeAttachment(ctx context.Context, 
 	if err := checkIdentity(); err != nil {
 		return err
 	}
-	pinned, err := r.server.pinKnownVolumeIdentity(ctx, volume)
+	history, err := r.server.readAttachmentHistory(ctx, volume)
 	if err != nil {
 		return err
 	}
-	ctx = pinned
+	if history.LastSuccessfulImageID > 0 {
+		ctx = opennebula.WithExpectedImageID(ctx, history.LastSuccessfulImageID)
+	}
 	imageID, _, err := r.server.volumeProvider.VolumeExists(ctx, volume)
 	if err != nil || imageID <= 0 {
 		return fmt.Errorf("stale attachment image identity is unknown: %v", err)
 	}
-	if history := r.server.currentVolumeHistory(volume); history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != imageID {
+	if history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != imageID {
 		return fmt.Errorf("stale attachment image differs from history")
+	}
+	if err := validateAttachmentImageAssertions(va.Status.AttachmentMetadata, imageID); err != nil {
+		return err
 	}
 	identity, err := r.server.driver.kubeRuntime.NodeIdentity(ctx, va.Spec.NodeName)
 	if err != nil || !identity.Exists || identity.UID == "" {
 		return fmt.Errorf("stale attachment Kubernetes node identity is unknown: %v", err)
 	}
-	if history := r.server.currentVolumeHistory(volume); history.LastSuccessfulNodeName == va.Spec.NodeName && history.LastSuccessfulNodeUID != "" && history.LastSuccessfulNodeUID != identity.UID {
+	if history.LastSuccessfulNodeName == va.Spec.NodeName && history.LastSuccessfulNodeUID != "" && history.LastSuccessfulNodeUID != identity.UID {
 		return fmt.Errorf("stale attachment node differs from history")
 	}
 	nodeID, err := r.server.volumeProvider.NodeExists(ctx, va.Spec.NodeName)
 	if err != nil || nodeID <= 0 {
 		return fmt.Errorf("stale attachment node identity is unknown: %v", err)
 	}
+	if history.LastSuccessfulNodeName == va.Spec.NodeName && history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != nodeID {
+		return fmt.Errorf("stale attachment VM differs from history")
+	}
 	if _, err := r.server.volumeProvider.GetVolumeInNode(ctx, imageID, nodeID); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
 		return fmt.Errorf("stale attachment absence is unverified: %v", err)
+	}
+	currentNode, err := r.server.driver.kubeRuntime.NodeIdentity(ctx, va.Spec.NodeName)
+	if err != nil || !currentNode.Exists || currentNode.UID != identity.UID {
+		return fmt.Errorf("stale attachment node identity changed: %v", err)
 	}
 	if err := checkIdentity(); err != nil {
 		return err

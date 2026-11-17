@@ -185,7 +185,7 @@ func TestControllerUnpublishCephRejectsUnverifiedRetention(t *testing.T) {
 			require.NoError(t, err)
 		},
 		"host quarantine active": func(t *testing.T, f *cephRestartTestFixture) {
-			_, active, err := f.server.driver.hostArtifactQuarantine.MarkFailure(context.Background(), HostArtifactQuarantineState{Key: cephRestartVolume + "@host", VolumeID: cephRestartVolume}, 1, time.Hour)
+			_, active, err := f.server.driver.hostArtifactQuarantine.MarkFailure(context.Background(), HostArtifactQuarantineState{Key: "vm-575", VMID: 575, ImageID: 3137, VolumeID: cephRestartVolume}, 1, time.Hour)
 			require.NoError(t, err)
 			require.True(t, active)
 		},
