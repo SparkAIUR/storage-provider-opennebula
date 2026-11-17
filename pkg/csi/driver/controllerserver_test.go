@@ -2084,6 +2084,7 @@ func TestControllerPublishVolumeRejectsAlreadyAttachedWhenLocalDeviceUnconfirmed
 		ExpectedTarget:    "sdb",
 		DeviceSerial:      "onecsi-244",
 		OpenNebulaImageID: "244",
+		FirstObservedAt:   time.Now().UTC().Add(-time.Minute),
 		LastObservedAt:    time.Now().UTC(),
 		Attempts:          3,
 		AttachmentState:   localDeviceAttachmentStateRuntimeUnconfirmed,

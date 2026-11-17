@@ -331,6 +331,7 @@ func TestAttachmentReconcilerPrunesDeletedVolumeState(t *testing.T) {
 				FailureClass:    localDeviceFailureClassMissingDevice,
 				FirstObservedAt: time.Now().UTC(),
 				LastObservedAt:  time.Now().UTC(),
+				Attempts:        1,
 			}
 			payload, err := json.Marshal(report)
 			require.NoError(t, err)
@@ -364,25 +365,47 @@ func TestAttachmentReconcilerPrunesDeletedVolumeState(t *testing.T) {
 }
 
 func TestAttachmentReconcilerPreservesMalformedAndReplacedDeviceReports(t *testing.T) {
-	for _, mode := range []string{"null", "wrong-volume", "unknown-state", "pruned", "replaced"} {
+	for _, mode := range []string{"null", "wrong-volume", "unknown-state", "incomplete-stale", "legacy-pruned", "pruned", "replaced"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			pv, pvc := newLocalPVAndPVC(cephRestartVolume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
 			node := newReadyNode("node-a", true)
 			key := localDeviceReportKey(node.Name, cephRestartVolume)
-			current := `{"node":"node-a","volumeID":"pvc-ceph-restart","failureClass":"wrong_device_identity"}`
-			raw := current
+			now := time.Now().UTC()
+			report := LocalDeviceMissingReport{Node: node.Name, VolumeID: cephRestartVolume, FailureClass: localDeviceFailureClassWrongIdentity,
+				FirstObservedAt: now, LastObservedAt: now, Attempts: 2}
 			switch mode {
-			case "null":
-				raw = "null"
 			case "wrong-volume":
-				raw = `{"node":"node-a","volumeID":"gone","failureClass":"wrong_device_identity"}`
+				report.VolumeID = "gone"
 			case "unknown-state":
-				raw = `{"node":"node-a","volumeID":"pvc-ceph-restart","confirmationState":"unknown"}`
-			case "pruned", "replaced":
-				key = localDeviceReportKey("gone-node", cephRestartVolume)
-				raw = `{"node":"gone-node","volumeID":"pvc-ceph-restart","failureClass":"device_missing"}`
-				current = `{"node":"gone-node","volumeID":"pvc-ceph-restart","failureClass":"wrong_device_identity"}`
+				report.ConfirmationState = "unknown"
+			case "incomplete-stale", "legacy-pruned", "pruned", "replaced":
+				report.Node = "gone-node"
+				key = localDeviceReportKey(report.Node, cephRestartVolume)
+				report.FailureClass = localDeviceFailureClassMissingDevice
+				if mode == "legacy-pruned" || mode == "incomplete-stale" {
+					report.FailureClass = ""
+				}
+				if mode == "incomplete-stale" {
+					report = LocalDeviceMissingReport{Node: report.Node, VolumeID: report.VolumeID}
+				}
+			}
+			payload, err := json.Marshal(report)
+			require.NoError(t, err)
+			raw := string(payload)
+			if mode == "null" {
+				raw = "null"
+			} else if mode == "incomplete-stale" {
+				raw = `{"node":"gone-node","volumeID":"pvc-ceph-restart"}`
+			}
+			current := raw
+			if mode == "replaced" {
+				report.FailureClass = localDeviceFailureClassWrongIdentity
+				report.LastObservedAt = now.Add(time.Second)
+				report.Attempts++
+				payload, err := json.Marshal(report)
+				require.NoError(t, err)
+				current = string(payload)
 			}
 			cm := &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: localDeviceStateConfigMapName, UID: "report-map", ResourceVersion: "1"},
@@ -390,9 +413,9 @@ func TestAttachmentReconcilerPreservesMalformedAndReplacedDeviceReports(t *testi
 			}
 			driver := newAttachmentTestDriver(pv, pvc, node, cm)
 			client := driver.kubeRuntime.client.(*fake.Clientset)
-			stale := mode == "pruned" || mode == "replaced"
+			deletable := mode == "pruned" || mode == "legacy-pruned" || mode == "replaced"
 			reportReads := 0
-			if stale {
+			if deletable {
 				client.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
 					if action.(ktesting.GetAction).GetName() != cm.Name {
 						return false, nil, nil
@@ -406,8 +429,6 @@ func TestAttachmentReconcilerPreservesMalformedAndReplacedDeviceReports(t *testi
 					}
 					return false, nil, nil
 				})
-			} else {
-				current = raw
 			}
 			base := new(MockOpenNebulaVolumeProviderTestify)
 			base.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{{VolumeHandle: cephRestartVolume, ImageID: 3137, NodeName: node.Name, NodeID: 575, DiskID: 1, Backend: "ceph"}}, opennebula.VMNameInventory{node.Name: {575}}, nil)
@@ -417,14 +438,14 @@ func TestAttachmentReconcilerPreservesMalformedAndReplacedDeviceReports(t *testi
 			r := NewAttachmentReconciler(NewControllerServer(driver, physical, nil))
 			r.orphanGrace = time.Nanosecond
 			require.NoError(t, r.ReconcileOnce(ctx))
-			if stale {
+			if deletable {
 				require.Equal(t, 2, reportReads)
 			} else {
 				require.NoError(t, r.ReconcileOnce(ctx))
 			}
 			after, err := client.CoreV1().ConfigMaps(cm.Namespace).Get(ctx, cm.Name, metav1.GetOptions{})
 			require.NoError(t, err)
-			if mode == "pruned" {
+			if mode == "pruned" || mode == "legacy-pruned" {
 				require.NotContains(t, after.Data, key)
 			} else {
 				require.Equal(t, current, after.Data[key])

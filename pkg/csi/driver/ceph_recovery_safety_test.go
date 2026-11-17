@@ -190,7 +190,7 @@ func TestControllerUnpublishCephDelayedRPCWithoutActiveDemand(t *testing.T) {
 
 func TestCephRestartCleanupReleaseGuards(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"released", "claim-removed", "terminal-released", "terminal-in-use", "terminal-terminating", "terminating", "node-in-use", "repair", "volume-quarantine", "host-quarantine", "observe", "desired-unknown", "provider-unknown", "late-pod", "late-observe-at-rpc", "pv-replaced-after-grace", "node-replaced", "already-absent", "readback-unknown", "readback-attached"} {
+		for _, mode := range []string{"released", "claim-removed", "terminal-released", "terminal-in-use", "terminal-terminating", "terminating", "node-in-use", "repair", "incomplete-device-report", "volume-quarantine", "host-quarantine", "observe", "desired-unknown", "provider-unknown", "late-pod", "late-observe-at-rpc", "pv-replaced-after-grace", "node-replaced", "already-absent", "readback-unknown", "readback-attached"} {
 			t.Run(fmt.Sprintf("%v/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				f := newCephRestartTestFixture(t, queued)
@@ -233,6 +233,8 @@ func TestCephRestartCleanupReleaseGuards(t *testing.T) {
 				if mode == "already-absent" {
 					physical.attached = false
 				}
+				reportKey := localDeviceReportKey(f.node.Name, cephRestartVolume)
+				incompleteReport := fmt.Sprintf(`{"node":%q,"volumeID":%q}`, f.node.Name, cephRestartVolume)
 				switch mode {
 				case "claim-removed":
 					require.NoError(t, driver.kubeRuntime.client.CoreV1().PersistentVolumeClaims(f.pvc.Namespace).Delete(ctx, f.pvc.Name, metav1.DeleteOptions{}))
@@ -248,6 +250,8 @@ func TestCephRestartCleanupReleaseGuards(t *testing.T) {
 				case "repair":
 					_, err := driver.volumeRepairState.Mark(ctx, VolumeRepairState{VolumeID: cephRestartVolume, Classification: "metadata_drift"})
 					require.NoError(t, err)
+				case "incomplete-device-report":
+					require.NoError(t, driver.kubeRuntime.UpsertConfigMapData(ctx, "default", localDeviceStateConfigMapName, map[string]string{reportKey: incompleteReport}))
 				case "volume-quarantine":
 					_, _, err := driver.volumeQuarantine.MarkFailure(ctx, VolumeQuarantineState{VolumeID: cephRestartVolume, Reason: "metadata_drift"}, 1, time.Hour)
 					require.NoError(t, err)
@@ -298,6 +302,11 @@ func TestCephRestartCleanupReleaseGuards(t *testing.T) {
 				secondErr := r.ReconcileOnce(ctx)
 				require.NoError(t, firstErr)
 				require.NoError(t, secondErr)
+				if mode == "incomplete-device-report" {
+					cm, err := driver.kubeRuntime.GetConfigMap(ctx, "default", localDeviceStateConfigMapName)
+					require.NoError(t, err)
+					require.Equal(t, incompleteReport, cm.Data[reportKey])
+				}
 				if mode == "released" || mode == "claim-removed" || mode == "terminal-released" {
 					base.AssertNumberOfCalls(t, "DetachVolume", 1)
 					require.False(t, physical.attached)
@@ -478,7 +487,7 @@ func TestControllerUnpublishCephLateDemandCannotAcknowledge(t *testing.T) {
 
 func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"null", "wrong-report-key", "unknown-confirmation", "unknown-failure", "host-key", "host-owner"} {
+		for _, mode := range []string{"null", "identity-only", "missing-count", "missing-last-observation", "reversed-observation", "wrong-report-key", "unknown-confirmation", "unknown-failure", "host-key", "host-owner"} {
 			t.Run(fmt.Sprintf("%v/%s", queued, mode), func(t *testing.T) {
 				f := newCephRestartTestFixture(t, queued)
 				key := localDeviceReportKey(f.node.Name, cephRestartVolume)
@@ -487,9 +496,19 @@ func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T
 				switch mode {
 				case "null":
 					raw = "null"
-				case "wrong-report-key", "unknown-confirmation", "unknown-failure":
-					report := LocalDeviceMissingReport{Node: f.node.Name, VolumeID: cephRestartVolume, FailureClass: localDeviceFailureClassMissingDevice}
+				case "identity-only":
+					raw = fmt.Sprintf(`{"node":%q,"volumeID":%q}`, f.node.Name, cephRestartVolume)
+				case "missing-count", "missing-last-observation", "reversed-observation", "wrong-report-key", "unknown-confirmation", "unknown-failure":
+					now := time.Now().UTC()
+					report := LocalDeviceMissingReport{Node: f.node.Name, VolumeID: cephRestartVolume, FailureClass: localDeviceFailureClassMissingDevice,
+						FirstObservedAt: now, LastObservedAt: now, Attempts: 1}
 					switch mode {
+					case "missing-count":
+						report.Attempts = 0
+					case "missing-last-observation":
+						report.LastObservedAt = time.Time{}
+					case "reversed-observation":
+						report.FirstObservedAt = now.Add(time.Minute)
 					case "wrong-report-key":
 						report.VolumeID = "another-volume"
 					case "unknown-confirmation":
@@ -520,6 +539,9 @@ func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T
 				require.Nil(t, reply)
 				require.Zero(t, f.provider.inspections.Load())
 				f.requireNoProviderMutation(t)
+				persisted, err := f.server.driver.kubeRuntime.GetConfigMap(context.Background(), "default", cm)
+				require.NoError(t, err)
+				require.Equal(t, raw, persisted.Data[key])
 			})
 		}
 	}
@@ -719,7 +741,7 @@ func TestControllerUnpublishCephRechecksPersistedProtection(t *testing.T) {
 		record    any
 	}{
 		{volumeRepairStateConfigMapName, volume, VolumeRepairState{Version: 1, VolumeID: volume, Classification: repairClassificationWrongDeviceIdentity}},
-		{localDeviceStateConfigMapName, localDeviceReportKey("node-a", volume), LocalDeviceMissingReport{Node: "node-a", VolumeID: volume, FailureClass: localDeviceFailureClassWrongIdentity}},
+		{localDeviceStateConfigMapName, localDeviceReportKey("node-a", volume), LocalDeviceMissingReport{Node: "node-a", VolumeID: volume, FailureClass: localDeviceFailureClassWrongIdentity, FirstObservedAt: now, LastObservedAt: now, Attempts: 1}},
 		{volumeQuarantineStateConfigMapName, volume, VolumeQuarantineState{VolumeID: volume, Reason: "metadata drift", FailureCount: 1, FirstObservedAt: now, LastObservedAt: now, ExpiresAt: now.Add(time.Hour)}},
 		{hostArtifactStateConfigMapName, "vm-575", HostArtifactQuarantineState{Key: "vm-575", VMID: 575, VolumeID: volume, FailureCount: 1, FirstObservedAt: now, LastObservedAt: now, ExpiresAt: now.Add(time.Hour)}},
 	}

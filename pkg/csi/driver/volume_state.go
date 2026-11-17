@@ -436,6 +436,10 @@ func decodeLocalDeviceReport(key, raw string) (LocalDeviceMissingReport, error) 
 	if strings.TrimSpace(report.Node) == "" || strings.TrimSpace(report.VolumeID) == "" || key != localDeviceReportKey(report.Node, report.VolumeID) {
 		return report, fmt.Errorf("node device report identity is invalid")
 	}
+	if report.Attempts <= 0 || report.RecoveryAttempts < 0 || report.FirstObservedAt.IsZero() ||
+		report.LastObservedAt.IsZero() || report.LastObservedAt.Before(report.FirstObservedAt) {
+		return report, fmt.Errorf("node device report observation is invalid")
+	}
 	switch report.ConfirmationState {
 	case "", localDeviceConfirmationStateInProgress, localDeviceConfirmationStatePending, localDeviceConfirmationStateConfirmed,
 		localDeviceConfirmationStateTimedOut, localDeviceConfirmationStateRepairRequired:

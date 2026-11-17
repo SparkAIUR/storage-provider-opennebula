@@ -497,7 +497,18 @@ func (state *VolumeHistoryRecord) observeSuccessfulAttachment(observation succes
 	state.LastSuccessfulDeviceSerial = firstNonEmpty(observation.serial, state.LastSuccessfulDeviceSerial)
 }
 
-func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID, requestedNode, target string, sourceContext map[string]string, protection *LocalRWOProtectionDecision, metadata *opennebula.VolumeAttachmentMetadata) {
+func (state *VolumeHistoryRecord) observeSuccessfulBackend(runtimeCtx *VolumeRuntimeContext, contextBackend string) {
+	if runtimeCtx != nil && (runtimeCtx.Backend != "" || strings.TrimSpace(runtimeCtx.backendAttribute) != "") {
+		if backend, err := runtimeCtx.verifiedAttachmentBackend(); err == nil {
+			state.Backend = backend
+		}
+		return
+	}
+	backend, _ := verifiedAttachmentBackend("", contextBackend)
+	state.Backend = firstNonEmpty(state.Backend, backend, "local")
+}
+
+func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target string, sourceContext map[string]string, protection *LocalRWOProtectionDecision, metadata *opennebula.VolumeAttachmentMetadata) {
 	if s == nil || s.driver == nil || s.driver.volumeHistory == nil || strings.TrimSpace(volumeID) == "" {
 		return
 	}
@@ -508,35 +519,25 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 			}
 		}
 	}
-	runtimeCtx := volumeRuntimeContextFromSource(sourceContext)
-	if runtimeCtx == nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
-		if resolved, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeID); err == nil {
-			runtimeCtx = resolved
-		}
-	}
+	var runtimeCtx *VolumeRuntimeContext
 	nodeUID := ""
 	if s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
+		runtimeCtx, _ = s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeID)
 		if identity, err := s.driver.kubeRuntime.NodeIdentity(ctx, requestedNode); err == nil {
 			nodeUID = identity.UID
 		}
 	}
 	observation := successfulAttachmentObservation{
-		nodeName: strings.TrimSpace(requestedNode), nodeUID: nodeUID, target: strings.TrimSpace(target), diskID: -1,
+		nodeName: strings.TrimSpace(requestedNode), nodeUID: nodeUID, target: strings.TrimSpace(target),
+		imageID: imageID, vmID: vmID, diskID: -1, serial: strings.TrimSpace(sourceContext[publishContextDeviceSerial]),
 	}
-	observation.imageID, observation.serial = imageAndSerialFromPublishContext(sourceContext)
-	if metadata != nil {
-		if observation.imageID == 0 {
-			observation.imageID = metadata.ImageID
-		}
-		if metadata.ImageID == observation.imageID && metadata.AttachedToRequestedNode &&
-			metadata.RequestedNodeID > 0 && strings.TrimSpace(metadata.RequestedNode) == observation.nodeName {
-			observation.vmID = metadata.RequestedNodeID
-			for _, disk := range metadata.DiskRecords {
-				if disk.NodeID == observation.vmID && strings.TrimSpace(disk.Target) == observation.target {
-					observation.diskID = disk.DiskID
-					observation.serial = firstNonEmpty(strings.TrimSpace(disk.Serial), observation.serial)
-					break
-				}
+	if metadata != nil && metadata.ImageID == imageID && metadata.AttachedToRequestedNode &&
+		metadata.RequestedNodeID == vmID && strings.TrimSpace(metadata.RequestedNode) == observation.nodeName {
+		for _, disk := range metadata.DiskRecords {
+			if disk.NodeID == vmID && strings.TrimSpace(disk.Target) == observation.target {
+				observation.diskID = disk.DiskID
+				observation.serial = firstNonEmpty(strings.TrimSpace(disk.Serial), observation.serial)
+				break
 			}
 		}
 	}
@@ -545,7 +546,7 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 		state.PVName = firstNonEmpty(state.PVName, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVName }), strings.TrimSpace(sourceContext[paramPVName]))
 		state.PVCNamespace = firstNonEmpty(state.PVCNamespace, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVCNamespace }), strings.TrimSpace(sourceContext[paramPVCNamespace]))
 		state.PVCName = firstNonEmpty(state.PVCName, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVCName }), strings.TrimSpace(sourceContext[paramPVCName]))
-		state.Backend = firstNonEmpty(runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.Backend }), state.Backend, "local")
+		state.observeSuccessfulBackend(runtimeCtx, sourceContext[annotationBackend])
 		if runtimeCtx != nil {
 			if runtimeCtx.DatastoreID > 0 {
 				state.DatastoreID = runtimeCtx.DatastoreID
@@ -590,13 +591,16 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 	}
 	normalizeLocalDiskIdentity(identity)
 	observation := successfulAttachmentObservation{nodeName: strings.TrimSpace(ns.Driver.nodeID), diskID: -1}
-	if observation.nodeName != "" && ns.Driver.kubeRuntime != nil && ns.Driver.kubeRuntime.enabled {
-		if node, err := ns.Driver.kubeRuntime.NodeIdentity(ctx, observation.nodeName); err == nil && node.Exists {
-			observation.nodeUID = strings.TrimSpace(node.UID)
+	var runtimeCtx *VolumeRuntimeContext
+	if ns.Driver.kubeRuntime != nil && ns.Driver.kubeRuntime.enabled {
+		runtimeCtx, _ = ns.Driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeID)
+		if observation.nodeName != "" {
+			if node, err := ns.Driver.kubeRuntime.NodeIdentity(ctx, observation.nodeName); err == nil && node.Exists {
+				observation.nodeUID = strings.TrimSpace(node.UID)
+			}
 		}
 	}
 	if identity != nil {
-		observation.imageID = parseIntOrZero(localDiskAssertedImageID(identity))
 		observation.serial = firstNonEmpty(localDiskObservedDeviceSerial(identity), localDiskAssertedDeviceSerial(identity))
 		observation.target = localDiskAssertedDiskTarget(identity)
 	}
@@ -604,7 +608,7 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 		state.PVName = firstNonEmpty(state.PVName, strings.TrimSpace(publishContext[paramPVName]))
 		state.PVCNamespace = firstNonEmpty(state.PVCNamespace, strings.TrimSpace(publishContext[paramPVCNamespace]))
 		state.PVCName = firstNonEmpty(state.PVCName, strings.TrimSpace(publishContext[paramPVCName]))
-		state.Backend = firstNonEmpty(state.Backend, strings.TrimSpace(publishContext[annotationBackend]), "local")
+		state.observeSuccessfulBackend(runtimeCtx, publishContext[annotationBackend])
 		state.EvidenceSource = volumeHistoryEvidenceSourceObserved
 		state.Bootstrapped = false
 		state.BootstrappedAt = time.Time{}
@@ -613,6 +617,9 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 		state.LastSuccessfulStageTime = time.Now().UTC()
 		if identity != nil {
 			state.LastHealthyIdentity = identity
+			if imageID := parseIntOrZero(localDiskAssertedImageID(identity)); state.LastSuccessfulImageID == 0 && imageID > 0 {
+				state.LastSuccessfulImageID = imageID
+			}
 		}
 	})
 	if err == nil {
@@ -667,31 +674,11 @@ func wrongDeviceIdentityMessage(volumeID string, expected, observed *LocalDiskId
 	)
 }
 
-func volumeRuntimeContextFromSource(params map[string]string) *VolumeRuntimeContext {
-	if len(params) == 0 {
-		return nil
-	}
-	return &VolumeRuntimeContext{
-		PVName:       strings.TrimSpace(params[paramPVName]),
-		PVCNamespace: strings.TrimSpace(params[paramPVCNamespace]),
-		PVCName:      strings.TrimSpace(params[paramPVCName]),
-		Backend:      strings.TrimSpace(params[annotationBackend]),
-	}
-}
-
 func runtimeCtxField(runtimeCtx *VolumeRuntimeContext, getter func(*VolumeRuntimeContext) string) string {
 	if runtimeCtx == nil || getter == nil {
 		return ""
 	}
 	return strings.TrimSpace(getter(runtimeCtx))
-}
-
-func imageAndSerialFromPublishContext(params map[string]string) (int, string) {
-	if len(params) == 0 {
-		return 0, ""
-	}
-	imageID, _ := strconv.Atoi(strings.TrimSpace(params[publishContextOpenNebulaImageID]))
-	return imageID, strings.TrimSpace(params[publishContextDeviceSerial])
 }
 
 func requestedNodeDiskEvidence(metadata *opennebula.VolumeAttachmentMetadata, requestedNode string) (int, string, string) {

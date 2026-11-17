@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,10 +24,12 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	mount "k8s.io/mount-utils"
 )
 
 type nodeAttachmentProtocol struct {
@@ -1774,13 +1778,14 @@ func TestCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t *testing.T) {
 type moveHistoryProvider struct {
 	*opennebula.PersistentDiskVolumeProvider
 	wire         *nodeAttachmentProtocol
+	destination  string
 	failedCensus atomic.Int32
 }
 
 func (p *moveHistoryProvider) InspectVolumeAttachment(ctx context.Context, volume, node string) (*opennebula.VolumeAttachmentMetadata, error) {
 	p.wire.mu.Lock()
 	_, moved := p.wire.disks[42]
-	if node != "node-new" || !moved {
+	if node != p.destination || !moved {
 		p.wire.mu.Unlock()
 		return p.PersistentDiskVolumeProvider.InspectVolumeAttachment(ctx, volume, node)
 	}
@@ -1799,45 +1804,180 @@ func (p *moveHistoryProvider) InspectVolumeAttachment(ctx context.Context, volum
 }
 
 func TestControllerPublishMoveClearsStaleAttachmentPinsWhenCensusFails(t *testing.T) {
-	ctx := context.Background()
-	pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
-	pv.Annotations[annotationAllowCrossNodeUntil] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-	oldNode, newNode := newReadyNode("node-old", true), newReadyNode("node-new", true)
-	driver := newStickyTestDriver(t, pv, pvc, oldNode, newNode)
-	driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
-	provider, wire := nodeAttachmentProvider(t)
-	probe := &moveHistoryProvider{PersistentDiskVolumeProvider: provider, wire: wire}
-	server := NewControllerServer(driver, probe, nil)
-	client := reviewControllerClient(t, server)
+	for _, sameNode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sameNode=%t", sameNode), func(t *testing.T) {
+			ctx := context.Background()
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			pv.Annotations[annotationAllowCrossNodeUntil] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+			oldNode, newNode := newReadyNode("node-old", true), newReadyNode("node-new", true)
+			driver := newStickyTestDriver(t, pv, pvc, oldNode, newNode)
+			if sameNode {
+				newNode = oldNode
+			}
+			driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+			provider, wire := nodeAttachmentProvider(t)
+			probe := &moveHistoryProvider{PersistentDiskVolumeProvider: provider, wire: wire, destination: newNode.Name}
+			server := NewControllerServer(driver, probe, nil)
+			client := reviewControllerClient(t, server)
 
-	_, err := client.ControllerPublishVolume(ctx, newPublishReq("volume-test", oldNode.Name))
-	require.NoError(t, err)
-	before, err := server.readAttachmentHistory(ctx, "volume-test")
-	require.NoError(t, err)
-	require.Equal(t, oldNode.Name, before.LastSuccessfulNodeName)
-	require.Equal(t, 41, before.LastSuccessfulOpenNebulaVMID)
-	require.Equal(t, 2, before.LastSuccessfulDiskID)
-	_, err = client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: oldNode.Name})
-	require.NoError(t, err)
+			_, err := client.ControllerPublishVolume(ctx, newPublishReq("volume-test", oldNode.Name))
+			require.NoError(t, err)
+			before, err := server.readAttachmentHistory(ctx, "volume-test")
+			require.NoError(t, err)
+			require.Equal(t, oldNode.Name, before.LastSuccessfulNodeName)
+			require.Equal(t, 41, before.LastSuccessfulOpenNebulaVMID)
+			require.Equal(t, 2, before.LastSuccessfulDiskID)
+			_, err = client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: oldNode.Name})
+			require.NoError(t, err)
 
-	_, err = client.ControllerPublishVolume(ctx, newPublishReq("volume-test", newNode.Name))
-	require.NoError(t, err)
-	require.EqualValues(t, 1, probe.failedCensus.Load())
-	moved, err := server.readAttachmentHistory(ctx, "volume-test")
-	require.NoError(t, err)
-	require.Equal(t, newNode.Name, moved.LastSuccessfulNodeName)
-	require.Equal(t, string(newNode.UID), moved.LastSuccessfulNodeUID)
-	require.Equal(t, 7, moved.LastSuccessfulImageID)
-	require.Equal(t, "vdb", moved.LastSuccessfulTarget)
-	require.Zero(t, moved.LastSuccessfulOpenNebulaVMID)
-	require.Zero(t, moved.LastSuccessfulDiskID)
+			if sameNode {
+				wire.mu.Lock()
+				wire.vmNames = map[int]string{41: "retired-vm", 42: newNode.Name}
+				wire.mu.Unlock()
+			}
 
-	_, err = client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: newNode.Name})
-	require.NoError(t, err)
-	wire.mu.Lock()
-	defer wire.mu.Unlock()
-	require.Contains(t, wire.mutations, "detach:41")
-	require.Contains(t, wire.mutations, "attach:42:false")
-	require.Contains(t, wire.mutations, "detach:42")
-	require.Empty(t, wire.disks)
+			_, err = client.ControllerPublishVolume(ctx, newPublishReq("volume-test", newNode.Name))
+			require.NoError(t, err)
+			require.EqualValues(t, 1, probe.failedCensus.Load())
+			moved, err := server.readAttachmentHistory(ctx, "volume-test")
+			require.NoError(t, err)
+			require.Equal(t, newNode.Name, moved.LastSuccessfulNodeName)
+			require.Equal(t, string(newNode.UID), moved.LastSuccessfulNodeUID)
+			require.Equal(t, 7, moved.LastSuccessfulImageID)
+			require.Equal(t, "vdb", moved.LastSuccessfulTarget)
+			require.Equal(t, 42, moved.LastSuccessfulOpenNebulaVMID)
+			require.Zero(t, moved.LastSuccessfulDiskID)
+
+			_, err = client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: newNode.Name})
+			require.NoError(t, err)
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			require.Contains(t, wire.mutations, "detach:41")
+			require.Contains(t, wire.mutations, "attach:42:false")
+			require.Contains(t, wire.mutations, "detach:42")
+			require.Empty(t, wire.disks)
+		})
+	}
+}
+
+func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queued=%t", queued), func(t *testing.T) {
+			ctx := context.Background()
+			const volume = "volume-test"
+			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+				annotationBackend: "ceph", annotationDatastoreID: "100",
+			})
+			pv.Status.Phase = corev1.VolumeBound
+			pv.Spec.Capacity = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("128Mi")}
+			pvc.Status.Phase = corev1.ClaimBound
+			pvc.Spec.AccessModes = pv.Spec.AccessModes
+			pvc.Spec.Resources.Requests = pv.Spec.Capacity.DeepCopy()
+			pvc.Status.Capacity = pv.Spec.Capacity.DeepCopy()
+			node := newReadyNode("node-old", true)
+			driver := newStickyTestDriver(t, pv, pvc, node)
+			driver.nodeID = node.Name
+			driver.featureGates = defaultFeatureGates()
+			driver.PluginConfig.OverrideVal(config.StuckAttachmentReconcilerEnabledVar, true)
+			driver.PluginConfig.OverrideVal(config.NodeDeviceRescanOnMissEnabledVar, false)
+			driver.PluginConfig.OverrideVal(config.NodeDeviceUdevSettleTimeoutSecondsVar, 0)
+			provider, wire := nodeAttachmentProvider(t)
+			wire.mu.Lock()
+			wire.ceph, wire.version = true, "7.4.0"
+			wire.disks[41], wire.marker = 128, 128*1024*1024
+			wire.mu.Unlock()
+			server := NewControllerServer(driver, provider, nil)
+			if queued {
+				driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+				driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+			}
+			client := reviewControllerClient(t, server)
+			require.Empty(t, driver.volumeHistory.Snapshot())
+			publish := newPublishReq(volume, node.Name)
+			publish.VolumeContext = map[string]string{"example.test/static-attribute": "unrelated"}
+			publish.VolumeCapability.GetMount().FsType = "ext4"
+			published, err := client.ControllerPublishVolume(ctx, publish)
+			require.NoError(t, err)
+			require.Equal(t, "ceph", published.PublishContext[annotationBackend])
+			publishedHistory, err := server.readAttachmentHistory(ctx, volume)
+			require.NoError(t, err)
+			require.Equal(t, "ceph", publishedHistory.Backend)
+			require.Equal(t, 7, publishedHistory.LastSuccessfulImageID)
+
+			diskPath := withTestDiskPath(t)
+			require.NoError(t, os.WriteFile(filepath.Join(diskPath, "vdb"), []byte("fixture"), 0o600))
+			stageMount := mount.NewFakeMounter(nil)
+			ns := NewNodeServer(driver, mount.NewSafeFormatAndMount(stageMount, reviewDeviceSerialFixture(t, func(string) string {
+				return "onecsi-7"
+			})))
+			ns.localDiskSessions = newLocalDiskSessionStore(t.TempDir())
+			stageContext := cloneStringMap(published.PublishContext)
+			if queued {
+				stageContext[publishContextOpenNebulaImageID] = "8"
+			}
+			staged, err := ns.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
+				VolumeId: volume, StagingTargetPath: t.TempDir(), VolumeCapability: publish.VolumeCapability, PublishContext: stageContext,
+			})
+			require.NoError(t, err)
+			require.NotNil(t, staged)
+			history, err := server.readAttachmentHistory(ctx, volume)
+			require.NoError(t, err)
+			require.Equal(t, "ceph", history.Backend)
+			require.Equal(t, 7, history.LastSuccessfulImageID)
+			require.False(t, history.LastSuccessfulStageTime.IsZero())
+
+			kube := driver.kubeRuntime.client
+			require.NoError(t, kube.CoreV1().PersistentVolumes().Delete(ctx, pv.Name, metav1.DeleteOptions{}))
+			require.NoError(t, kube.CoreV1().PersistentVolumeClaims(pvc.Namespace).Delete(ctx, pvc.Name, metav1.DeleteOptions{}))
+			pv, pvc = pv.DeepCopy(), pvc.DeepCopy()
+			pv.Name, pv.UID = "rebound-static-pv", "rebound-static-pv-uid"
+			pvc.Name, pvc.UID = "rebound-static-pvc", "rebound-static-pvc-uid"
+			pv.Spec.ClaimRef.Name, pv.Spec.ClaimRef.UID = pvc.Name, pvc.UID
+			pvc.Spec.VolumeName = pv.Name
+			delete(pv.Annotations, annotationBackend)
+			pv.Spec.CSI.VolumeAttributes = map[string]string{annotationBackend: "Ceph"}
+			_, err = kube.CoreV1().PersistentVolumes().Create(ctx, pv, metav1.CreateOptions{})
+			require.NoError(t, err)
+			_, err = kube.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(ctx, pvc, metav1.CreateOptions{})
+			require.NoError(t, err)
+
+			pod := activePodForPVC("replacement", pvc.Name, node.Name)
+			pod.UID = "static-consumer-uid"
+			pod.Status.Phase = corev1.PodPending
+			_, err = kube.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+			require.NoError(t, err)
+			metadata := cloneStringMap(published.PublishContext)
+			metadata[paramPVName], metadata[paramPVCName] = pv.Name, pvc.Name
+			deleting := metav1.Now()
+			va := &storagev1.VolumeAttachment{
+				ObjectMeta: metav1.ObjectMeta{Name: "rebound-static-va", UID: "rebound-static-va-uid", DeletionTimestamp: &deleting, Finalizers: []string{"external-attacher/" + DefaultDriverName}},
+				Spec:       storagev1.VolumeAttachmentSpec{Attacher: DefaultDriverName, NodeName: node.Name, Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name}},
+				Status:     storagev1.VolumeAttachmentStatus{Attached: true, AttachmentMetadata: metadata},
+			}
+			_, err = kube.StorageV1().VolumeAttachments().Create(ctx, va, metav1.CreateOptions{})
+			require.NoError(t, err)
+			response, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+			require.NoError(t, err)
+			require.NotNil(t, response)
+			retainedHistory, err := server.readAttachmentHistory(ctx, volume)
+			require.NoError(t, err)
+			require.Equal(t, history, retainedHistory)
+			wire.mu.Lock()
+			mutations := append([]string(nil), wire.mutations...)
+			wire.mu.Unlock()
+			require.Empty(t, mutations)
+
+			require.NoError(t, kube.StorageV1().VolumeAttachments().Delete(ctx, va.Name, metav1.DeleteOptions{}))
+			require.NoError(t, kube.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{}))
+			reconciler := NewAttachmentReconciler(server)
+			reconciler.orphanGrace = time.Nanosecond
+			require.NoError(t, reconciler.ReconcileOnce(ctx))
+			require.Len(t, reconciler.orphanSeen, 1)
+			require.NoError(t, reconciler.ReconcileOnce(ctx))
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			require.Equal(t, []string{"detach:41"}, wire.mutations)
+			require.Empty(t, wire.disks)
+		})
+	}
 }
