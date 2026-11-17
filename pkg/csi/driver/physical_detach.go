@@ -62,9 +62,11 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if pvc == nil {
 		runtimeCtx.PVCNamespace = ""
 		runtimeCtx.PVCName = ""
+		runtimeCtx.PVCUID = ""
 	} else {
 		runtimeCtx.PVCName = pvc.Name
 		runtimeCtx.PVCNamespace = pvc.Namespace
+		runtimeCtx.PVCUID = pvc.UID
 		runtimeCtx.PVCAnnotations = pvc.Annotations
 	}
 
@@ -210,10 +212,15 @@ func (s *ControllerServer) recheckAttachmentAuthority(ctx context.Context, volum
 }
 
 func (s *ControllerServer) verifyProviderAttachmentBackend(ctx context.Context, volume string, imageID, vmID int, backend string) error {
-	if provider, ok := s.volumeProvider.(opennebula.AttachmentBackendVerifier); ok {
-		if err := provider.VerifyAttachmentBackend(ctx, volume, imageID, vmID, backend); err != nil {
-			return attachmentEvidenceUnavailable("provider attachment backend is unverified", err)
-		}
+	if backend == "" {
+		return nil
+	}
+	provider, ok := s.volumeProvider.(opennebula.AttachmentBackendVerifier)
+	if !ok {
+		return attachmentEvidenceUnavailable("provider cannot verify the attachment backend", nil)
+	}
+	if err := provider.VerifyAttachmentBackend(ctx, volume, imageID, vmID, backend); err != nil {
+		return attachmentEvidenceUnavailable("provider attachment backend is unverified", err)
 	}
 	return nil
 }

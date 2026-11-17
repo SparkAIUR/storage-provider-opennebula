@@ -2765,6 +2765,10 @@ func (p *serializingVolumeProvider) AttachVolume(ctx context.Context, volume str
 	return p.MockOpenNebulaVolumeProviderTestify.AttachVolume(ctx, volume, node, immutable, params)
 }
 
+func (m *MockOpenNebulaVolumeProviderTestify) VerifyAttachmentBackend(ctx context.Context, _ string, _, _ int, _ string) error {
+	return ctx.Err()
+}
+
 func (m *MockOpenNebulaVolumeProviderTestify) DetachVolume(ctx context.Context, volume string, node string) error {
 	args := m.Called(ctx, volume, node)
 	return args.Error(0)

@@ -35,6 +35,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 )
 
@@ -1223,7 +1224,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	}
 	if recoveryControl.ManualActive() {
 		message := recoveryControl.QueueBlockMessage(req.VolumeId, req.NodeId, "detach")
-		s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReasonRecoveryModeActive, message)
+		s.recordPVCEventFromRuntimeContext(ctx, recoveryRuntimeCtx, eventReasonRecoveryModeActive, message)
 		s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
@@ -1284,12 +1285,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 			s.recordPVCEventFromRuntimeContext(queueCtx, runtimeCtx, eventReasonDetachGraceBypassed, fmt.Sprintf("detach grace bypassed for volume %s: %s", req.VolumeId, stickyReason))
 		}
 
-		if runtimeCtx != nil {
-			s.recordPVCEventFromParams(queueCtx, map[string]string{
-				paramPVCName:      runtimeCtx.PVCName,
-				paramPVCNamespace: runtimeCtx.PVCNamespace,
-			}, eventReasonHotplugQueued, fmt.Sprintf("queued detach for volume %s on node %s", req.GetVolumeId(), req.GetNodeId()))
-		}
+		s.recordPVCEventFromRuntimeContext(queueCtx, recoveryRuntimeCtx, eventReasonHotplugQueued, fmt.Sprintf("queued detach for volume %s on node %s", req.GetVolumeId(), req.GetNodeId()))
 		klog.V(3).InfoS("Detaching volume from node",
 			"method", "ControllerUnpublishVolume", "volumeID", volumeID, "nodeID", nodeID)
 
@@ -1300,7 +1296,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 				return err
 			}
 			s.handleHotplugTimeout(queueCtx, req.NodeId, req.VolumeId, nil, "detach", "disk", err)
-			if driftErr := s.detachMetadataDriftError(queueCtx, req.VolumeId, req.NodeId, err); driftErr != nil {
+			if driftErr := s.detachMetadataDriftError(queueCtx, req.VolumeId, req.NodeId, err, recoveryRuntimeCtx); driftErr != nil {
 				return driftErr
 			}
 			klog.V(0).ErrorS(err, "Failed to detach volume",
@@ -1336,22 +1332,25 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		}
 		var pausedQueueErr *HotplugQueuePausedError
 		if errors.As(queueErr, &pausedQueueErr) {
-			s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReasonHotplugCooldown, pausedQueueErr.Error())
+			s.recordPVCEventFromRuntimeContext(ctx, recoveryRuntimeCtx, eventReasonHotplugCooldown, pausedQueueErr.Error())
 			return nil, status.Error(codes.Unavailable, pausedQueueErr.Error())
 		}
 		var queueTimeoutErr *HotplugQueueTimeoutError
 		if errors.As(queueErr, &queueTimeoutErr) {
-			s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReasonHotplugQueueTimeout, queueTimeoutErr.Error())
+			s.recordPVCEventFromRuntimeContext(ctx, recoveryRuntimeCtx, eventReasonHotplugQueueTimeout, queueTimeoutErr.Error())
 			return nil, status.Error(codes.DeadlineExceeded, queueTimeoutErr.Error())
 		}
 		var activeTimeoutErr *HotplugQueueActiveTimeoutError
 		if errors.As(queueErr, &activeTimeoutErr) {
-			s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReasonHotplugQueueTimeout, activeTimeoutErr.Error())
+			if diagnosis, ok := s.diagnoseAndPersistHotplug(ctx, req.NodeId); ok {
+				s.driver.metrics.RecordHotplugRecovery("detach", strings.ToLower(diagnosis.Classification), "queue_active_timeout")
+			}
+			s.recordPVCEventFromRuntimeContext(ctx, recoveryRuntimeCtx, eventReasonHotplugQueueTimeout, activeTimeoutErr.Error())
 			return nil, status.Error(codes.DeadlineExceeded, activeTimeoutErr.Error())
 		}
 		var staleQueueErr *HotplugQueueStaleRequestError
 		if errors.As(queueErr, &staleQueueErr) {
-			s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReasonHotplugQueueStale, staleQueueErr.Error())
+			s.recordPVCEventFromRuntimeContext(ctx, recoveryRuntimeCtx, eventReasonHotplugQueueStale, staleQueueErr.Error())
 			return nil, status.Error(codes.Aborted, staleQueueErr.Error())
 		}
 		if status.Code(queueErr) == codes.Unknown {
@@ -2062,7 +2061,7 @@ func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *cs
 		if decision.Reason == queueReasonRecoveryModeManual || decision.Reason == queueReasonRecoveryModeObserve {
 			eventReason = eventReasonRecoveryModeActive
 		}
-		s.recordPVCEventForVolumeHandle(ctx, req.VolumeId, eventReason, decision.Message)
+		s.recordPVCEventFromRuntimeContext(ctx, decision.Evidence.RuntimeCtx, eventReason, decision.Message)
 		return true, nil, decision.Err()
 	default:
 		return false, nil, nil
@@ -2389,11 +2388,19 @@ func (s *ControllerServer) recordPVCEventFromParams(ctx context.Context, params 
 	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil {
 		return
 	}
+	if uid := types.UID(params[paramPVCUID]); uid != "" {
+		s.driver.kubeRuntime.EmitPVCEvent(ctx, params[paramPVCNamespace], params[paramPVCName], reason, message, uid)
+		return
+	}
 	s.driver.kubeRuntime.EmitPVCEvent(ctx, params[paramPVCNamespace], params[paramPVCName], reason, message)
 }
 
 func (s *ControllerServer) recordPVCWarningFromParams(ctx context.Context, params map[string]string, reason, message string) {
 	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil {
+		return
+	}
+	if uid := types.UID(params[paramPVCUID]); uid != "" {
+		s.driver.kubeRuntime.EmitWarningEventOnPVC(ctx, params[paramPVCNamespace], params[paramPVCName], reason, message, uid)
 		return
 	}
 	s.driver.kubeRuntime.EmitWarningEventOnPVC(ctx, params[paramPVCNamespace], params[paramPVCName], reason, message)
@@ -2466,6 +2473,7 @@ func (s *ControllerServer) startMaintenanceDetachHold(ctx context.Context, req *
 		DatastoreID:        runtimeCtx.DatastoreID,
 		PVCNamespace:       runtimeCtx.PVCNamespace,
 		PVCName:            runtimeCtx.PVCName,
+		PVCUID:             runtimeCtx.PVCUID,
 		StartedAt:          now,
 		ExpiresAt:          now.Add(time.Duration(graceSeconds) * time.Second),
 		GraceSeconds:       graceSeconds,
@@ -2556,6 +2564,7 @@ func (s *ControllerServer) shouldDelayDetach(ctx context.Context, req *csi.Contr
 		DatastoreID:        runtimeCtx.DatastoreID,
 		PVCNamespace:       runtimeCtx.PVCNamespace,
 		PVCName:            runtimeCtx.PVCName,
+		PVCUID:             runtimeCtx.PVCUID,
 		StartedAt:          time.Now().UTC(),
 		ExpiresAt:          time.Now().UTC().Add(time.Duration(graceSeconds) * time.Second),
 		GraceSeconds:       graceSeconds,
@@ -2658,7 +2667,7 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 		if status.Code(err) != codes.Unknown || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return true, nil, err
 		}
-		if driftErr := s.detachMetadataDriftError(ctx, req.VolumeId, state.NodeID, err); driftErr != nil {
+		if driftErr := s.detachMetadataDriftError(ctx, req.VolumeId, state.NodeID, err, state.pvcEventContext()); driftErr != nil {
 			return true, nil, driftErr
 		}
 		message := fmt.Sprintf("failed to detach stale attachment for local RWO volume %s from old node %s before publishing to requested node %s: %v", req.VolumeId, state.NodeID, req.NodeId, err)
@@ -2759,7 +2768,7 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 			if status.Code(err) != codes.Unknown || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return err
 			}
-			if driftErr := s.detachMetadataDriftError(queueCtx, confirmed.VolumeID, confirmed.NodeID, err); driftErr != nil {
+			if driftErr := s.detachMetadataDriftError(queueCtx, confirmed.VolumeID, confirmed.NodeID, err, confirmed.pvcEventContext()); driftErr != nil {
 				klog.V(2).InfoS("Classified sticky detach failure as OpenNebula metadata drift", "volumeID", confirmed.VolumeID, "nodeID", confirmed.NodeID, "err", driftErr)
 				return driftErr
 			}
@@ -2855,41 +2864,21 @@ func (s *ControllerServer) annotateRestartOptimizationForVolume(ctx context.Cont
 }
 
 func (s *ControllerServer) recordPVCEventFromRuntimeContext(ctx context.Context, runtimeCtx *VolumeRuntimeContext, reason, message string) {
-	if runtimeCtx == nil {
+	if s == nil || s.driver == nil || runtimeCtx == nil {
 		return
 	}
-	s.recordPVCEventFromParams(ctx, map[string]string{
-		paramPVCNamespace: runtimeCtx.PVCNamespace,
-		paramPVCName:      runtimeCtx.PVCName,
-	}, reason, message)
+	s.driver.kubeRuntime.EmitPVCEvent(ctx, runtimeCtx.PVCNamespace, runtimeCtx.PVCName, reason, message, runtimeCtx.PVCUID)
 }
 
 func (s *ControllerServer) recordPVCWarningFromRuntimeContext(ctx context.Context, runtimeCtx *VolumeRuntimeContext, reason, message string) {
-	if runtimeCtx == nil {
+	if s == nil || s.driver == nil || runtimeCtx == nil {
 		return
 	}
-	s.recordPVCWarningFromParams(ctx, map[string]string{
-		paramPVCNamespace: runtimeCtx.PVCNamespace,
-		paramPVCName:      runtimeCtx.PVCName,
-	}, reason, message)
+	s.driver.kubeRuntime.EmitWarningEventOnPVC(ctx, runtimeCtx.PVCNamespace, runtimeCtx.PVCName, reason, message, runtimeCtx.PVCUID)
 }
 
 func (s *ControllerServer) recordPVCEventFromStickyState(ctx context.Context, state StickyAttachmentState, reason, message string) {
-	s.recordPVCEventFromParams(ctx, map[string]string{
-		paramPVCNamespace: state.PVCNamespace,
-		paramPVCName:      state.PVCName,
-	}, reason, message)
-}
-
-func (s *ControllerServer) recordPVCEventForVolumeHandle(ctx context.Context, volumeHandle, reason, message string) {
-	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
-		return
-	}
-	runtimeCtx, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeHandle)
-	if err != nil {
-		return
-	}
-	s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, reason, message)
+	s.recordPVCEventFromRuntimeContext(ctx, state.pvcEventContext(), reason, message)
 }
 
 func (s *ControllerServer) localRestartOptimizationEnabled() bool {

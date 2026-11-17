@@ -109,13 +109,18 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 	pvByName := make(map[string]*corev1.PersistentVolume, len(pvList.Items))
 	pvByHandle := make(map[string]*corev1.PersistentVolume, len(pvList.Items))
 	ambiguousHandles := map[string]bool{}
+	presentHandles := make(map[string]*corev1.PersistentVolume, len(pvList.Items))
 	for idx := range pvList.Items {
 		pv := &pvList.Items[idx]
-		if pv.Spec.CSI == nil || pv.Spec.CSI.Driver != r.server.driver.name || pv.Spec.CSI.VolumeHandle == "" {
+		if pv.Spec.CSI == nil || pv.Spec.CSI.VolumeHandle == "" {
+			continue
+		}
+		handle := pv.Spec.CSI.VolumeHandle
+		presentHandles[handle] = pv
+		if pv.Spec.CSI.Driver != r.server.driver.name {
 			continue
 		}
 		pvByName[pv.Name] = pv
-		handle := pv.Spec.CSI.VolumeHandle
 		if pvByHandle[handle] != nil || ambiguousHandles[handle] {
 			ambiguousHandles[handle] = true
 			delete(pvByHandle, handle)
@@ -126,10 +131,6 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 	existingNodes := make(map[string]struct{}, len(nodeList.Items))
 	for idx := range nodeList.Items {
 		existingNodes[strings.TrimSpace(nodeList.Items[idx].Name)] = struct{}{}
-	}
-	presentHandles := make(map[string]*corev1.PersistentVolume, len(pvByName))
-	for _, pv := range pvByName {
-		presentHandles[pv.Spec.CSI.VolumeHandle] = pv
 	}
 	r.cleanupStaleDriverState(ctx, presentHandles, existingNodes)
 
@@ -217,7 +218,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 		if singleWriter && len(observed) > 1 {
 			currentMultiAttach[volumeHandle] = struct{}{}
 			r.server.driver.metrics.RecordAttachmentReconciler("multi_attach", "warn", "observed")
-			r.recordPVCEventForVolume(ctx, volumeHandle, eventReasonStuckAttachmentMultiple, fmt.Sprintf("detected multiple attachments for single-writer volume %s", volumeHandle))
+			r.recordPVCEventForPV(ctx, pv, eventReasonStuckAttachmentMultiple, fmt.Sprintf("detected multiple attachments for single-writer volume %s", volumeHandle))
 			if cephSingleWriter {
 				continue
 			}
@@ -257,7 +258,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 					klog.V(2).InfoS("Failed to detach divergent attachment", "volume", volumeHandle, "node", attachment.NodeName, "err", err)
 				} else {
 					r.server.driver.metrics.RecordAttachmentReconciler("divergent_attachment", "detach", "success")
-					r.recordPVCEventForVolume(ctx, volumeHandle, eventReasonStuckAttachmentDetached, fmt.Sprintf("detached divergent attachment for volume %s from node %s", volumeHandle, attachment.NodeName))
+					r.recordPVCEventForPV(ctx, pv, eventReasonStuckAttachmentDetached, fmt.Sprintf("detached divergent attachment for volume %s from node %s", volumeHandle, attachment.NodeName))
 				}
 				continue
 			}
@@ -271,7 +272,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 				klog.V(2).InfoS("Failed to detach orphan attachment", "volume", volumeHandle, "node", attachment.NodeName, "err", err)
 			} else {
 				r.server.driver.metrics.RecordAttachmentReconciler("orphan_attachment", "detach", "success")
-				r.recordPVCEventForVolume(ctx, volumeHandle, eventReasonStuckAttachmentDetached, fmt.Sprintf("detached orphan attachment for volume %s from node %s", volumeHandle, attachment.NodeName))
+				r.recordPVCEventForPV(ctx, pv, eventReasonStuckAttachmentDetached, fmt.Sprintf("detached orphan attachment for volume %s from node %s", volumeHandle, attachment.NodeName))
 			}
 		}
 	}
@@ -303,7 +304,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			continue
 		}
 		r.server.driver.metrics.RecordAttachmentReconciler("stale_volume_attachment", "delete", "success")
-		r.recordPVCEventForVolume(ctx, volumeHandle, eventReasonStuckAttachmentRepublish, fmt.Sprintf("requested deletion of stale VolumeAttachment %s for volume %s to trigger republish", va.Name, volumeHandle))
+		r.recordPVCEventForPV(ctx, pv, eventReasonStuckAttachmentRepublish, fmt.Sprintf("requested deletion of stale VolumeAttachment %s for volume %s to trigger republish", va.Name, volumeHandle))
 	}
 
 	r.prune(r.orphanSeen, currentOrphans)
@@ -330,7 +331,7 @@ func attachmentNodesByVM(vmNames opennebula.VMNameInventory, nodes []corev1.Node
 			}
 			continue
 		case err != nil || vmID <= 0:
-			return nil
+			continue
 		}
 		if byVM[vmID] != nil || node.UID == "" || node.DeletionTimestamp != nil {
 			conflicts[vmID] = true
@@ -553,11 +554,10 @@ func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, att
 	return err
 }
 
-func (r *AttachmentReconciler) recordPVCEventForVolume(ctx context.Context, volumeHandle, reason, message string) {
-	if r == nil || r.server == nil {
-		return
+func (r *AttachmentReconciler) recordPVCEventForPV(ctx context.Context, pv *corev1.PersistentVolume, reason, message string) {
+	if claim := pv.Spec.ClaimRef; claim != nil {
+		r.server.driver.kubeRuntime.EmitPVCEvent(ctx, claim.Namespace, claim.Name, reason, message, claim.UID)
 	}
-	r.server.recordPVCEventForVolumeHandle(ctx, volumeHandle, reason, message)
 }
 
 func (r *AttachmentReconciler) due(store map[string]time.Time, key string, now time.Time, grace time.Duration) bool {

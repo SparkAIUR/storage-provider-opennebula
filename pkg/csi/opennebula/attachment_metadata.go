@@ -118,7 +118,7 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 		return deny("disk is not an eligible persistent Ceph attachment")
 	}
 	if err := p.verifyObservedAttachmentBackend(ctx, image, *selected, "ceph"); err != nil {
-		return deny(err.Error())
+		return nil, fmt.Errorf("cannot verify same-node Ceph retention backend: %w", err)
 	}
 	diskSizeMB, sizeErr := selected.GetI(shared.Size)
 	if sizeErr != nil || diskSizeMB != image.Size {
@@ -149,7 +149,7 @@ func (p *PersistentDiskVolumeProvider) VerifyAttachmentBackend(ctx context.Conte
 	if err != nil {
 		return err
 	}
-	_, disk, err := volumeDiskFromVM(info, imageID, vmID)
+	_, disk, err := volumeDiskFromVM(info, imageID, vmID, true)
 	if err != nil {
 		return err
 	}
@@ -157,12 +157,18 @@ func (p *PersistentDiskVolumeProvider) VerifyAttachmentBackend(ctx context.Conte
 }
 
 func (p *PersistentDiskVolumeProvider) verifyObservedAttachmentBackend(ctx context.Context, image *img.Image, disk shared.Disk, expected string) error {
-	var datastoreBackend string
-	if image.DatastoreID != nil {
-		datastoreBackend = p.attachmentImageBackend(ctx, *image.DatastoreID)
-		if datastoreBackend != "" && datastoreBackend != expected {
-			return fmt.Errorf("image %d datastore backend %q differs from %q", image.ID, datastoreBackend, expected)
-		}
+	if image.DatastoreID == nil || *image.DatastoreID < 0 {
+		return &datastoreConfigError{message: fmt.Sprintf("image %d has no valid datastore identity", image.ID)}
+	}
+	datastoreBackend, err := p.attachmentImageBackend(ctx, *image.DatastoreID)
+	if err != nil {
+		return err
+	}
+	if expected == "" {
+		expected = datastoreBackend
+	}
+	if datastoreBackend != expected {
+		return fmt.Errorf("image %d datastore backend %q differs from %q", image.ID, datastoreBackend, expected)
 	}
 	transfer, _ := disk.Get("TM_MAD")
 	switch strings.ToLower(strings.TrimSpace(transfer)) {
@@ -170,12 +176,16 @@ func (p *PersistentDiskVolumeProvider) verifyObservedAttachmentBackend(ctx conte
 		if expected == "ceph" {
 			return nil
 		}
-	case "ssh", "fs_lvm", "fs_lvm_ssh", "local":
-		if expected == "local" || (expected == "nfs" && datastoreBackend == "nfs") {
+	case "ssh", "shared":
+		if expected == "local" || expected == "nfs" {
 			return nil
 		}
-	default:
-		if datastoreBackend == expected {
+	case "fs_lvm", "fs_lvm_ssh", "local":
+		if expected == "local" {
+			return nil
+		}
+	case "nfs":
+		if expected == "nfs" {
 			return nil
 		}
 	}

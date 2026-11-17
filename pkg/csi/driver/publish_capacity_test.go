@@ -513,11 +513,7 @@ func TestControllerPublishCapacityRestorationContextErrors(t *testing.T) {
 					response, err := reviewControllerClient(t, controller).ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-test"))
 					require.Nil(t, response)
 					require.Equal(t, failure.code, status.Code(err))
-					if queued && failure.code == codes.DeadlineExceeded {
-						require.ErrorContains(t, err, "executing hotplug queue request")
-					} else {
-						require.ErrorContains(t, err, failure.err.Error())
-					}
+					require.ErrorContains(t, err, failure.err.Error())
 					if path == "sticky_reuse" {
 						_, exists := driver.stickyAttachments.Get("volume-test")
 						require.True(t, exists)

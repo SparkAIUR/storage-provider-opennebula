@@ -884,7 +884,7 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 }
 
 func TestForegroundAndStickyDetachPreserveProviderNoOpOutcome(t *testing.T) {
-	for _, action := range []string{"unpublish", "expiry", "transfer"} {
+	for _, action := range []string{"unpublish", "expiry", "expiry-recreated", "transfer"} {
 		t.Run(action, func(t *testing.T) {
 			ctx := context.Background()
 			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
@@ -900,8 +900,8 @@ func TestForegroundAndStickyDetachPreserveProviderNoOpOutcome(t *testing.T) {
 			driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, action == "transfer")
 			tracker := opennebula.NewAdaptiveTimeoutTracker(opennebula.AdaptiveTimeoutConfig{Enabled: true})
 			driver.adaptiveTimeouts = tracker
-			sticky := StickyAttachmentState{VolumeID: "volume-test", NodeID: "node-old", Backend: "local", PVCName: pvc.Name, PVCNamespace: pvc.Namespace, StartedAt: time.Now().Add(-2 * time.Minute), ExpiresAt: time.Now().Add(time.Minute), GraceSeconds: 60}
-			if action == "expiry" {
+			sticky := StickyAttachmentState{VolumeID: "volume-test", NodeID: "node-old", Backend: "local", PVCName: pvc.Name, PVCNamespace: pvc.Namespace, PVCUID: pvc.UID, StartedAt: time.Now().Add(-2 * time.Minute), ExpiresAt: time.Now().Add(time.Minute), GraceSeconds: 60}
+			if strings.HasPrefix(action, "expiry") {
 				sticky.ExpiresAt = time.Now().Add(-time.Minute)
 			}
 			if action != "unpublish" {
@@ -921,6 +921,19 @@ func TestForegroundAndStickyDetachPreserveProviderNoOpOutcome(t *testing.T) {
 				require.NoError(t, err)
 			case "expiry":
 				controller.expireStickyDetach(ctx, sticky)
+			case "expiry-recreated":
+				kube := driver.kubeRuntime.client.CoreV1().PersistentVolumeClaims(pvc.Namespace)
+				require.NoError(t, kube.Delete(ctx, pvc.Name, metav1.DeleteOptions{}))
+				replacement := pvc.DeepCopy()
+				replacement.UID = "replacement"
+				replacement.Spec.VolumeName = ""
+				_, err := kube.Create(ctx, replacement, metav1.CreateOptions{})
+				require.NoError(t, err)
+				require.NoError(t, driver.stickyAttachments.LoadFromConfigMap(ctx))
+				protocol.mu.Lock()
+				delete(protocol.disks, 41)
+				protocol.mu.Unlock()
+				controller.expireStickyDetach(ctx, sticky)
 			case "transfer":
 				_, err := client.ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-new"))
 				require.NoError(t, err)
@@ -931,11 +944,12 @@ func TestForegroundAndStickyDetachPreserveProviderNoOpOutcome(t *testing.T) {
 			for _, event := range events.Items {
 				if event.Reason == eventReasonDetachGraceCancelled || event.Reason == eventReasonDetachGraceExpired {
 					require.Contains(t, event.Message, "already absent")
+					require.Equal(t, pvc.UID, event.InvolvedObject.UID)
 					sawAbsence = true
 				}
 			}
 			if action != "unpublish" {
-				require.True(t, sawAbsence)
+				require.Equal(t, action != "expiry-recreated", sawAbsence)
 				_, held := driver.stickyAttachments.Get("volume-test")
 				require.False(t, held)
 			}
@@ -949,8 +963,8 @@ func TestForegroundAndStickyDetachPreserveProviderNoOpOutcome(t *testing.T) {
 	}
 }
 
-func TestControllerForegroundRejectsCephProviderBackendConflict(t *testing.T) {
-	for _, mode := range []string{"local-rescue", "maintenance-hold", "queue-disabled-pause", "foreground", "queued-foreground", "sticky-transfer", "sticky-expiry", "explicit-manual"} {
+func TestControllerForegroundRejectsUnknownOrConflictingProviderBackend(t *testing.T) {
+	for _, mode := range []string{"local-rescue", "maintenance-hold", "queue-disabled-pause", "foreground", "queued-foreground", "sticky-transfer", "sticky-expiry", "explicit-manual", "unknown-local-rescue", "unknown-foreground"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
@@ -969,7 +983,7 @@ func TestControllerForegroundRejectsCephProviderBackendConflict(t *testing.T) {
 			kube := driver.kubeRuntime.client.(*fake.Clientset)
 			pod := activePodForPVC("local-consumer", pvc.Name, "node-old")
 			switch mode {
-			case "local-rescue", "explicit-manual":
+			case "local-rescue", "explicit-manual", "unknown-local-rescue":
 				_, err := kube.CoreV1().Pods(pvc.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 				require.NoError(t, err)
 			case "queue-disabled-pause":
@@ -987,7 +1001,11 @@ func TestControllerForegroundRejectsCephProviderBackendConflict(t *testing.T) {
 			}
 			provider, state := nodeAttachmentProvider(t)
 			state.mu.Lock()
-			state.ceph = true
+			if strings.HasPrefix(mode, "unknown-") {
+				state.failMethod = "one.datastorepool.info"
+			} else {
+				state.ceph = true
+			}
 			state.mu.Unlock()
 			server := NewControllerServer(driver, provider, nil)
 			if mode == "queued-foreground" {
@@ -1014,7 +1032,7 @@ func TestControllerForegroundRejectsCephProviderBackendConflict(t *testing.T) {
 				} else {
 					require.Nil(t, reply)
 					require.Equal(t, codes.Unavailable, status.Code(err))
-					if mode == "foreground" || mode == "queued-foreground" {
+					if mode == "foreground" || mode == "queued-foreground" || mode == "unknown-foreground" {
 						require.Equal(t, "detach disk identity or completed capacity is unverified", status.Convert(err).Message())
 					} else {
 						require.Equal(t, "provider attachment backend is unverified", status.Convert(err).Message())
@@ -1170,4 +1188,139 @@ func TestControllerUnpublishCancellationDoesNotPauseHost(t *testing.T) {
 	defer protocol.mu.Unlock()
 	require.Equal(t, 1, protocol.detachAttempts)
 	require.Empty(t, protocol.mutations)
+}
+
+func TestControllerQueuedUnpublishPreservesPendingAndCoalescedCancellation(t *testing.T) {
+	for _, coalesced := range []bool{false, true} {
+		t.Run(fmt.Sprintf("coalesced=%t", coalesced), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
+			driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+			provider, protocol := nodeAttachmentProvider(t)
+			server := NewControllerServer(driver, provider, nil)
+			queue := NewHotplugQueueManager(nil, "default", driver.metrics, 4*time.Second, 0)
+			queue.Configure(true, 0, 0, 0, nil)
+			driver.hotplugQueue = queue
+
+			blockerCtx, release := context.WithCancel(ctx)
+			defer release()
+			started, blockerDone := make(chan struct{}), make(chan error, 1)
+			go func() {
+				blockerDone <- queue.Run(blockerCtx, "node-old", "test", "other-volume", hotplugQueuePriorityNormal, func(ctx context.Context) error {
+					close(started)
+					<-ctx.Done()
+					return ctx.Err()
+				})
+			}()
+			select {
+			case <-started:
+			case <-ctx.Done():
+				t.Fatal("queue blocker did not start")
+			}
+
+			req := &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: "node-old"}
+			unpublish := func(ctx context.Context) <-chan error {
+				done := make(chan error, 1)
+				go func() {
+					_, err := server.ControllerUnpublishVolume(ctx, req)
+					done <- err
+				}()
+				return done
+			}
+			waitForPending := func(wantCoalesced int) {
+				require.Eventually(t, func() bool {
+					pending := queue.Snapshot()["node-old"].Queued
+					return len(pending) == 1 && pending[0].Volume == req.VolumeId && pending[0].Coalesced == wantCoalesced
+				}, time.Second, time.Millisecond)
+			}
+			leaderCtx, cancelLeader := context.WithCancel(ctx)
+			defer cancelLeader()
+			leaderDone := unpublish(leaderCtx)
+			waitForPending(0)
+			if coalesced {
+				followerCtx, cancelFollower := context.WithCancel(ctx)
+				defer cancelFollower()
+				followerDone := unpublish(followerCtx)
+				waitForPending(1)
+				cancelFollower()
+				require.Equal(t, codes.Canceled, status.Code(<-followerDone))
+				waitForPending(1)
+			}
+			cancelLeader()
+			require.Equal(t, codes.Canceled, status.Code(<-leaderDone))
+			release()
+			require.ErrorIs(t, <-blockerDone, context.Canceled)
+			events, err := driver.kubeRuntime.client.CoreV1().Events(pvc.Namespace).List(ctx, metav1.ListOptions{})
+			require.NoError(t, err)
+			require.Empty(t, events.Items)
+			protocol.mu.Lock()
+			defer protocol.mu.Unlock()
+			require.Zero(t, protocol.detachAttempts)
+		})
+	}
+}
+
+func TestControllerQueuedUnpublishDistinguishesCallerAndActiveDeadlines(t *testing.T) {
+	for _, queueLimit := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queue-limit=%t", queueLimit), func(t *testing.T) {
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
+			driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+			driver.PluginConfig.OverrideVal(config.HotplugDiagnosticsEnabledVar, true)
+			kube := driver.kubeRuntime.client.(*fake.Clientset)
+			kube.PrependReactor("create", "events", func(action ktesting.Action) (bool, kruntime.Object, error) {
+				event := action.(ktesting.CreateAction).GetObject().(*corev1.Event)
+				event.Name = event.Reason
+				return false, nil, nil
+			})
+
+			var attempted, blocked atomic.Bool
+			provider, protocol := nodeAttachmentProvider(t, func(method string, ctx context.Context) {
+				if method == "one.vm.detach" {
+					attempted.Store(true)
+				}
+				if method == "one.vm.info" && attempted.Load() && blocked.CompareAndSwap(false, true) {
+					<-ctx.Done()
+				}
+			})
+			protocol.mu.Lock()
+			protocol.rejectFirstDetach = true
+			protocol.mu.Unlock()
+
+			server := NewControllerServer(driver, provider, nil)
+			driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, time.Second, 0)
+			callerTimeout, activeLimit := 500*time.Millisecond, 5*time.Second
+			if queueLimit {
+				callerTimeout, activeLimit = 5*time.Second, 500*time.Millisecond
+			}
+			driver.hotplugQueue.Configure(true, 0, 0, activeLimit, nil)
+			ctx, cancel := context.WithTimeout(context.Background(), callerTimeout)
+			defer cancel()
+			reply, err := server.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: "node-old"})
+			require.Nil(t, reply)
+			require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+			require.True(t, blocked.Load(), "deadline must interrupt provider readback")
+			events, err := kube.CoreV1().Events(pvc.Namespace).List(context.Background(), metav1.ListOptions{})
+			require.NoError(t, err)
+			sawQueueTimeout := false
+			for _, event := range events.Items {
+				if event.Reason == eventReasonHotplugQueueTimeout {
+					sawQueueTimeout = true
+					require.Equal(t, pvc.UID, event.InvolvedObject.UID)
+					require.Contains(t, event.Message, "executing hotplug queue request")
+					require.NotContains(t, event.Message, "onecsi-7")
+					require.NotContains(t, event.Message, "provider-private-disk-detail")
+				}
+			}
+			require.Equal(t, queueLimit, sawQueueTimeout)
+			require.Equal(t, queueLimit, server.loadHotplugObservation(context.Background(), "node-old") != nil)
+			require.Empty(t, driver.hotplugGuard.Snapshot())
+			protocol.mu.Lock()
+			defer protocol.mu.Unlock()
+			require.Equal(t, 1, protocol.detachAttempts)
+			require.Empty(t, protocol.mutations)
+		})
+	}
 }

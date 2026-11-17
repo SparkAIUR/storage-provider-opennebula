@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 )
 
@@ -27,11 +28,16 @@ type StickyAttachmentState struct {
 	DatastoreID        int       `json:"datastoreID"`
 	PVCNamespace       string    `json:"pvcNamespace"`
 	PVCName            string    `json:"pvcName"`
+	PVCUID             types.UID `json:"pvcUID,omitempty"`
 	StartedAt          time.Time `json:"startedAt"`
 	ExpiresAt          time.Time `json:"expiresAt"`
 	GraceSeconds       int       `json:"graceSeconds"`
 	Reason             string    `json:"reason"`
 	LastKnownNodeReady bool      `json:"lastKnownNodeReady"`
+}
+
+func (s StickyAttachmentState) pvcEventContext() *VolumeRuntimeContext {
+	return &VolumeRuntimeContext{PVCNamespace: s.PVCNamespace, PVCName: s.PVCName, PVCUID: s.PVCUID}
 }
 
 type StickyAttachmentManager struct {

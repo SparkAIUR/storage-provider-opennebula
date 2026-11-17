@@ -225,7 +225,7 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if backend, present := authority.AttachmentMetadata[annotationBackend]; present && !isCephBackend(backend) {
 		return nil, cephRetentionUnavailable("VolumeAttachment backend contradicts Ceph binding", nil)
 	}
-	currentRuntime := &VolumeRuntimeContext{PVName: pv.Name, PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVAnnotations: cloneStringMap(pv.Annotations), PVCAnnotations: cloneStringMap(pvc.Annotations), Backend: backend, AccessModes: append([]corev1.PersistentVolumeAccessMode(nil), pv.Spec.AccessModes...)}
+	currentRuntime := &VolumeRuntimeContext{PVName: pv.Name, PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVCUID: pvc.UID, PVAnnotations: cloneStringMap(pv.Annotations), PVCAnnotations: cloneStringMap(pvc.Annotations), Backend: backend, AccessModes: append([]corev1.PersistentVolumeAccessMode(nil), pv.Spec.AccessModes...)}
 	control := resolvedRecoveryControlState(req.VolumeId, currentRuntime, VolumeRecoveryControlState{})
 	if control.Invalid || control.Active() {
 		return nil, status.Error(codes.FailedPrecondition, "Ceph same-node retention is blocked by active or invalid recovery controls")

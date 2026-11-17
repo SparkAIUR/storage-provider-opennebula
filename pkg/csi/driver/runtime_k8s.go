@@ -91,6 +91,7 @@ type VolumeRuntimeContext struct {
 	PVName           string
 	PVCNamespace     string
 	PVCName          string
+	PVCUID           types.UID
 	PVAnnotations    map[string]string
 	PVCAnnotations   map[string]string
 	AccessModes      []corev1.PersistentVolumeAccessMode
@@ -169,8 +170,15 @@ func newInventoryRuntimeClient(cfg *rest.Config) ctrlclient.Client {
 	return client
 }
 
-func (r *KubeRuntime) EmitPVCEvent(ctx context.Context, namespace, name, reason, message string) {
+func (r *KubeRuntime) EmitPVCEvent(ctx context.Context, namespace, name, reason, message string, expectedUID ...types.UID) {
+	r.emitPVCEvent(ctx, namespace, name, corev1.EventTypeNormal, reason, message, expectedUID...)
+}
+
+func (r *KubeRuntime) emitPVCEvent(ctx context.Context, namespace, name, eventType, reason, message string, expectedUID ...types.UID) {
 	if r == nil || !r.enabled || namespace == "" || name == "" {
+		return
+	}
+	if len(expectedUID) != 0 && expectedUID[0] == "" {
 		return
 	}
 	pvc, err := r.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
@@ -178,7 +186,10 @@ func (r *KubeRuntime) EmitPVCEvent(ctx context.Context, namespace, name, reason,
 		klog.V(2).InfoS("Skipping PVC event emission", "namespace", namespace, "name", name, "reason", reason, "err", err)
 		return
 	}
-	r.emitNamespacedEvent(ctx, pvc.Namespace, pvc.Name, pvc.UID, "PersistentVolumeClaim", corev1.EventTypeNormal, reason, message)
+	if len(expectedUID) != 0 && pvc.UID != expectedUID[0] {
+		return
+	}
+	r.emitNamespacedEvent(ctx, pvc.Namespace, pvc.Name, pvc.UID, "PersistentVolumeClaim", eventType, reason, message)
 }
 
 func (r *KubeRuntime) EmitPVEvent(ctx context.Context, name, reason, message string) {
@@ -193,16 +204,8 @@ func (r *KubeRuntime) EmitPVEvent(ctx context.Context, name, reason, message str
 	r.recorder.Eventf(pv, corev1.EventTypeNormal, reason, "%s", message)
 }
 
-func (r *KubeRuntime) EmitWarningEventOnPVC(ctx context.Context, namespace, name, reason, message string) {
-	if r == nil || !r.enabled || namespace == "" || name == "" {
-		return
-	}
-	pvc, err := r.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		klog.V(2).InfoS("Skipping PVC warning emission", "namespace", namespace, "name", name, "reason", reason, "err", err)
-		return
-	}
-	r.emitNamespacedEvent(ctx, pvc.Namespace, pvc.Name, pvc.UID, "PersistentVolumeClaim", corev1.EventTypeWarning, reason, message)
+func (r *KubeRuntime) EmitWarningEventOnPVC(ctx context.Context, namespace, name, reason, message string, expectedUID ...types.UID) {
+	r.emitPVCEvent(ctx, namespace, name, corev1.EventTypeWarning, reason, message, expectedUID...)
 }
 
 func (r *KubeRuntime) AnnotatePVAsync(ctx context.Context, pvName string, report PlacementReport) {
@@ -495,6 +498,7 @@ func (r *KubeRuntime) ResolveVolumeRuntimeContext(ctx context.Context, volumeHan
 				runtimeCtx.PVCNamespace = ""
 				runtimeCtx.PVCName = ""
 			} else if pvcErr == nil {
+				runtimeCtx.PVCUID = pv.Spec.ClaimRef.UID
 				runtimeCtx.PVCAnnotations = cloneStringMap(pvc.Annotations)
 				if runtimeCtx.RestartMode == "" {
 					runtimeCtx.RestartMode = strings.TrimSpace(runtimeCtx.PVCAnnotations[annotationRestartOpt])

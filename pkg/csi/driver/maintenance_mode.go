@@ -294,7 +294,7 @@ func (m *MaintenanceModeManager) prepare(ctx context.Context) maintenancePrepare
 			report.Patched++
 			m.recordMaintenanceOutcome("prepare", "patched")
 			if pv.Spec.ClaimRef != nil {
-				m.runtime.EmitPVCEvent(ctx, pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name, eventReasonMaintenanceModePrepared, fmt.Sprintf("prepared local RWO volume %s to remain on node %s during maintenance mode", volumeHandle, node))
+				m.runtime.EmitPVCEvent(ctx, pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name, eventReasonMaintenanceModePrepared, fmt.Sprintf("prepared local RWO volume %s to remain on node %s during maintenance mode", volumeHandle, node), pv.Spec.ClaimRef.UID)
 			}
 		} else {
 			m.recordMaintenanceOutcome("prepare", "observed")
@@ -436,7 +436,7 @@ func (m *MaintenanceModeManager) releaseMaintenanceHolds(ctx context.Context) {
 		}
 		m.recordMaintenanceOutcome("release", "scheduled")
 		if m.runtime != nil {
-			m.runtime.EmitPVCEvent(ctx, state.PVCNamespace, state.PVCName, eventReasonMaintenanceModeReleased, fmt.Sprintf("scheduled maintenance attachment release for volume %s on node %s after %s", state.VolumeID, state.NodeID, delay))
+			m.runtime.EmitPVCEvent(ctx, state.PVCNamespace, state.PVCName, eventReasonMaintenanceModeReleased, fmt.Sprintf("scheduled maintenance attachment release for volume %s on node %s after %s", state.VolumeID, state.NodeID, delay), state.PVCUID)
 		}
 	}
 }
@@ -495,7 +495,7 @@ func (m *MaintenanceModeManager) emitMaintenanceHintIgnored(ctx context.Context,
 	m.recordMaintenanceOutcome("prepare", "ignored_invalid_hint")
 	klog.V(2).InfoS("Maintenance mode ignored invalid node hint", "pv", pvNameForLog(pv), "message", message)
 	if pv != nil && pv.Spec.ClaimRef != nil {
-		m.runtime.EmitPVCEvent(ctx, pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name, eventReasonMaintenanceHintIgnored, message)
+		m.runtime.EmitPVCEvent(ctx, pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name, eventReasonMaintenanceHintIgnored, message, pv.Spec.ClaimRef.UID)
 	}
 }
 

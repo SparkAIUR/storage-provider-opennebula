@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -47,7 +48,8 @@ func TestAttachmentReconcilerDetachesOrphanAttachment(t *testing.T) {
 	pvc.Spec.VolumeName = pv.Name
 	node := newReadyNode("node-a", true)
 	node.UID = "node-owned"
-	driver := newAttachmentTestDriver(pv, pvc, node)
+	unusable := newReadyNode("node-unusable", true)
+	driver := newAttachmentTestDriver(pv, pvc, node, unusable)
 	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
 	mockProvider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{{
 		VolumeHandle: "vol-1",
@@ -55,12 +57,27 @@ func TestAttachmentReconcilerDetachesOrphanAttachment(t *testing.T) {
 		NodeName:     "node-a",
 		NodeID:       101,
 		Backend:      "local",
-	}}, opennebula.VMNameInventory{"node-a": {101}}, nil).Once()
+	}}, opennebula.VMNameInventory{"node-a": {101}, "node-unusable": {0}}, nil).Once()
 	mockProvider.On("NodeExists", mock.Anything, "node-a").Return(101, nil)
 
 	physical := &cleanupReadbackProvider{MockOpenNebulaVolumeProviderTestify: mockProvider, attached: true, imageID: 1, vmID: 101, diskID: 0}
 	mockProvider.On("DetachVolume", mock.Anything, "vol-1", "node-a").Run(func(mock.Arguments) { physical.attached = false }).Return(nil).Once()
 	mockProvider.On("ResolveVolumeSizeBytes", mock.Anything, "vol-1").Return(int64(1024), nil).Once()
+
+	kube := driver.kubeRuntime.client.(*fake.Clientset)
+	replacement := pvc.DeepCopy()
+	replacement.UID = "replacement"
+	replacement.Spec.VolumeName = ""
+	pvcResource := corev1.SchemeGroupVersion.WithResource("persistentvolumeclaims")
+	replaced := false
+	kube.PrependReactor("get", "persistentvolumeclaims", func(ktesting.Action) (bool, runtime.Object, error) {
+		if !physical.attached && !replaced {
+			require.NoError(t, kube.Tracker().Update(pvcResource, replacement, pvc.Namespace))
+			replaced = true
+			return true, pvc.DeepCopy(), nil
+		}
+		return false, nil, nil
+	})
 
 	server := NewControllerServer(driver, physical, &MockSharedFilesystemProviderTestify{})
 	reconciler := NewAttachmentReconciler(server)
@@ -68,6 +85,12 @@ func TestAttachmentReconcilerDetachesOrphanAttachment(t *testing.T) {
 
 	require.NoError(t, reconciler.ReconcileOnce(context.Background()))
 	mockProvider.AssertExpectations(t)
+	require.True(t, replaced)
+	events, err := kube.CoreV1().Events(pvc.Namespace).List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, events.Items, 1)
+	require.Equal(t, eventReasonStuckAttachmentDetached, events.Items[0].Reason)
+	require.Equal(t, pvc.UID, events.Items[0].InvolvedObject.UID)
 }
 
 func TestAttachmentReconcilerDeletesStaleVolumeAttachment(t *testing.T) {
@@ -242,64 +265,85 @@ func TestAttachmentReconcilerSkipsSharedFilesystemVolumeAttachments(t *testing.T
 }
 
 func TestAttachmentReconcilerPrunesDeletedVolumeState(t *testing.T) {
-	driver := newAttachmentTestDriver()
-	require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
-		VolumeID:     "vol-gone",
-		NodeID:       "node-a",
-		Backend:      "local",
-		PVCNamespace: "default",
-		PVCName:      "pvc-vol-gone",
-		StartedAt:    time.Now().Add(-10 * time.Second),
-		ExpiresAt:    time.Now().Add(90 * time.Second),
-		GraceSeconds: 90,
-		Reason:       "stateful_restart",
-	}))
-	_, err := driver.volumeHistory.Upsert(context.Background(), "vol-gone", func(state *VolumeHistoryRecord) {
-		state.VolumeID = "vol-gone"
-		state.Backend = "local"
-		state.LastSuccessfulNodeName = "node-a"
-		state.LastSuccessfulPublishTime = time.Now().UTC()
-	})
-	require.NoError(t, err)
-	_, err = driver.volumeRepairState.Mark(context.Background(), VolumeRepairState{
-		VolumeID:        "vol-gone",
-		Version:         stateObjectVersion,
-		Classification:  repairClassificationMissingImageRecord,
-		Message:         "missing image",
-		FirstObservedAt: time.Now().UTC(),
-		LastObservedAt:  time.Now().UTC(),
-	})
-	require.NoError(t, err)
-	report := LocalDeviceMissingReport{
-		Node:            "node-a",
-		VolumeID:        "vol-gone",
-		FailureClass:    localDeviceFailureClassMissingDevice,
-		FirstObservedAt: time.Now().UTC(),
-		LastObservedAt:  time.Now().UTC(),
+	for _, live := range []bool{false, true} {
+		t.Run(fmt.Sprintf("foreign-live=%t", live), func(t *testing.T) {
+			const volume = "vol-state"
+			ctx := context.Background()
+			objects := []runtime.Object{newReadyNode("node-a", true)}
+			if live {
+				pv, _ := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+				pv.Spec.CSI.Driver = "foreign.csi.example"
+				objects = append(objects, pv)
+			}
+			driver := newAttachmentTestDriver(objects...)
+			driver.volumeRecoveryControl = NewVolumeRecoveryControlManager(driver.kubeRuntime, "default")
+			_, err := driver.volumeRecoveryControl.Upsert(ctx, volume, func(state *VolumeRecoveryControlState) {
+				state.Mode = recoveryModeManual
+			})
+			require.NoError(t, err)
+			require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
+				VolumeID:     volume,
+				NodeID:       "node-a",
+				Backend:      "local",
+				PVCNamespace: "default",
+				PVCName:      "pvc-vol-gone",
+				StartedAt:    time.Now().Add(-10 * time.Second),
+				ExpiresAt:    time.Now().Add(90 * time.Second),
+				GraceSeconds: 90,
+				Reason:       "stateful_restart",
+			}))
+			_, err = driver.volumeHistory.Upsert(context.Background(), volume, func(state *VolumeHistoryRecord) {
+				state.VolumeID = volume
+				state.Backend = "local"
+				state.LastSuccessfulNodeName = "node-a"
+				state.LastSuccessfulPublishTime = time.Now().UTC()
+			})
+			require.NoError(t, err)
+			_, err = driver.volumeRepairState.Mark(context.Background(), VolumeRepairState{
+				VolumeID:        volume,
+				Version:         stateObjectVersion,
+				Classification:  repairClassificationMissingImageRecord,
+				Message:         "missing image",
+				FirstObservedAt: time.Now().UTC(),
+				LastObservedAt:  time.Now().UTC(),
+			})
+			require.NoError(t, err)
+			report := LocalDeviceMissingReport{
+				Node:            "node-a",
+				VolumeID:        volume,
+				FailureClass:    localDeviceFailureClassMissingDevice,
+				FirstObservedAt: time.Now().UTC(),
+				LastObservedAt:  time.Now().UTC(),
+			}
+			payload, err := json.Marshal(report)
+			require.NoError(t, err)
+			require.NoError(t, driver.kubeRuntime.UpsertConfigMapData(context.Background(), "default", localDeviceStateConfigMapName, map[string]string{
+				localDeviceReportKey("node-a", volume): string(payload),
+			}))
+
+			mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+			mockProvider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil, nil).Once()
+
+			server := NewControllerServer(driver, mockProvider, &MockSharedFilesystemProviderTestify{})
+			reconciler := NewAttachmentReconciler(server)
+
+			require.NoError(t, reconciler.ReconcileOnce(context.Background()))
+
+			_, sticky := driver.stickyAttachments.Get(volume)
+			_, history := driver.volumeHistory.Get(volume)
+			_, repair := driver.volumeRepairState.Get(volume)
+			_, control := driver.volumeRecoveryControl.Get(volume)
+			cm, getErr := driver.kubeRuntime.client.CoreV1().ConfigMaps("default").Get(ctx, localDeviceStateConfigMapName, metav1.GetOptions{})
+			require.NoError(t, getErr)
+			_, reportPresent := cm.Data[localDeviceReportKey("node-a", volume)]
+			assert.Equal(t, live, sticky, "sticky hold")
+			assert.Equal(t, live, history, "volume history")
+			assert.Equal(t, live, repair, "repair state")
+			assert.Equal(t, live, control, "recovery control")
+			assert.Equal(t, live, reportPresent, "local-device report")
+			mockProvider.AssertExpectations(t)
+		})
 	}
-	payload, err := json.Marshal(report)
-	require.NoError(t, err)
-	require.NoError(t, driver.kubeRuntime.UpsertConfigMapData(context.Background(), "default", localDeviceStateConfigMapName, map[string]string{
-		localDeviceReportKey("node-a", "vol-gone"): string(payload),
-	}))
-
-	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
-	mockProvider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil, nil).Once()
-
-	server := NewControllerServer(driver, mockProvider, &MockSharedFilesystemProviderTestify{})
-	reconciler := NewAttachmentReconciler(server)
-
-	require.NoError(t, reconciler.ReconcileOnce(context.Background()))
-
-	_, ok := driver.stickyAttachments.Get("vol-gone")
-	assert.False(t, ok)
-	assert.Empty(t, driver.volumeHistory.Snapshot())
-	assert.Empty(t, driver.volumeRepairState.Snapshot())
-
-	cm, getErr := driver.kubeRuntime.client.CoreV1().ConfigMaps("default").Get(context.Background(), localDeviceStateConfigMapName, metav1.GetOptions{})
-	require.NoError(t, getErr)
-	assert.Empty(t, cm.Data)
-	mockProvider.AssertExpectations(t)
 }
 
 func TestAttachmentReconcilerPreservesMalformedAndReplacedDeviceReports(t *testing.T) {
