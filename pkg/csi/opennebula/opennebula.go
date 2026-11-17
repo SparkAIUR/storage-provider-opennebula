@@ -130,6 +130,10 @@ type AuthorizedVolumeDetacher interface {
 	DetachVolumeWithAuthority(ctx context.Context, volume, node, expectedBackend string, verifyOwner DetachOwnerCheck, authorize DetachAuthorization) (accepted bool, err error)
 }
 
+type AttachmentBackendVerifier interface {
+	VerifyAttachmentBackend(ctx context.Context, volume string, imageID, vmID int, expected string) error
+}
+
 type VolumeAttachmentInspector interface {
 	InspectVolumeAttachment(ctx context.Context, volume string, node string) (*VolumeAttachmentMetadata, error)
 }

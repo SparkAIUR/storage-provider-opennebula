@@ -11,7 +11,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -49,23 +48,26 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if identity.ceph && !isCephBackend(backend) {
 		return status.Error(codes.Unavailable, "Ceph backend changed before detach")
 	}
-	if identity.background && (identity.backend != backend || identity.cephSingleWriter != (isCephBackend(backend) && hasSingleWriterAccessMode(pv.Spec.AccessModes))) {
+	if identity.backend != "" && identity.backend != backend {
+		return attachmentEvidenceUnavailable("detach backend changed", nil)
+	}
+	if identity.background && identity.cephSingleWriter != (isCephBackend(backend) && hasSingleWriterAccessMode(pv.Spec.AccessModes)) {
 		return attachmentEvidenceUnavailable("background detach scope changed", nil)
 	}
-	var pvc *corev1.PersistentVolumeClaim
-	if pv.Spec.ClaimRef != nil {
-		claim := pv.Spec.ClaimRef
-		pvc, err = runtime.client.CoreV1().PersistentVolumeClaims(claim.Namespace).Get(ctx, claim.Name, metav1.GetOptions{})
-		if (err != nil && !apierrors.IsNotFound(err)) || claim.UID == "" || (err == nil && (pvc == nil || pvc.UID != claim.UID || pvc.Spec.VolumeName != pv.Name)) {
-			return attachmentEvidenceUnavailable("detach claim identity is unverified", err)
-		}
-		if err == nil {
-			runtimeCtx.PVCAnnotations = pvc.Annotations
-		} else {
-			pvc = nil
-			runtimeCtx.PVCAnnotations = nil
-		}
+	pvc, replacement, err := runtime.attachmentClaim(ctx, pv)
+	if err != nil {
+		return attachmentEvidenceUnavailable("detach claim identity is unverified", err)
 	}
+	runtimeCtx.PVCAnnotations = nil
+	if pvc == nil {
+		runtimeCtx.PVCNamespace = ""
+		runtimeCtx.PVCName = ""
+	} else {
+		runtimeCtx.PVCName = pvc.Name
+		runtimeCtx.PVCNamespace = pvc.Namespace
+		runtimeCtx.PVCAnnotations = pvc.Annotations
+	}
+
 	history, err := s.readAttachmentHistory(ctx, volume)
 	if err != nil {
 		return attachmentEvidenceUnavailable("detach history is unreadable", err)
@@ -138,10 +140,10 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			}
 		}
 	}
-	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc); err != nil {
+	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, replacement); err != nil {
 		return err
 	}
-	if claim := pv.Spec.ClaimRef; claim != nil {
+	if claim := pv.Spec.ClaimRef; claim != nil && !replacement {
 		pods, err := runtime.client.CoreV1().Pods(claim.Namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return attachmentEvidenceUnavailable("cannot verify Pod release", err)
@@ -182,7 +184,7 @@ func terminalPodMayBeReleased(pod *corev1.Pod) bool {
 		(pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed)
 }
 
-func (s *ControllerServer) recheckAttachmentAuthority(ctx context.Context, volume string, runtimeCtx *VolumeRuntimeContext, target opennebula.HostArtifactAttachmentTarget, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim) error {
+func (s *ControllerServer) recheckAttachmentAuthority(ctx context.Context, volume string, runtimeCtx *VolumeRuntimeContext, target opennebula.HostArtifactAttachmentTarget, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, replacement bool) error {
 	if err := s.attachmentProtectionChecks(ctx, volume, runtimeCtx, target); err != nil {
 		return err
 	}
@@ -193,20 +195,25 @@ func (s *ControllerServer) recheckAttachmentAuthority(ctx context.Context, volum
 		!reflect.DeepEqual(currentPV.DeletionTimestamp, pv.DeletionTimestamp) {
 		return status.Error(codes.Unavailable, "volume binding or recovery controls changed during attachment checks")
 	}
-	if claim := pv.Spec.ClaimRef; claim != nil {
-		currentPVC, err := client.PersistentVolumeClaims(claim.Namespace).Get(ctx, claim.Name, metav1.GetOptions{})
-		if pvc == nil {
-			if !apierrors.IsNotFound(err) {
-				return status.Error(codes.Unavailable, "volume claim changed during attachment checks")
-			}
-		} else if err != nil || currentPVC.UID != pvc.UID || !reflect.DeepEqual(currentPVC.Spec, pvc.Spec) ||
+	currentPVC, currentReplacement, err := s.driver.kubeRuntime.attachmentClaim(ctx, currentPV)
+	if err != nil || replacement != currentReplacement || (pvc == nil) != (currentPVC == nil) ||
+		(pvc != nil && (currentPVC.UID != pvc.UID || !reflect.DeepEqual(currentPVC.Spec, pvc.Spec) ||
 			!reflect.DeepEqual(currentPVC.Status, pvc.Status) || !reflect.DeepEqual(currentPVC.Annotations, pvc.Annotations) ||
-			!reflect.DeepEqual(currentPVC.DeletionTimestamp, pvc.DeletionTimestamp) {
-			return status.Error(codes.Unavailable, "volume claim or recovery controls changed during attachment checks")
-		}
+			!reflect.DeepEqual(currentPVC.DeletionTimestamp, pvc.DeletionTimestamp))) {
+		return status.Error(codes.Unavailable, "volume claim or recovery controls changed during attachment checks")
 	}
+
 	if err := ctx.Err(); err != nil {
 		return status.FromContextError(err).Err()
+	}
+	return nil
+}
+
+func (s *ControllerServer) verifyProviderAttachmentBackend(ctx context.Context, volume string, imageID, vmID int, backend string) error {
+	if provider, ok := s.volumeProvider.(opennebula.AttachmentBackendVerifier); ok {
+		if err := provider.VerifyAttachmentBackend(ctx, volume, imageID, vmID, backend); err != nil {
+			return attachmentEvidenceUnavailable("provider attachment backend is unverified", err)
+		}
 	}
 	return nil
 }
@@ -270,6 +277,12 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 				return false, attachmentEvidenceUnavailable("cannot verify detach PV UID", err)
 			}
 			identity.pvUID = pv.UID
+			if identity.backend == "" {
+				identity.backend, err = persistentVolumeBackend(pv)
+				if err != nil {
+					return false, attachmentEvidenceUnavailable("cannot verify detach backend", err)
+				}
+			}
 		}
 		current, err := runtime.NodeIdentity(ctx, node)
 		if err != nil || !current.Exists || current.UID == "" || (identity.nodeUID != "" && identity.nodeUID != types.UID(current.UID)) {
@@ -286,6 +299,9 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 		return s.checkPhysicalDetachAuthority(ctx, volume, node, attempt)
 	}
 	if err := s.checkPhysicalDetachAuthority(ctx, volume, node, identity); err != nil {
+		if parentErr := ctx.Err(); parentErr != nil {
+			return false, parentErr
+		}
 		return false, err
 	}
 	ctx = opennebula.WithExpectedImageID(ctx, identity.imageID)
@@ -296,10 +312,17 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 				return s.verifySoleDetachOwner(ctx, volume, node, imageID, vmID, diskID)
 			}
 		}
-		return provider.DetachVolumeWithAuthority(ctx, volume, node, identity.backend, verifyOwner, authorize)
+		accepted, err := provider.DetachVolumeWithAuthority(ctx, volume, node, identity.backend, verifyOwner, authorize)
+		if parentErr := ctx.Err(); parentErr != nil {
+			return false, parentErr
+		}
+		return accepted, err
 	}
 	if identity.cephSingleWriter {
 		return false, attachmentEvidenceUnavailable("provider cannot verify Ceph detach authority", nil)
+	}
+	if err := s.verifyProviderAttachmentBackend(ctx, volume, identity.imageID, identity.vmID, identity.backend); err != nil {
+		return false, err
 	}
 	err := s.volumeProvider.DetachVolume(ctx, volume, node)
 	return err == nil, err

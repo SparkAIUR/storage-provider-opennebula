@@ -181,6 +181,44 @@ func TestControllerUnpublishCephDeletingAttachmentSameNode(t *testing.T) {
 	}
 }
 
+func TestControllerUnpublishCephRejectsDeletingNodeInEitherSnapshot(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, late := range []bool{false, true} {
+			t.Run(fmt.Sprintf("queued=%v/late=%v", queued, late), func(t *testing.T) {
+				f := newCephRestartTestFixture(t, queued)
+				node := f.node.DeepCopy()
+				now := metav1.Now()
+				node.DeletionTimestamp = &now
+				markDeleting := func() {
+					_, err := f.server.driver.kubeRuntime.client.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{})
+					require.NoError(t, err)
+				}
+				if late {
+					f.provider.observe = func(context.Context) (*opennebula.SameNodeRetentionEvidence, error) {
+						if f.provider.inspections.Load() == 2 {
+							markDeleting()
+						}
+						return validCephRetentionTestEvidence(), nil
+					}
+				} else {
+					markDeleting()
+				}
+				reply, err := f.unpublish(t)
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.Nil(t, reply)
+				if late {
+					require.EqualValues(t, 2, f.provider.inspections.Load())
+				} else {
+					require.Zero(t, f.provider.inspections.Load())
+				}
+				history, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
+				require.True(t, history.LastSafeDetachTime.IsZero())
+				f.requireNoProviderMutation(t)
+			})
+		}
+	}
+}
+
 func TestControllerUnpublishCephRejectsUnverifiedRetention(t *testing.T) {
 	cases := map[string]func(*testing.T, *cephRestartTestFixture){
 		"missing PV UID": func(t *testing.T, f *cephRestartTestFixture) { f.pv.UID = "" },

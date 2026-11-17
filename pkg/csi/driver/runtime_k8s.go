@@ -415,6 +415,30 @@ func (r *KubeRuntime) GetConfigMap(ctx context.Context, namespace, name string) 
 	return r.client.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
 }
 
+func (r *KubeRuntime) attachmentClaim(ctx context.Context, pv *corev1.PersistentVolume) (*corev1.PersistentVolumeClaim, bool, error) {
+	claim := pv.Spec.ClaimRef
+	if claim == nil {
+		return nil, false, nil
+	}
+	if claim.UID == "" {
+		return nil, false, fmt.Errorf("PV claim UID is unavailable")
+	}
+	pvc, err := r.client.CoreV1().PersistentVolumeClaims(claim.Namespace).Get(ctx, claim.Name, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if pvc.UID != "" && pvc.UID != claim.UID && pv.Status.Phase == corev1.VolumeReleased && pvc.Spec.VolumeName != pv.Name {
+		return nil, true, nil
+	}
+	if pvc.UID != claim.UID || pvc.Spec.VolumeName != pv.Name {
+		return nil, false, fmt.Errorf("PV claim identity is unverified")
+	}
+	return pvc, false, nil
+}
+
 func (r *KubeRuntime) ResolveVolumeRuntimeContext(ctx context.Context, volumeHandle string) (*VolumeRuntimeContext, error) {
 	if r == nil || !r.enabled {
 		return nil, fmt.Errorf("kubernetes runtime is not enabled")
@@ -467,7 +491,10 @@ func (r *KubeRuntime) ResolveVolumeRuntimeContext(ctx context.Context, volumeHan
 			runtimeCtx.PVCNamespace = pv.Spec.ClaimRef.Namespace
 			runtimeCtx.PVCName = pv.Spec.ClaimRef.Name
 			pvc, pvcErr := r.client.CoreV1().PersistentVolumeClaims(runtimeCtx.PVCNamespace).Get(ctx, runtimeCtx.PVCName, metav1.GetOptions{})
-			if pvcErr == nil {
+			if pvcErr == nil && pv.Spec.ClaimRef.UID != "" && pvc.UID != pv.Spec.ClaimRef.UID {
+				runtimeCtx.PVCNamespace = ""
+				runtimeCtx.PVCName = ""
+			} else if pvcErr == nil {
 				runtimeCtx.PVCAnnotations = cloneStringMap(pvc.Annotations)
 				if runtimeCtx.RestartMode == "" {
 					runtimeCtx.RestartMode = strings.TrimSpace(runtimeCtx.PVCAnnotations[annotationRestartOpt])

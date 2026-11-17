@@ -14,7 +14,7 @@ type retentionProtocolCase struct {
 	imageSize, diskSize, imageID, vmID, diskID, imageState                   int
 	vmState, lcmState                                                        int
 	imageName, serial, target, persistence, diskFacts, resize, requestedSize string
-	imageOwners, extraVM, extraDisk, failMethod                              string
+	imageOwners, extraVM, extraDisk, failMethod, datastoreBackend            string
 	beforeReply                                                              func(string)
 }
 
@@ -26,7 +26,11 @@ func retentionProtocolFixture(t *testing.T, modify func(*retentionProtocolCase))
 	}
 	mutations := &atomic.Int32{}
 	image := func() string {
-		return fmt.Sprintf(`<IMAGE><ID>%d</ID><NAME>%s</NAME><STATE>%d</STATE><SIZE>%d</SIZE><PERSISTENT>%s</PERSISTENT><RUNNING_VMS>1</RUNNING_VMS><VMS>%s</VMS><TEMPLATE>%s</TEMPLATE></IMAGE>`, cfg.imageID, cfg.imageName, cfg.imageState, cfg.imageSize, cfg.persistence, cfg.imageOwners, cfg.requestedSize)
+		datastore := ""
+		if cfg.datastoreBackend != "" {
+			datastore = "<DATASTORE_ID>100</DATASTORE_ID>"
+		}
+		return fmt.Sprintf(`<IMAGE><ID>%d</ID><NAME>%s</NAME><STATE>%d</STATE><SIZE>%d</SIZE><PERSISTENT>%s</PERSISTENT>%s<RUNNING_VMS>1</RUNNING_VMS><VMS>%s</VMS><TEMPLATE>%s</TEMPLATE></IMAGE>`, cfg.imageID, cfg.imageName, cfg.imageState, cfg.imageSize, cfg.persistence, datastore, cfg.imageOwners, cfg.requestedSize)
 	}
 	disk := func() string {
 		return fmt.Sprintf(`<DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>%d</DISK_ID><TARGET>%s</TARGET><SERIAL>%s</SERIAL><SIZE>%d</SIZE>%s%s</DISK>`, cfg.diskID, cfg.target, cfg.serial, cfg.diskSize, cfg.diskFacts, cfg.resize)
@@ -50,6 +54,8 @@ func retentionProtocolFixture(t *testing.T, modify func(*retentionProtocolCase))
 			return true, "<VM_POOL>" + vmXML() + cfg.extraVM + "</VM_POOL>", 0
 		case "one.vm.info":
 			return true, vmXML(), 0
+		case "one.datastorepool.info":
+			return true, fmt.Sprintf(`<DATASTORE_POOL><DATASTORE><ID>100</ID><TYPE>IMAGE</TYPE><DS_MAD>%s</DS_MAD></DATASTORE></DATASTORE_POOL>`, cfg.datastoreBackend), 0
 		default:
 			mutations.Add(1)
 			return false, "unexpected mutation", 0x800
@@ -70,8 +76,9 @@ func TestSameNodeRetentionReadOnlyEvidence(t *testing.T) {
 
 func TestSameNodeRetentionRejectsUncertainOrUnsafeEvidence(t *testing.T) {
 	cases := map[string]func(*retentionProtocolCase){
-		"unstable image":          func(c *retentionProtocolCase) { c.imageState = 9 },
-		"image capacity overflow": func(c *retentionProtocolCase) { c.imageSize = 1 << 50 },
+		"contradictory image datastore backend": func(c *retentionProtocolCase) { c.datastoreBackend = "fs" },
+		"unstable image":                        func(c *retentionProtocolCase) { c.imageState = 9 },
+		"image capacity overflow":               func(c *retentionProtocolCase) { c.imageSize = 1 << 50 },
 		"fresh VM identity changed": func(c *retentionProtocolCase) {
 			c.beforeReply = func(method string) {
 				if method == "one.vm.info" {
@@ -197,7 +204,7 @@ func TestDiskInventoryRejectsMalformedImageReference(t *testing.T) {
 	require.ErrorContains(t, err, "malformed VM disk image identity")
 	require.Empty(t, attachments)
 	size, err := p.completedDiskSize(ctx, 11, 2, 7)
-	require.ErrorContains(t, err, "malformed VM disk image identity")
-	require.Zero(t, size)
+	require.NoError(t, err)
+	require.EqualValues(t, 1_073_741_824, size)
 	require.Zero(t, mutations.Load())
 }

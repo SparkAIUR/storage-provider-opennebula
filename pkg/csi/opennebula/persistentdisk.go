@@ -1047,6 +1047,9 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 		return err
 	}
 	detachErr := detachDisk(ctx)
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if authorityErr != nil {
 		return false, authorityErr
 	}
@@ -1070,6 +1073,9 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 		}
 		return attached, ready, nil
 	}, retryDetach, volume, node); err != nil {
+		if parentErr := ctx.Err(); parentErr != nil {
+			return false, parentErr
+		}
 		if detachErr != nil {
 			klog.V(2).InfoS("Initial detach attempt failed", "volume", volume, "node", node, "err", detachErr)
 		}
@@ -1573,6 +1579,9 @@ func (p *PersistentDiskVolumeProvider) waitForDetachState(ctx context.Context, t
 	lastReady := false
 	retryPending := retryDetach != nil
 	timedOut := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return &HotplugTimeoutError{
 			Operation:            "detach",
 			Volume:               volume,
@@ -1640,11 +1649,6 @@ func (p *PersistentDiskVolumeProvider) observeDetachDisk(ctx context.Context, vo
 	if err != nil || size <= 0 || image.ID != volumeID || image.Name != volume {
 		return 0, 0, fmt.Errorf("durable capacity or identity is unverified for image %d: %v", volumeID, err)
 	}
-	if expectedBackend != "" && image.DatastoreID != nil {
-		if backend := p.attachmentImageBackend(ctx, *image.DatastoreID); backend != "" && backend != expectedBackend {
-			return 0, 0, fmt.Errorf("detach image %d backend %q differs from %q", volumeID, backend, expectedBackend)
-		}
-	}
 	info, err := p.ctrl.VM(vmID).InfoContext(ctx, true)
 	if err != nil {
 		return 0, 0, err
@@ -1653,9 +1657,10 @@ func (p *PersistentDiskVolumeProvider) observeDetachDisk(ctx context.Context, vo
 	if err != nil {
 		return 0, 0, err
 	}
-	transferDriver, _ := disk.Get("TM_MAD")
-	if expectedBackend != "" && strings.EqualFold(strings.TrimSpace(transferDriver), "ceph") && expectedBackend != "ceph" {
-		return 0, 0, fmt.Errorf("detach VM %d disk is backed by Ceph", vmID)
+	if expectedBackend != "" {
+		if err := p.verifyObservedAttachmentBackend(ctx, image, *disk, expectedBackend); err != nil {
+			return 0, 0, err
+		}
 	}
 	if target != "" {
 		currentTarget, _ := disk.Get(shared.TargetDisk)

@@ -200,7 +200,7 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if err != nil {
 		return nil, cephRetentionUnavailable("node identity lookup failed", err)
 	}
-	if !identity.Exists || !identity.Ready || identity.UID == "" {
+	if !identity.Exists || !identity.Ready || identity.Deleting || identity.UID == "" {
 		return nil, cephRetentionUnavailable("node identity is unknown or not Ready", nil)
 	}
 	authority := &cephRetentionAuthority{PVName: pv.Name, PVUID: pv.UID, PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVCUID: pvc.UID, NodeUID: types.UID(identity.UID), Capacity: capacity, RequestedCapacity: requestedCapacity.String()}
@@ -244,7 +244,7 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 		return nil, err
 	}
 	authority.History = history
-	if err := s.recheckAttachmentAuthority(ctx, req.VolumeId, currentRuntime, target, pv, pvc); err != nil {
+	if err := s.recheckAttachmentAuthority(ctx, req.VolumeId, currentRuntime, target, pv, pvc, false); err != nil {
 		return nil, err
 	}
 	pods, err := runtime.client.CoreV1().Pods(pvc.Namespace).List(ctx, metav1.ListOptions{})

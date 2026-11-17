@@ -203,8 +203,14 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			continue
 		}
 
-		pvcKey := pvcKeyForPV(pv)
-		users := activePVCUsers[pvcKey]
+		_, replacement, err := r.server.driver.kubeRuntime.attachmentClaim(ctx, pv)
+		if err != nil {
+			continue
+		}
+		var users map[string]bool
+		if claim := pv.Spec.ClaimRef; claim != nil && !replacement {
+			users = activePVCUsers[claim.Namespace+"/"+claim.Name]
+		}
 		vas := vaByVolume[volumeHandle]
 		singleWriter := hasSingleWriterAccessMode(pv.Spec.AccessModes)
 		cephSingleWriter := singleWriter && isCephBackend(backend)
@@ -573,16 +579,6 @@ func (r *AttachmentReconciler) prune(store map[string]time.Time, current map[str
 			delete(store, key)
 		}
 	}
-}
-
-func pvcKeyForPV(pv *corev1.PersistentVolume) string {
-	if pv == nil || pv.Spec.ClaimRef == nil {
-		return ""
-	}
-	if strings.TrimSpace(pv.Spec.ClaimRef.Namespace) == "" || strings.TrimSpace(pv.Spec.ClaimRef.Name) == "" {
-		return ""
-	}
-	return pv.Spec.ClaimRef.Namespace + "/" + pv.Spec.ClaimRef.Name
 }
 
 func observedAttachmentBackend(attachment opennebula.ObservedAttachment) string {

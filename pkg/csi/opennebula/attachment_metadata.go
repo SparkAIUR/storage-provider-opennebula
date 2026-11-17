@@ -117,11 +117,14 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 	if !strings.EqualFold(persistent, "YES") || !strings.EqualFold(clone, "NO") || !strings.EqualFold(transfer, "ceph") || !strings.EqualFold(targetMode, "NONE") {
 		return deny("disk is not an eligible persistent Ceph attachment")
 	}
+	if err := p.verifyObservedAttachmentBackend(ctx, image, *selected, "ceph"); err != nil {
+		return deny(err.Error())
+	}
 	diskSizeMB, sizeErr := selected.GetI(shared.Size)
 	if sizeErr != nil || diskSizeMB != image.Size {
 		return deny("raw disk capacity is unknown or inconsistent with the image")
 	}
-	completedSize, err := completedDiskSizeFromVM(info, record.DiskID, metadata.ImageID)
+	completedSize, err := completedSelectedDiskSize(info, *selected)
 	if err != nil {
 		return deny(err.Error())
 	}
@@ -132,4 +135,49 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 		return nil, err
 	}
 	return &SameNodeRetentionEvidence{VolumeID: volume, ImageID: metadata.ImageID, NodeID: metadata.RequestedNodeID, DiskID: record.DiskID, Target: record.Target, DeviceSerial: record.Serial, SizeBytes: completedSize}, nil
+}
+
+func (p *PersistentDiskVolumeProvider) VerifyAttachmentBackend(ctx context.Context, volume string, imageID, vmID int, expected string) error {
+	image, err := p.ctrl.Image(imageID).InfoContext(ctx, true)
+	if err != nil {
+		return err
+	}
+	if image.ID != imageID || image.Name != volume {
+		return fmt.Errorf("attachment image identity changed")
+	}
+	info, err := p.ctrl.VM(vmID).InfoContext(ctx, true)
+	if err != nil {
+		return err
+	}
+	_, disk, err := volumeDiskFromVM(info, imageID, vmID)
+	if err != nil {
+		return err
+	}
+	return p.verifyObservedAttachmentBackend(ctx, image, *disk, expected)
+}
+
+func (p *PersistentDiskVolumeProvider) verifyObservedAttachmentBackend(ctx context.Context, image *img.Image, disk shared.Disk, expected string) error {
+	var datastoreBackend string
+	if image.DatastoreID != nil {
+		datastoreBackend = p.attachmentImageBackend(ctx, *image.DatastoreID)
+		if datastoreBackend != "" && datastoreBackend != expected {
+			return fmt.Errorf("image %d datastore backend %q differs from %q", image.ID, datastoreBackend, expected)
+		}
+	}
+	transfer, _ := disk.Get("TM_MAD")
+	switch strings.ToLower(strings.TrimSpace(transfer)) {
+	case "ceph":
+		if expected == "ceph" {
+			return nil
+		}
+	case "ssh", "fs_lvm", "fs_lvm_ssh", "local":
+		if expected == "local" || (expected == "nfs" && datastoreBackend == "nfs") {
+			return nil
+		}
+	default:
+		if datastoreBackend == expected {
+			return nil
+		}
+	}
+	return fmt.Errorf("image %d disk transfer driver %q does not establish backend %q", image.ID, transfer, expected)
 }

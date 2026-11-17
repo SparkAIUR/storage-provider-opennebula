@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -946,4 +947,227 @@ func TestForegroundAndStickyDetachPreserveProviderNoOpOutcome(t *testing.T) {
 			require.Zero(t, protocol.detachAttempts)
 		})
 	}
+}
+
+func TestControllerForegroundRejectsCephProviderBackendConflict(t *testing.T) {
+	for _, mode := range []string{"local-rescue", "maintenance-hold", "queue-disabled-pause", "foreground", "queued-foreground", "sticky-transfer", "sticky-expiry", "explicit-manual"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			if mode == "explicit-manual" {
+				pvc.Annotations[annotationRecoveryMode] = recoveryModeManual
+			}
+			pv.Annotations[annotationAllowCrossNodeUntil] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true), newReadyNode("node-new", true))
+			driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+			_, err := driver.volumeHistory.Upsert(ctx, "volume-test", func(record *VolumeHistoryRecord) {
+				record.Backend = "local"
+				record.LastSuccessfulPublishTime = time.Now().UTC().Add(-time.Hour)
+				record.LastSuccessfulImageID = 7
+			})
+			require.NoError(t, err)
+			kube := driver.kubeRuntime.client.(*fake.Clientset)
+			pod := activePodForPVC("local-consumer", pvc.Name, "node-old")
+			switch mode {
+			case "local-rescue", "explicit-manual":
+				_, err := kube.CoreV1().Pods(pvc.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+				require.NoError(t, err)
+			case "queue-disabled-pause":
+				podReads := 0
+				kube.PrependReactor("list", "pods", func(ktesting.Action) (bool, kruntime.Object, error) {
+					podReads++
+					if podReads == 2 {
+						require.NoError(t, kube.Tracker().Create(corev1.SchemeGroupVersion.WithResource("pods"), pod, pod.Namespace))
+					}
+					return false, nil, nil
+				})
+			case "maintenance-hold":
+				driver.maintenanceMode = NewMaintenanceModeManager(driver, "default")
+				driver.maintenanceMode.setState(true, false, false)
+			}
+			provider, state := nodeAttachmentProvider(t)
+			state.mu.Lock()
+			state.ceph = true
+			state.mu.Unlock()
+			server := NewControllerServer(driver, provider, nil)
+			if mode == "queued-foreground" {
+				driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+				driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+			}
+			client := reviewControllerClient(t, server)
+			sticky := StickyAttachmentState{VolumeID: "volume-test", NodeID: "node-old", Backend: "local", PVCNamespace: pvc.Namespace, PVCName: pvc.Name, StartedAt: time.Now().Add(-2 * time.Minute), ExpiresAt: time.Now().Add(time.Minute), GraceSeconds: 60}
+			switch mode {
+			case "sticky-expiry":
+				sticky.ExpiresAt = time.Now().Add(-time.Minute)
+				require.NoError(t, driver.stickyAttachments.StartGrace(sticky))
+				server.expireStickyDetach(ctx, sticky)
+			case "sticky-transfer":
+				require.NoError(t, driver.stickyAttachments.StartGrace(sticky))
+				reply, err := client.ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-new"))
+				require.Nil(t, reply)
+				require.Equal(t, codes.Unavailable, status.Code(err))
+			default:
+				reply, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: "node-old"})
+				if mode == "explicit-manual" {
+					require.NoError(t, err)
+					require.NotNil(t, reply)
+				} else {
+					require.Nil(t, reply)
+					require.Equal(t, codes.Unavailable, status.Code(err))
+					if mode == "foreground" || mode == "queued-foreground" {
+						require.Equal(t, "detach disk identity or completed capacity is unverified", status.Convert(err).Message())
+					} else {
+						require.Equal(t, "provider attachment backend is unverified", status.Convert(err).Message())
+					}
+				}
+			}
+			history, _ := driver.volumeHistory.Get("volume-test")
+			require.Equal(t, mode != "explicit-manual", history.LastSafeDetachTime.IsZero())
+			_, held := driver.stickyAttachments.Get("volume-test")
+			require.Equal(t, strings.HasPrefix(mode, "sticky-"), held)
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			require.Zero(t, state.detachAttempts)
+			require.Empty(t, state.mutations)
+			require.Contains(t, state.disks, 41)
+		})
+	}
+}
+
+func TestCephReleasedPVRetainsAuthorityAcrossClaimRecreation(t *testing.T) {
+	for _, mode := range []string{"released", "unreadable", "old-node-in-use", "claim-references-old-pv", "missing-claim-with-pod"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			pv, replacement := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+			pv.Status.Phase = corev1.VolumeReleased
+			replacement.UID = "replacement-claim"
+			replacement.Spec.VolumeName = ""
+			replacement.Status.Phase = corev1.ClaimPending
+			replacement.Annotations[annotationRecoveryMode] = recoveryModeManual
+			if mode == "claim-references-old-pv" {
+				replacement.Spec.VolumeName = pv.Name
+			}
+			node := newReadyNode("node-old", true)
+			if mode == "old-node-in-use" {
+				node.Status.VolumesInUse = []corev1.UniqueVolumeName{"kubernetes.io/csi/" + DefaultDriverName + "^volume-test"}
+			}
+			driver := newStickyTestDriver(t, pv, replacement, node, activePodForPVC("replacement-pod", replacement.Name, node.Name))
+			_, err := driver.volumeHistory.Upsert(ctx, "volume-test", func(record *VolumeHistoryRecord) {
+				record.Backend = "ceph"
+				record.LastSuccessfulPublishTime = time.Now().UTC().Add(-time.Hour)
+				record.LastSuccessfulImageID = 7
+				record.LastSuccessfulNodeName = node.Name
+				record.LastSuccessfulNodeUID = string(node.UID)
+				record.LastSuccessfulOpenNebulaVMID = 41
+			})
+			require.NoError(t, err)
+			kube := driver.kubeRuntime.client.(*fake.Clientset)
+			if mode == "missing-claim-with-pod" {
+				require.NoError(t, kube.CoreV1().PersistentVolumeClaims(replacement.Namespace).Delete(ctx, replacement.Name, metav1.DeleteOptions{}))
+				kube.ClearActions()
+			}
+			if mode == "unreadable" {
+				kube.PrependReactor("get", "persistentvolumeclaims", func(ktesting.Action) (bool, kruntime.Object, error) {
+					return true, nil, errors.New("replacement claim observation unavailable")
+				})
+			}
+			provider, state := nodeAttachmentProvider(t)
+			state.mu.Lock()
+			state.ceph = true
+			state.mu.Unlock()
+			r := NewAttachmentReconciler(NewControllerServer(driver, provider, nil))
+			r.orphanGrace = time.Nanosecond
+			require.NoError(t, r.ReconcileOnce(ctx))
+			require.NoError(t, r.ReconcileOnce(ctx))
+			events, err := kube.CoreV1().Events(replacement.Namespace).List(ctx, metav1.ListOptions{})
+			require.NoError(t, err)
+			require.Empty(t, events.Items)
+			for _, action := range kube.Actions() {
+				if action.GetResource().Resource == "persistentvolumeclaims" || action.GetResource().Resource == "pods" {
+					require.Contains(t, []string{"get", "list"}, action.GetVerb())
+				}
+			}
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			if mode == "released" {
+				require.Equal(t, []string{"detach:41"}, state.mutations)
+				require.NotContains(t, state.disks, 41)
+			} else {
+				require.Zero(t, state.detachAttempts)
+				require.Contains(t, state.disks, 41)
+			}
+		})
+	}
+}
+
+func TestProviderDetachPreservesParentCancellationDuringPollAndRetry(t *testing.T) {
+	for _, phase := range []string{"poll", "retry"} {
+		t.Run(phase, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var detachStarted atomic.Bool
+			provider, protocol := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+				if method == "one.vm.detach" {
+					detachStarted.Store(true)
+				}
+				if phase == "poll" && method == "one.vm.info" && detachStarted.Load() {
+					cancel()
+				}
+			})
+			protocol.mu.Lock()
+			protocol.rejectFirstDetach = true
+			protocol.mu.Unlock()
+			authorizations := 0
+			accepted, err := provider.DetachVolumeWithAuthority(ctx, "volume-test", "node-old", "", nil, func(attempt context.Context, _, _, _ int) error {
+				authorizations++
+				if phase == "retry" && authorizations == 2 {
+					cancel()
+					<-attempt.Done()
+				}
+				return nil
+			})
+			require.ErrorIs(t, err, context.Canceled)
+			var timeout *opennebula.HotplugTimeoutError
+			require.False(t, errors.As(err, &timeout))
+			require.False(t, accepted)
+			require.True(t, detachStarted.Load())
+			protocol.mu.Lock()
+			defer protocol.mu.Unlock()
+			require.Equal(t, 1, protocol.detachAttempts)
+			require.Empty(t, protocol.mutations)
+		})
+	}
+}
+
+func TestControllerUnpublishCancellationDoesNotPauseHost(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
+	driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+	driver.PluginConfig.OverrideVal(config.NodeHotplugGuardFailureThresholdVar, 1)
+	var detachStarted atomic.Bool
+	provider, protocol := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+		if method == "one.vm.detach" {
+			detachStarted.Store(true)
+		}
+		if method == "one.vm.info" && detachStarted.Load() {
+			cancel()
+		}
+	})
+	protocol.mu.Lock()
+	protocol.rejectFirstDetach = true
+	protocol.mu.Unlock()
+	server := NewControllerServer(driver, provider, nil)
+	reply, err := server.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: "node-old"})
+	require.Equal(t, codes.Canceled, status.Code(err))
+	require.Nil(t, reply)
+	require.True(t, detachStarted.Load())
+	require.Empty(t, driver.hotplugGuard.Snapshot())
+	history, _ := driver.volumeHistory.Get("volume-test")
+	require.True(t, history.LastSafeDetachTime.IsZero())
+	protocol.mu.Lock()
+	defer protocol.mu.Unlock()
+	require.Equal(t, 1, protocol.detachAttempts)
+	require.Empty(t, protocol.mutations)
 }

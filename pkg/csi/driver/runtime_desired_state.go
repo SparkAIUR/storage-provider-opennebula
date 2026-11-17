@@ -21,6 +21,7 @@ type KubernetesNodeIdentity struct {
 	Exists        bool
 	Ready         bool
 	Unschedulable bool
+	Deleting      bool
 }
 
 type VolumeDesiredState struct {
@@ -69,6 +70,7 @@ func (r *KubeRuntime) NodeIdentity(ctx context.Context, nodeName string) (Kubern
 		UID:           string(node.UID),
 		Exists:        true,
 		Unschedulable: node.Spec.Unschedulable,
+		Deleting:      node.DeletionTimestamp != nil,
 	}
 	for _, condition := range node.Status.Conditions {
 		if condition.Type == corev1.NodeReady {

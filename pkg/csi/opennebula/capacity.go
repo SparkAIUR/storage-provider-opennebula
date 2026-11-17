@@ -37,16 +37,11 @@ func (p *PersistentDiskVolumeProvider) completedDiskSize(ctx context.Context, vm
 	return completedDiskSizeFromVM(info, diskID, imageID)
 }
 
-// completedDiskSizeFromVM keeps completion checks on the same VM observation
-// as the identity checks made by read-only attachment inspectors.
 func completedDiskSizeFromVM(info *vm.VM, diskID, imageID int) (int64, error) {
 	var selected *shared.Disk
 	for _, disk := range info.Template.GetDisks() {
-		iid, present, err := diskImageReference(disk)
-		if err != nil {
-			return 0, err
-		}
-		if !present || iid != imageID {
+		iid, err := disk.GetI(shared.ImageID)
+		if err != nil || iid != imageID {
 			continue
 		}
 		did, e := disk.GetI(shared.DiskID)

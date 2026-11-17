@@ -185,6 +185,22 @@ func TestProviderGrowthCompatibilityUsesSelectedDiskForAdmission(t *testing.T) {
 	require.Zero(t, state.otherMutations.Load())
 }
 
+func TestProviderGrowthCompletionIgnoresUnrelatedBlankImageReference(t *testing.T) {
+	provider, state := growthCompatibilityFixture(t, "7.4.1", false, func(config *growthFixtureConfig) {
+		config.beforeObservation = func(method string) {
+			if method == "one.vm.diskresize" {
+				config.extraDisk = `<DISK><IMAGE_ID></IMAGE_ID><DISK_ID>3</DISK_ID></DISK>`
+			}
+		}
+	})
+	size, err := provider.ExpandVolume(context.Background(), "volume-test", 268_435_456, false)
+	require.NoError(t, err)
+	require.EqualValues(t, 268_435_456, size)
+	require.EqualValues(t, 1, state.resizeCalls.Load())
+	require.EqualValues(t, 1, state.metadataWrites.Load())
+	require.Zero(t, state.otherMutations.Load())
+}
+
 func TestProviderGrowthCompatibilityUnknownIdentity(t *testing.T) {
 	for _, tc := range []struct{ name, facts, persistence string }{
 		{"missing disk persistence", strings.ReplaceAll(persistentSystemDiskFacts, "<PERSISTENT>YES</PERSISTENT>", ""), "1"},
