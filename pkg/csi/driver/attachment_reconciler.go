@@ -200,10 +200,14 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 		users := activePVCUsers[pvcKey]
 		vas := vaByVolume[volumeHandle]
 		singleWriter := hasSingleWriterAccessMode(pv.Spec.AccessModes)
+		cephSingleWriter := singleWriter && isCephBackend(backend)
 		if singleWriter && len(observed) > 1 {
 			currentMultiAttach[volumeHandle] = struct{}{}
 			r.server.driver.metrics.RecordAttachmentReconciler("multi_attach", "warn", "observed")
 			r.recordPVCEventForVolume(ctx, volumeHandle, eventReasonStuckAttachmentMultiple, fmt.Sprintf("detected multiple attachments for single-writer volume %s", volumeHandle))
+			if cephSingleWriter {
+				continue
+			}
 		}
 
 		for _, attachment := range observed {
@@ -218,9 +222,9 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			if matchingVA != nil {
 				continue
 			}
-			remoteCephDemand := singleWriter && isCephBackend(backend) && len(observed) == 1 &&
+			remoteCephDemand := cephSingleWriter &&
 				!users[""] && !users[attachment.NodeName] && len(users) == 1
-			if users[""] || users[attachment.NodeName] || (singleWriter && len(users) > 0 && !remoteCephDemand) {
+			if len(users) > 0 && !remoteCephDemand {
 				continue
 			}
 			queueScope := ""
@@ -235,7 +239,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 				if !r.due(r.divergentSeen, key, now, r.orphanGrace) {
 					continue
 				}
-				if err := r.detachObservedAttachment(ctx, attachment, pv.UID, nodesByVM[attachment.NodeID].UID, hotplugQueuePriorityCritical); err != nil {
+				if err := r.detachObservedAttachment(ctx, attachment, pv.UID, nodesByVM[attachment.NodeID].UID, cephSingleWriter, hotplugQueuePriorityCritical); err != nil {
 					r.server.driver.metrics.RecordAttachmentReconciler("divergent_attachment", "detach", attachmentCleanupOutcome(err))
 					klog.V(2).InfoS("Failed to detach divergent attachment", "volume", volumeHandle, "node", attachment.NodeName, "err", err)
 				} else {
@@ -249,7 +253,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			if !r.due(r.orphanSeen, key, now, r.orphanGrace) {
 				continue
 			}
-			if err := r.detachObservedAttachment(ctx, attachment, pv.UID, nodesByVM[attachment.NodeID].UID, hotplugQueuePriorityBackground); err != nil {
+			if err := r.detachObservedAttachment(ctx, attachment, pv.UID, nodesByVM[attachment.NodeID].UID, cephSingleWriter, hotplugQueuePriorityBackground); err != nil {
 				r.server.driver.metrics.RecordAttachmentReconciler("orphan_attachment", "detach", attachmentCleanupOutcome(err))
 				klog.V(2).InfoS("Failed to detach orphan attachment", "volume", volumeHandle, "node", attachment.NodeName, "err", err)
 			} else {
@@ -459,7 +463,7 @@ func (r *AttachmentReconciler) skipVolume(ctx context.Context, volumeHandle, cle
 	return false
 }
 
-func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, attachment opennebula.ObservedAttachment, pvUID, nodeUID types.UID, priority HotplugQueuePriority) error {
+func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, attachment opennebula.ObservedAttachment, pvUID, nodeUID types.UID, cephSingleWriter bool, priority HotplugQueuePriority) error {
 	if pvUID == "" || nodeUID == "" {
 		return errAttachmentSkipped
 	}
@@ -506,7 +510,7 @@ func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, att
 		}
 		detachStarted := time.Now()
 		accepted, err := r.server.detachVolumeWithAuthority(queueCtx, attachment.VolumeHandle, attachment.NodeName,
-			physicalDetachIdentity{pvUID: pvUID, nodeUID: nodeUID, imageID: attachment.ImageID, vmID: attachment.NodeID, diskID: attachment.DiskID, background: true})
+			physicalDetachIdentity{pvUID: pvUID, nodeUID: nodeUID, imageID: attachment.ImageID, vmID: attachment.NodeID, diskID: attachment.DiskID, background: true, cephSingleWriter: cephSingleWriter})
 		if err != nil {
 			r.server.handleHotplugTimeout(queueCtx, attachment.NodeName, attachment.VolumeHandle, nil, "detach", observedAttachmentBackend(attachment), err)
 			return err

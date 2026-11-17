@@ -971,11 +971,11 @@ func addDiskParams(disk *shared.Disk, params map[string]string) {
 }
 
 func (p *PersistentDiskVolumeProvider) DetachVolume(ctx context.Context, volume, node string) error {
-	_, err := p.DetachVolumeWithAuthority(ctx, volume, node, nil)
+	_, err := p.DetachVolumeWithAuthority(ctx, volume, node, nil, nil)
 	return err
 }
 
-func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, authorize DetachAuthorization) (bool, error) {
+func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, verifyOwner, authorize DetachAuthorization) (bool, error) {
 	nodeID, err := p.NodeExists(ctx, node)
 	if err != nil || nodeID < 0 {
 		return false, detachEvidenceError(ctx, "detach VM identity is unavailable", err)
@@ -1009,6 +1009,10 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 		if err != nil || currentNode != nodeID {
 			return deny(detachEvidenceError(ctx, "detach VM identity changed", fmt.Errorf("expected VM %d, observed %d: %v", nodeID, currentNode, err)))
 		}
+		var ownershipErr error
+		if verifyOwner != nil {
+			ownershipErr = verifyOwner(ctx, volumeID, nodeID, diskID)
+		}
 		currentDisk, _, err := p.observeDetachDisk(ctx, volumeID, nodeID)
 		if errors.Is(err, ErrAttachmentNotFound) {
 			_, observedErr := p.GetVolumeInNode(ctx, volumeID, nodeID)
@@ -1022,6 +1026,9 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 		}
 		if currentDisk != diskID {
 			return deny(detachEvidenceError(ctx, "detach disk identity changed", fmt.Errorf("expected disk %d, observed %d", diskID, currentDisk)))
+		}
+		if ownershipErr != nil {
+			return deny(ownershipErr)
 		}
 		if authorize != nil {
 			if err := authorize(ctx, volumeID, nodeID, diskID); err != nil {
@@ -1844,6 +1851,7 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Conte
 			record := VolumeDiskRecord{
 				NodeName: vmInfo.Name,
 				NodeID:   vmInfo.ID,
+				DiskID:   -1,
 			}
 			if diskID, diskIDErr := disk.GetI(shared.DiskID); diskIDErr == nil {
 				record.DiskID = diskID

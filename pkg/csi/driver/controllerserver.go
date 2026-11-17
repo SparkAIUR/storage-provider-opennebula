@@ -2707,6 +2707,9 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 
 		detachStarted := time.Now()
 		if _, err := s.detachVolumeWithAuthority(queueCtx, confirmed.VolumeID, confirmed.NodeID, physicalDetachIdentity{imageID: volumeID, vmID: nodeID, diskID: -1}); err != nil {
+			if status.Code(err) != codes.Unknown {
+				return err
+			}
 			if driftErr := s.detachMetadataDriftError(queueCtx, confirmed.VolumeID, confirmed.NodeID, err); driftErr != nil {
 				klog.V(2).InfoS("Classified sticky detach failure as OpenNebula metadata drift", "volumeID", confirmed.VolumeID, "nodeID", confirmed.NodeID, "err", driftErr)
 				return driftErr

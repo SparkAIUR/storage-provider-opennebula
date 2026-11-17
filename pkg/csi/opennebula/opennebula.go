@@ -125,7 +125,7 @@ func (m VolumeAttachmentMetadata) ConflictingOwnerVMIDs() []int {
 type DetachAuthorization func(ctx context.Context, imageID, vmID, diskID int) error
 
 type AuthorizedVolumeDetacher interface {
-	DetachVolumeWithAuthority(ctx context.Context, volume, node string, authorize DetachAuthorization) (accepted bool, err error)
+	DetachVolumeWithAuthority(ctx context.Context, volume, node string, verifyOwner, authorize DetachAuthorization) (accepted bool, err error)
 }
 
 type VolumeAttachmentInspector interface {

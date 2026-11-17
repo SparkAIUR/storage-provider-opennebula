@@ -46,7 +46,12 @@ func (p *cleanupReadbackProvider) GetVolumeInNode(context.Context, int, int) (st
 	return "vdb", nil
 }
 
-func (p *cleanupReadbackProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, authorize opennebula.DetachAuthorization) (bool, error) {
+func (p *cleanupReadbackProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, verifyOwner, authorize opennebula.DetachAuthorization) (bool, error) {
+	if verifyOwner != nil {
+		if err := verifyOwner(ctx, p.imageID, p.vmID, p.diskID); err != nil {
+			return false, err
+		}
+	}
 	if p.beforeAuthorize != nil {
 		p.beforeAuthorize()
 	}
@@ -211,6 +216,7 @@ func TestCephRestartCleanupReleaseGuards(t *testing.T) {
 				base.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{{VolumeHandle: cephRestartVolume, ImageID: 3137, NodeName: "node-a", NodeID: 575, DiskID: 1, Backend: "ceph"}}, opennebula.VMNameInventory{"node-a": {575}}, nil)
 				base.On("VolumeExists", mock.Anything, cephRestartVolume).Return(3137, 1024*1024*1024, nil)
 				base.On("NodeExists", mock.Anything, "node-a").Return(575, nil)
+				base.On("InspectVolumeAttachment", mock.Anything, cephRestartVolume, "node-a").Return(cephRestartOwnerMetadata(), nil).Maybe()
 				if mode == "released" || mode == "claim-removed" || mode == "terminal-released" || mode == "readback-unknown" || mode == "readback-attached" {
 					base.On("DetachVolume", mock.Anything, cephRestartVolume, "node-a").Run(func(mock.Arguments) {
 						if mode == "released" || mode == "claim-removed" || mode == "terminal-released" {
@@ -546,6 +552,37 @@ func enableObserveOnConfigMapRead(t *testing.T, client *fake.Clientset, pvc *cor
 		}
 		return false, nil, nil
 	})
+}
+
+func TestControllerUnpublishCephRechecksDemandAfterProtectionReads(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(fmt.Sprint(queued), func(t *testing.T) {
+			f := newCephRestartTestFixture(t, queued)
+			client := f.server.driver.kubeRuntime.client.(*fake.Clientset)
+			f.provider.observe = func(context.Context) (*opennebula.SameNodeRetentionEvidence, error) {
+				if f.provider.inspections.Load() == 2 {
+					fired := false
+					client.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+						if !fired && action.(ktesting.GetAction).GetName() == hostArtifactStateConfigMapName {
+							fired = true
+							pod := activePodForPVC("late-remote-consumer", f.pvc.Name, "node-b")
+							pod.UID = "late-remote-pod"
+							err := client.Tracker().Create(corev1.SchemeGroupVersion.WithResource("pods"), pod, pod.Namespace)
+							require.NoError(t, err)
+						}
+						return false, nil, nil
+					})
+				}
+				return validCephRetentionTestEvidence(), nil
+			}
+			response, err := f.unpublish(t)
+			require.Equal(t, codes.Unavailable, status.Code(err))
+			require.Nil(t, response)
+			history, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
+			require.True(t, history.LastSafeDetachTime.IsZero())
+			f.requireNoProviderMutation(t)
+		})
+	}
 }
 
 func TestControllerUnpublishCephDeniesObserveDuringFinalRead(t *testing.T) {

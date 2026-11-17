@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -520,14 +521,157 @@ func TestCephRestartCleanupUsesVerifiedVMMapping(t *testing.T) {
 	}
 }
 
+type detachCensusProbe struct {
+	*opennebula.PersistentDiskVolumeProvider
+	inDetach, inCensus atomic.Bool
+	beforeDetach       func()
+}
+
+func (p *detachCensusProbe) InspectVolumeAttachment(ctx context.Context, volume, node string) (*opennebula.VolumeAttachmentMetadata, error) {
+	p.inCensus.Store(true)
+	defer p.inCensus.Store(false)
+	return p.PersistentDiskVolumeProvider.InspectVolumeAttachment(ctx, volume, node)
+}
+
+func (p *detachCensusProbe) DetachVolumeWithAuthority(ctx context.Context, volume, node string, verifyOwner, authorize opennebula.DetachAuthorization) (bool, error) {
+	if p.beforeDetach != nil {
+		p.beforeDetach()
+	}
+	p.inDetach.Store(true)
+	defer p.inDetach.Store(false)
+	return p.PersistentDiskVolumeProvider.DetachVolumeWithAuthority(ctx, volume, node, verifyOwner, authorize)
+}
+
+func TestCephBackgroundDetachUsesFreshSoleOwnerAndRelease(t *testing.T) {
+	for _, mode := range []string{"remote-released", "late-pod", "resize", "retry-resize", "parked-contradictory", "demand-disappeared"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+			node := newReadyNode("node-old", true)
+			driver := newStickyTestDriver(t, pv, pvc, node, newReadyNode("node-new", true))
+			_, err := driver.volumeHistory.Upsert(ctx, "volume-test", func(record *VolumeHistoryRecord) {
+				record.Backend = "ceph"
+				record.LastSuccessfulPublishTime = time.Now().UTC().Add(-time.Hour)
+				record.LastSuccessfulImageID = 7
+				record.LastSuccessfulNodeName = node.Name
+				record.LastSuccessfulNodeUID = string(node.UID)
+				record.LastSuccessfulOpenNebulaVMID = 41
+			})
+			require.NoError(t, err)
+			pods := driver.kubeRuntime.client.CoreV1().Pods(pvc.Namespace)
+			if mode != "parked-contradictory" {
+				_, err := pods.Create(ctx, activePodForPVC("remote-consumer", pvc.Name, "node-new"), metav1.CreateOptions{})
+				require.NoError(t, err)
+			}
+
+			var probe *detachCensusProbe
+			var protocol *nodeAttachmentProtocol
+			var censusImageRead, injected atomic.Bool
+			provider, state := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+				if !probe.inDetach.Load() || !probe.inCensus.Load() {
+					return
+				}
+				if method == "one.image.info" {
+					censusImageRead.Store(true)
+				}
+				if method != "one.vmpool.info" || !censusImageRead.Swap(false) {
+					return
+				}
+				protocol.mu.Lock()
+				defer protocol.mu.Unlock()
+				switch {
+				case mode == "late-pod" && injected.CompareAndSwap(false, true):
+					_, err := pods.Create(ctx, activePodForPVC("late-consumer", pvc.Name, "node-old"), metav1.CreateOptions{})
+					require.NoError(t, err)
+				case mode == "resize" || (mode == "retry-resize" && protocol.detachAttempts == 1):
+					injected.Store(true)
+					protocol.pending = true
+				}
+			})
+			protocol = state
+			probe = &detachCensusProbe{PersistentDiskVolumeProvider: provider}
+			if mode == "demand-disappeared" {
+				probe.beforeDetach = func() {
+					require.NoError(t, pods.Delete(ctx, "remote-consumer", metav1.DeleteOptions{}))
+					state.mu.Lock()
+					defer state.mu.Unlock()
+					state.claimNew = true
+				}
+			}
+			state.mu.Lock()
+			state.rejectFirstDetach = mode == "retry-resize"
+			state.claimNew = mode == "parked-contradictory"
+			state.mu.Unlock()
+
+			r := NewAttachmentReconciler(NewControllerServer(driver, probe, nil))
+			r.orphanGrace = time.Nanosecond
+			require.NoError(t, r.ReconcileOnce(ctx))
+			require.Len(t, r.orphanSeen, 1)
+			require.NoError(t, r.ReconcileOnce(ctx))
+			events, err := driver.kubeRuntime.client.CoreV1().Events(pvc.Namespace).List(ctx, metav1.ListOptions{})
+			require.NoError(t, err)
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			if mode == "remote-released" {
+				require.Equal(t, []string{"detach:41"}, state.mutations)
+				require.Len(t, events.Items, 1)
+				require.Equal(t, eventReasonStuckAttachmentDetached, events.Items[0].Reason)
+				return
+			}
+			require.Empty(t, state.mutations)
+			require.Contains(t, state.disks, 41)
+			require.Empty(t, events.Items)
+			switch mode {
+			case "late-pod", "resize":
+				require.True(t, injected.Load())
+				require.Zero(t, state.detachAttempts)
+			case "retry-resize":
+				require.True(t, injected.Load())
+				require.Equal(t, 1, state.detachAttempts)
+			default:
+				require.Zero(t, state.detachAttempts)
+			}
+		})
+	}
+}
+
+func TestBackgroundDetachLeavesNonCephRemoteReadersAttached(t *testing.T) {
+	for _, divergent := range []bool{false, true} {
+		t.Run(fmt.Sprint(divergent), func(t *testing.T) {
+			ctx := context.Background()
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany}, nil)
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true), newReadyNode("node-new", true), activePodForPVC("reader", pvc.Name, "node-new"))
+			if divergent {
+				_, err := driver.kubeRuntime.client.StorageV1().VolumeAttachments().Create(ctx, &storagev1.VolumeAttachment{
+					ObjectMeta: metav1.ObjectMeta{Name: "reader-attachment", UID: "reader-va"},
+					Spec: storagev1.VolumeAttachmentSpec{Attacher: DefaultDriverName, NodeName: "node-new",
+						Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name}},
+				}, metav1.CreateOptions{})
+				require.NoError(t, err)
+			}
+			provider, state := nodeAttachmentProvider(t)
+			r := NewAttachmentReconciler(NewControllerServer(driver, provider, nil))
+			r.orphanGrace = time.Nanosecond
+			require.NoError(t, r.ReconcileOnce(ctx))
+			require.NoError(t, r.ReconcileOnce(ctx))
+			require.Empty(t, r.orphanSeen)
+			require.Empty(t, r.divergentSeen)
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			require.Zero(t, state.detachAttempts)
+			require.Contains(t, state.disks, 41)
+		})
+	}
+}
+
 type disappearingDetachProvider struct {
 	*opennebula.PersistentDiskVolumeProvider
 	disappear func()
 }
 
-func (p disappearingDetachProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, authorize opennebula.DetachAuthorization) (bool, error) {
+func (p disappearingDetachProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, verifyOwner, authorize opennebula.DetachAuthorization) (bool, error) {
 	p.disappear()
-	return p.PersistentDiskVolumeProvider.DetachVolumeWithAuthority(ctx, volume, node, authorize)
+	return p.PersistentDiskVolumeProvider.DetachVolumeWithAuthority(ctx, volume, node, verifyOwner, authorize)
 }
 
 func TestAttachmentReconcilerDistinguishesProviderNoOp(t *testing.T) {

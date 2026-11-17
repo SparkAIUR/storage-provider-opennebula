@@ -225,6 +225,28 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if backend, present := authority.AttachmentMetadata[annotationBackend]; present && !isCephBackend(backend) {
 		return nil, cephRetentionUnavailable("VolumeAttachment backend contradicts Ceph binding", nil)
 	}
+	currentRuntime := &VolumeRuntimeContext{PVName: pv.Name, PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVAnnotations: cloneStringMap(pv.Annotations), PVCAnnotations: cloneStringMap(pvc.Annotations), Backend: backend, AccessModes: append([]corev1.PersistentVolumeAccessMode(nil), pv.Spec.AccessModes...)}
+	control := resolvedRecoveryControlState(req.VolumeId, currentRuntime, VolumeRecoveryControlState{})
+	if control.Invalid || control.Active() {
+		return nil, status.Error(codes.FailedPrecondition, "Ceph same-node retention is blocked by active or invalid recovery controls")
+	}
+	history, err := s.readAttachmentHistory(ctx, req.VolumeId)
+	if err != nil {
+		return nil, cephRetentionUnavailable("volume history read failed", err)
+	}
+	if history.VolumeID != req.VolumeId || !cephHistoryHasObservedAuthority(history) {
+		return nil, cephRetentionUnavailable("observed volume history is unavailable", nil)
+	}
+	target := opennebula.HostArtifactAttachmentTarget{
+		NodeName: req.NodeId, VMID: nodeID, DiskID: diskID, ImageID: history.LastSuccessfulImageID,
+	}
+	if err := s.attachmentProtectionChecks(ctx, req.VolumeId, currentRuntime, target); err != nil {
+		return nil, err
+	}
+	authority.History = history
+	if err := s.recheckAttachmentAuthority(ctx, req.VolumeId, currentRuntime, target, pv, pvc); err != nil {
+		return nil, err
+	}
 	pods, err := runtime.client.CoreV1().Pods(pvc.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, cephRetentionUnavailable("current Pod demand lookup failed", err)
@@ -251,28 +273,6 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 		return nil, cephRetentionUnavailable("RWOP volume has multiple consumers", nil)
 	}
 	sort.Strings(authority.ConsumerUIDs)
-	currentRuntime := &VolumeRuntimeContext{PVName: pv.Name, PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVAnnotations: cloneStringMap(pv.Annotations), PVCAnnotations: cloneStringMap(pvc.Annotations), Backend: backend, AccessModes: append([]corev1.PersistentVolumeAccessMode(nil), pv.Spec.AccessModes...)}
-	control := resolvedRecoveryControlState(req.VolumeId, currentRuntime, VolumeRecoveryControlState{})
-	if control.Invalid || control.Active() {
-		return nil, status.Error(codes.FailedPrecondition, "Ceph same-node retention is blocked by active or invalid recovery controls")
-	}
-	history, err := s.readAttachmentHistory(ctx, req.VolumeId)
-	if err != nil {
-		return nil, cephRetentionUnavailable("volume history read failed", err)
-	}
-	if history.VolumeID != req.VolumeId || !cephHistoryHasObservedAuthority(history) {
-		return nil, cephRetentionUnavailable("observed volume history is unavailable", nil)
-	}
-	target := opennebula.HostArtifactAttachmentTarget{
-		NodeName: req.NodeId, VMID: nodeID, DiskID: diskID, ImageID: history.LastSuccessfulImageID,
-	}
-	if err := s.attachmentProtectionChecks(ctx, req.VolumeId, currentRuntime, target); err != nil {
-		return nil, err
-	}
-	authority.History = history
-	if err := s.recheckAttachmentAuthority(ctx, req.VolumeId, currentRuntime, target, pv, pvc); err != nil {
-		return nil, err
-	}
 	return authority, nil
 }
 
@@ -403,10 +403,12 @@ func verifiedAttachmentBackend(annotation, attribute string) (string, error) {
 		return "", fmt.Errorf("persistent volume backend assertions disagree")
 	}
 	backend := firstNonEmpty(annotation, attribute)
-	if backend == "" {
+	switch backend {
+	case "ceph", "cephfs", "local", "nfs":
+		return backend, nil
+	default:
 		return "", fmt.Errorf("persistent volume backend is unknown")
 	}
-	return backend, nil
 }
 
 func persistentVolumeBackend(pv *corev1.PersistentVolume) (string, error) {

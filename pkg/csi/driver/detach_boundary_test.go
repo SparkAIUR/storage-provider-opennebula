@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestProviderDetachRequiresDurableCompletedCapacity(t *testing.T) {
@@ -113,6 +114,37 @@ func TestControllerLegacyDetachBoundaries(t *testing.T) {
 			require.Zero(t, state.marker)
 		})
 	}
+}
+
+func TestStickyExpiryDoesNotQuarantineDetachAuthorityDenial(t *testing.T) {
+	ctx := context.Background()
+	pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	node := newReadyNode("node-old", true)
+	node.Status.VolumesInUse = []corev1.UniqueVolumeName{"kubernetes.io/csi/" + DefaultDriverName + "^volume-test"}
+	driver := newStickyTestDriver(t, pv, pvc, node)
+	driver.PluginConfig.OverrideVal(config.MetadataDriftQuarantineEnabledVar, true)
+	driver.PluginConfig.OverrideVal(config.MetadataDriftQuarantineFailureThresholdVar, 1)
+	state := StickyAttachmentState{
+		VolumeID: "volume-test", NodeID: node.Name, Backend: "local", PVCName: pvc.Name, PVCNamespace: pvc.Namespace,
+		StartedAt: time.Now().Add(-2 * time.Minute), ExpiresAt: time.Now().Add(-time.Minute), GraceSeconds: 60,
+	}
+	require.NoError(t, driver.stickyAttachments.StartGrace(state))
+	provider, protocol := nodeAttachmentProvider(t)
+	controller := NewControllerServer(driver, provider, nil)
+	controller.expireStickyDetach(ctx, state)
+
+	_, quarantined := controller.activeVolumeQuarantine(ctx, "volume-test")
+	require.False(t, quarantined)
+	_, held := driver.stickyAttachments.Get("volume-test")
+	require.True(t, held)
+	require.True(t, driver.volumeHistory.Snapshot()["volume-test"].LastSafeDetachTime.IsZero())
+	events, err := driver.kubeRuntime.client.CoreV1().Events(pvc.Namespace).List(ctx, metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Empty(t, events.Items)
+	protocol.mu.Lock()
+	defer protocol.mu.Unlock()
+	require.Zero(t, protocol.detachAttempts)
+	require.Contains(t, protocol.disks, 41)
 }
 
 func TestProviderDetachRejectsContradictoryNoDiskReread(t *testing.T) {

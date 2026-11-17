@@ -47,7 +47,12 @@ func (p *cephRetentionTestProvider) GetVolumeInNode(ctx context.Context, imageID
 	return p.MockOpenNebulaVolumeProviderTestify.GetVolumeInNode(ctx, imageID, nodeID)
 }
 
-func (p *cephRetentionTestProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, authorize opennebula.DetachAuthorization) (bool, error) {
+func (p *cephRetentionTestProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, verifyOwner, authorize opennebula.DetachAuthorization) (bool, error) {
+	if verifyOwner != nil {
+		if err := verifyOwner(ctx, 3137, 575, 1); err != nil {
+			return false, err
+		}
+	}
 	if err := authorize(ctx, 3137, 575, 1); err != nil {
 		return false, err
 	}
@@ -499,12 +504,15 @@ func TestControllerUnpublishCephPreservesExplicitManualRecovery(t *testing.T) {
 
 func TestCephLegacyStaticUnpublishRequiresBackendEvidence(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, attribute := range []string{"", "local"} {
-			t.Run(fmt.Sprintf("queued=%v/attribute=%s", queued, attribute), func(t *testing.T) {
+		for _, evidence := range []struct{ annotation, attribute string }{{}, {attribute: "local"}, {annotation: "cehp"}, {attribute: "cehp"}, {annotation: "unknown", attribute: "unknown"}} {
+			t.Run(fmt.Sprintf("queued=%v/%s/%s", queued, evidence.annotation, evidence.attribute), func(t *testing.T) {
 				f := newCephRestartTestFixture(t, queued)
 				delete(f.pv.Annotations, annotationBackend)
-				if attribute != "" {
-					f.pv.Spec.CSI.VolumeAttributes = map[string]string{annotationBackend: attribute}
+				if evidence.annotation != "" {
+					f.pv.Annotations[annotationBackend] = evidence.annotation
+				}
+				if evidence.attribute != "" {
+					f.pv.Spec.CSI.VolumeAttributes = map[string]string{annotationBackend: evidence.attribute}
 				}
 				f.syncObjects(t)
 				_, err := f.server.driver.volumeHistory.Upsert(context.Background(), cephRestartVolume, func(record *VolumeHistoryRecord) {
@@ -522,6 +530,14 @@ func TestCephLegacyStaticUnpublishRequiresBackendEvidence(t *testing.T) {
 				f.requireNoProviderMutation(t)
 			})
 		}
+	}
+}
+
+func cephRestartOwnerMetadata() *opennebula.VolumeAttachmentMetadata {
+	return &opennebula.VolumeAttachmentMetadata{
+		VolumeHandle: cephRestartVolume, ImageID: 3137, ImageName: cephRestartVolume, RequestedNode: "node-a", RequestedNodeID: 575,
+		ImageRunningVMs: 1, ImageVMIDs: []int{575}, AttachedToRequestedNode: true,
+		DiskRecords: []opennebula.VolumeDiskRecord{{NodeID: 575, DiskID: 1, Target: "vdb"}},
 	}
 }
 
@@ -572,17 +588,11 @@ func TestCephRetentionSurvivesControllerRestartAndOrphanCleanup(t *testing.T) {
 				if detachAllowed {
 					base.On("DetachVolume", mock.Anything, cephRestartVolume, "node-a").Run(func(mock.Arguments) { physical.attached = false }).Return(nil).Once()
 				}
-				if demand != "none" {
-					metadata := &opennebula.VolumeAttachmentMetadata{
-						ImageID: 3137, ImageName: cephRestartVolume, RequestedNodeID: 575,
-						ImageRunningVMs: 1, ImageVMIDs: []int{575}, AttachedToRequestedNode: true,
-						DiskRecords: []opennebula.VolumeDiskRecord{{NodeID: 575, DiskID: 1}},
-					}
-					if demand == "remote-multiple-owners" {
-						metadata.DiskRecords = append(metadata.DiskRecords, opennebula.VolumeDiskRecord{NodeID: 576, DiskID: 1})
-					}
-					base.On("InspectVolumeAttachment", mock.Anything, cephRestartVolume, "node-a").Return(metadata, nil).Maybe()
+				metadata := cephRestartOwnerMetadata()
+				if demand == "remote-multiple-owners" {
+					metadata.DiskRecords = append(metadata.DiskRecords, opennebula.VolumeDiskRecord{NodeID: 576, DiskID: 1})
 				}
+				base.On("InspectVolumeAttachment", mock.Anything, cephRestartVolume, "node-a").Return(metadata, nil).Maybe()
 				server := NewControllerServer(driver, physical, nil)
 				if queued {
 					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
@@ -593,25 +603,46 @@ func TestCephRetentionSurvivesControllerRestartAndOrphanCleanup(t *testing.T) {
 						return server.validateHotplugQueueRequest(ctx, node, operation, volume)
 					})
 					if demand != "none" {
-						ctx, cancel := context.WithCancel(context.Background())
+						blockerCtx, cancelBlocker := context.WithCancel(context.Background())
+						publishCtx, cancelPublish := context.WithCancel(context.Background())
 						blocked := make(chan struct{})
 						blockerDone, publishDone := make(chan error, 1), make(chan error, 1)
 						go func() {
-							blockerDone <- driver.hotplugQueue.Run(ctx, "node-b", "test", "other-volume", hotplugQueuePriorityNormal, func(ctx context.Context) error {
+							blockerDone <- driver.hotplugQueue.Run(blockerCtx, "node-b", "test", "other-volume", hotplugQueuePriorityNormal, func(ctx context.Context) error {
 								close(blocked)
 								<-ctx.Done()
 								return ctx.Err()
 							})
 						}()
-						t.Cleanup(func() { cancel(); <-blockerDone; <-publishDone })
+						t.Cleanup(func() {
+							cancelPublish()
+							defer cancelBlocker()
+							select {
+							case err := <-publishDone:
+								var canceledWait *HotplugQueueTimeoutError
+								if !errors.Is(err, context.Canceled) {
+									require.ErrorAs(t, err, &canceledWait)
+									require.Equal(t, cephRestartVolume, canceledWait.Volume)
+								}
+							case <-time.After(time.Second):
+								t.Error("pending Publish did not exit after cancellation")
+							}
+							cancelBlocker()
+							select {
+							case err := <-blockerDone:
+								require.ErrorIs(t, err, context.Canceled)
+							case <-time.After(time.Second):
+								t.Error("active queue blocker did not exit after cancellation")
+							}
+						})
 						go func() {
 							select {
 							case <-blocked:
-							case <-ctx.Done():
-								publishDone <- ctx.Err()
+							case <-publishCtx.Done():
+								publishDone <- publishCtx.Err()
 								return
 							}
-							publishDone <- server.withQueuedHotplug(ctx, "node-b", "attach", cephRestartVolume, hotplugQueuePriorityNormal, func(context.Context) error {
+							publishDone <- server.withQueuedHotplug(publishCtx, "node-b", "attach", cephRestartVolume, hotplugQueuePriorityNormal, func(context.Context) error {
 								return fmt.Errorf("pending Publish ran before the destination queue was released")
 							})
 						}()
