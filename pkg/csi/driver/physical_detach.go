@@ -39,7 +39,10 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		return attachmentEvidenceUnavailable("cannot verify owned PV identity for detach", err)
 	}
 	runtimeCtx.PVAnnotations = pv.Annotations
-	runtimeCtx.Backend = strings.TrimSpace(pv.Annotations[annotationBackend])
+	runtimeCtx.Backend, err = persistentVolumeBackend(pv)
+	if err != nil {
+		return attachmentEvidenceUnavailable("cannot verify detach backend", err)
+	}
 	if identity.ceph && !isCephBackend(runtimeCtx.Backend) {
 		return status.Error(codes.Unavailable, "Ceph backend changed before detach")
 	}
@@ -93,9 +96,10 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if control.Invalid || control.Active() {
 		return status.Error(codes.FailedPrecondition, "physical detach is blocked by recovery controls")
 	}
-	if err := s.attachmentProtectionChecks(ctx, volume, runtimeCtx, opennebula.HostArtifactAttachmentTarget{
+	target := opennebula.HostArtifactAttachmentTarget{
 		NodeName: nodeName, VMID: identity.vmID, ImageID: identity.imageID, DiskID: identity.diskID,
-	}); err != nil {
+	}
+	if err := s.attachmentProtectionChecks(ctx, volume, runtimeCtx, target); err != nil {
 		return err
 	}
 	desired, err := runtime.DesiredNodeForVolume(ctx, volume)
@@ -147,7 +151,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			}
 		}
 	}
-	return s.recheckAttachmentBinding(ctx, pv, pvc)
+	return s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc)
 }
 
 func terminalPodMayBeReleased(pod *corev1.Pod) bool {
@@ -155,7 +159,10 @@ func terminalPodMayBeReleased(pod *corev1.Pod) bool {
 		(pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed)
 }
 
-func (s *ControllerServer) recheckAttachmentBinding(ctx context.Context, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim) error {
+func (s *ControllerServer) recheckAttachmentAuthority(ctx context.Context, volume string, runtimeCtx *VolumeRuntimeContext, target opennebula.HostArtifactAttachmentTarget, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim) error {
+	if err := s.attachmentProtectionChecks(ctx, volume, runtimeCtx, target); err != nil {
+		return err
+	}
 	client := s.driver.kubeRuntime.client.CoreV1()
 	currentPV, err := client.PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
 	if err != nil || currentPV.UID != pv.UID || !reflect.DeepEqual(currentPV.Spec, pv.Spec) ||

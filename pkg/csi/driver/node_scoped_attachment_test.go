@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +17,8 @@ import (
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -28,6 +31,7 @@ type nodeAttachmentProtocol struct {
 	ignoreMarkerWrite bool
 	mu                sync.Mutex
 	disks             map[int]int
+	vmNames           map[int]string
 	marker            int64
 	mutations         []string
 	failMethod        string
@@ -67,6 +71,9 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 			name := "node-old"
 			if id == 42 {
 				name = "node-new"
+			}
+			if override := state.vmNames[id]; override != "" {
+				name = override
 			}
 			disk := ""
 			if size, ok := state.disks[id]; ok && (!direct || !state.hideDiskInfo) {
@@ -123,7 +130,7 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				require.Equal(t, 2, number(2))
 				state.detachAttempts++
 				if state.rejectFirstDetach && state.detachAttempts == 1 {
-					ok, body, code = 0, "wrong state HOTPLUG", 0x800
+					ok, body, code = 0, "wrong state HOTPLUG: provider-private-disk-detail", 0x800
 					break
 				}
 				delete(state.disks, id)
@@ -290,7 +297,7 @@ func TestProviderRequestedVMCapacityWaitsForCompletion(t *testing.T) {
 }
 
 func TestControllerDetachRechecksReleaseAtProviderAttempt(t *testing.T) {
-	for _, mode := range []string{"first-attempt", "retry", "late-observe", "released-retry", "remote-readers"} {
+	for _, mode := range []string{"first-attempt", "retry", "late-observe", "late-repair-first", "late-repair-retry", "released-retry", "remote-readers"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			accessMode := corev1.ReadWriteOnce
@@ -320,6 +327,11 @@ func TestControllerDetachRechecksReleaseAtProviderAttempt(t *testing.T) {
 					detachCalls++
 					inject = mode == "retry" && detachCalls == 1
 				}
+				if (mode == "late-repair-first" && method == "one.image.info" && imageReads == 6) ||
+					(mode == "late-repair-retry" && method == "one.vm.detach" && detachCalls == 1) {
+					persistProtectionAfterHostRead(t, driver.kubeRuntime.client.(*fake.Clientset), volumeRepairStateConfigMapName, "volume-test",
+						`{"version":1,"volumeID":"volume-test","classification":"wrong_device_identity","message":"provider-private-repair-detail"}`)
+				}
 				if inject {
 					_, err := driver.kubeRuntime.client.CoreV1().Pods(pvc.Namespace).Create(ctx,
 						activePodForPVC("late-consumer", pvc.Name, "node-old"), metav1.CreateOptions{})
@@ -327,7 +339,7 @@ func TestControllerDetachRechecksReleaseAtProviderAttempt(t *testing.T) {
 				}
 			})
 			state.mu.Lock()
-			state.rejectFirstDetach = mode == "retry" || mode == "released-retry"
+			state.rejectFirstDetach = mode == "retry" || mode == "released-retry" || mode == "late-repair-retry"
 			state.mu.Unlock()
 
 			client := reviewControllerClient(t, NewControllerServer(driver, provider, nil))
@@ -335,13 +347,27 @@ func TestControllerDetachRechecksReleaseAtProviderAttempt(t *testing.T) {
 			state.mu.Lock()
 			defer state.mu.Unlock()
 			switch mode {
-			case "first-attempt", "retry", "late-observe":
+			case "first-attempt", "retry", "late-observe", "late-repair-first", "late-repair-retry":
 				require.Error(t, err)
+				got := status.Convert(err)
+				switch mode {
+				case "late-repair-first", "late-repair-retry":
+					require.Equal(t, codes.FailedPrecondition, got.Code())
+					require.Equal(t, "volume repair is required before attachment changes", got.Message())
+				case "first-attempt", "retry":
+					require.Equal(t, codes.Unavailable, got.Code())
+					require.Equal(t, "a current Pod still references the volume on the detach node", got.Message())
+				}
+				events, listErr := driver.kubeRuntime.client.CoreV1().Events(pvc.Namespace).List(ctx, metav1.ListOptions{})
+				require.NoError(t, listErr)
+				for _, event := range events.Items {
+					require.NotContains(t, event.Message, "provider-private-")
+				}
 				require.Nil(t, resp)
 				require.Equal(t, 256, state.disks[41])
 				require.Empty(t, state.mutations)
 				want := 0
-				if mode == "retry" {
+				if mode == "retry" || mode == "late-repair-retry" {
 					want = 1
 				}
 				require.Equal(t, want, state.detachAttempts)
@@ -351,6 +377,72 @@ func TestControllerDetachRechecksReleaseAtProviderAttempt(t *testing.T) {
 				require.NotNil(t, resp)
 				require.NotContains(t, state.disks, 41)
 				require.Equal(t, []string{"detach:41"}, state.mutations)
+			}
+		})
+	}
+}
+
+func TestCephRestartCleanupUsesVerifiedVMMapping(t *testing.T) {
+	for _, mode := range []string{"exact", "mixed-case", "ambiguous", "unavailable", "dissent"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
+			for i := range 30 {
+				_, err := driver.kubeRuntime.client.CoreV1().Nodes().Create(ctx, newReadyNode(fmt.Sprintf("no-vm-%d", i), true), metav1.CreateOptions{})
+				require.NoError(t, err)
+			}
+			var poolReads atomic.Int32
+			var protocol *nodeAttachmentProtocol
+			provider, state := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+				if method == "one.vmpool.info" {
+					poolReads.Add(1)
+				}
+				if mode == "dissent" && method == "one.image.info" && poolReads.Load() == 2 {
+					protocol.mu.Lock()
+					protocol.vmNames[41], protocol.vmNames[42] = "other-vm", "node-old"
+					protocol.mu.Unlock()
+				}
+			})
+			protocol = state
+			state.mu.Lock()
+			state.vmNames = map[int]string{}
+			switch mode {
+			case "mixed-case", "dissent":
+				state.vmNames[41] = "NODE-OLD"
+			case "ambiguous":
+				state.vmNames[41], state.vmNames[42] = "NODE-OLD", "Node-Old"
+			case "unavailable":
+				state.failMethod = "one.vmpool.info"
+			}
+			state.mu.Unlock()
+			reconciler := NewAttachmentReconciler(NewControllerServer(driver, provider, nil))
+			reconciler.orphanGrace = time.Nanosecond
+			err := reconciler.ReconcileOnce(ctx)
+			require.EqualValues(t, 1, poolReads.Load())
+			switch mode {
+			case "unavailable":
+				require.Error(t, err)
+				require.Empty(t, reconciler.orphanSeen)
+			case "ambiguous":
+				require.NoError(t, err)
+				require.Empty(t, reconciler.orphanSeen)
+				require.NoError(t, reconciler.ReconcileOnce(ctx))
+				require.EqualValues(t, 2, poolReads.Load())
+			default:
+				require.NoError(t, err)
+				require.Len(t, reconciler.orphanSeen, 1)
+				require.NoError(t, reconciler.ReconcileOnce(ctx))
+			}
+
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			if mode == "exact" || mode == "mixed-case" {
+				require.Equal(t, []string{"detach:41"}, state.mutations)
+				require.NotContains(t, state.disks, 41)
+			} else {
+				require.Zero(t, state.detachAttempts)
+				require.Contains(t, state.disks, 41)
 			}
 		})
 	}

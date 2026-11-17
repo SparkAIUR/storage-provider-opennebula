@@ -234,7 +234,7 @@ type OpenNebulaVolumeProvider interface {
 	NodeExists(ctx context.Context, node string) (int, error)
 	GetVolumeInNode(ctx context.Context, volumeID int, nodeID int) (string, error)
 	VolumeReadyWithTimeout(ctx context.Context, volumeID int) (bool, error)
-	ListCurrentAttachments(ctx context.Context) ([]ObservedAttachment, error)
+	ListCurrentAttachments(ctx context.Context) ([]ObservedAttachment, VMNameInventory, error)
 }
 
 type SharedFilesystemProvider interface {

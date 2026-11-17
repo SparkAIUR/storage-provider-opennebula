@@ -54,7 +54,7 @@ func TestAttachmentReconcilerDetachesOrphanAttachment(t *testing.T) {
 		NodeName:     "node-a",
 		NodeID:       101,
 		Backend:      "local",
-	}}, nil).Once()
+	}}, opennebula.VMNameInventory{"node-a": {101}}, nil).Once()
 	mockProvider.On("NodeExists", mock.Anything, "node-a").Return(101, nil)
 
 	physical := &cleanupReadbackProvider{MockOpenNebulaVolumeProviderTestify: mockProvider, attached: true, imageID: 1, vmID: 101, diskID: 0}
@@ -91,7 +91,7 @@ func TestAttachmentReconcilerDeletesStaleVolumeAttachment(t *testing.T) {
 	mockProvider.On("VolumeExists", mock.Anything, "vol-1").Return(1, 1024, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-a").Return(101, nil)
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 101).Return("", opennebula.ErrAttachmentNotFound)
-	mockProvider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil).Once()
+	mockProvider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil, nil).Once()
 
 	server := NewControllerServer(driver, mockProvider, &MockSharedFilesystemProviderTestify{})
 	reconciler := NewAttachmentReconciler(server)
@@ -222,7 +222,7 @@ func TestAttachmentReconcilerSkipsSharedFilesystemVolumeAttachments(t *testing.T
 	}
 	driver := newAttachmentTestDriver(sharedPrefixPV, sharedPrefixPVC, metadataPV, metadataPVC, vaPrefixA, vaPrefixB, vaMetadata, pod)
 	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
-	mockProvider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil).Once()
+	mockProvider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil, nil).Once()
 
 	server := NewControllerServer(driver, mockProvider, &MockSharedFilesystemProviderTestify{})
 	reconciler := NewAttachmentReconciler(server)
@@ -283,7 +283,7 @@ func TestAttachmentReconcilerPrunesDeletedVolumeState(t *testing.T) {
 	}))
 
 	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
-	mockProvider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil).Once()
+	mockProvider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil, nil).Once()
 
 	server := NewControllerServer(driver, mockProvider, &MockSharedFilesystemProviderTestify{})
 	reconciler := NewAttachmentReconciler(server)

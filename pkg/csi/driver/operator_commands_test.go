@@ -303,3 +303,30 @@ func TestSupportBundleProjectsLiveMaintenanceAttachmentWithoutWrites(t *testing.
 	require.NoError(t, err)
 	require.Equal(t, pv.Annotations, current.Annotations)
 }
+
+func TestSupportBundlePreservesPodDemandWhenAttachmentListFails(t *testing.T) {
+	modes := []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+	pv, pvc := newLocalPVAndPVC("vol-active", modes, nil)
+	idlePV, idlePVC := newLocalPVAndPVC("vol-no-pod", modes, nil)
+	pod := activePodForPVC("consumer", pvc.Name, "node-a")
+	client := fake.NewSimpleClientset(pv, pvc, idlePV, idlePVC, pod)
+	attachmentLists := 0
+	client.PrependReactor("*", "*", func(action ktesting.Action) (bool, kruntime.Object, error) {
+		switch action.GetVerb() {
+		case "list", "get":
+			if action.GetResource().Resource == "volumeattachments" {
+				attachmentLists++
+				return true, nil, fmt.Errorf("collector may not list VolumeAttachments")
+			}
+			return false, nil, nil
+		default:
+			t.Errorf("diagnostic collection attempted %s %s", action.GetVerb(), action.GetResource().Resource)
+			return true, nil, fmt.Errorf("diagnostics must be read-only")
+		}
+	})
+	_, _, _, demand, _ := collectSupportBundleLocalRWOSnapshot(context.Background(), config.LoadConfiguration(), client, []corev1.PersistentVolume{*pv, *idlePV})
+	require.Equal(t, 1, attachmentLists)
+	require.Equal(t, "active_pod", demand["vol-active"].DemandSource)
+	require.Equal(t, "node-a", demand["vol-active"].NodeName)
+	require.NotContains(t, demand, "vol-no-pod")
+}

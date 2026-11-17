@@ -395,6 +395,22 @@ func (r *KubeRuntime) GetConfigMap(ctx context.Context, namespace, name string) 
 	return r.client.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
 }
 
+var errPersistentVolumeBackendConflict = fmt.Errorf("persistent volume backend assertions disagree")
+
+func persistentVolumeBackend(pv *corev1.PersistentVolume) (string, error) {
+	backend := strings.TrimSpace(pv.Annotations[annotationBackend])
+	if pv.Spec.CSI != nil {
+		attribute := strings.TrimSpace(pv.Spec.CSI.VolumeAttributes[annotationBackend])
+		if backend != "" && attribute != "" && !strings.EqualFold(backend, attribute) {
+			return "", errPersistentVolumeBackendConflict
+		}
+		if backend == "" {
+			backend = attribute
+		}
+	}
+	return backend, nil
+}
+
 func (r *KubeRuntime) ResolveVolumeRuntimeContext(ctx context.Context, volumeHandle string) (*VolumeRuntimeContext, error) {
 	if r == nil || !r.enabled {
 		return nil, fmt.Errorf("kubernetes runtime is not enabled")
@@ -429,7 +445,10 @@ func (r *KubeRuntime) ResolveVolumeRuntimeContext(ctx context.Context, volumeHan
 			PVAnnotations: cloneStringMap(pv.Annotations),
 			AccessModes:   append([]corev1.PersistentVolumeAccessMode(nil), pv.Spec.AccessModes...),
 		}
-		runtimeCtx.Backend = strings.TrimSpace(runtimeCtx.PVAnnotations[annotationBackend])
+		runtimeCtx.Backend, err = persistentVolumeBackend(pv)
+		if err != nil {
+			return nil, err
+		}
 		runtimeCtx.RestartMode = strings.TrimSpace(runtimeCtx.PVAnnotations[annotationRestartOpt])
 		if rawGrace := strings.TrimSpace(runtimeCtx.PVAnnotations[annotationDetachGrace]); rawGrace != "" {
 			if parsed, convErr := strconv.Atoi(rawGrace); convErr == nil {

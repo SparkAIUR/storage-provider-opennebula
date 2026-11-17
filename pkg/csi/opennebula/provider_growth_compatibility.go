@@ -35,9 +35,12 @@ func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context
 	}
 	var selected *shared.Disk
 	for _, disk := range info.Template.GetDisks() {
-		iid, ie := disk.GetI(shared.ImageID)
+		iid, present, err := diskImageReference(disk)
+		if err != nil {
+			return deny(err.Error())
+		}
 		did, de := disk.GetI(shared.DiskID)
-		if ie != nil || de != nil || iid != imageID || did != diskID {
+		if !present || de != nil || iid != imageID || did != diskID {
 			continue
 		}
 		if selected != nil {

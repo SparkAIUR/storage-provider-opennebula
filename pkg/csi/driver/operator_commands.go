@@ -1297,10 +1297,8 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 		if recoveryState.Active() || recoveryState.Expired || recoveryState.Invalid || recoveryState.Adopted || strings.TrimSpace(recoveryState.Mode) != "" || strings.TrimSpace(recoveryState.Warning) != "" || strings.TrimSpace(recoveryState.Message) != "" {
 			recoverySnapshot[pv.Spec.CSI.VolumeHandle] = recoveryState
 		}
-		if vaErr == nil {
-			if desiredState, err := runtime.desiredNodeForVolume(ctx, pv.Spec.CSI.VolumeHandle, vaSnapshot); err == nil {
-				demandSnapshot[pv.Spec.CSI.VolumeHandle] = desiredState
-			}
+		if desiredState, err := runtime.desiredNodeForVolume(ctx, pv.Spec.CSI.VolumeHandle, vaSnapshot, vaErr); err == nil {
+			demandSnapshot[pv.Spec.CSI.VolumeHandle] = desiredState
 		}
 		decision, err := (&ControllerServer{driver: driver}).localRWOProtectionProjection(ctx, pv.Spec.CSI.VolumeHandle, "", runtimeCtx, false, false)
 		if err != nil {

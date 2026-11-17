@@ -40,6 +40,20 @@ func (e *VMDuplicateNameError) Error() string {
 	return fmt.Sprintf("multiple opennebula vms matched %q: %v", e.Name, e.Match)
 }
 
+type VMNameInventory map[string][]int
+
+func (inventory VMNameInventory) Resolve(nodeName string) (int, error) {
+	matches := inventory[nodeName]
+	if len(matches) == 0 {
+		for name, ids := range inventory {
+			if strings.EqualFold(name, nodeName) {
+				matches = append(matches, ids...)
+			}
+		}
+	}
+	return uniqueVMMatch(nodeName, matches)
+}
+
 func ResolveNodeVMID(ctx context.Context, ctrl *goca.Controller, nodeName string) (int, string, error) {
 	if ctrl == nil {
 		return -1, VMResolutionNotFound, errors.New("opennebula controller is nil")
@@ -79,12 +93,24 @@ func resolveNodeVMIDWithFallback(nodeName string, byName func(string) (int, erro
 		}
 	}
 
+	id, err := uniqueVMMatch(nodeName, matches)
+	var duplicate *VMDuplicateNameError
+	if errors.As(err, &duplicate) {
+		return -1, VMResolutionDuplicateMatch, err
+	}
+	if err != nil {
+		return -1, VMResolutionNotFound, err
+	}
+	return id, VMResolutionPoolExactMatch, nil
+}
+
+func uniqueVMMatch(nodeName string, matches []int) (int, error) {
 	switch len(matches) {
 	case 0:
-		return -1, VMResolutionNotFound, &VMNotFoundError{Name: nodeName}
+		return -1, &VMNotFoundError{Name: nodeName}
 	case 1:
-		return matches[0], VMResolutionPoolExactMatch, nil
+		return matches[0], nil
 	default:
-		return -1, VMResolutionDuplicateMatch, &VMDuplicateNameError{Name: nodeName, Match: matches}
+		return -1, &VMDuplicateNameError{Name: nodeName, Match: matches}
 	}
 }

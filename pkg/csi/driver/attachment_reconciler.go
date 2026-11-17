@@ -85,7 +85,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 		return nil
 	}
 
-	attachments, err := r.server.volumeProvider.ListCurrentAttachments(ctx)
+	attachments, vmNames, err := r.server.volumeProvider.ListCurrentAttachments(ctx)
 	if err != nil {
 		return err
 	}
@@ -156,7 +156,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 	unresolvedVolume := make(map[string]bool)
 	nodesByVM := map[int]*corev1.Node{}
 	if len(attachments) > 0 {
-		nodesByVM = r.attachmentNodesByVM(ctx, nodeList.Items)
+		nodesByVM = attachmentNodesByVM(vmNames, nodeList.Items)
 	}
 	for _, attachment := range attachments {
 		node := nodesByVM[attachment.NodeID]
@@ -286,12 +286,12 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 	return nil
 }
 
-func (r *AttachmentReconciler) attachmentNodesByVM(ctx context.Context, nodes []corev1.Node) map[int]*corev1.Node {
+func attachmentNodesByVM(vmNames opennebula.VMNameInventory, nodes []corev1.Node) map[int]*corev1.Node {
 	byVM := make(map[int]*corev1.Node)
 	conflicts := make(map[int]bool)
 	for i := range nodes {
 		node := &nodes[i]
-		vmID, err := r.server.volumeProvider.NodeExists(ctx, node.Name)
+		vmID, err := vmNames.Resolve(node.Name)
 		var notFound *opennebula.VMNotFoundError
 		var ambiguous *opennebula.VMDuplicateNameError
 		switch {
@@ -417,12 +417,8 @@ func (r *AttachmentReconciler) skipDiskAttachmentReconcile(ctx context.Context, 
 		return true
 	}
 	if pv != nil {
-		if strings.EqualFold(strings.TrimSpace(pv.Annotations[annotationBackend]), "cephfs") {
-			return true
-		}
-		if pv.Spec.CSI != nil && strings.EqualFold(strings.TrimSpace(pv.Spec.CSI.VolumeAttributes[annotationBackend]), "cephfs") {
-			return true
-		}
+		backend, err := persistentVolumeBackend(pv)
+		return err != nil || strings.EqualFold(backend, "cephfs")
 	}
 	return false
 }

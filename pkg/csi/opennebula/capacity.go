@@ -50,24 +50,34 @@ func completedDiskSizeFromVM(info *vm.VM, diskID, imageID int) (int64, error) {
 	if (state != vm.Active || lcm != vm.Running) && (state != vm.Poweroff || lcm != vm.LcmInit) {
 		return 0, fmt.Errorf("VM is not in an eligible resize-completion state: %s/%s", state, lcm)
 	}
+	var selected *shared.Disk
 	for _, disk := range info.Template.GetDisks() {
-		iid, e := disk.GetI(shared.ImageID)
-		if e != nil || iid != imageID {
+		iid, present, err := diskImageReference(disk)
+		if err != nil {
+			return 0, err
+		}
+		if !present || iid != imageID {
 			continue
 		}
 		did, e := disk.GetI(shared.DiskID)
 		if e != nil || did != diskID {
 			continue
 		}
-		if prev, e := disk.Get("SIZE_PREV"); e == nil && strings.TrimSpace(prev) != "" {
-			return 0, nil
+		if selected != nil {
+			return 0, fmt.Errorf("duplicate resize disk identity")
 		}
-		if marker, e := disk.Get("RESIZE"); e == nil && marker != "" && marker != "NO" && marker != "0" && marker != "false" {
-			return 0, nil
-		}
-		return diskSizeBytesFromTemplate(disk)
+		selected = &disk
 	}
-	return 0, fmt.Errorf("resize identity changed: image %d vm %d disk %d", imageID, info.ID, diskID)
+	if selected == nil {
+		return 0, fmt.Errorf("resize identity changed: image %d vm %d disk %d", imageID, info.ID, diskID)
+	}
+	if prev, e := selected.Get("SIZE_PREV"); e == nil && strings.TrimSpace(prev) != "" {
+		return 0, nil
+	}
+	if marker, e := selected.Get("RESIZE"); e == nil && marker != "" && marker != "NO" && marker != "0" && marker != "false" {
+		return 0, nil
+	}
+	return diskSizeBytesFromTemplate(*selected)
 }
 
 func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, id int, size int64) error {

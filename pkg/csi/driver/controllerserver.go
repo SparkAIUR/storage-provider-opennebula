@@ -1181,6 +1181,9 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	if s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
 		recoveryRuntimeCtx, recoveryRuntimeErr = s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId)
 	}
+	if errors.Is(recoveryRuntimeErr, errPersistentVolumeBackendConflict) {
+		return nil, attachmentEvidenceUnavailable("persistent volume backend assertions disagree", recoveryRuntimeErr)
+	}
 	ceph := isCephBackend(s.currentVolumeHistory(req.VolumeId).Backend) ||
 		isCephBackend(runtimeCtxField(recoveryRuntimeCtx, func(v *VolumeRuntimeContext) string { return v.Backend }))
 	if !ceph {

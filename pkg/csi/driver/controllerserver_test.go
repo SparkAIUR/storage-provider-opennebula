@@ -2871,15 +2871,14 @@ func (m *MockOpenNebulaVolumeProviderTestify) VolumeReadyWithTimeout(ctx context
 	return args.Bool(0), args.Error(1)
 }
 
-func (m *MockOpenNebulaVolumeProviderTestify) ListCurrentAttachments(ctx context.Context) ([]opennebula.ObservedAttachment, error) {
+func (m *MockOpenNebulaVolumeProviderTestify) ListCurrentAttachments(ctx context.Context) ([]opennebula.ObservedAttachment, opennebula.VMNameInventory, error) {
 	if !m.hasExpectation("ListCurrentAttachments") {
-		return nil, nil
+		return nil, nil, nil
 	}
 	args := m.Called(ctx)
-	if attachments := args.Get(0); attachments != nil {
-		return attachments.([]opennebula.ObservedAttachment), args.Error(1)
-	}
-	return nil, args.Error(1)
+	attachments, _ := args.Get(0).([]opennebula.ObservedAttachment)
+	names, _ := args.Get(1).(opennebula.VMNameInventory)
+	return attachments, names, args.Error(2)
 }
 
 func (m *MockOpenNebulaVolumeProviderTestify) InspectVolumeAttachment(ctx context.Context, volume string, node string) (*opennebula.VolumeAttachmentMetadata, error) {

@@ -31,6 +31,7 @@ type cephRetentionAuthority struct {
 	PVName, PVCNamespace, PVCName, VAName string
 	PVUID, PVCUID, NodeUID, VAUID         types.UID
 	Capacity                              int64
+	RequestedCapacity                     string
 	ConsumerUIDs                          []string
 	History                               VolumeHistoryRecord
 	AttachmentMetadata                    map[string]string
@@ -186,7 +187,8 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if err != nil {
 		return nil, cephRetentionUnavailable("PV lookup failed", err)
 	}
-	if pv.UID == "" || pv.DeletionTimestamp != nil || pv.Status.Phase != corev1.VolumeBound || pv.Spec.CSI == nil || pv.Spec.CSI.Driver != s.driver.name || pv.Spec.CSI.VolumeHandle != req.VolumeId || pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.UID == "" || !strings.EqualFold(strings.TrimSpace(pv.Annotations[annotationBackend]), "ceph") {
+	backend, backendErr := persistentVolumeBackend(pv)
+	if pv.UID == "" || pv.DeletionTimestamp != nil || pv.Status.Phase != corev1.VolumeBound || pv.Spec.CSI == nil || pv.Spec.CSI.Driver != s.driver.name || pv.Spec.CSI.VolumeHandle != req.VolumeId || pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.UID == "" || backendErr != nil || !isCephBackend(backend) {
 		return nil, cephRetentionUnavailable("bound PV identity is incomplete or inconsistent", nil)
 	}
 	pvc, err := runtime.client.CoreV1().PersistentVolumeClaims(pv.Spec.ClaimRef.Namespace).Get(ctx, pv.Spec.ClaimRef.Name, metav1.GetOptions{})
@@ -199,8 +201,10 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if !hasSingleWriterAccessMode(pv.Spec.AccessModes) || !hasSingleWriterAccessMode(pvc.Spec.AccessModes) || len(pv.Spec.AccessModes) != 1 || len(pvc.Spec.AccessModes) != 1 || pv.Spec.AccessModes[0] != pvc.Spec.AccessModes[0] {
 		return nil, status.Error(codes.FailedPrecondition, "Ceph same-node retention requires matching RWO or RWOP access modes")
 	}
-	capacity := pv.Spec.Capacity.Storage().Value()
-	if capacity <= 0 || pvc.Status.Capacity.Storage().Value() != capacity || pvc.Spec.Resources.Requests.Storage().Value() != capacity || len(pvc.Status.Conditions) > 0 || len(pvc.Status.AllocatedResourceStatuses) > 0 {
+	completedCapacity := pv.Spec.Capacity.Storage()
+	capacity := completedCapacity.Value()
+	requestedCapacity := pvc.Spec.Resources.Requests.Storage()
+	if requestedCapacity.Sign() <= 0 || requestedCapacity.Cmp(*completedCapacity) > 0 || capacity <= 0 || pvc.Status.Capacity.Storage().Cmp(*completedCapacity) != 0 || len(pvc.Status.Conditions) > 0 || len(pvc.Status.AllocatedResourceStatuses) > 0 {
 		return nil, cephRetentionUnavailable("PVC capacity is pending or inconsistent", nil)
 	}
 	identity, err := runtime.NodeIdentity(ctx, req.NodeId)
@@ -210,7 +214,7 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if !identity.Exists || !identity.Ready || identity.UID == "" {
 		return nil, cephRetentionUnavailable("node identity is unknown or not Ready", nil)
 	}
-	authority := &cephRetentionAuthority{PVName: pv.Name, PVUID: pv.UID, PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVCUID: pvc.UID, NodeUID: types.UID(identity.UID), Capacity: capacity}
+	authority := &cephRetentionAuthority{PVName: pv.Name, PVUID: pv.UID, PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVCUID: pvc.UID, NodeUID: types.UID(identity.UID), Capacity: capacity, RequestedCapacity: requestedCapacity.String()}
 	vas, err := runtime.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, cephRetentionUnavailable("VolumeAttachment lookup failed", err)
@@ -258,7 +262,7 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 		return nil, cephRetentionUnavailable("RWOP volume has multiple consumers", nil)
 	}
 	sort.Strings(authority.ConsumerUIDs)
-	currentRuntime := &VolumeRuntimeContext{PVName: pv.Name, PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVAnnotations: cloneStringMap(pv.Annotations), PVCAnnotations: cloneStringMap(pvc.Annotations), Backend: "ceph", AccessModes: append([]corev1.PersistentVolumeAccessMode(nil), pv.Spec.AccessModes...)}
+	currentRuntime := &VolumeRuntimeContext{PVName: pv.Name, PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVAnnotations: cloneStringMap(pv.Annotations), PVCAnnotations: cloneStringMap(pvc.Annotations), Backend: backend, AccessModes: append([]corev1.PersistentVolumeAccessMode(nil), pv.Spec.AccessModes...)}
 	control := resolvedRecoveryControlState(req.VolumeId, currentRuntime, VolumeRecoveryControlState{})
 	if control.Invalid || control.Active() {
 		return nil, status.Error(codes.FailedPrecondition, "Ceph same-node retention is blocked by active or invalid recovery controls")
@@ -270,13 +274,14 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if history.VolumeID != req.VolumeId || !cephHistoryHasObservedAuthority(history) {
 		return nil, cephRetentionUnavailable("observed volume history is unavailable", nil)
 	}
-	if err := s.attachmentProtectionChecks(ctx, req.VolumeId, currentRuntime, opennebula.HostArtifactAttachmentTarget{
+	target := opennebula.HostArtifactAttachmentTarget{
 		NodeName: req.NodeId, VMID: nodeID, DiskID: diskID, ImageID: history.LastSuccessfulImageID,
-	}); err != nil {
+	}
+	if err := s.attachmentProtectionChecks(ctx, req.VolumeId, currentRuntime, target); err != nil {
 		return nil, err
 	}
 	authority.History = history
-	if err := s.recheckAttachmentBinding(ctx, pv, pvc); err != nil {
+	if err := s.recheckAttachmentAuthority(ctx, req.VolumeId, currentRuntime, target, pv, pvc); err != nil {
 		return nil, err
 	}
 	return authority, nil
@@ -357,13 +362,7 @@ func attachmentEvidenceUnavailable(message string, err error) error {
 }
 
 func validQuarantineObservation(count int, first, last, expiry time.Time) bool {
-	if count <= 0 {
-		return false
-	}
-	if expiry.IsZero() {
-		return !first.IsZero() && !last.Before(first)
-	}
-	return true
+	return count > 0 && !first.IsZero() && !last.IsZero() && !last.Before(first) && (expiry.IsZero() || expiry.After(last))
 }
 
 // Unknown future fields are not evidence of an expired protection record.
