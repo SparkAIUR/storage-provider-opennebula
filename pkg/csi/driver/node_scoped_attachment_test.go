@@ -1770,3 +1770,74 @@ func TestCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t *testing.T) {
 	require.Equal(t, []string{"detach:41"}, wire.mutations)
 	require.Equal(t, 1, wire.detachAttempts)
 }
+
+type moveHistoryProvider struct {
+	*opennebula.PersistentDiskVolumeProvider
+	wire         *nodeAttachmentProtocol
+	failedCensus atomic.Int32
+}
+
+func (p *moveHistoryProvider) InspectVolumeAttachment(ctx context.Context, volume, node string) (*opennebula.VolumeAttachmentMetadata, error) {
+	p.wire.mu.Lock()
+	_, moved := p.wire.disks[42]
+	if node != "node-new" || !moved {
+		p.wire.mu.Unlock()
+		return p.PersistentDiskVolumeProvider.InspectVolumeAttachment(ctx, volume, node)
+	}
+	p.wire.failMethod = "one.vmpool.info"
+	p.wire.mu.Unlock()
+	defer func() {
+		p.wire.mu.Lock()
+		p.wire.failMethod = ""
+		p.wire.mu.Unlock()
+	}()
+	metadata, err := p.PersistentDiskVolumeProvider.InspectVolumeAttachment(ctx, volume, node)
+	if err != nil {
+		p.failedCensus.Add(1)
+	}
+	return metadata, err
+}
+
+func TestControllerPublishMoveClearsStaleAttachmentPinsWhenCensusFails(t *testing.T) {
+	ctx := context.Background()
+	pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv.Annotations[annotationAllowCrossNodeUntil] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	oldNode, newNode := newReadyNode("node-old", true), newReadyNode("node-new", true)
+	driver := newStickyTestDriver(t, pv, pvc, oldNode, newNode)
+	driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+	provider, wire := nodeAttachmentProvider(t)
+	probe := &moveHistoryProvider{PersistentDiskVolumeProvider: provider, wire: wire}
+	server := NewControllerServer(driver, probe, nil)
+	client := reviewControllerClient(t, server)
+
+	_, err := client.ControllerPublishVolume(ctx, newPublishReq("volume-test", oldNode.Name))
+	require.NoError(t, err)
+	before, err := server.readAttachmentHistory(ctx, "volume-test")
+	require.NoError(t, err)
+	require.Equal(t, oldNode.Name, before.LastSuccessfulNodeName)
+	require.Equal(t, 41, before.LastSuccessfulOpenNebulaVMID)
+	require.Equal(t, 2, before.LastSuccessfulDiskID)
+	_, err = client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: oldNode.Name})
+	require.NoError(t, err)
+
+	_, err = client.ControllerPublishVolume(ctx, newPublishReq("volume-test", newNode.Name))
+	require.NoError(t, err)
+	require.EqualValues(t, 1, probe.failedCensus.Load())
+	moved, err := server.readAttachmentHistory(ctx, "volume-test")
+	require.NoError(t, err)
+	require.Equal(t, newNode.Name, moved.LastSuccessfulNodeName)
+	require.Equal(t, string(newNode.UID), moved.LastSuccessfulNodeUID)
+	require.Equal(t, 7, moved.LastSuccessfulImageID)
+	require.Equal(t, "vdb", moved.LastSuccessfulTarget)
+	require.Zero(t, moved.LastSuccessfulOpenNebulaVMID)
+	require.Zero(t, moved.LastSuccessfulDiskID)
+
+	_, err = client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: newNode.Name})
+	require.NoError(t, err)
+	wire.mu.Lock()
+	defer wire.mu.Unlock()
+	require.Contains(t, wire.mutations, "detach:41")
+	require.Contains(t, wire.mutations, "attach:42:false")
+	require.Contains(t, wire.mutations, "detach:42")
+	require.Empty(t, wire.disks)
+}

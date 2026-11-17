@@ -364,7 +364,7 @@ func TestAttachmentReconcilerPrunesDeletedVolumeState(t *testing.T) {
 }
 
 func TestAttachmentReconcilerPreservesMalformedAndReplacedDeviceReports(t *testing.T) {
-	for _, mode := range []string{"null", "wrong-volume", "unknown-state", "replaced"} {
+	for _, mode := range []string{"null", "wrong-volume", "unknown-state", "pruned", "replaced"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			pv, pvc := newLocalPVAndPVC(cephRestartVolume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
@@ -379,10 +379,10 @@ func TestAttachmentReconcilerPreservesMalformedAndReplacedDeviceReports(t *testi
 				raw = `{"node":"node-a","volumeID":"gone","failureClass":"wrong_device_identity"}`
 			case "unknown-state":
 				raw = `{"node":"node-a","volumeID":"pvc-ceph-restart","confirmationState":"unknown"}`
-			case "replaced":
+			case "pruned", "replaced":
 				key = localDeviceReportKey("gone-node", cephRestartVolume)
-				raw = `{"node":"gone-node","volumeID":"pvc-ceph-restart","failureClass":"missing_device"}`
-				current = "null"
+				raw = `{"node":"gone-node","volumeID":"pvc-ceph-restart","failureClass":"device_missing"}`
+				current = `{"node":"gone-node","volumeID":"pvc-ceph-restart","failureClass":"wrong_device_identity"}`
 			}
 			cm := &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: localDeviceStateConfigMapName, UID: "report-map", ResourceVersion: "1"},
@@ -390,18 +390,21 @@ func TestAttachmentReconcilerPreservesMalformedAndReplacedDeviceReports(t *testi
 			}
 			driver := newAttachmentTestDriver(pv, pvc, node, cm)
 			client := driver.kubeRuntime.client.(*fake.Clientset)
-			if mode == "replaced" {
-				swapped := false
+			stale := mode == "pruned" || mode == "replaced"
+			reportReads := 0
+			if stale {
 				client.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
-					if swapped || action.(ktesting.GetAction).GetName() != cm.Name {
+					if action.(ktesting.GetAction).GetName() != cm.Name {
 						return false, nil, nil
 					}
-					swapped = true
-					replaced := cm.DeepCopy()
-					replaced.ResourceVersion = "2"
-					replaced.Data[key] = current
-					err := client.Tracker().Update(corev1.SchemeGroupVersion.WithResource("configmaps"), replaced, cm.Namespace)
-					return true, cm.DeepCopy(), err
+					reportReads++
+					if reportReads == 2 && mode == "replaced" {
+						replaced := cm.DeepCopy()
+						replaced.ResourceVersion = "2"
+						replaced.Data[key] = current
+						require.NoError(t, client.Tracker().Update(corev1.SchemeGroupVersion.WithResource("configmaps"), replaced, cm.Namespace))
+					}
+					return false, nil, nil
 				})
 			} else {
 				current = raw
@@ -414,10 +417,18 @@ func TestAttachmentReconcilerPreservesMalformedAndReplacedDeviceReports(t *testi
 			r := NewAttachmentReconciler(NewControllerServer(driver, physical, nil))
 			r.orphanGrace = time.Nanosecond
 			require.NoError(t, r.ReconcileOnce(ctx))
-			require.NoError(t, r.ReconcileOnce(ctx))
+			if stale {
+				require.Equal(t, 2, reportReads)
+			} else {
+				require.NoError(t, r.ReconcileOnce(ctx))
+			}
 			after, err := client.CoreV1().ConfigMaps(cm.Namespace).Get(ctx, cm.Name, metav1.GetOptions{})
 			require.NoError(t, err)
-			require.Equal(t, current, after.Data[key])
+			if mode == "pruned" {
+				require.NotContains(t, after.Data, key)
+			} else {
+				require.Equal(t, current, after.Data[key])
+			}
 			base.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
 		})
 	}

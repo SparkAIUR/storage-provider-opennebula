@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,7 +22,9 @@ import (
 	kruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ktesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/record"
 )
 
 type cleanupReadbackProvider struct {
@@ -522,20 +525,104 @@ func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T
 	}
 }
 
-func TestControllerUnpublishCephEventOmitsProviderIDs(t *testing.T) {
-	f := newCephRestartTestFixture(t, false)
-	reply, err := f.unpublish(t)
-	require.NoError(t, err)
-	require.NotNil(t, reply)
-	events, err := f.server.driver.kubeRuntime.client.CoreV1().Events(f.pvc.Namespace).List(context.Background(), metav1.ListOptions{})
-	require.NoError(t, err)
-	require.Len(t, events.Items, 1)
-	event := events.Items[0]
-	require.Equal(t, eventReasonSameNodeDetachRescued, event.Reason)
-	require.Contains(t, event.Message, "logical attachment deletion")
-	require.NotContains(t, event.Message, "3137")
-	require.NotContains(t, event.Message, "575")
-	require.NotContains(t, event.Message, "disk 1")
+func TestControllerUnpublishCephEventUsesVerifiedClaimWithoutLateReads(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(fmt.Sprint(queued), func(t *testing.T) {
+			f := newCephRestartTestFixture(t, queued)
+			client := f.server.driver.kubeRuntime.client.(*fake.Clientset)
+			var finalAuthorityRead atomic.Bool
+			var lateActions atomic.Int32
+			client.PrependReactor("*", "*", func(action ktesting.Action) (bool, kruntime.Object, error) {
+				if finalAuthorityRead.Load() {
+					lateActions.Add(1)
+				}
+				if action.Matches("list", "pods") && f.provider.inspections.Load() == 2 {
+					finalAuthorityRead.Store(true)
+				}
+				return false, nil, nil
+			})
+			broadcaster := record.NewBroadcaster()
+			t.Cleanup(broadcaster.Shutdown)
+			events := make(chan *corev1.Event, 1)
+			watcher := broadcaster.StartEventWatcher(func(event *corev1.Event) { events <- event })
+			t.Cleanup(watcher.Stop)
+			f.server.driver.kubeRuntime.recorder = broadcaster.NewRecorder(clientgoscheme.Scheme, corev1.EventSource{Component: DefaultDriverName})
+
+			reply, err := f.unpublish(t)
+			require.NoError(t, err)
+			require.NotNil(t, reply)
+			require.True(t, finalAuthorityRead.Load())
+			require.Zero(t, lateActions.Load(), "acknowledgement must follow the final authority read without another synchronous API call")
+			select {
+			case event := <-events:
+				require.Equal(t, f.pvc.UID, event.InvolvedObject.UID)
+				require.Equal(t, f.pvc.Namespace, event.InvolvedObject.Namespace)
+				require.Equal(t, f.pvc.Name, event.InvolvedObject.Name)
+				require.Equal(t, eventReasonSameNodeDetachRescued, event.Reason)
+				require.Contains(t, event.Message, "logical attachment deletion")
+				require.NotContains(t, event.Message, "3137")
+				require.NotContains(t, event.Message, "575")
+				require.NotContains(t, event.Message, "disk 1")
+			case <-time.After(time.Second):
+				t.Fatal("retention event was not queued")
+			}
+		})
+	}
+}
+
+func TestControllerUnpublishCephPreservesPersistedRecoveryControlsForAUTO(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, mode := range []string{"auto", "observe", "manual"} {
+			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
+				ctx := context.Background()
+				f := newCephRestartTestFixture(t, queued)
+				client := f.server.driver.kubeRuntime.client.(*fake.Clientset)
+				if mode != "auto" {
+					f.pvc.Annotations[annotationRecoveryMode] = mode
+					f.syncObjects(t)
+				}
+				_, err := f.server.driver.volumeRecoveryControl.Upsert(ctx, cephRestartVolume, func(state *VolumeRecoveryControlState) {
+					state.Mode = recoveryModeObserve
+					state.SuppressRepairActions = true
+				})
+				require.NoError(t, err)
+				configMaps := client.CoreV1().ConfigMaps("default")
+				before, err := configMaps.Get(ctx, volumeRecoveryControlStateConfigMapName, metav1.GetOptions{})
+				require.NoError(t, err)
+				historyBefore, err := f.server.readAttachmentHistory(ctx, cephRestartVolume)
+				require.NoError(t, err)
+				client.ClearActions()
+
+				reply, err := f.unpublish(t)
+				requestActions := client.Actions()
+				if mode == "observe" {
+					require.Equal(t, codes.FailedPrecondition, status.Code(err))
+					require.Nil(t, reply)
+				} else {
+					require.NoError(t, err)
+					require.NotNil(t, reply)
+				}
+				after, err := configMaps.Get(ctx, volumeRecoveryControlStateConfigMapName, metav1.GetOptions{})
+				require.NoError(t, err)
+				historyAfter, err := f.server.readAttachmentHistory(ctx, cephRestartVolume)
+				require.NoError(t, err)
+				if mode == "manual" {
+					var control VolumeRecoveryControlState
+					require.NoError(t, json.Unmarshal([]byte(after.Data[cephRestartVolume]), &control))
+					require.Equal(t, recoveryModeManual, control.Mode)
+					require.False(t, historyAfter.LastSafeDetachTime.IsZero())
+					require.Zero(t, f.provider.inspections.Load())
+				} else {
+					require.Equal(t, before.Data, after.Data)
+					require.Equal(t, historyBefore, historyAfter)
+					for _, action := range requestActions {
+						require.Contains(t, []string{"get", "list"}, action.GetVerb(), "automatic eligibility must be read-only")
+					}
+				}
+				f.requireNoProviderMutation(t)
+			})
+		}
+	}
 }
 
 func enableObserveOnConfigMapRead(t *testing.T, client *fake.Clientset, pvc *corev1.PersistentVolumeClaim, after int) {

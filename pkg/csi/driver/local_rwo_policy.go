@@ -457,6 +457,46 @@ func (ns *NodeServer) clearObservedStageRepair(ctx context.Context, volumeID str
 	return nil
 }
 
+type successfulAttachmentObservation struct {
+	nodeName, nodeUID, target, serial string
+	vmID, imageID, diskID             int
+}
+
+func (state *VolumeHistoryRecord) observeSuccessfulAttachment(observation successfulAttachmentObservation) {
+	nodeChanged := (observation.nodeName != "" && observation.nodeName != state.LastSuccessfulNodeName) ||
+		(observation.nodeUID != "" && state.LastSuccessfulNodeUID != "" && observation.nodeUID != state.LastSuccessfulNodeUID)
+	vmChanged := observation.vmID > 0 && state.LastSuccessfulOpenNebulaVMID > 0 && observation.vmID != state.LastSuccessfulOpenNebulaVMID
+	imageChanged := observation.imageID > 0 && state.LastSuccessfulImageID > 0 && observation.imageID != state.LastSuccessfulImageID
+	diskChanged := (observation.diskID >= 0 && state.LastSuccessfulDiskID > 0 && observation.diskID != state.LastSuccessfulDiskID) ||
+		(observation.target != "" && state.LastSuccessfulTarget != "" && observation.target != state.LastSuccessfulTarget) ||
+		(observation.serial != "" && state.LastSuccessfulDeviceSerial != "" && observation.serial != state.LastSuccessfulDeviceSerial)
+	if nodeChanged || vmChanged {
+		state.LastSuccessfulNodeUID = ""
+	}
+	if nodeChanged || vmChanged || imageChanged {
+		state.LastSuccessfulOpenNebulaVMID = 0
+	}
+	if nodeChanged || vmChanged || imageChanged || diskChanged {
+		state.LastSuccessfulDiskID = 0
+		state.LastSuccessfulTarget = ""
+		state.LastSuccessfulDeviceSerial = ""
+		state.LastHealthyIdentity = nil
+	}
+	state.LastSuccessfulNodeName = firstNonEmpty(observation.nodeName, state.LastSuccessfulNodeName)
+	state.LastSuccessfulNodeUID = firstNonEmpty(observation.nodeUID, state.LastSuccessfulNodeUID)
+	if observation.vmID > 0 {
+		state.LastSuccessfulOpenNebulaVMID = observation.vmID
+	}
+	if observation.imageID > 0 {
+		state.LastSuccessfulImageID = observation.imageID
+	}
+	if observation.diskID >= 0 {
+		state.LastSuccessfulDiskID = observation.diskID
+	}
+	state.LastSuccessfulTarget = firstNonEmpty(observation.target, state.LastSuccessfulTarget)
+	state.LastSuccessfulDeviceSerial = firstNonEmpty(observation.serial, state.LastSuccessfulDeviceSerial)
+}
+
 func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID, requestedNode, target string, sourceContext map[string]string, protection *LocalRWOProtectionDecision, metadata *opennebula.VolumeAttachmentMetadata) {
 	if s == nil || s.driver == nil || s.driver.volumeHistory == nil || strings.TrimSpace(volumeID) == "" {
 		return
@@ -480,19 +520,28 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 			nodeUID = identity.UID
 		}
 	}
-	imageID, deviceSerial := imageAndSerialFromPublishContext(sourceContext)
-	diskID, diskTarget, serial := requestedNodeDiskEvidence(metadata, requestedNode)
-	if diskTarget == "" {
-		diskTarget = strings.TrimSpace(target)
+	observation := successfulAttachmentObservation{
+		nodeName: strings.TrimSpace(requestedNode), nodeUID: nodeUID, target: strings.TrimSpace(target), diskID: -1,
 	}
-	if serial != "" {
-		deviceSerial = serial
-	}
-	if imageID == 0 && metadata != nil {
-		imageID = metadata.ImageID
+	observation.imageID, observation.serial = imageAndSerialFromPublishContext(sourceContext)
+	if metadata != nil {
+		if observation.imageID == 0 {
+			observation.imageID = metadata.ImageID
+		}
+		if metadata.ImageID == observation.imageID && metadata.AttachedToRequestedNode &&
+			metadata.RequestedNodeID > 0 && strings.TrimSpace(metadata.RequestedNode) == observation.nodeName {
+			observation.vmID = metadata.RequestedNodeID
+			for _, disk := range metadata.DiskRecords {
+				if disk.NodeID == observation.vmID && strings.TrimSpace(disk.Target) == observation.target {
+					observation.diskID = disk.DiskID
+					observation.serial = firstNonEmpty(strings.TrimSpace(disk.Serial), observation.serial)
+					break
+				}
+			}
+		}
 	}
 	now := time.Now().UTC()
-	record, err := s.driver.volumeHistory.Upsert(ctx, volumeID, func(state *VolumeHistoryRecord) {
+	_, err := s.driver.volumeHistory.Upsert(ctx, volumeID, func(state *VolumeHistoryRecord) {
 		state.PVName = firstNonEmpty(state.PVName, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVName }), strings.TrimSpace(sourceContext[paramPVName]))
 		state.PVCNamespace = firstNonEmpty(state.PVCNamespace, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVCNamespace }), strings.TrimSpace(sourceContext[paramPVCNamespace]))
 		state.PVCName = firstNonEmpty(state.PVCName, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVCName }), strings.TrimSpace(sourceContext[paramPVCName]))
@@ -510,24 +559,8 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 		state.Bootstrapped = false
 		state.BootstrappedAt = time.Time{}
 		state.BootstrappedFields = nil
-		state.LastSuccessfulNodeName = strings.TrimSpace(requestedNode)
-		state.LastSuccessfulNodeUID = nodeUID
+		state.observeSuccessfulAttachment(observation)
 		state.LastSuccessfulPublishTime = now
-		if metadata != nil && metadata.RequestedNodeID > 0 {
-			state.LastSuccessfulOpenNebulaVMID = metadata.RequestedNodeID
-		}
-		if imageID > 0 {
-			state.LastSuccessfulImageID = imageID
-		}
-		if diskID > 0 {
-			state.LastSuccessfulDiskID = diskID
-		}
-		if diskTarget != "" {
-			state.LastSuccessfulTarget = diskTarget
-		}
-		if deviceSerial != "" {
-			state.LastSuccessfulDeviceSerial = deviceSerial
-		}
 	})
 	if err == nil {
 		s.driver.metrics.RecordVolumeHistory("publish", "persisted")
@@ -535,7 +568,6 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 			_ = s.driver.kubeRuntime.DeletePVAnnotation(ctx, runtimeCtx.PVName, annotationAllowCrossNodeUntil)
 			s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonCrossNodeOverrideUsed, protection.Message)
 		}
-		_ = record
 	}
 }
 
@@ -557,6 +589,17 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 		return
 	}
 	normalizeLocalDiskIdentity(identity)
+	observation := successfulAttachmentObservation{nodeName: strings.TrimSpace(ns.Driver.nodeID), diskID: -1}
+	if observation.nodeName != "" && ns.Driver.kubeRuntime != nil && ns.Driver.kubeRuntime.enabled {
+		if node, err := ns.Driver.kubeRuntime.NodeIdentity(ctx, observation.nodeName); err == nil && node.Exists {
+			observation.nodeUID = strings.TrimSpace(node.UID)
+		}
+	}
+	if identity != nil {
+		observation.imageID = parseIntOrZero(localDiskAssertedImageID(identity))
+		observation.serial = firstNonEmpty(localDiskObservedDeviceSerial(identity), localDiskAssertedDeviceSerial(identity))
+		observation.target = localDiskAssertedDiskTarget(identity)
+	}
 	_, err := ns.Driver.volumeHistory.Upsert(ctx, volumeID, func(state *VolumeHistoryRecord) {
 		state.PVName = firstNonEmpty(state.PVName, strings.TrimSpace(publishContext[paramPVName]))
 		state.PVCNamespace = firstNonEmpty(state.PVCNamespace, strings.TrimSpace(publishContext[paramPVCNamespace]))
@@ -566,30 +609,10 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 		state.Bootstrapped = false
 		state.BootstrappedAt = time.Time{}
 		state.BootstrappedFields = nil
-		if ns.Driver != nil {
-			if nodeName := strings.TrimSpace(ns.Driver.nodeID); nodeName != "" {
-				state.LastSuccessfulNodeName = nodeName
-				if ns.Driver.kubeRuntime != nil && ns.Driver.kubeRuntime.enabled {
-					if identity, err := ns.Driver.kubeRuntime.NodeIdentity(ctx, nodeName); err == nil && identity.Exists {
-						state.LastSuccessfulNodeUID = strings.TrimSpace(identity.UID)
-					}
-				}
-			}
-		}
+		state.observeSuccessfulAttachment(observation)
 		state.LastSuccessfulStageTime = time.Now().UTC()
 		if identity != nil {
 			state.LastHealthyIdentity = identity
-			if imageID := localDiskAssertedImageID(identity); imageID != "" && state.LastSuccessfulImageID == 0 {
-				if parsed, err := strconv.Atoi(imageID); err == nil {
-					state.LastSuccessfulImageID = parsed
-				}
-			}
-			if serial := firstNonEmpty(localDiskObservedDeviceSerial(identity), localDiskAssertedDeviceSerial(identity)); serial != "" {
-				state.LastSuccessfulDeviceSerial = serial
-			}
-			if target := localDiskAssertedDiskTarget(identity); target != "" {
-				state.LastSuccessfulTarget = target
-			}
 		}
 	})
 	if err == nil {

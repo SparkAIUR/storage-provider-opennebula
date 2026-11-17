@@ -82,10 +82,10 @@ func (r *KubeRuntime) NodeIdentity(ctx context.Context, nodeName string) (Kubern
 }
 
 func (r *KubeRuntime) DesiredNodeForVolume(ctx context.Context, volumeHandle string) (VolumeDesiredState, error) {
-	return r.desiredNodeForVolume(ctx, volumeHandle, nil, nil)
+	return r.desiredNodeForVolume(ctx, volumeHandle, nil)
 }
 
-func (r *KubeRuntime) desiredNodeForVolume(ctx context.Context, volumeHandle string, attachmentSnapshot *storagev1.VolumeAttachmentList, attachmentErr error) (VolumeDesiredState, error) {
+func (r *KubeRuntime) desiredNodeForVolume(ctx context.Context, volumeHandle string, attachmentSnapshot *storagev1.VolumeAttachmentList) (VolumeDesiredState, error) {
 	if r == nil || !r.enabled {
 		return VolumeDesiredState{}, fmt.Errorf("kubernetes runtime is not enabled")
 	}
@@ -181,9 +181,6 @@ func (r *KubeRuntime) desiredNodeForVolume(ctx context.Context, volumeHandle str
 		return state, nil
 	}
 
-	if attachmentErr != nil {
-		return state, attachmentErr
-	}
 	vas := attachmentSnapshot
 	if vas == nil {
 		vas, err = r.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})

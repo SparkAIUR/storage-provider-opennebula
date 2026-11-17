@@ -450,7 +450,7 @@ func writeSupportBundle(ctx context.Context, cfg config.CSIPluginConfig, kubeCli
 	hotplugDiagnostics := hotplugDiagnosticSnapshot(ctx, kubeClient, cfg)
 	adaptiveSnapshot := configMapJSONSnapshot(ctx, kubeClient, adaptiveTimeoutObservationsConfigMapName)
 	adaptiveRecommendations := adaptiveRecommendationSnapshot(cfg, adaptiveSnapshot)
-	volumeHistorySnapshot, volumeRepairSnapshot, volumeRecoverySnapshot, volumeDemandSnapshot, protectionSnapshot := collectSupportBundleLocalRWOSnapshot(ctx, cfg, kubeClient, invClient, pvList.Items, vaList, nil)
+	volumeHistorySnapshot, volumeRepairSnapshot, volumeRecoverySnapshot, volumeDemandSnapshot, protectionSnapshot := collectSupportBundleLocalRWOSnapshot(ctx, cfg, kubeClient, invClient, pvList.Items, vaList)
 	nodeLocalDiskSessions, nodeLocalSessionReference := supportBundleLocalDiskSessionDiagnostics(ctx, kubeClient)
 	volumeRecoverySnapshot = enrichRecoveryControlSupportSnapshot(volumeRecoverySnapshot, volumeDemandSnapshot, nodeLocalDiskSessions, volumeQuarantineSnapshot, hostArtifactSnapshot)
 
@@ -1227,7 +1227,7 @@ func typedHotplugQueueSnapshot(ctx context.Context, kubeClient kubernetes.Interf
 	return snapshot
 }
 
-func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPluginConfig, kubeClient kubernetes.Interface, invClient ctrlclient.Client, pvs []corev1.PersistentVolume, vaSnapshot *storagev1.VolumeAttachmentList, vaErr error) (map[string]VolumeHistoryRecord, map[string]VolumeRepairState, map[string]VolumeRecoveryControlState, map[string]VolumeDesiredState, map[string]LocalRWOProtectionDecision) {
+func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPluginConfig, kubeClient kubernetes.Interface, invClient ctrlclient.Client, pvs []corev1.PersistentVolume, vaSnapshot *storagev1.VolumeAttachmentList) (map[string]VolumeHistoryRecord, map[string]VolumeRepairState, map[string]VolumeRecoveryControlState, map[string]VolumeDesiredState, map[string]LocalRWOProtectionDecision) {
 	runtime := &KubeRuntime{client: kubeClient, inventoryClient: invClient, enabled: true, staleVAGrace: loadStaleVolumeAttachmentGrace(cfg)}
 	driver := &Driver{
 		PluginConfig: cfg,
@@ -1262,7 +1262,7 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 	}
 	var attached map[string]string
 	var conflicts map[string]struct{}
-	if vaErr == nil && driver.maintenanceMode.Active() {
+	if driver.maintenanceMode.Active() {
 		var owned []storagev1.VolumeAttachment
 		for _, va := range vaSnapshot.Items {
 			if va.Spec.Attacher == DefaultDriverName {
@@ -1294,7 +1294,7 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 		if recoveryState.Active() || recoveryState.Expired || recoveryState.Invalid || recoveryState.Adopted || strings.TrimSpace(recoveryState.Mode) != "" || strings.TrimSpace(recoveryState.Warning) != "" || strings.TrimSpace(recoveryState.Message) != "" {
 			recoverySnapshot[pv.Spec.CSI.VolumeHandle] = recoveryState
 		}
-		if desiredState, err := runtime.desiredNodeForVolume(ctx, pv.Spec.CSI.VolumeHandle, vaSnapshot, vaErr); err == nil {
+		if desiredState, err := runtime.desiredNodeForVolume(ctx, pv.Spec.CSI.VolumeHandle, vaSnapshot); err == nil {
 			demandSnapshot[pv.Spec.CSI.VolumeHandle] = desiredState
 		}
 		decision, err := (&ControllerServer{driver: driver}).localRWOProtectionProjection(ctx, pv.Spec.CSI.VolumeHandle, "", runtimeCtx, false, false)

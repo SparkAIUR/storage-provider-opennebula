@@ -126,7 +126,11 @@ func (s *ControllerServer) rescueCephSameNodeUnpublish(ctx context.Context, req 
 		return true, nil, status.FromContextError(err).Err()
 	}
 	s.driver.metrics.RecordSameNodeRestartReuse("disk")
-	s.recordPVCEventFromRuntimeContext(ctx, lastRuntime, eventReasonSameNodeDetachRescued, "retained the Ceph disk on the same node while completing logical attachment deletion")
+	if recorder := s.driver.kubeRuntime.recorder; recorder != nil {
+		recorder.Event(&corev1.ObjectReference{
+			APIVersion: "v1", Kind: "PersistentVolumeClaim", Namespace: last.PVCNamespace, Name: last.PVCName, UID: last.PVCUID,
+		}, corev1.EventTypeNormal, eventReasonSameNodeDetachRescued, "retained the Ceph disk on the same node while completing logical attachment deletion")
+	}
 	return true, &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 

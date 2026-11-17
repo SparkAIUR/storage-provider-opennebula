@@ -1207,11 +1207,15 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		}
 	}
 
-	recoveryControl, recoveryErr := s.recoveryControlState(ctx, req.VolumeId, recoveryRuntimeCtx)
-	if recoveryErr != nil {
-		return nil, recoveryErr
+	recoveryControl := resolvedRecoveryControlState(req.VolumeId, recoveryRuntimeCtx, VolumeRecoveryControlState{})
+	if recoveryControl.ManualActive() || (!ceph && recoveryRuntimeErr == nil && (recoveryRuntimeCtx == nil || backendErr == nil)) {
+		var recoveryErr error
+		recoveryControl, recoveryErr = s.recoveryControlState(ctx, req.VolumeId, recoveryRuntimeCtx)
+		if recoveryErr != nil {
+			return nil, recoveryErr
+		}
+		s.recordRecoveryModeExpiryWarning(ctx, recoveryRuntimeCtx, recoveryControl)
 	}
-	s.recordRecoveryModeExpiryWarning(ctx, recoveryRuntimeCtx, recoveryControl)
 	if recoveryControl.Invalid {
 		s.recordPVCWarningFromRuntimeContext(ctx, recoveryRuntimeCtx, eventReasonRecoveryAdoptionRejected, recoveryControl.Message)
 		return nil, status.Error(codes.FailedPrecondition, recoveryControl.Message)

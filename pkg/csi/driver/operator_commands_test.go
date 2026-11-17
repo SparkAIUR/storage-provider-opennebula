@@ -104,7 +104,7 @@ func TestSupportBundleLocalRWOSnapshotMarksBootstrappedHistory(t *testing.T) {
 	client := fake.NewSimpleClientset(pv, pvc, newReadyNode("node-old", true))
 	cfg := config.LoadConfiguration()
 
-	history, _, _, _, _ := collectSupportBundleLocalRWOSnapshot(context.Background(), cfg, client, newInventoryFakeClient(t), []corev1.PersistentVolume{*pv}, &storagev1.VolumeAttachmentList{}, nil)
+	history, _, _, _, _ := collectSupportBundleLocalRWOSnapshot(context.Background(), cfg, client, newInventoryFakeClient(t), []corev1.PersistentVolume{*pv}, &storagev1.VolumeAttachmentList{})
 	record, ok := history["vol-support-bootstrap"]
 	if !ok {
 		t.Fatalf("expected bootstrapped support history for volume")
@@ -383,12 +383,11 @@ func TestSupportBundleProjectsLiveMaintenanceAttachmentWithoutWrites(t *testing.
 	require.Equal(t, pv.Annotations, current.Annotations)
 }
 
-func TestSupportBundlePreservesPodDemandWhenAttachmentListFails(t *testing.T) {
+func TestSupportBundleReturnsAttachmentListFailure(t *testing.T) {
 	modes := []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
 	pv, pvc := newLocalPVAndPVC("vol-active", modes, nil)
-	idlePV, idlePVC := newLocalPVAndPVC("vol-no-pod", modes, nil)
 	pod := activePodForPVC("consumer", pvc.Name, "node-a")
-	client := fake.NewSimpleClientset(pv, pvc, idlePV, idlePVC, pod)
+	client := fake.NewSimpleClientset(pv, pvc, pod)
 	attachmentLists := 0
 	listErr := fmt.Errorf("VolumeAttachment census denied")
 	client.PrependReactor("*", "*", func(action ktesting.Action) (bool, kruntime.Object, error) {
@@ -410,10 +409,5 @@ func TestSupportBundlePreservesPodDemandWhenAttachmentListFails(t *testing.T) {
 	inventory := newInventoryFakeClient(t)
 	require.ErrorIs(t, writeSupportBundle(context.Background(), cfg, client, inventory, &output), listErr)
 	require.Empty(t, output.Bytes())
-	_, _, _, demand, _ := collectSupportBundleLocalRWOSnapshot(context.Background(), cfg, client, inventory,
-		[]corev1.PersistentVolume{*pv, *idlePV}, nil, listErr)
 	require.Equal(t, 1, attachmentLists)
-	require.Equal(t, "active_pod", demand["vol-active"].DemandSource)
-	require.Equal(t, "node-a", demand["vol-active"].NodeName)
-	require.NotContains(t, demand, "vol-no-pod")
 }
