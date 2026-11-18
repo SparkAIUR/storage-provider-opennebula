@@ -1168,15 +1168,21 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 
 	nodeID, err := s.volumeProvider.NodeExists(ctx, req.NodeId)
 	if err != nil || nodeID <= 0 {
+		var missingNode *opennebula.VMNotFoundError
+		if errors.As(err, &missingNode) && history.LastSuccessfulNodeName == req.NodeId &&
+			history.LastSuccessfulImageID == volumeID && history.LastSuccessfulOpenNebulaVMID > 0 {
+			return s.confirmUnpublishAbsence(ctx, req, volumeID, history.LastSuccessfulOpenNebulaVMID, true)
+		}
 		return nil, attachmentEvidenceUnavailable("attachment node identity is unavailable", err)
 	}
 
 	_, err = s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 	if err != nil {
-		if !errors.Is(err, opennebula.ErrAttachmentNotFound) {
+		retiredRequired := opennebula.IsAuthoritativeVolumeAbsence(err)
+		if !errors.Is(err, opennebula.ErrAttachmentNotFound) && !retiredRequired {
 			return nil, attachmentEvidenceUnavailable("attachment state is unknown", err)
 		}
-		return s.confirmUnpublishAbsence(ctx, req, volumeID, nodeID)
+		return s.confirmUnpublishAbsence(ctx, req, volumeID, nodeID, retiredRequired)
 	}
 
 	var recoveryRuntimeCtx *VolumeRuntimeContext
@@ -1353,7 +1359,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return nil, queueErr
 	}
 	if !completed {
-		return s.confirmUnpublishAbsence(ctx, req, volumeID, nodeID)
+		return s.confirmUnpublishAbsence(ctx, req, volumeID, nodeID, false)
 	}
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
@@ -1378,7 +1384,11 @@ func (s *ControllerServer) confirmMissingUnpublish(ctx context.Context, volume, 
 		if err := s.verifyUnpinnedVolumeAbsence(ctx, volume); err != nil {
 			return attachmentEvidenceUnavailable("missing volume ownership is unverified", err)
 		}
-		return s.verifyDetachAbsenceNode(ctx, node, history, "", false)
+		retired, err := s.detachAbsenceNodeRetired(ctx, node, history, "")
+		if retired {
+			return attachmentEvidenceUnavailable("missing volume has no pinned identity for a retired node", err)
+		}
+		return err
 	}
 	verifier, ok := s.volumeProvider.(opennebula.VolumeAbsenceVerifier)
 	if !ok {
@@ -1400,7 +1410,8 @@ func (s *ControllerServer) confirmMissingUnpublish(ctx context.Context, volume, 
 	if err := verifier.VerifyVolumeAbsent(ctx, volume, history.LastSuccessfulImageID, vmIDs...); err != nil {
 		return attachmentEvidenceUnavailable("missing volume ownership is unverified", err)
 	}
-	return s.verifyDetachAbsenceNode(ctx, node, history, "", true)
+	_, err = s.detachAbsenceNodeRetired(ctx, node, history, "")
+	return err
 }
 
 func (s *ControllerServer) verifyUnpinnedVolumeAbsence(ctx context.Context, volume string) error {
@@ -1414,7 +1425,7 @@ func (s *ControllerServer) verifyUnpinnedVolumeAbsence(ctx context.Context, volu
 	return ctx.Err()
 }
 
-func (s *ControllerServer) confirmUnpublishAbsence(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, imageID, vmID int) (*csi.ControllerUnpublishVolumeResponse, error) {
+func (s *ControllerServer) confirmUnpublishAbsence(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, imageID, vmID int, retiredRequired bool) (*csi.ControllerUnpublishVolumeResponse, error) {
 	nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(req.NodeId))
 	defer nodeRelease()
 	volumeRelease := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
@@ -1423,13 +1434,19 @@ func (s *ControllerServer) confirmUnpublishAbsence(ctx context.Context, req *csi
 	if err := ctx.Err(); err != nil {
 		return nil, status.FromContextError(err).Err()
 	}
-	if _, err := s.volumeProvider.GetVolumeInNode(ctx, imageID, vmID); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
-		if err != nil {
+	if !retiredRequired {
+		_, err := s.volumeProvider.GetVolumeInNode(ctx, imageID, vmID)
+		switch {
+		case errors.Is(err, opennebula.ErrAttachmentNotFound):
+		case opennebula.IsAuthoritativeVolumeAbsence(err):
+			retiredRequired = true
+		case err != nil:
 			return nil, attachmentEvidenceUnavailable("attachment state is unknown", err)
+		default:
+			return nil, status.Error(codes.Aborted, "unpublish completion is unverified while the volume is attached; retry the request")
 		}
-		return nil, status.Error(codes.Aborted, "unpublish completion is unverified while the volume is attached; retry the request")
 	}
-	if err := s.verifyDetachAbsenceTarget(ctx, req.VolumeId, req.NodeId, imageID, vmID, ""); err != nil {
+	if err := s.checkDetachAbsenceTarget(ctx, req.VolumeId, req.NodeId, imageID, vmID, "", retiredRequired); err != nil {
 		return nil, err
 	}
 	s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)

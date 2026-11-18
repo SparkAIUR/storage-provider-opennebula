@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -22,7 +23,7 @@ type volumeDeletionIdentity struct {
 	PVUID   types.UID `json:"pvUID"`
 	Driver  string    `json:"driver"`
 	Handle  string    `json:"handle"`
-	ImageID int       `json:"imageID"`
+	ImageID *int      `json:"imageID"`
 }
 
 func (s *ControllerServer) ownedDeletionPV(ctx context.Context, volume string) (*corev1.PersistentVolume, error) {
@@ -69,25 +70,40 @@ func (s *ControllerServer) prepareVolumeDeletion(ctx context.Context, volume str
 		var record volumeDeletionIdentity
 		err := decodeCephRetentionProtection(raw, &record)
 		if err != nil || record.Version != 1 || record.PVUID != pv.UID || record.Driver != s.driver.name ||
-			record.Handle != volume || record.ImageID <= 0 || (imageID > 0 && record.ImageID != imageID) {
+			record.Handle != volume || record.ImageID == nil || *record.ImageID < 0 || (imageID > 0 && *record.ImageID != imageID) {
 			return ctx, attachmentEvidenceUnavailable("PV deletion identity is unverified", err)
 		}
-		imageID = record.ImageID
+		imageID = *record.ImageID
 	}
 	if err := s.verifyVolumeDeletionProtection(ctx, volume, imageID, history.LastSuccessfulOpenNebulaVMID, pv != nil); err != nil {
 		return ctx, err
 	}
-	if imageID > 0 {
+	if marked || imageID > 0 {
 		ctx = opennebula.WithExpectedImageID(ctx, imageID)
 	}
 	if history.LastSuccessfulOpenNebulaVMID > 0 {
 		ctx = opennebula.WithExpectedDeletionVMID(ctx, history.LastSuccessfulOpenNebulaVMID)
 	}
-	if pv != nil {
-		ctx = opennebula.WithVolumeDeletionAuthorization(ctx, func(ctx context.Context, actualImageID int) error {
-			return s.authorizePVDeletion(ctx, pv, volume, actualImageID, history, raw, marked)
-		})
+	var stage func(context.Context, int) error
+	var expectedVersion string
+	verify := func(ctx context.Context, actualImageID int) error {
+		return s.verifyPVDeletion(ctx, pv, volume, actualImageID, history, expectedVersion, raw, marked)
 	}
+	if pv != nil {
+		expectedVersion = pv.ResourceVersion
+		stage = func(ctx context.Context, actualImageID int) error {
+			if !marked && history.LastSuccessfulImageID <= 0 {
+				var err error
+				expectedVersion, raw, err = s.markPVDeletion(ctx, pv, volume, actualImageID)
+				if err != nil {
+					return err
+				}
+				marked = true
+			}
+			return verify(ctx, actualImageID)
+		}
+	}
+	ctx = opennebula.WithVolumeDeletionAuthorization(ctx, stage, verify)
 	return ctx, nil
 }
 
@@ -109,54 +125,69 @@ func (s *ControllerServer) verifyVolumeDeletionProtection(ctx context.Context, v
 	return nil
 }
 
-func (s *ControllerServer) authorizePVDeletion(ctx context.Context, pv *corev1.PersistentVolume, volume string, imageID int, history VolumeHistoryRecord, raw string, marked bool) error {
-	if imageID <= 0 || (history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != imageID) {
-		return fmt.Errorf("provider image identity is unverified for deletion")
+func (s *ControllerServer) markPVDeletion(ctx context.Context, pv *corev1.PersistentVolume, volume string, imageID int) (string, string, error) {
+	if imageID < 0 || pv.ResourceVersion == "" {
+		return "", "", fmt.Errorf("provider image identity or PV resourceVersion is unavailable")
 	}
-	expectedVersion := pv.ResourceVersion
-	if !marked {
-		if expectedVersion == "" {
-			return fmt.Errorf("PV resourceVersion is unavailable")
-		}
-		identity, err := json.Marshal(volumeDeletionIdentity{Version: 1, PVUID: pv.UID, Driver: s.driver.name, Handle: volume, ImageID: imageID})
-		if err != nil {
-			return err
-		}
-		raw = string(identity)
-		path := "/metadata/annotations/" + strings.ReplaceAll(annotationDeleteVolumeIdentity, "/", "~1")
-		var value any = raw
-		if len(pv.Annotations) == 0 {
-			path, value = "/metadata/annotations", map[string]string{annotationDeleteVolumeIdentity: raw}
-		}
-		patch, err := json.Marshal([]map[string]any{
-			{"op": "test", "path": "/metadata/uid", "value": pv.UID},
-			{"op": "test", "path": "/metadata/resourceVersion", "value": expectedVersion},
-			{"op": "add", "path": path, "value": value},
-		})
-		if err != nil {
-			return err
-		}
-		updated, err := s.driver.kubeRuntime.client.CoreV1().PersistentVolumes().Patch(ctx, pv.Name, types.JSONPatchType, patch, metav1.PatchOptions{})
-		if err != nil {
-			return err
-		}
-		expectedVersion = updated.ResourceVersion
+	identity, err := json.Marshal(volumeDeletionIdentity{Version: 1, PVUID: pv.UID, Driver: s.driver.name, Handle: volume, ImageID: &imageID})
+	if err != nil {
+		return "", "", err
+	}
+	raw := string(identity)
+	path := "/metadata/annotations/" + strings.ReplaceAll(annotationDeleteVolumeIdentity, "/", "~1")
+	var value any = raw
+	if len(pv.Annotations) == 0 {
+		path, value = "/metadata/annotations", map[string]string{annotationDeleteVolumeIdentity: raw}
+	}
+	patch, err := json.Marshal([]map[string]any{
+		{"op": "test", "path": "/metadata/uid", "value": pv.UID},
+		{"op": "test", "path": "/metadata/resourceVersion", "value": pv.ResourceVersion},
+		{"op": "add", "path": path, "value": value},
+	})
+	if err != nil {
+		return "", "", err
+	}
+	updated, err := s.driver.kubeRuntime.client.CoreV1().PersistentVolumes().Patch(ctx, pv.Name, types.JSONPatchType, patch, metav1.PatchOptions{})
+	if err != nil {
+		return "", "", err
+	}
+	if updated.ResourceVersion == "" {
+		return "", "", fmt.Errorf("PV deletion identity write returned no resourceVersion")
+	}
+	return updated.ResourceVersion, raw, nil
+}
+
+func (s *ControllerServer) verifyPVDeletion(ctx context.Context, pv *corev1.PersistentVolume, volume string, imageID int, history VolumeHistoryRecord, expectedVersion, raw string, marked bool) error {
+	if (pv != nil && imageID < 0) || (history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != imageID) {
+		return fmt.Errorf("provider image identity is unverified for deletion")
 	}
 	current, err := s.ownedDeletionPV(ctx, volume)
 	if err != nil {
 		return err
 	}
-	if expectedVersion == "" || current == nil || current.Name != pv.Name || current.UID != pv.UID || current.ResourceVersion != expectedVersion ||
-		current.Annotations[annotationDeleteVolumeIdentity] != raw {
+	if (pv == nil) != (current == nil) {
 		return fmt.Errorf("PV deletion identity changed during admission")
 	}
-	currentHistory, err := s.readAttachmentHistory(ctx, volume)
-	if err != nil {
-		return err
+	if current != nil {
+		currentRaw, currentMarked := current.Annotations[annotationDeleteVolumeIdentity]
+		if current.Name != pv.Name || current.UID != pv.UID || current.ResourceVersion != expectedVersion ||
+			!apiequality.Semantic.DeepEqual(current.Spec.ClaimRef, pv.Spec.ClaimRef) || currentMarked != marked || currentRaw != raw {
+			return fmt.Errorf("PV deletion identity changed during admission")
+		}
 	}
-	if currentHistory.LastSuccessfulImageID != history.LastSuccessfulImageID ||
-		currentHistory.LastSuccessfulOpenNebulaVMID != history.LastSuccessfulOpenNebulaVMID {
-		return fmt.Errorf("deletion history changed during admission")
+	if manager := s.driver.volumeHistory; manager != nil && manager.runtime != nil && manager.runtime.enabled {
+		currentHistory, err := s.readAttachmentHistory(ctx, volume)
+		if err != nil {
+			return err
+		}
+		if currentHistory.LastSuccessfulImageID != history.LastSuccessfulImageID ||
+			currentHistory.LastSuccessfulOpenNebulaVMID != history.LastSuccessfulOpenNebulaVMID ||
+			currentHistory.LastSuccessfulNodeName != history.LastSuccessfulNodeName ||
+			currentHistory.LastSuccessfulNodeUID != history.LastSuccessfulNodeUID {
+			return fmt.Errorf("deletion history changed during admission")
+		}
+	} else if pv != nil {
+		return fmt.Errorf("volume history manager is unavailable")
 	}
-	return s.verifyVolumeDeletionProtection(ctx, volume, imageID, history.LastSuccessfulOpenNebulaVMID, true)
+	return s.verifyVolumeDeletionProtection(ctx, volume, imageID, history.LastSuccessfulOpenNebulaVMID, pv != nil)
 }

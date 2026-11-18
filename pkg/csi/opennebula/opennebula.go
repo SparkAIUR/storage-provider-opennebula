@@ -142,6 +142,10 @@ type VolumeAbsenceVerifier interface {
 	VerifyVolumeAbsent(ctx context.Context, volume string, imageID int, vmIDs ...int) error
 }
 
+type VMVolumeAbsenceVerifier interface {
+	VerifyVolumeAbsentFromVM(ctx context.Context, volume string, imageID, vmID int) error
+}
+
 type VolumeAttachmentInspector interface {
 	InspectVolumeAttachment(ctx context.Context, volume string, node string) (*VolumeAttachmentMetadata, error)
 }

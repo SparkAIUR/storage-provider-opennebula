@@ -304,6 +304,10 @@ func (s *ControllerServer) verifyProviderAttachmentBackend(ctx context.Context, 
 }
 
 func (s *ControllerServer) verifyDetachAbsenceTarget(ctx context.Context, volume, node string, imageID, vmID int, nodeUID types.UID) error {
+	return s.checkDetachAbsenceTarget(ctx, volume, node, imageID, vmID, nodeUID, false)
+}
+
+func (s *ControllerServer) checkDetachAbsenceTarget(ctx context.Context, volume, node string, imageID, vmID int, nodeUID types.UID, retiredRequired bool) error {
 	runtime := s.driver.kubeRuntime
 	if runtime != nil && runtime.enabled {
 		history, err := s.readAttachmentHistory(ctx, volume)
@@ -316,9 +320,16 @@ func (s *ControllerServer) verifyDetachAbsenceTarget(ctx context.Context, volume
 		if history.LastSuccessfulNodeName == node && history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != vmID {
 			return attachmentEvidenceUnavailable("detach absence VM differs from history", nil)
 		}
-		if err := s.verifyDetachAbsenceNode(ctx, node, history, nodeUID, false); err != nil {
+		retired, err := s.detachAbsenceNodeRetired(ctx, node, history, nodeUID)
+		if err != nil {
 			return err
 		}
+		if retired {
+			return s.verifyRetiredNodeAbsence(ctx, volume, node, imageID, vmID, history)
+		}
+	}
+	if retiredRequired {
+		return attachmentEvidenceUnavailable("retired node identity is unverified", nil)
 	}
 	currentVM, err := s.volumeProvider.NodeExists(ctx, node)
 	if err != nil || vmID <= 0 || currentVM != vmID {
@@ -331,23 +342,45 @@ func (s *ControllerServer) verifyDetachAbsenceTarget(ctx context.Context, volume
 	return status.FromContextError(ctx.Err()).Err()
 }
 
-func (s *ControllerServer) verifyDetachAbsenceNode(ctx context.Context, node string, history VolumeHistoryRecord, nodeUID types.UID, allowMissing bool) error {
+func (s *ControllerServer) verifyRetiredNodeAbsence(ctx context.Context, volume, node string, imageID, vmID int, history VolumeHistoryRecord) error {
+	if history.LastSuccessfulNodeName != node || history.LastSuccessfulNodeUID == "" || imageID <= 0 ||
+		history.LastSuccessfulImageID != imageID || vmID <= 0 || history.LastSuccessfulOpenNebulaVMID != vmID {
+		return attachmentEvidenceUnavailable("retired node lacks pinned attachment identity", nil)
+	}
+	currentVM, err := s.volumeProvider.NodeExists(ctx, node)
+	var missing *opennebula.VMNotFoundError
+	if (err != nil && !errors.As(err, &missing)) || (err == nil && currentVM != vmID) {
+		return attachmentEvidenceUnavailable("retired node VM identity changed", err)
+	}
+	verifier, ok := s.volumeProvider.(opennebula.VMVolumeAbsenceVerifier)
+	if !ok {
+		return attachmentEvidenceUnavailable("provider cannot verify retired node disk absence", nil)
+	}
+	if err := verifier.VerifyVolumeAbsentFromVM(ctx, volume, imageID, vmID); err != nil {
+		return attachmentEvidenceUnavailable("retired node disk absence is unverified", err)
+	}
+	current, err := s.driver.kubeRuntime.NodeIdentity(ctx, node)
+	if err != nil || current.Exists {
+		return attachmentEvidenceUnavailable("retired node identity changed", err)
+	}
+	return status.FromContextError(ctx.Err()).Err()
+}
+
+func (s *ControllerServer) detachAbsenceNodeRetired(ctx context.Context, node string, history VolumeHistoryRecord, nodeUID types.UID) (bool, error) {
 	if history.LastSuccessfulNodeName == node && history.LastSuccessfulNodeUID != "" {
 		if nodeUID != "" && string(nodeUID) != history.LastSuccessfulNodeUID {
-			return attachmentEvidenceUnavailable("detach absence node differs from history", nil)
+			return false, attachmentEvidenceUnavailable("detach absence node differs from history", nil)
 		}
 		nodeUID = types.UID(history.LastSuccessfulNodeUID)
 	}
 	if runtime := s.driver.kubeRuntime; runtime != nil && runtime.enabled && nodeUID != "" {
 		current, err := runtime.NodeIdentity(ctx, node)
-		if err == nil && !current.Exists && allowMissing {
-			return status.FromContextError(ctx.Err()).Err()
+		if err != nil || (current.Exists && (current.Deleting || current.UID != string(nodeUID))) {
+			return false, attachmentEvidenceUnavailable("detach absence node identity changed", err)
 		}
-		if err != nil || !current.Exists || current.Deleting || current.UID != string(nodeUID) {
-			return attachmentEvidenceUnavailable("detach absence node identity changed", err)
-		}
+		return !current.Exists, status.FromContextError(ctx.Err()).Err()
 	}
-	return status.FromContextError(ctx.Err()).Err()
+	return false, status.FromContextError(ctx.Err()).Err()
 }
 
 func (s *ControllerServer) verifySoleDetachOwner(ctx context.Context, volume, node string, imageID, vmID, diskID int) (string, error) {
@@ -416,12 +449,16 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 	if err != nil {
 		return false, err
 	}
+	retiredRequired := false
 	if identity.ceph || isCephBackend(identity.backend) || identity.background {
 		if _, err := s.volumeProvider.GetVolumeInNode(ctx, identity.imageID, identity.vmID); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
-			return false, attachmentEvidenceUnavailable("detach readback did not establish absence", err)
+			if !opennebula.IsAuthoritativeVolumeAbsence(err) {
+				return false, attachmentEvidenceUnavailable("detach readback did not establish absence", err)
+			}
+			retiredRequired = true
 		}
 	}
-	if err := s.verifyDetachAbsenceTarget(ctx, volume, node, identity.imageID, identity.vmID, identity.nodeUID); err != nil {
+	if err := s.checkDetachAbsenceTarget(ctx, volume, node, identity.imageID, identity.vmID, identity.nodeUID, retiredRequired); err != nil {
 		return false, err
 	}
 	return accepted, nil

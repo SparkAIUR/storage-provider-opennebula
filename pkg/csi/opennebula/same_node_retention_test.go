@@ -148,6 +148,16 @@ func TestSameNodeRetentionRejectsUncertainOrUnsafeEvidence(t *testing.T) {
 		"blank census image reference": func(c *retentionProtocolCase) {
 			c.extraVM = `<VM><ID>12</ID><NAME>other</NAME><TEMPLATE><DISK><IMAGE_ID></IMAGE_ID><DISK_ID>4</DISK_ID></DISK></TEMPLATE></VM>`
 		},
+		"backed census disk without image ID": func(c *retentionProtocolCase) {
+			c.extraVM = `<VM><ID>12</ID><NAME>other</NAME><TEMPLATE><DISK><DISK_ID>4</DISK_ID><IMAGE>volume-test</IMAGE><SOURCE>/ceph/disk</SOURCE><PERSISTENT>YES</PERSISTENT></DISK></TEMPLATE></VM>`
+		},
+		"backed fresh disk without image ID": func(c *retentionProtocolCase) {
+			c.beforeReply = func(method string) {
+				if method == "one.vm.info" {
+					c.extraDisk = `<DISK><DISK_ID>3</DISK_ID><IMAGE>volume-test</IMAGE><SOURCE>/ceph/disk</SOURCE><PERSISTENT>YES</PERSISTENT></DISK>`
+				}
+			}
+		},
 		"blank fresh image reference": func(c *retentionProtocolCase) {
 			c.beforeReply = func(method string) {
 				if method == "one.vm.info" {

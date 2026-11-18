@@ -51,6 +51,8 @@ type nodeAttachmentProtocol struct {
 	claimNew          bool
 	ceph              bool
 	imageName         string
+	zeroImage         bool
+	omitPoolImageID   bool
 	duplicateImage    bool
 	missingImage      bool
 	missingImageID    int
@@ -96,6 +98,10 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 		number := func(i int) int { v := call.Params[i].Value; return v.Int + v.I4 + v.I8 }
 		state.mu.Lock()
 		defer state.mu.Unlock()
+		imageID := 7
+		if state.zeroImage {
+			imageID = 0
+		}
 		vmXML := func(id int, direct bool) string {
 			name := "node-old"
 			if id == 42 {
@@ -145,7 +151,7 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 			if datastoreID == 0 {
 				datastoreID = 100
 			}
-			return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>%s</NAME><STATE>%d</STATE><SIZE>128</SIZE><DATASTORE_ID>%d</DATASTORE_ID><SOURCE>/fixture/disk</SOURCE><PERSISTENT>1</PERSISTENT><FORMAT>raw</FORMAT><RUNNING_VMS>%d</RUNNING_VMS><VMS>%s</VMS><TEMPLATE><PERSISTENT_TYPE>SHAREABLE</PERSISTENT_TYPE>%s</TEMPLATE></IMAGE>`, firstNonEmpty(state.imageName, "volume-test"), imageState, datastoreID, count, ids, tag)
+			return fmt.Sprintf(`<IMAGE><ID>%d</ID><NAME>%s</NAME><STATE>%d</STATE><SIZE>128</SIZE><DATASTORE_ID>%d</DATASTORE_ID><SOURCE>/fixture/disk</SOURCE><PERSISTENT>1</PERSISTENT><FORMAT>raw</FORMAT><RUNNING_VMS>%d</RUNNING_VMS><VMS>%s</VMS><TEMPLATE><PERSISTENT_TYPE>SHAREABLE</PERSISTENT_TYPE>%s</TEMPLATE></IMAGE>`, imageID, firstNonEmpty(state.imageName, "volume-test"), imageState, datastoreID, count, ids, tag)
 		}
 		ok, body, code := 1, "", 0
 		if call.Method == state.failMethod {
@@ -155,7 +161,11 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 			case "one.imagepool.info":
 				body = "<IMAGE_POOL>"
 				if !state.missingImage && !state.hideImageName {
-					body += imageXML()
+					image := imageXML()
+					if state.omitPoolImageID {
+						image = strings.Replace(image, fmt.Sprintf("<ID>%d</ID>", imageID), "", 1)
+					}
+					body += image
 				}
 				if state.duplicateImage {
 					body += fmt.Sprintf("<IMAGE><ID>8</ID><NAME>%s</NAME></IMAGE>", firstNonEmpty(state.imageName, "volume-test"))
@@ -228,10 +238,10 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				body = strconv.Itoa(id)
 			case "one.image.delete":
 				require.True(t, state.allowImageDelete, "unexpected provider image deletion")
-				require.Equal(t, 7, number(1))
+				require.Equal(t, imageID, number(1))
 				state.missingImage = true
-				state.mutations = append(state.mutations, "image-delete:7")
-				body = "7"
+				state.mutations = append(state.mutations, fmt.Sprintf("image-delete:%d", imageID))
+				body = strconv.Itoa(imageID)
 			case "one.image.update":
 				require.Equal(t, 1, number(3))
 				key, raw, found := strings.Cut(strings.TrimSpace(call.Params[2].Value.String), "=")
@@ -942,7 +952,7 @@ func TestProviderDetachRetryRespectsHotplugDeadline(t *testing.T) {
 
 func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"same-node", "replacement-uid", "replacement-vm", "vm-changed-before-dispatch", "duplicate-image", "replacement-image", "late-duplicate-image", "missing-image", "missing-image-replacement-uid", "hidden-handle", "missing-image-retained-disk", "missing-image-unknown-ownership", "missing-image-malformed-disk", "owner-omitted", "owner-omitted-released", "owner-omitted-gone", "owner-omitted-unreadable", "retired-node", "live-image-retired-node", "missing-image-unreadable-node"} {
+		for _, mode := range []string{"same-node", "replacement-uid", "replacement-vm", "vm-changed-before-dispatch", "duplicate-image", "replacement-image", "late-duplicate-image", "missing-image", "missing-image-replacement-uid", "hidden-handle", "missing-image-retained-disk", "missing-image-unknown-ownership", "missing-image-malformed-disk", "missing-image-backed-disk-without-id", "owner-omitted", "owner-omitted-released", "owner-omitted-gone", "owner-omitted-unreadable", "retired-node", "live-image-retired-node", "live-image-retired-node-gone", "live-image-retired-node-attached", "live-image-unreadable-node", "missing-image-unreadable-node"} {
 			t.Run(fmt.Sprintf("queued=%v/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
@@ -953,9 +963,9 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 				}
 				driver := newStickyTestDriver(t, pv, pvc, node, newReadyNode("node-new", true))
 				switch mode {
-				case "retired-node", "live-image-retired-node":
+				case "retired-node", "live-image-retired-node", "live-image-retired-node-gone", "live-image-retired-node-attached":
 					require.NoError(t, driver.kubeRuntime.client.CoreV1().Nodes().Delete(ctx, node.Name, metav1.DeleteOptions{}))
-				case "missing-image-unreadable-node":
+				case "missing-image-unreadable-node", "live-image-unreadable-node":
 					driver.kubeRuntime.client.(*fake.Clientset).PrependReactor("get", "nodes", func(ktesting.Action) (bool, kruntime.Object, error) {
 						return true, nil, fmt.Errorf("Node read unavailable")
 					})
@@ -989,8 +999,11 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 				switch mode {
 				case "replacement-vm":
 					state.vmNames = map[int]string{41: "retired-vm", 42: "node-old"}
-				case "same-node", "replacement-uid", "late-duplicate-image", "live-image-retired-node":
+				case "same-node", "replacement-uid", "late-duplicate-image", "live-image-retired-node", "live-image-unreadable-node":
 					delete(state.disks, 41)
+				case "live-image-retired-node-gone":
+					delete(state.disks, 41)
+					state.omitOriginalVM, state.missingOriginalVM = true, true
 				case "duplicate-image", "replacement-image", "missing-image", "missing-image-replacement-uid", "missing-image-unreadable-node":
 					delete(state.disks, 41)
 					state.missingImage = mode != "duplicate-image"
@@ -1001,6 +1014,10 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 					if mode == "missing-image-unknown-ownership" {
 						state.failMethod = "one.vmpool.info"
 					}
+				case "missing-image-backed-disk-without-id":
+					delete(state.disks, 41)
+					state.missingImage, state.omitOriginalVM = true, true
+					state.extraDiskByVM = map[int]string{41: `<DISK><DISK_ID>2</DISK_ID><IMAGE>volume-test</IMAGE><SOURCE>/fixture/disk</SOURCE><PERSISTENT>YES</PERSISTENT></DISK>`}
 					if mode == "missing-image-malformed-disk" {
 						delete(state.disks, 41)
 						state.extraDiskBefore = "<DISK><IMAGE_ID>invalid</IMAGE_ID></DISK>"
@@ -1028,7 +1045,7 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 				history, historyErr := controller.readAttachmentHistory(ctx, "volume-test")
 				require.NoError(t, historyErr)
 				switch mode {
-				case "same-node":
+				case "same-node", "live-image-retired-node", "live-image-retired-node-gone":
 					require.NoError(t, err)
 					require.NotNil(t, response)
 					require.False(t, history.LastSafeDetachTime.IsZero())
@@ -1537,6 +1554,8 @@ func TestControllerPublishWithImageLessDiskOnTarget(t *testing.T) {
 		{"ambiguous", "<TYPE>DISK</TYPE>", false},
 		{"backed CDROM", "<TYPE>CDROM</TYPE><SOURCE>/fixture/image.iso</SOURCE>", false},
 		{"CSI serial", "<TYPE>CDROM</TYPE><SERIAL>onecsi-7</SERIAL>", false},
+		{"omitted image ID on legacy device", "", true},
+		{"omitted image ID on backed disk", "<IMAGE>volume-test</IMAGE><SOURCE>/fixture/disk</SOURCE><PERSISTENT>YES</PERSISTENT>", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -1548,7 +1567,11 @@ func TestControllerPublishWithImageLessDiskOnTarget(t *testing.T) {
 			wire.mu.Lock()
 			delete(wire.disks, 41)
 			wire.marker = 128 * 1024 * 1024
-			wire.extraDiskBefore = "<DISK><DISK_ID>4</DISK_ID><IMAGE_ID/>" + tc.facts + "</DISK>"
+			imageRef := "<IMAGE_ID/>"
+			if strings.HasPrefix(tc.name, "omitted ") {
+				imageRef = ""
+			}
+			wire.extraDiskBefore = "<DISK><DISK_ID>4</DISK_ID>" + imageRef + tc.facts + "</DISK>"
 			wire.mu.Unlock()
 
 			reply, err := reviewControllerClient(t, NewControllerServer(driver, provider, nil)).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))

@@ -18,6 +18,7 @@ package opennebula
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	gocaerrors "github.com/OpenNebula/one/src/oca/go/src/goca/errors"
@@ -164,33 +165,41 @@ func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name st
 }
 
 func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume string) error {
-	expectedID, _ := ctx.Value(expectedImageIdentity{}).(int)
+	expectedID, pinned := ctx.Value(expectedImageIdentity{}).(int)
 	vmID, _ := ctx.Value(expectedDeletionVMIdentity{}).(int)
+	admission, _ := ctx.Value(volumeDeletionAuthorization{}).(deletionAdmission)
 	volumeID, err := p.lookupImageID(ctx, volume)
 	if errors.Is(err, ErrVolumeNotFound) {
-		if expectedID > 0 {
-			return p.VerifyVolumeAbsent(ctx, volume, expectedID, vmID)
+		if pinned {
+			return p.confirmVolumeDeletion(ctx, volume, expectedID, vmID, admission.verify)
+		}
+		if admission.verify != nil {
+			if err := admission.verify(ctx, -1); err != nil {
+				return err
+			}
 		}
 		return ErrVolumeNotFound
 	}
 	if err != nil {
 		return err
 	}
-	if volumeID <= 0 {
-		return fmt.Errorf("provider image identity is unverified for deletion")
-	}
-	if expectedID > 0 && volumeID != expectedID {
+	if pinned && volumeID != expectedID {
 		return fmt.Errorf("live image differs from the expected deletion identity")
 	}
 	ctx = WithExpectedImageID(ctx, volumeID)
 	if err := p.checkVolumeDeletion(ctx, volume, volumeID, vmID); err != nil {
 		return err
 	}
-	if authorize, ok := ctx.Value(volumeDeletionAuthorization{}).(func(context.Context, int) error); ok {
-		if err := authorize(ctx, volumeID); err != nil {
+	if admission.prepare != nil {
+		if err := admission.prepare(ctx, volumeID); err != nil {
 			return err
 		}
 		if err := p.checkVolumeDeletion(ctx, volume, volumeID, vmID); err != nil {
+			return err
+		}
+	}
+	if admission.verify != nil {
+		if err := admission.verify(ctx, volumeID); err != nil {
 			return err
 		}
 	}
@@ -200,11 +209,21 @@ func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume 
 	if err := p.waitForResourceStatusContext(ctx, volumeID, p.hotplugPolicy.BaseTimeout, p.volumeDeletedContext); err != nil {
 		return err
 	}
-	return p.VerifyVolumeAbsent(ctx, volume, volumeID, vmID)
+	return p.confirmVolumeDeletion(ctx, volume, volumeID, vmID, admission.verify)
+}
+
+func (p *PersistentDiskVolumeProvider) confirmVolumeDeletion(ctx context.Context, volume string, imageID, vmID int, verify func(context.Context, int) error) error {
+	if err := p.VerifyVolumeAbsent(ctx, volume, imageID, vmID); err != nil {
+		return err
+	}
+	if verify != nil {
+		return verify(ctx, imageID)
+	}
+	return ctx.Err()
 }
 
 func (p *PersistentDiskVolumeProvider) checkVolumeDeletion(ctx context.Context, volume string, volumeID, vmID int) error {
-	info, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
+	info, err := p.readImageInfo(ctx, volumeID)
 	if err != nil {
 		return fmt.Errorf("cannot establish deletion authority for image %d: %w", volumeID, err)
 	}
@@ -245,7 +264,7 @@ func (p *PersistentDiskVolumeProvider) checkVolumeDeletion(ctx context.Context, 
 }
 
 func (p *PersistentDiskVolumeProvider) VerifyVolumeAbsent(ctx context.Context, volume string, imageID int, vmIDs ...int) error {
-	if imageID <= 0 {
+	if imageID < 0 {
 		return fmt.Errorf("image identity is required to verify volume absence")
 	}
 	if _, err := p.ctrl.Image(imageID).InfoContext(ctx, true); !IsAuthoritativeVolumeAbsence(err) {
@@ -301,6 +320,30 @@ func (p *PersistentDiskVolumeProvider) verifyPinnedVMDiskAbsent(ctx context.Cont
 		return fmt.Errorf("pinned VM still has the image disk")
 	}
 	return nil
+}
+
+func (p *PersistentDiskVolumeProvider) VerifyVolumeAbsentFromVM(ctx context.Context, volume string, imageID, vmID int) error {
+	if imageID <= 0 || vmID <= 0 {
+		return fmt.Errorf("pinned image and VM identities are required")
+	}
+	metadata, err := p.inspectVolumeAttachment(WithExpectedImageID(ctx, imageID), volume, "", vmID)
+	if err != nil {
+		return err
+	}
+	metadata.RequestedNodeID = vmID
+	if present, err := attachmentPresence(metadata, volume, imageID, vmID); err != nil {
+		return err
+	} else if present {
+		return fmt.Errorf("pinned VM still owns the image")
+	}
+	liveID, err := p.lookupImageID(ctx, volume)
+	if err != nil {
+		return err
+	}
+	if liveID != imageID {
+		return fmt.Errorf("live image identity changed while checking VM absence")
+	}
+	return ctx.Err()
 }
 
 func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name string, sourceVolume string, selection DatastoreSelectionConfig) (*VolumeCreateResult, error) {
@@ -1355,33 +1398,35 @@ func diskImageReference(disk shared.Disk, allowBlank bool) (int, bool, error) {
 				return 0, false, &diskImageConflict{imageID: id, serialID: serialID}
 			}
 		}
-		if blank && !isImageLessDisk(disk, serial) {
+		if !present && (hasDiskBacking(disk, serial) || (blank && !isImageLessDisk(disk))) {
 			return 0, false, fmt.Errorf("malformed VM disk image identity")
 		}
 	}
 	return id, present, nil
 }
 
-func isImageLessDisk(disk shared.Disk, serial string) bool {
-	if strings.HasPrefix(strings.TrimSpace(serial), "onecsi-") {
-		return false
-	}
+func isImageLessDisk(disk shared.Disk) bool {
 	kind, _ := disk.Get("TYPE")
 	switch strings.ToUpper(strings.TrimSpace(kind)) {
 	case "CDROM", "FS", "SWAP":
+		return true
 	default:
 		volatile, _ := disk.Get("VOLATILE")
-		if !strings.EqualFold(strings.TrimSpace(volatile), "YES") {
-			return false
-		}
+		return strings.EqualFold(strings.TrimSpace(volatile), "YES")
+	}
+}
+
+func hasDiskBacking(disk shared.Disk, serial string) bool {
+	if strings.HasPrefix(strings.TrimSpace(serial), "onecsi-") {
+		return true
 	}
 	for _, key := range []shared.DiskKeys{"IMAGE", "IMAGE_UNAME", "IMAGE_UID", "SOURCE", "ORIGINAL_SOURCE"} {
 		if value, _ := disk.Get(key); strings.TrimSpace(value) != "" {
-			return false
+			return true
 		}
 	}
 	persistent, _ := disk.Get("PERSISTENT")
-	return strings.TrimSpace(persistent) == "" || strings.EqualFold(strings.TrimSpace(persistent), "NO")
+	return strings.TrimSpace(persistent) != "" && !strings.EqualFold(strings.TrimSpace(persistent), "NO")
 }
 
 func diskImageReferenceForVolume(disk shared.Disk, volumeID int, requireComplete bool) (int, bool, error) {
@@ -1468,8 +1513,13 @@ type expectedDeletionVMIdentity struct{}
 
 type volumeDeletionAuthorization struct{}
 
-func WithVolumeDeletionAuthorization(ctx context.Context, authorize func(context.Context, int) error) context.Context {
-	return context.WithValue(ctx, volumeDeletionAuthorization{}, authorize)
+type deletionAdmission struct {
+	prepare func(context.Context, int) error
+	verify  func(context.Context, int) error
+}
+
+func WithVolumeDeletionAuthorization(ctx context.Context, prepare, verify func(context.Context, int) error) context.Context {
+	return context.WithValue(ctx, volumeDeletionAuthorization{}, deletionAdmission{prepare: prepare, verify: verify})
 }
 
 func WithExpectedDeletionVMID(ctx context.Context, vmID int) context.Context {
@@ -1492,26 +1542,64 @@ var ErrVolumeNotFound = errors.New("volume not found")
 var ErrAttachmentNotFound = errors.New("volume attachment not found")
 
 func (p *PersistentDiskVolumeProvider) lookupImageID(ctx context.Context, name string) (int, error) {
-	pool, err := p.ctrl.Images().InfoContext(ctx)
+	response, err := p.ctrl.Client.ImagePoolInfo(ctx, parameters.PoolWhoAll, -1, -1)
 	if err != nil {
+		return -1, err
+	}
+	var pool struct {
+		XMLName xml.Name       `xml:"IMAGE_POOL"`
+		Images  []imageInfoXML `xml:"IMAGE"`
+	}
+	if err := xml.Unmarshal([]byte(response.Body()), &pool); err != nil {
 		return -1, err
 	}
 	found := -1
 	for _, v := range pool.Images {
 		if v.Name == name {
-			if v.ID < 0 {
+			id, valid := v.imageID()
+			if !valid {
 				return -1, fmt.Errorf("invalid image identity for volume handle")
 			}
 			if found != -1 {
 				return -1, fmt.Errorf("duplicate image name %q", name)
 			}
-			found = v.ID
+			found = id
 		}
 	}
 	if found < 0 {
 		return -1, fmt.Errorf("%w: %s", ErrVolumeNotFound, name)
 	}
 	return found, nil
+}
+
+type imageInfoXML struct {
+	img.Image
+	IDs []string `xml:"ID"`
+}
+
+func (info imageInfoXML) imageID() (int, bool) {
+	if len(info.IDs) != 1 {
+		return 0, false
+	}
+	id, err := strconv.Atoi(strings.TrimSpace(info.IDs[0]))
+	return id, err == nil && id >= 0
+}
+
+func (p *PersistentDiskVolumeProvider) readImageInfo(ctx context.Context, imageID int) (*img.Image, error) {
+	response, err := p.ctrl.Client.ImageInfo(ctx, imageID, true)
+	if err != nil {
+		return nil, err
+	}
+	var info imageInfoXML
+	if err := xml.Unmarshal([]byte(response.Body()), &info); err != nil {
+		return nil, err
+	}
+	id, valid := info.imageID()
+	if !valid {
+		id = -1
+	}
+	info.Image.ID = id
+	return &info.Image, nil
 }
 
 func (p *PersistentDiskVolumeProvider) VolumeExists(ctx context.Context, volume string) (int, int, error) {
@@ -1523,7 +1611,7 @@ func (p *PersistentDiskVolumeProvider) VolumeExists(ctx context.Context, volume 
 	if err != nil {
 		return -1, -1, err
 	}
-	info, err := p.ctrl.Image(id).InfoContext(ctx, true)
+	info, err := p.readImageInfo(ctx, id)
 	if err != nil {
 		return -1, -1, err
 	}
@@ -1659,12 +1747,15 @@ func (p *PersistentDiskVolumeProvider) volumeDeleted(volumeID int) (bool, error)
 	return p.volumeDeletedContext(context.Background(), volumeID)
 }
 func (p *PersistentDiskVolumeProvider) volumeDeletedContext(ctx context.Context, volumeID int) (bool, error) {
-	info, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
+	info, err := p.readImageInfo(ctx, volumeID)
 	if err != nil {
 		if openNebulaLookupNotFound(err) {
 			return true, nil
 		}
 		return false, err
+	}
+	if info.ID != volumeID {
+		return false, fmt.Errorf("image identity is unverified during deletion readback")
 	}
 	state, err := info.State()
 	if err != nil {
@@ -1982,7 +2073,7 @@ func (p *PersistentDiskVolumeProvider) getVolumeInNode(ctx context.Context, volu
 			}
 		}
 	}
-	info, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
+	info, err := p.readImageInfo(ctx, volumeID)
 	if err != nil {
 		return "", err
 	}
@@ -2028,7 +2119,7 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeLookup(ctx context.Context, 
 		return nil, fmt.Errorf("failed to inspect volume %s by name: %w", volume, err)
 	}
 
-	imageInfo, err := p.ctrl.Image(imgID).InfoContext(ctx, true)
+	imageInfo, err := p.readImageInfo(ctx, imgID)
 	if err != nil {
 		if openNebulaLookupNotFound(err) {
 			result.Status = VolumeLookupProviderInconsistent
@@ -2075,7 +2166,7 @@ func (p *PersistentDiskVolumeProvider) inspectVolumeAttachment(ctx context.Conte
 		}
 	}
 
-	imageInfo, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
+	imageInfo, err := p.readImageInfo(ctx, volumeID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to inspect image %d attachment metadata: %w", volumeID, err)
 	}
@@ -2197,7 +2288,7 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 		}
 		imageMeta, ok := imageCache[imageID]
 		if !ok {
-			imageInfo, imageErr := p.ctrl.Image(imageID).InfoContext(ctx, true)
+			imageInfo, imageErr := p.readImageInfo(ctx, imageID)
 			if IsAuthoritativeVolumeAbsence(imageErr) {
 				conflictedImages[imageID] = true
 				continue
@@ -2228,11 +2319,11 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 }
 
 func (p *PersistentDiskVolumeProvider) InspectVolumeDatastore(ctx context.Context, volume string, imageID int) (Datastore, error) {
-	image, err := p.ctrl.Image(imageID).InfoContext(ctx, true)
+	image, err := p.readImageInfo(ctx, imageID)
 	if err != nil {
 		return Datastore{}, err
 	}
-	if imageID <= 0 || image.ID != imageID || image.Name != volume || image.DatastoreID == nil || *image.DatastoreID < 0 {
+	if imageID < 0 || image.ID != imageID || image.Name != volume || image.DatastoreID == nil || *image.DatastoreID < 0 {
 		return Datastore{}, fmt.Errorf("image or datastore identity is unverified")
 	}
 	return p.attachmentDatastore(ctx, *image.DatastoreID)
