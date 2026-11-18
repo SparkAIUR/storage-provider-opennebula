@@ -157,7 +157,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 	}
 	for _, attachment := range attachments {
 		node := nodesByVM[attachment.NodeID]
-		if node == nil {
+		if node == nil || attachment.DiskID < 0 {
 			unresolvedVolume[attachment.VolumeHandle] = true
 			continue
 		}

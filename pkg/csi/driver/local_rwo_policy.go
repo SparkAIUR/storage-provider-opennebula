@@ -610,24 +610,32 @@ func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volume
 	if err != nil || currentVM != vmID {
 		return observation, attachmentEvidenceUnavailable("publish VM identity changed or is unverified", err)
 	}
-	currentNode, err := s.publishNodeIdentity(ctx, requestedNode)
-	if err != nil {
+	if err := s.checkPublishedAttachmentNode(ctx, volumeID, requestedNode, admittedNode, newAttachment); err != nil {
 		return observation, err
 	}
-	if currentNode.UID != admittedNode.UID || currentNode.Exists != admittedNode.Exists {
-		return observation, attachmentEvidenceUnavailable("publish Kubernetes Node identity changed", nil)
-	}
 	observation.nodeUID = admittedNode.UID
+	return observation, ctx.Err()
+}
+
+func (s *ControllerServer) checkPublishedAttachmentNode(ctx context.Context, volumeID, nodeName string, admittedNode KubernetesNodeIdentity, newAttachment bool) error {
 	if !newAttachment && s.driver.volumeHistory != nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
 		history, err := s.readAttachmentHistory(ctx, volumeID)
 		if err != nil {
-			return observation, attachmentEvidenceUnavailable("publish attachment history is unverified", err)
+			return attachmentEvidenceUnavailable("publish attachment history is unverified", err)
 		}
+		observation := successfulAttachmentObservation{nodeName: strings.TrimSpace(nodeName), nodeUID: admittedNode.UID}
 		if err := history.checkAttachmentNode(observation); err != nil {
-			return observation, status.Error(codes.Unavailable, err.Error())
+			return status.Error(codes.Unavailable, err.Error())
 		}
 	}
-	return observation, ctx.Err()
+	currentNode, err := s.publishNodeIdentity(ctx, nodeName)
+	if err != nil {
+		return err
+	}
+	if currentNode.UID != admittedNode.UID || currentNode.Exists != admittedNode.Exists {
+		return attachmentEvidenceUnavailable("publish Kubernetes Node identity changed", nil)
+	}
+	return ctx.Err()
 }
 
 func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID string, observation successfulAttachmentObservation, sourceContext map[string]string, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision) error {

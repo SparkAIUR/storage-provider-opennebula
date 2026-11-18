@@ -35,46 +35,48 @@ import (
 )
 
 type nodeAttachmentProtocol struct {
-	endpoint          string
-	hideDiskInfo      bool
-	rejectFirstDetach bool
-	detachAttempts    int
-	ignoreMarkerWrite bool
-	mu                sync.Mutex
-	disks             map[int]int
-	vmNames           map[int]string
-	diskSlot          string
-	extraDiskBefore   string
-	extraDiskByVM     map[int]string
-	poolExtraDisk     string
-	directDiskFields  string
-	marker            int64
-	mutations         []string
-	failMethod        string
-	claimNew          bool
-	ceph              bool
-	imageName         string
-	zeroImage         bool
-	omitPoolImageID   bool
-	duplicateImage    bool
-	missingImage      bool
-	missingImageID    int
-	allowImageDelete  bool
-	hideImageName     bool
-	omitOriginalVM    bool
-	missingOriginalVM bool
-	replacementDisk   bool
-	imageDatastoreID  int
-	extraImages       string
-	imageInfoByID     map[int]string
-	prependImageID    bool
-	imageTransfer     string
-	diskTransfer      string
-	diskTarget        string
-	ownerCount        int
-	ready             bool
-	pending           bool
-	version           string
+	endpoint            string
+	hideDiskInfo        bool
+	rejectFirstDetach   bool
+	detachAttempts      int
+	ignoreMarkerWrite   bool
+	mu                  sync.Mutex
+	disks               map[int]int
+	vmNames             map[int]string
+	diskSlot            string
+	extraDiskBefore     string
+	extraDiskByVM       map[int]string
+	poolExtraDisk       string
+	directDiskFields    string
+	directImageFields   string
+	imageTemplateFields string
+	marker              int64
+	mutations           []string
+	failMethod          string
+	claimNew            bool
+	ceph                bool
+	imageName           string
+	zeroImage           bool
+	omitPoolImageID     bool
+	duplicateImage      bool
+	missingImage        bool
+	missingImageID      int
+	allowImageDelete    bool
+	hideImageName       bool
+	omitOriginalVM      bool
+	missingOriginalVM   bool
+	replacementDisk     bool
+	imageDatastoreID    int
+	extraImages         string
+	imageInfoByID       map[int]string
+	prependImageID      bool
+	imageTransfer       string
+	diskTransfer        string
+	diskTarget          string
+	ownerCount          int
+	ready               bool
+	pending             bool
+	version             string
 }
 
 // This fixture models durable shareable storage, not ephemeral cloned disks.
@@ -190,6 +192,8 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				body += state.extraImages + "</IMAGE_POOL>"
 			case "one.image.info":
 				body = imageXML()
+				body = strings.Replace(body, "<IMAGE>", "<IMAGE>"+state.directImageFields, 1)
+				body = strings.Replace(body, "<TEMPLATE>", "<TEMPLATE>"+state.imageTemplateFields, 1)
 				if state.prependImageID {
 					body = strings.Replace(body, "<IMAGE>", "<IMAGE><ID>8</ID>", 1)
 				}
@@ -1753,6 +1757,95 @@ func TestControllerPublishPinsAdmittedKubernetesNode(t *testing.T) {
 	}
 }
 
+func TestControllerPublishChecksRetainedNodeBeforeRestoration(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, path := range []struct {
+			name    string
+			arrival int
+		}{{"attached", 0}, {"precheck", 2}, {"sticky", 3}} {
+			for _, replaced := range []bool{false, true} {
+				t.Run(fmt.Sprintf("queued=%t/%s/replaced=%t", queued, path.name, replaced), func(t *testing.T) {
+					ctx := context.Background()
+					const volume = "volume-test"
+					pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+					node := newReadyNode("node-old", true)
+					owner := node.UID
+					if replaced {
+						node.UID = "replacement-uid"
+					}
+					driver := newStickyTestDriver(t, pv, pvc, node, activePodForPVC("consumer", pvc.Name, node.Name))
+					_, err := driver.volumeHistory.Upsert(ctx, volume, func(record *VolumeHistoryRecord) {
+						record.Backend = "ceph"
+						record.LastSuccessfulNodeName = node.Name
+						record.LastSuccessfulNodeUID = string(owner)
+						record.LastSuccessfulImageID = 7
+						record.LastSuccessfulOpenNebulaVMID = 41
+						record.LastSuccessfulPublishTime = time.Now().Add(-time.Hour).UTC()
+					})
+					require.NoError(t, err)
+					if path.name == "sticky" {
+						require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
+							VolumeID: volume, NodeID: node.Name, Backend: "local", StartedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute), GraceSeconds: 60,
+						}))
+					}
+					var protocol *nodeAttachmentProtocol
+					var directReads int
+					provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+						if method != "one.vm.info" {
+							return
+						}
+						protocol.mu.Lock()
+						defer protocol.mu.Unlock()
+						directReads++
+						if directReads == path.arrival {
+							protocol.disks[41] = 128
+						}
+					})
+					protocol = wire
+					wire.mu.Lock()
+					wire.ceph, wire.marker = true, 256*1024*1024
+					if path.arrival == 0 {
+						wire.disks[41] = 128
+					} else {
+						delete(wire.disks, 41)
+					}
+					wire.mu.Unlock()
+					server := NewControllerServer(driver, provider, nil)
+					if queued {
+						driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+						driver.hotplugQueue.Configure(true, 0, 0, 0, nil)
+					}
+					before, err := server.readAttachmentHistory(ctx, volume)
+					require.NoError(t, err)
+					reply, err := reviewControllerClient(t, server).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
+					after, historyErr := server.readAttachmentHistory(ctx, volume)
+					require.NoError(t, historyErr)
+					_, held := driver.stickyAttachments.Get(volume)
+					wire.mu.Lock()
+					defer wire.mu.Unlock()
+					if replaced {
+						require.Equal(t, codes.Unavailable, status.Code(err))
+						require.ErrorContains(t, err, "does not match the retained attachment")
+						require.Nil(t, reply)
+						require.Equal(t, before, after)
+						require.Equal(t, path.name == "sticky", held)
+						require.Equal(t, max(1, path.arrival), directReads)
+						require.Equal(t, 128, wire.disks[41])
+						require.Empty(t, wire.mutations)
+					} else {
+						require.NoError(t, err)
+						require.Equal(t, "vdb", reply.GetPublishContext()["volumeName"])
+						require.True(t, after.LastSuccessfulPublishTime.After(before.LastSuccessfulPublishTime))
+						require.False(t, held)
+						require.Equal(t, 256, wire.disks[41])
+						require.Equal(t, []string{"resize:41:256", "marker:268435456"}, wire.mutations)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestPublishAndStagePreserveRetainedNodeUIDUntilFreshAttach(t *testing.T) {
 	for _, queued := range []bool{false, true} {
 		t.Run(fmt.Sprintf("queued=%t", queued), func(t *testing.T) {
@@ -1915,8 +2008,12 @@ func TestAttachmentInventorySharesDatastorePoolPerPass(t *testing.T) {
 	wire.extraDiskByVM[42] = strings.Replace(wire.extraDiskByVM[42], "</DISK>", "<RESIZE>NO</RESIZE><RESIZE>YES</RESIZE></DISK>", 1)
 	wire.mu.Unlock()
 	attachments, _, err := provider.ListCurrentAttachments(ctx)
-	require.ErrorIs(t, err, opennebula.ErrConflictingAttachmentEvidence)
-	require.Empty(t, attachments)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []opennebula.ObservedAttachment{
+		{VolumeHandle: "volume-test", ImageID: 7, NodeName: "node-old", NodeID: 41, DiskID: 2, Backend: "local"},
+		{VolumeHandle: "other-volume", ImageID: 8, NodeName: "node-new", NodeID: 42, DiskID: -1, Backend: "local"},
+	}, attachments)
+	require.EqualValues(t, 4, datastoreReads.Load())
 }
 
 func TestProviderDetachPreservesParentCancellationDuringPollAndRetry(t *testing.T) {
@@ -2599,7 +2696,7 @@ func TestStickyTransferRetriesAgainstConcurrentAbsentUnpublish(t *testing.T) {
 }
 
 func TestCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t *testing.T) {
-	for _, mode := range []string{"serial", "wrong-image-id", "blank-image-name", "missing-image"} {
+	for _, mode := range []string{"serial", "wrong-image-id", "blank-image-name", "missing-image", "duplicate-resize"} {
 		t.Run(mode, func(t *testing.T) {
 			testCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t, mode)
 		})
@@ -2635,6 +2732,9 @@ func testCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t *testing.T, mode st
 		wire.imageInfoByID = map[int]string{8: `<IMAGE><ID>8</ID><NAME></NAME></IMAGE>`}
 	case "missing-image":
 		wire.missingImageID = 8
+	case "duplicate-resize":
+		wire.extraDiskByVM[42] = strings.Replace(wire.extraDiskByVM[42], "</DISK>", "<RESIZE>NO</RESIZE><RESIZE>YES</RESIZE></DISK>", 1)
+		wire.imageInfoByID = map[int]string{8: `<IMAGE><ID>8</ID><NAME>other-volume</NAME><STATE>8</STATE><SIZE>128</SIZE><DATASTORE_ID>100</DATASTORE_ID><RUNNING_VMS>1</RUNNING_VMS><VMS><ID>42</ID></VMS></IMAGE>`}
 	}
 	if mode != "serial" {
 		wire.extraDiskByVM[42] = strings.Replace(wire.extraDiskByVM[42], "onecsi-9", "onecsi-8", 1)
@@ -2643,7 +2743,8 @@ func testCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t *testing.T, mode st
 
 	_, err := provider.GetVolumeInNode(ctx, 7, 42)
 	require.ErrorIs(t, err, opennebula.ErrAttachmentNotFound)
-	reconciler := NewAttachmentReconciler(NewControllerServer(driver, provider, nil))
+	server := NewControllerServer(driver, provider, nil)
+	reconciler := NewAttachmentReconciler(server)
 	reconciler.orphanGrace = time.Nanosecond
 	reconciler.staleVAGrace = time.Nanosecond
 	require.NoError(t, reconciler.ReconcileOnce(ctx))
@@ -2651,6 +2752,13 @@ func testCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t *testing.T, mode st
 	require.NoError(t, reconciler.ReconcileOnce(ctx))
 	_, err = driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(ctx, otherVA.Name, metav1.GetOptions{})
 	require.NoError(t, err)
+	if mode == "duplicate-resize" {
+		require.Empty(t, reconciler.staleVASeen)
+		reply, err := reviewControllerClient(t, server).ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "other-volume", NodeId: "node-new"})
+		require.ErrorContains(t, err, "attachment state is unknown")
+		require.Equal(t, codes.Unavailable, status.Code(err))
+		require.Nil(t, reply)
+	}
 	wire.mu.Lock()
 	defer wire.mu.Unlock()
 	require.Equal(t, []string{"detach:41"}, wire.mutations)
@@ -2777,6 +2885,8 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 		{false, false, "system-datastore"}, {true, false, "system-datastore"},
 		{false, false, "late-duplicate-id"}, {true, false, "late-duplicate-id"},
 		{false, false, "late-duplicate-resize"}, {true, false, "late-duplicate-resize"},
+		{false, false, "late-duplicate-persistent"}, {true, false, "late-duplicate-persistent"},
+		{false, false, "late-duplicate-capacity"}, {true, false, "late-duplicate-capacity"},
 		{false, true, "zero-slot"}, {true, true, "zero-slot"},
 		{false, false, "zero-slot-changed"}, {true, false, "zero-slot-changed"},
 		{false, false, "legacy-slot-omitted"}, {true, false, "legacy-slot-omitted"},
@@ -2803,10 +2913,18 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 			var protocol *nodeAttachmentProtocol
 			var unpublishActive atomic.Bool
 			var imageReads, directReads atomic.Int32
+			duplicateImage := tc.drift == "late-duplicate-id" || tc.drift == "late-duplicate-persistent" || tc.drift == "late-duplicate-capacity"
 			provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
-				if tc.drift == "late-duplicate-id" && unpublishActive.Load() && method == "one.image.info" && imageReads.Add(1) == 4 {
+				if duplicateImage && unpublishActive.Load() && method == "one.image.info" && imageReads.Add(1) == 4 {
 					protocol.mu.Lock()
-					protocol.prependImageID = true
+					switch tc.drift {
+					case "late-duplicate-id":
+						protocol.prependImageID = true
+					case "late-duplicate-persistent":
+						protocol.directImageFields = "<PERSISTENT>0</PERSISTENT>"
+					case "late-duplicate-capacity":
+						protocol.imageTemplateFields = "<CSI_REQUESTED_SIZE_BYTES>1</CSI_REQUESTED_SIZE_BYTES>"
+					}
 					protocol.mu.Unlock()
 				}
 				if tc.drift == "late-duplicate-resize" && unpublishActive.Load() && method == "one.vm.info" && directReads.Add(1) == 2 {
@@ -2979,6 +3097,9 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 				case "late-duplicate-resize":
 					require.ErrorContains(t, err, "provider")
 					require.EqualValues(t, 2, directReads.Load())
+				case "late-duplicate-persistent", "late-duplicate-capacity":
+					require.ErrorContains(t, err, "provider")
+					require.EqualValues(t, 4, imageReads.Load())
 				case "zero-slot-changed":
 					require.ErrorContains(t, err, "device identity contradicts observed history")
 					require.NoError(t, kube.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{}))

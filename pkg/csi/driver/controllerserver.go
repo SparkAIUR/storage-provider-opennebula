@@ -985,7 +985,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 		target, err := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
 		if err == nil {
-			if err := s.restoreVolumeCapacity(queueCtx, req.VolumeId, nodeID, volumeID); err != nil {
+			if err := s.restoreRetainedVolumeCapacity(queueCtx, req, nodeID, volumeID, publishNode); err != nil {
 				return err
 			}
 			if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(queueCtx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), runtimeCtx); localErr != nil {
@@ -2051,6 +2051,13 @@ func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node
 	return validation
 }
 
+func (s *ControllerServer) restoreRetainedVolumeCapacity(ctx context.Context, req *csi.ControllerPublishVolumeRequest, vmID, imageID int, admittedNode KubernetesNodeIdentity) error {
+	if err := s.checkPublishedAttachmentNode(ctx, req.VolumeId, req.NodeId, admittedNode, false); err != nil {
+		return err
+	}
+	return s.restoreVolumeCapacity(ctx, req.VolumeId, vmID, imageID)
+}
+
 func (s *ControllerServer) restoreVolumeCapacity(ctx context.Context, volume string, nodeID, volumeID int) error {
 	err := s.volumeProvider.RestoreVolumeCapacity(ctx, volume, nodeID, volumeID)
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -2087,7 +2094,7 @@ func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.
 			return false, nil, nil
 		}
 		if validation.Reason != queueReasonManualRecoveryAdopted {
-			if err := s.restoreVolumeCapacity(ctx, req.VolumeId, nodeID, volumeID); err != nil {
+			if err := s.restoreRetainedVolumeCapacity(ctx, req, nodeID, volumeID, publishNode); err != nil {
 				return true, nil, err
 			}
 		}
@@ -2739,7 +2746,7 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 			_ = s.driver.stickyAttachments.Clear(req.VolumeId)
 			return false, nil, nil
 		}
-		if err := s.restoreVolumeCapacity(ctx, req.VolumeId, nodeID, volumeID); err != nil {
+		if err := s.restoreRetainedVolumeCapacity(ctx, req, nodeID, volumeID, publishNode); err != nil {
 			return true, nil, err
 		}
 		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), nil); localErr != nil {

@@ -977,13 +977,16 @@ func linuxDiskLetters(index int) string {
 }
 
 func (p *PersistentDiskVolumeProvider) inspectAttachmentEnvironment(ctx context.Context, volumeID, nodeID int) (*DatastoreEnvironmentReport, error) {
-	imageInfo, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
+	imageInfo, err := p.readImageInfo(ctx, volumeID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to inspect image %d before attach: %w", volumeID, err)
 	}
 
 	if imageInfo.DatastoreID == nil {
 		return nil, &datastoreConfigError{message: fmt.Sprintf("volume %d does not expose a source datastore ID", volumeID)}
+	}
+	if imageInfo.ID != volumeID {
+		return nil, fmt.Errorf("image identity changed before attach")
 	}
 
 	datastorePool, err := p.ctrl.Datastores().InfoContext(ctx)
@@ -1461,11 +1464,11 @@ func validateAttachmentDiskFields(disk shared.Disk, imageID int) error {
 }
 
 func diskIdentifiesOtherImage(disk shared.Disk, imageID int) bool {
-	if imageID < 0 || len(disk.GetPairs(string(shared.ImageID))) != 1 {
+	if imageID < 0 {
 		return false
 	}
 	id, err := disk.GetI(shared.ImageID)
-	if err != nil || id < 0 || id == imageID {
+	if err != nil || id < 0 || id == imageID || !diskHasOnlyImageID(disk, id) {
 		return false
 	}
 	for _, serial := range disk.GetPairs(string(shared.Serial)) {
@@ -1473,6 +1476,32 @@ func diskIdentifiesOtherImage(disk shared.Disk, imageID int) bool {
 		serialID, err := strconv.Atoi(suffix)
 		if isCSI && err == nil && serialID == imageID {
 			return false
+		}
+	}
+	return true
+}
+
+func diskHasOnlyImageID(disk shared.Disk, imageID int) bool {
+	fields := disk.GetPairs(string(shared.ImageID))
+	for _, field := range fields {
+		id, err := strconv.Atoi(field.Value)
+		if err != nil || id != imageID {
+			return false
+		}
+	}
+	return len(fields) != 0
+}
+
+func diskFieldsBelongToImage(disk shared.Disk, imageID int) bool {
+	if !diskHasOnlyImageID(disk, imageID) {
+		return false
+	}
+	for _, serial := range disk.GetPairs(string(shared.Serial)) {
+		if suffix, ok := strings.CutPrefix(strings.ToLower(strings.TrimSpace(serial.Value)), "onecsi-"); ok {
+			id, err := strconv.Atoi(suffix)
+			if err != nil || id != imageID {
+				return false
+			}
 		}
 	}
 	return true
@@ -1591,17 +1620,17 @@ func (p *PersistentDiskVolumeProvider) lookupImageID(ctx context.Context, name s
 		return -1, err
 	}
 	var pool struct {
-		XMLName xml.Name       `xml:"IMAGE_POOL"`
-		Images  []imageInfoXML `xml:"IMAGE"`
+		XMLName xml.Name           `xml:"IMAGE_POOL"`
+		Images  []imageIdentityXML `xml:"IMAGE"`
 	}
 	if err := xml.Unmarshal([]byte(response.Body()), &pool); err != nil {
 		return -1, err
 	}
 	found := -1
 	for _, v := range pool.Images {
-		if v.Name == name {
+		if slices.Contains(v.Names, name) {
 			id, valid := v.imageID()
-			if !valid {
+			if !valid || len(v.Names) != 1 {
 				return -1, fmt.Errorf("invalid image identity for volume handle")
 			}
 			if found != -1 {
@@ -1616,12 +1645,12 @@ func (p *PersistentDiskVolumeProvider) lookupImageID(ctx context.Context, name s
 	return found, nil
 }
 
-type imageInfoXML struct {
-	img.Image
-	IDs []string `xml:"ID"`
+type imageIdentityXML struct {
+	IDs   []string `xml:"ID"`
+	Names []string `xml:"NAME"`
 }
 
-func (info imageInfoXML) imageID() (int, bool) {
+func (info imageIdentityXML) imageID() (int, bool) {
 	if len(info.IDs) != 1 {
 		return 0, false
 	}
@@ -1629,16 +1658,65 @@ func (info imageInfoXML) imageID() (int, bool) {
 	return id, err == nil && id >= 0
 }
 
+type imageAuthorityField struct {
+	XMLName xml.Name
+}
+
+func validateImageAuthorityXML(data []byte) error {
+	var image struct {
+		XMLName   xml.Name              `xml:"IMAGE"`
+		Fields    []imageAuthorityField `xml:",any"`
+		Templates []struct {
+			Fields []imageAuthorityField `xml:",any"`
+		} `xml:"TEMPLATE"`
+	}
+	if err := xml.Unmarshal(data, &image); err != nil {
+		return err
+	}
+	seen := make(map[string]bool)
+	for _, field := range image.Fields {
+		switch key := field.XMLName.Local; key {
+		case "ID", "NAME", "STATE", "PERSISTENT", "RUNNING_VMS", "CLONING_OPS", "SIZE", "DATASTORE_ID", "VMS", "SOURCE", "SNAPSHOTS":
+			if seen[key] {
+				return fmt.Errorf("%w: repeated image field %s", ErrConflictingAttachmentEvidence, key)
+			}
+			seen[key] = true
+		}
+	}
+	if len(image.Templates) > 1 {
+		return fmt.Errorf("%w: repeated image field TEMPLATE", ErrConflictingAttachmentEvidence)
+	}
+	for _, template := range image.Templates {
+		for _, field := range template.Fields {
+			switch key := field.XMLName.Local; key {
+			case requestedSizeTag, "FORCE_DELETE":
+				if seen[key] {
+					return fmt.Errorf("%w: repeated image template field %s", ErrConflictingAttachmentEvidence, key)
+				}
+				seen[key] = true
+			}
+		}
+	}
+	return nil
+}
+
 func (p *PersistentDiskVolumeProvider) readImageInfo(ctx context.Context, imageID int) (*img.Image, error) {
 	response, err := p.ctrl.Client.ImageInfo(ctx, imageID, true)
 	if err != nil {
 		return nil, err
 	}
-	var info imageInfoXML
-	if err := xml.Unmarshal([]byte(response.Body()), &info); err != nil {
+	data := []byte(response.Body())
+	if err := validateImageAuthorityXML(data); err != nil {
 		return nil, err
 	}
-	id, valid := info.imageID()
+	var info struct {
+		img.Image
+		IDs []string `xml:"ID"`
+	}
+	if err := xml.Unmarshal(data, &info); err != nil {
+		return nil, err
+	}
+	id, valid := (imageIdentityXML{IDs: info.IDs}).imageID()
 	if !valid {
 		id = -1
 	}
@@ -2347,13 +2425,17 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 	attachments := make([]ObservedAttachment, 0)
 	vmNames := make(VMNameInventory, len(vmPool.VMs))
 	conflictedImages := make(map[int]bool)
+	incompleteImages := make(map[int]bool)
 	for _, vmInfo := range vmPool.VMs {
 		vmNames[vmInfo.Name] = append(vmNames[vmInfo.Name], vmInfo.ID)
 		for _, disk := range vmInfo.Template.GetDisks() {
-			if err := validateAttachmentDiskFields(disk, -1); err != nil {
-				return nil, nil, err
-			}
 			diskImageID, present, diskErr := diskImageReference(disk, false)
+			if err := validateAttachmentDiskFields(disk, -1); err != nil {
+				if diskErr != nil || !present || !diskFieldsBelongToImage(disk, diskImageID) {
+					return nil, nil, err
+				}
+				incompleteImages[diskImageID] = true
+			}
 			var conflict *diskImageConflict
 			if errors.As(diskErr, &conflict) {
 				conflictedImages[conflict.imageID] = true
@@ -2368,7 +2450,10 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 			}
 			diskID, diskIDErr := disk.GetI(shared.DiskID)
 			if diskIDErr != nil {
-				continue
+				if !incompleteImages[diskImageID] {
+					continue
+				}
+				diskID = -1
 			}
 			attachments = append(attachments, ObservedAttachment{
 				ImageID: diskImageID, NodeName: vmInfo.Name, NodeID: vmInfo.ID, DiskID: diskID,
@@ -2391,7 +2476,7 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 		imageMeta, ok := imageCache[imageID]
 		if !ok {
 			imageInfo, imageErr := p.readImageInfo(ctx, imageID)
-			if IsAuthoritativeVolumeAbsence(imageErr) {
+			if IsAuthoritativeVolumeAbsence(imageErr) || errors.Is(imageErr, ErrConflictingAttachmentEvidence) {
 				conflictedImages[imageID] = true
 				continue
 			}
@@ -2419,6 +2504,9 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 		}
 		attachment.VolumeHandle = imageMeta.name
 		attachment.Backend = imageMeta.backend
+		if incompleteImages[imageID] {
+			attachment.DiskID = -1
+		}
 	}
 	attachments = slices.DeleteFunc(attachments, func(a ObservedAttachment) bool { return conflictedImages[a.ImageID] })
 	return attachments, vmNames, nil

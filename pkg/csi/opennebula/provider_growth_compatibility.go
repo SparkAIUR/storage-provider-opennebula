@@ -55,7 +55,7 @@ func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context
 	if marker, _ := selected.Get("RESIZE"); marker != "" && marker != "NO" && marker != "0" && marker != "false" {
 		return deny("disk growth remains pending")
 	}
-	image, err := p.ctrl.Image(imageID).InfoContext(ctx, true)
+	image, err := p.readImageInfo(ctx, imageID)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
 	}

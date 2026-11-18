@@ -410,7 +410,7 @@ func TestDeleteVolumeRechecksLiveImageWithExistingPVIdentity(t *testing.T) {
 func TestControllerDeleteVolumeRejectsUnverifiedPVIdentity(t *testing.T) {
 	for _, mode := range []string{"uid-drift", "resource-version-drift", "binding-drift", "patch-refused", "readback-refused",
 		"wrong-readback", "provider-identity-drift", "provider-ownership-drift", "malformed-marker", "marker-other-pv", "marker-without-image-id", "marker-duplicate-image-id", "pool-without-image-id", "info-without-image-id",
-		"marker-conflicts-with-history", "marker-conflicts-with-provider", "repair-required"} {
+		"marker-conflicts-with-history", "marker-conflicts-with-provider", "repair-required", "pool-conflicting-names", "duplicate-force-delete"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			const volume = "volume-test"
@@ -451,6 +451,13 @@ func TestControllerDeleteVolumeRejectsUnverifiedPVIdentity(t *testing.T) {
 				} else {
 					wire.imageInfoByID = map[int]string{0: `<IMAGE><NAME>volume-test</NAME><STATE>1</STATE><SIZE>128</SIZE><SOURCE>/fixture/disk</SOURCE></IMAGE>`}
 				}
+			}
+			switch mode {
+			case "pool-conflicting-names":
+				wire.hideImageName = true
+				wire.extraImages = `<IMAGE><ID>7</ID><NAME>volume-test</NAME><NAME>another-handle</NAME></IMAGE>`
+			case "duplicate-force-delete":
+				wire.imageTemplateFields = `<FORCE_DELETE>NO</FORCE_DELETE><FORCE_DELETE>YES</FORCE_DELETE>`
 			}
 			wire.mu.Unlock()
 

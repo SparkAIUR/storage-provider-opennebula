@@ -73,9 +73,12 @@ func completedSelectedDiskSize(info *vm.VM, disk shared.Disk) (int64, error) {
 }
 
 func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, id int, size int64) error {
-	info, err := p.ctrl.Image(id).InfoContext(ctx, true)
+	info, err := p.readImageInfo(ctx, id)
 	if err != nil {
 		return err
+	}
+	if info.ID != id {
+		return fmt.Errorf("image identity changed before recording verified capacity")
 	}
 	existing, err := effectiveImageSize(info)
 	if err != nil {
@@ -91,19 +94,19 @@ func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, 
 	if err := p.ctrl.Image(id).UpdateContext(ctx, tpl.String(), parameters.Merge); err != nil {
 		return err
 	}
-	info, err = p.ctrl.Image(id).InfoContext(ctx, true)
+	info, err = p.readImageInfo(ctx, id)
 	if err != nil {
 		return err
 	}
 	raw, err := info.Template.GetStr(requestedSizeTag)
-	if err != nil || raw != strconv.FormatInt(size, 10) {
+	if err != nil || info.ID != id || raw != strconv.FormatInt(size, 10) {
 		return fmt.Errorf("verified size metadata readback failed for image %d", id)
 	}
 	return nil
 }
 
 func (p *PersistentDiskVolumeProvider) RestoreVolumeCapacity(ctx context.Context, volume string, vmID, imageID int) error {
-	info, err := p.ctrl.Image(imageID).InfoContext(ctx, true)
+	info, err := p.readImageInfo(ctx, imageID)
 	if err != nil {
 		return err
 	}
