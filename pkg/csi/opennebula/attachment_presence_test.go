@@ -55,7 +55,7 @@ func TestAttachRetryRequiresConsistentAbsence(t *testing.T) {
 				}
 				attached, err := attachmentPresence(metadata, "volume", 7, 11)
 				return attached, true, err
-			}, func() error { attaches++; return nil }, "volume", "node")
+			}, func(context.Context) error { attaches++; return nil }, "volume", "node")
 			switch scenario {
 			case "absent", "another-vm":
 				require.NoError(t, err)

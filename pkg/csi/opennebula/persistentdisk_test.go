@@ -358,7 +358,7 @@ func TestWaitForAttachStateRetriesAfterNodeBecomesReady(t *testing.T) {
 			return true, true, nil
 		}
 		return false, false, nil
-	}, func() error {
+	}, func(context.Context) error {
 		retryCount++
 		attached = true
 		return nil
@@ -377,7 +377,7 @@ func TestWaitForAttachStateRetriesHotplugUntilSuccess(t *testing.T) {
 			return true, true, nil
 		}
 		return false, true, nil
-	}, func() error {
+	}, func(context.Context) error {
 		retryCount++
 		if retryCount == 1 {
 			return fmt.Errorf("wrong state HOTPLUG")
@@ -394,7 +394,7 @@ func TestWaitForAttachStateFailsOnNonHotplugRetryError(t *testing.T) {
 
 	err := provider.waitForAttachState(context.Background(), 50*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		return false, true, nil
-	}, func() error {
+	}, func(context.Context) error {
 		return fmt.Errorf("permission denied")
 	}, "vol-a", "node-a")
 

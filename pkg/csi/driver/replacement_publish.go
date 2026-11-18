@@ -18,6 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 )
 
@@ -306,8 +307,9 @@ func (s *ControllerServer) inspectReplacementDisk(ctx context.Context, attempt r
 func (s *ControllerServer) retireIdleReplacementAttach(ctx context.Context, attempt replacementAttachAttempt) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
-	err := s.retireReplacementAttach(ctx, attempt)
-	if err != nil {
+	if err := retryOnConflict(retry.DefaultRetry, func() error {
+		return s.retireReplacementAttach(ctx, attempt)
+	}); err != nil {
 		klog.V(2).InfoS("Could not retire idle replacement Ceph attach", "volumeID", attempt.VolumeID, "err", err)
 	}
 }

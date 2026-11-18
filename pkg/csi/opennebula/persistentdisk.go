@@ -763,10 +763,17 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		"sizeBytes", sizeBytes,
 		"timeout", hotplugTimeout)
 
-	attachDisk := func() error {
+	diskTemplate := disk.String()
+	attachDisk := func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		err := p.verifyPublishMutation(ctx, nodeID, volumeID, vmName, func() error {
 			var err error
 			hostArtifactTarget, err = p.hostArtifactAttachmentTargetForResolved(ctx, volume, node, volumeID, nodeID, vmName, params, report)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			if err != nil {
 				return status.Error(codes.Unavailable, "host artifact attachment target is unverified")
 			}
@@ -784,7 +791,7 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		if dispatch != nil {
 			dispatch.definitelyIdle = false
 		}
-		err = p.ctrl.VM(nodeID).DiskAttachContext(ctx, disk.String())
+		err = p.ctrl.VM(nodeID).DiskAttachContext(ctx, diskTemplate)
 		if dispatch != nil {
 			var refusal *gocaerrors.ResponseError
 			dispatch.definitelyIdle = errors.As(err, &refusal) && refusal.Code == gocaerrors.OneActionError && isHotplugStateError(refusal)
@@ -792,7 +799,7 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		return err
 	}
 
-	attachErr := attachDisk()
+	attachErr := attachDisk(ctx)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -810,18 +817,21 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 			volume, node, attachErr)
 	}
 
-	var retryAttach func() error
+	var retryAttach func(context.Context) error
 	if attachErr != nil {
 		if attempt != "" {
 			return status.Error(codes.Unavailable, "replacement attach outcome is unverified")
 		}
-		retryAttach = func() error {
+		retryAttach = func(ctx context.Context) error {
 			var err error
 			report, err = p.inspectAttachmentEnvironment(ctx, volumeID, nodeID, vmName)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			if err != nil {
 				return status.Error(codes.Unavailable, "retry attachment environment is unverified")
 			}
-			return attachDisk()
+			return attachDisk(ctx)
 		}
 	}
 
@@ -1693,6 +1703,9 @@ func (p *PersistentDiskVolumeProvider) verifyPublishMutation(ctx context.Context
 	if err := verifyTarget(); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return admitted.verifyNode(ctx)
 }
 
@@ -2094,7 +2107,7 @@ func (p *PersistentDiskVolumeProvider) nodeReadyContext(ctx context.Context, nod
 	return vmLCMState == vm.Running, nil
 }
 
-func (p *PersistentDiskVolumeProvider) waitForAttachState(ctx context.Context, timeout, pollInterval time.Duration, observe func(context.Context) (bool, bool, error), retryAttach func() error, volume, node string) error {
+func (p *PersistentDiskVolumeProvider) waitForAttachState(ctx context.Context, timeout, pollInterval time.Duration, observe func(context.Context) (bool, bool, error), retryAttach func(context.Context) error, volume, node string) error {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
@@ -2134,12 +2147,15 @@ func (p *PersistentDiskVolumeProvider) waitForAttachState(ctx context.Context, t
 		}
 
 		if retryPending && ready && !attached && deadlineCtx.Err() == nil {
-			retryErr := retryAttach()
-			if retryErr != nil {
+			retryErr := retryAttach(deadlineCtx)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if retryErr != nil && deadlineCtx.Err() == nil {
 				if !isHotplugStateError(retryErr) || status.Code(retryErr) == codes.Unavailable || status.Code(retryErr) == codes.FailedPrecondition {
 					return fmt.Errorf("failed to retry attach of volume %s on node %s: %w", volume, node, retryErr)
 				}
-			} else {
+			} else if retryErr == nil {
 				retryPending = false
 			}
 		}

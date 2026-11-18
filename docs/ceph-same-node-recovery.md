@@ -69,9 +69,11 @@ VolumeAttachment retires the record after verified detach. Retirement preserves
 the original Publish and Stage history.
 
 The caller that verified the physical detach can retry a conflicting history
-write after rechecking the exact attempt, binding, release authority and provider
-absence. If the history write commits and its reply is lost, independent readback
-can confirm the exact completion. If the provider detach reply is lost without
+write after rechecking the original attempt and provider absence. The receipt
+keeps the identities admitted for the detach. Before acknowledging Unpublish,
+the controller checks the current binding, attachment, release and protection.
+A change can block acknowledgement even after the history write commits.
+Independent readback can confirm a committed receipt whose write reply was lost. If the provider detach reply is lost without
 verified proof or the controller restarts before recording completion, a later
 caller holds the unresolved attempt even when both VMs appear idle.
 
