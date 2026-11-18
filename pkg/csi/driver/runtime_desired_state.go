@@ -78,13 +78,25 @@ func podReferencesClaim(pod *corev1.Pod, claimName string, pvc *corev1.Persisten
 }
 
 func podMayUseAttachmentClaim(pod *corev1.Pod, claim *corev1.ObjectReference, pvc *corev1.PersistentVolumeClaim, replacement bool) (bool, error) {
-	if replacement {
-		if !pvc.CreationTimestamp.IsZero() && pod.CreationTimestamp.After(pvc.CreationTimestamp.Time) {
-			return false, nil
-		}
-		pvc = nil
+	if !replacement {
+		return podReferencesClaim(pod, claim.Name, pvc)
 	}
-	return podReferencesClaim(pod, claim.Name, pvc)
+	owner := metav1.GetControllerOfNoCopy(pvc)
+	newer := !pvc.CreationTimestamp.IsZero() && pod.CreationTimestamp.After(pvc.CreationTimestamp.Time)
+	for _, volume := range pod.Spec.Volumes {
+		if podVolumeClaimName(pod, volume) != claim.Name {
+			continue
+		}
+		if volume.Ephemeral != nil {
+			if owner == nil || owner.APIVersion != "v1" || owner.Kind != "Pod" || owner.Name != pod.Name ||
+				pvc.Namespace != pod.Namespace || pod.UID == "" || owner.UID != pod.UID {
+				return false, fmt.Errorf("ephemeral PVC ownership is unverified for Pod %s/%s", pod.Namespace, pod.Name)
+			}
+		} else if !newer {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (r *KubeRuntime) NodeIdentity(ctx context.Context, nodeName string) (KubernetesNodeIdentity, error) {

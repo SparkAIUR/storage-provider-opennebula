@@ -23,30 +23,50 @@ func unmarshalAuthorityRoute(raw string, target any, fields ...string) error {
 	if err != nil {
 		return err
 	}
+	duplicates := false
 	if token == json.Delim('{') {
-		seen := make(map[string]struct{})
+		seen := make(map[string]any)
 		for decoder.More() {
 			token, err := decoder.Token()
 			if err != nil {
 				return err
 			}
 			key := token.(string)
+			var rawValue json.RawMessage
+			if err := decoder.Decode(&rawValue); err != nil {
+				return err
+			}
 			for _, field := range fields {
 				if strings.EqualFold(key, field) {
-					if _, duplicate := seen[field]; duplicate {
-						return fmt.Errorf("%w: %q", errDuplicateAuthorityKey, key)
+					valueDecoder := json.NewDecoder(strings.NewReader(string(rawValue)))
+					valueDecoder.UseNumber()
+					value, err := valueDecoder.Token()
+					if err != nil {
+						return err
 					}
-					seen[field] = struct{}{}
+					if previous, duplicate := seen[field]; duplicate {
+						switch value.(type) {
+						case string, json.Number:
+							if previous == value {
+								duplicates = true
+								break
+							}
+							return fmt.Errorf("%w: %q", errDuplicateAuthorityKey, key)
+						default:
+							return fmt.Errorf("%w: %q", errDuplicateAuthorityKey, key)
+						}
+					}
+					seen[field] = value
 					break
 				}
 			}
-			var value json.RawMessage
-			if err := decoder.Decode(&value); err != nil {
-				return err
-			}
 		}
 	}
-	return json.Unmarshal([]byte(raw), target)
+	err = json.Unmarshal([]byte(raw), target)
+	if err != nil && duplicates {
+		return fmt.Errorf("%w: %v", errDuplicateAuthorityKey, err)
+	}
+	return err
 }
 
 func requireUniqueAuthorityKeys(raw string) error {

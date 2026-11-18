@@ -959,6 +959,16 @@ func TestControllerUnpublishRejectsDuplicateProtectionEvidence(t *testing.T) {
 			fmt.Sprintf(`{"key":"vm-999","vmID":575,"VMId":999,"volumeID":"other-volume","failureCount":1,%s}`, times),
 			"host artifact quarantine is malformed",
 		},
+		{
+			"duplicate matching device route", localDeviceStateConfigMapName, localDeviceReportKey("node-a", cephRestartVolume),
+			fmt.Sprintf(`{"node":"node-a","volumeID":%q,"VolumeID":%q,"firstObservedAt":%q,"lastObservedAt":%q,"attempts":1}`, cephRestartVolume, cephRestartVolume, observed, observed),
+			"cannot verify current volume repair state",
+		},
+		{
+			"duplicate matching host route", hostArtifactStateConfigMapName, "vm-575",
+			fmt.Sprintf(`{"key":"vm-575","vmID":575,"VMID":575,"volumeID":%q,"failureCount":1,%s}`, cephRestartVolume, times),
+			"host artifact quarantine is malformed",
+		},
 	} {
 		for _, tcPath := range []struct{ queued, physical bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
 			t.Run(fmt.Sprintf("%s/queued=%t/physical=%t", tc.name, tcPath.queued, tcPath.physical), func(t *testing.T) {
@@ -992,8 +1002,8 @@ func TestAttachmentProtectionRoutesUnrelatedMalformedRecords(t *testing.T) {
 		for _, auto := range []bool{false, true} {
 			t.Run(fmt.Sprintf("queued=%t/auto=%t", queued, auto), func(t *testing.T) {
 				ctx := context.Background()
-				const report = `{"node":"node-b","volumeID":"volume-b","attempts":5,"Attempts":0}`
-				const quarantine = `{"key":"vm-999","vmID":999,"volumeID":"volume-b","expiresAt":"invalid","ExpiresAt":null}`
+				const report = `{"node":"node-b","volumeID":"volume-b","VolumeID":"volume-b","attempts":5,"Attempts":0}`
+				const quarantine = `{"key":"vm-999","vmID":999,"VMID":999,"volumeID":"volume-b","expiresAt":"invalid","ExpiresAt":null}`
 				reportKey := localDeviceReportKey("node-b", "volume-b")
 				var driver *Driver
 				var check func()

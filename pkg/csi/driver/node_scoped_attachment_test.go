@@ -45,6 +45,7 @@ type nodeAttachmentProtocol struct {
 	diskSlot          string
 	extraDiskBefore   string
 	extraDiskByVM     map[int]string
+	poolExtraDisk     string
 	marker            int64
 	mutations         []string
 	failMethod        string
@@ -120,6 +121,9 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				}
 				slot := firstNonEmpty(state.diskSlot, "2")
 				disk = fmt.Sprintf(`<DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><SAVE>YES</SAVE><SHAREABLE>YES</SHAREABLE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>ssh</TM_MAD><TM_MAD_SYSTEM>ssh</TM_MAD_SYSTEM><IMAGE_ID>%d</IMAGE_ID><DISK_ID>%s</DISK_ID><TARGET>%s</TARGET><SIZE>%d</SIZE><SERIAL>onecsi-%d</SERIAL>%s</DISK>`, imageID, slot, firstNonEmpty(state.diskTarget, "vdb"), size, imageID, marker)
+				if slot == "missing" {
+					disk = strings.Replace(disk, "<DISK_ID>missing</DISK_ID>", "", 1)
+				}
 				if state.ceph {
 					disk = strings.NewReplacer("<LN_TARGET>SYSTEM</LN_TARGET>", "<LN_TARGET>NONE</LN_TARGET>", "<TM_MAD>ssh</TM_MAD>", "<TM_MAD>ceph</TM_MAD>", "<TM_MAD_SYSTEM>ssh</TM_MAD_SYSTEM>", "<TM_MAD_SYSTEM>ceph</TM_MAD_SYSTEM>").Replace(disk)
 				}
@@ -129,6 +133,9 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 			}
 			if id == 41 && state.replacementDisk {
 				disk += "<DISK><IMAGE_ID>8</IMAGE_ID><DISK_ID>3</DISK_ID><TARGET>vdc</TARGET><SERIAL>onecsi-8</SERIAL></DISK>"
+			}
+			if !direct && id == 41 {
+				disk += state.poolExtraDisk
 			}
 			return fmt.Sprintf(`<VM><ID>%d</ID><NAME>%s</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE>%s</TEMPLATE><HISTORY_RECORDS><HISTORY><SEQ>0</SEQ><DS_ID>200</DS_ID></HISTORY></HISTORY_RECORDS></VM>`, id, name, state.extraDiskBefore+disk+state.extraDiskByVM[id])
 		}
@@ -1492,7 +1499,7 @@ func TestCephReleasedPVRetainsAuthorityAcrossClaimRecreation(t *testing.T) {
 func TestReleasedClaimDetachChecksOriginalConsumers(t *testing.T) {
 	for _, queued := range []bool{false, true} {
 		for _, background := range []bool{false, true} {
-			for _, mode := range []string{"original-terminating", "claim-absent", "unknown-age", "replacement-only"} {
+			for _, mode := range []string{"original-terminating", "claim-absent", "unknown-age", "replacement-only", "ephemeral-replacement", "ephemeral-original", "ephemeral-ambiguous"} {
 				t.Run(fmt.Sprintf("queued=%t/background=%t/%s", queued, background, mode), func(t *testing.T) {
 					ctx := context.Background()
 					const volume = "volume-test"
@@ -1505,11 +1512,24 @@ func TestReleasedClaimDetachChecksOriginalConsumers(t *testing.T) {
 					pod.CreationTimestamp = metav1.NewTime(pvc.CreationTimestamp.Add(-time.Minute))
 					terminating := metav1.Now()
 					pod.DeletionTimestamp = &terminating
-					if mode == "replacement-only" {
+					switch mode {
+					case "replacement-only":
 						pod.CreationTimestamp = metav1.NewTime(pvc.CreationTimestamp.Add(time.Minute))
-					} else if mode == "unknown-age" {
+					case "unknown-age":
 						pod.CreationTimestamp = metav1.Time{}
+					case "ephemeral-replacement", "ephemeral-original", "ephemeral-ambiguous":
+						pod.UID = "consumer-pod"
+						pod.Spec.Volumes = []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{Ephemeral: &corev1.EphemeralVolumeSource{}}}}
+						pvc.Name, pv.Spec.ClaimRef.Name = "consumer-data", "consumer-data"
+						if mode != "ephemeral-ambiguous" {
+							ref := metav1.NewControllerRef(pod, corev1.SchemeGroupVersion.WithKind("Pod"))
+							if mode == "ephemeral-original" {
+								ref.UID = "new-pod"
+							}
+							pvc.OwnerReferences = []metav1.OwnerReference{*ref}
+						}
 					}
+					replacementOnly := mode == "replacement-only" || mode == "ephemeral-replacement"
 					objects := []kruntime.Object{pv, node, pod}
 					if mode != "claim-absent" {
 						objects = append(objects, pvc)
@@ -1531,17 +1551,21 @@ func TestReleasedClaimDetachChecksOriginalConsumers(t *testing.T) {
 						require.NoError(t, r.ReconcileOnce(ctx))
 					} else {
 						reply, err := reviewControllerClient(t, server).ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
-						if mode == "replacement-only" {
+						if replacementOnly {
 							require.NoError(t, err)
 							require.NotNil(t, reply)
 						} else {
-							require.ErrorContains(t, err, "a current Pod still references the volume")
+							if strings.HasPrefix(mode, "ephemeral-") {
+								require.ErrorContains(t, err, "cannot verify Pod claim ownership")
+							} else {
+								require.ErrorContains(t, err, "a current Pod still references the volume")
+							}
 							require.Nil(t, reply)
 						}
 					}
 					wire.mu.Lock()
 					defer wire.mu.Unlock()
-					if mode == "replacement-only" {
+					if replacementOnly {
 						require.Equal(t, []string{"detach:41"}, wire.mutations)
 					} else {
 						require.Zero(t, wire.detachAttempts)
@@ -1614,6 +1638,143 @@ func TestControllerPublishPrecheckUsesVerifiedVM(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestControllerPublishPinsAdmittedKubernetesNode(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, mode := range []string{"stable", "recreated", "newly-observed"} {
+			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+				node := newReadyNode("node-old", true)
+				objects := []kruntime.Object{pv, pvc}
+				if mode != "newly-observed" {
+					objects = append(objects, node)
+				}
+				driver := newStickyTestDriver(t, objects...)
+				nodes := driver.kubeRuntime.client.CoreV1().Nodes()
+				var replace sync.Once
+				provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+					if method != "one.vm.info" || mode == "stable" {
+						return
+					}
+					replace.Do(func() {
+						if mode == "recreated" {
+							require.NoError(t, nodes.Delete(ctx, node.Name, metav1.DeleteOptions{}))
+						}
+						replacement := node.DeepCopy()
+						replacement.UID = "replacement-node"
+						_, err := nodes.Create(ctx, replacement, metav1.CreateOptions{})
+						require.NoError(t, err)
+					})
+				})
+				server := NewControllerServer(driver, provider, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+				}
+				reply, err := reviewControllerClient(t, server).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
+				history, historyErr := server.readAttachmentHistory(ctx, volume)
+				require.NoError(t, historyErr)
+				if mode == "stable" {
+					require.NoError(t, err)
+					require.Equal(t, "vdb", reply.GetPublishContext()["volumeName"])
+					require.Equal(t, "onecsi-7", reply.GetPublishContext()[publishContextDeviceSerial])
+					require.Equal(t, string(node.UID), history.LastSuccessfulNodeUID)
+					require.False(t, history.LastSuccessfulPublishTime.IsZero())
+				} else {
+					require.Equal(t, codes.Unavailable, status.Code(err))
+					require.ErrorContains(t, err, "publish Kubernetes Node identity changed")
+					require.Nil(t, reply)
+					require.Empty(t, history.LastSuccessfulNodeUID)
+					require.True(t, history.LastSuccessfulPublishTime.IsZero())
+				}
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				require.Empty(t, wire.mutations)
+			})
+		}
+	}
+}
+
+func TestControllerPublishVerifiesDiskSlot(t *testing.T) {
+	for _, tc := range []struct {
+		name, slot   string
+		poolConflict bool
+		noCensus     bool
+		wantSuccess  bool
+	}{
+		{name: "pool-duplicate", slot: "2", poolConflict: true},
+		{name: "missing", slot: "missing"},
+		{name: "negative", slot: "-1"},
+		{name: "zero", slot: "0", wantSuccess: true},
+		{name: "fallback-zero", slot: "0", noCensus: true, wantSuccess: true},
+		{name: "fallback-negative", slot: "-1", noCensus: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			const volume = "volume-test"
+			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			node := newReadyNode("node-old", true)
+			driver := newStickyTestDriver(t, pv, pvc, node)
+			provider, wire := nodeAttachmentProvider(t)
+			wire.mu.Lock()
+			wire.diskSlot = tc.slot
+			wire.marker = 0
+			if tc.poolConflict {
+				wire.poolExtraDisk = "<DISK><IMAGE_ID>8</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdc</TARGET></DISK>"
+			}
+			wire.mu.Unlock()
+			probe := &moveHistoryProvider{PersistentDiskVolumeProvider: provider, wire: wire, destination: node.Name, vmID: 41}
+			probe.failCensus.Store(tc.noCensus)
+			server := NewControllerServer(driver, probe, nil)
+			reply, err := reviewControllerClient(t, server).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
+			history, historyErr := server.readAttachmentHistory(ctx, volume)
+			require.NoError(t, historyErr)
+			if tc.wantSuccess {
+				require.NoError(t, err)
+				require.Equal(t, "vdb", reply.GetPublishContext()["volumeName"])
+				require.Equal(t, "onecsi-7", reply.GetPublishContext()[publishContextDeviceSerial])
+				require.False(t, history.LastSuccessfulPublishTime.IsZero())
+				require.Zero(t, history.LastSuccessfulDiskID)
+			} else {
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.Nil(t, reply)
+				require.True(t, history.LastSuccessfulPublishTime.IsZero())
+			}
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			require.Empty(t, wire.mutations)
+		})
+	}
+}
+
+func TestAttachmentInventorySharesDatastorePoolPerPass(t *testing.T) {
+	ctx := context.Background()
+	var datastoreReads atomic.Int32
+	provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+		if method == "one.datastorepool.info" {
+			datastoreReads.Add(1)
+		}
+	})
+	wire.mu.Lock()
+	wire.extraDiskByVM = map[int]string{42: "<DISK><IMAGE_ID>8</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdc</TARGET><SERIAL>onecsi-8</SERIAL></DISK>"}
+	wire.imageInfoByID = map[int]string{8: "<IMAGE><ID>8</ID><NAME>other-volume</NAME><DATASTORE_ID>100</DATASTORE_ID></IMAGE>"}
+	wire.mu.Unlock()
+	for pass := int32(1); pass <= 2; pass++ {
+		attachments, _, err := provider.ListCurrentAttachments(ctx)
+		require.NoError(t, err)
+		require.ElementsMatch(t, []opennebula.ObservedAttachment{
+			{VolumeHandle: "volume-test", ImageID: 7, NodeName: "node-old", NodeID: 41, DiskID: 2, Backend: "local"},
+			{VolumeHandle: "other-volume", ImageID: 8, NodeName: "node-new", NodeID: 42, DiskID: 2, Backend: "local"},
+		}, attachments)
+		require.Equal(t, pass, datastoreReads.Load())
+	}
+	datastore, err := provider.InspectVolumeDatastore(ctx, "volume-test", 7)
+	require.NoError(t, err)
+	require.Equal(t, "local", datastore.Backend)
+	require.EqualValues(t, 3, datastoreReads.Load())
 }
 
 func TestProviderDetachPreservesParentCancellationDuringPollAndRetry(t *testing.T) {
@@ -2434,7 +2595,7 @@ func TestControllerPublishMoveClearsStaleAttachmentPinsWhenCensusFails(t *testin
 			require.Equal(t, 7, moved.LastSuccessfulImageID)
 			require.Equal(t, "vdb", moved.LastSuccessfulTarget)
 			require.Equal(t, 42, moved.LastSuccessfulOpenNebulaVMID)
-			require.Zero(t, moved.LastSuccessfulDiskID)
+			require.Equal(t, 2, moved.LastSuccessfulDiskID)
 
 			_, err = client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: newNode.Name})
 			require.NoError(t, err)
@@ -2846,7 +3007,7 @@ func TestCephSameVMFreshAttachReplacesUnobservedDiskSlot(t *testing.T) {
 			probe.failCensus.Store(false)
 			after, err := server.readAttachmentHistory(ctx, volume)
 			require.NoError(t, err)
-			require.Zero(t, after.LastSuccessfulDiskID)
+			require.Equal(t, 3, after.LastSuccessfulDiskID)
 			require.Equal(t, before.LastSuccessfulOpenNebulaVMID, after.LastSuccessfulOpenNebulaVMID)
 			require.Equal(t, before.LastSuccessfulImageID, after.LastSuccessfulImageID)
 

@@ -2245,7 +2245,7 @@ func TestControllerPublishVolumeClearsStickyWhenOldAttachmentAlreadyAbsent(t *te
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", fmt.Errorf("already absent: %w", opennebula.ErrAttachmentNotFound)).Once()
 
 	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
-	handled, resp, err := cs.reuseStickyAttachment(context.Background(), newPublishReq("vol-absent", "node-new"), 1, 42)
+	handled, resp, err := cs.reuseStickyAttachment(context.Background(), newPublishReq("vol-absent", "node-new"), 1, 42, KubernetesNodeIdentity{})
 	require.NoError(t, err)
 	assert.False(t, handled)
 	assert.Nil(t, resp)
@@ -2901,6 +2901,11 @@ func (m *MockOpenNebulaVolumeProviderTestify) ListCurrentAttachments(ctx context
 	attachments, _ := args.Get(0).([]opennebula.ObservedAttachment)
 	names, _ := args.Get(1).(opennebula.VMNameInventory)
 	return attachments, names, args.Error(2)
+}
+
+func (m *MockOpenNebulaVolumeProviderTestify) InspectVolumeDisk(ctx context.Context, imageID, vmID int) (opennebula.VolumeDiskRecord, error) {
+	target, err := m.GetVolumeInNode(ctx, imageID, vmID)
+	return opennebula.VolumeDiskRecord{NodeID: vmID, DiskID: 1, Target: target}, err
 }
 
 func (m *MockOpenNebulaVolumeProviderTestify) InspectVolumeAttachment(ctx context.Context, volume string, node string) (*opennebula.VolumeAttachmentMetadata, error) {

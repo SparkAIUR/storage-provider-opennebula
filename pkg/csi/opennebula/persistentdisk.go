@@ -26,6 +26,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/OpenNebula/one/src/oca/go/src/goca"
@@ -1442,7 +1443,10 @@ func diskImageReferenceForVolume(disk shared.Disk, volumeID int, requireComplete
 func validateUniqueVMDiskSlot(disks []shared.Disk, diskID int) error {
 	found := false
 	for _, disk := range disks {
-		if slot, err := disk.GetI(shared.DiskID); err == nil && slot == diskID {
+		for _, slot := range disk.GetInts(string(shared.DiskID)) {
+			if slot != diskID {
+				continue
+			}
 			if found {
 				return fmt.Errorf("selected VM disk slot is claimed by multiple records")
 			}
@@ -1541,6 +1545,7 @@ var ErrCloneConflict = errors.New("incompatible or uncertain clone target")
 // These errors mean absence observed through a successful provider response, never transport failure.
 var ErrVolumeNotFound = errors.New("volume not found")
 var ErrAttachmentNotFound = errors.New("volume attachment not found")
+var ErrConflictingAttachmentEvidence = errors.New("attachment evidence is contradictory or malformed")
 
 func (p *PersistentDiskVolumeProvider) lookupImageID(ctx context.Context, name string) (int, error) {
 	response, err := p.ctrl.Client.ImagePoolInfo(ctx, parameters.PoolWhoAll, -1, -1)
@@ -2146,6 +2151,65 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeLookup(ctx context.Context, 
 	return result, nil
 }
 
+func (p *PersistentDiskVolumeProvider) InspectVolumeDisk(ctx context.Context, imageID, vmID int) (VolumeDiskRecord, error) {
+	info, err := p.ctrl.VM(vmID).InfoContext(ctx, true)
+	if err != nil {
+		return VolumeDiskRecord{}, err
+	}
+	_, disk, err := volumeDiskFromVM(info, imageID, vmID, false)
+	if err != nil {
+		return VolumeDiskRecord{}, err
+	}
+	disks := info.Template.GetDisks()
+	for _, candidate := range disks {
+		if _, err := attachmentDiskImage(candidate, imageID); errors.Is(err, ErrConflictingAttachmentEvidence) {
+			return VolumeDiskRecord{}, err
+		}
+	}
+	return attachmentDiskRecord(info, disks, *disk)
+}
+
+func attachmentDiskImage(disk shared.Disk, imageID int) (bool, error) {
+	imageFields := disk.GetPairs(string(shared.ImageID))
+	if len(imageFields) > 1 && slices.ContainsFunc(disk.GetInts(string(shared.ImageID)), func(id int) bool { return id == imageID }) {
+		return false, fmt.Errorf("%w: repeated VM disk image identity", ErrConflictingAttachmentEvidence)
+	}
+	id, present, err := diskImageReferenceForVolume(disk, imageID, true)
+	if err != nil {
+		if _, permissivePresent, permissiveErr := diskImageReference(disk, true); permissiveErr == nil && !permissivePresent {
+			serial, _ := disk.Get(shared.Serial)
+			if !hasDiskBacking(disk, serial) {
+				return false, err
+			}
+		}
+		return false, fmt.Errorf("%w: %v", ErrConflictingAttachmentEvidence, err)
+	}
+	return present && id == imageID, nil
+}
+
+func attachmentDiskRecord(info *vm.VM, disks []shared.Disk, disk shared.Disk) (VolumeDiskRecord, error) {
+	seen := make(map[string]bool)
+	for _, pair := range disk.Pairs {
+		switch key := pair.Key(); shared.DiskKeys(key) {
+		case shared.ImageID, shared.DiskID, shared.TargetDisk, shared.Serial:
+			if seen[key] {
+				return VolumeDiskRecord{}, fmt.Errorf("%w: repeated VM disk field %s", ErrConflictingAttachmentEvidence, key)
+			}
+			seen[key] = true
+		}
+	}
+	slot, err := disk.GetI(shared.DiskID)
+	if err != nil || slot < 0 {
+		return VolumeDiskRecord{}, fmt.Errorf("%w: disk slot is invalid", ErrConflictingAttachmentEvidence)
+	}
+	if err := validateUniqueVMDiskSlot(disks, slot); err != nil {
+		return VolumeDiskRecord{}, fmt.Errorf("%w: %v", ErrConflictingAttachmentEvidence, err)
+	}
+	target, _ := disk.Get(shared.TargetDisk)
+	serial, _ := disk.Get(shared.Serial)
+	return VolumeDiskRecord{NodeName: info.Name, NodeID: info.ID, DiskID: slot, Target: target, Serial: serial}, nil
+}
+
 func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Context, volume string, node string) (*VolumeAttachmentMetadata, error) {
 	return p.inspectVolumeAttachment(ctx, volume, node, 0)
 }
@@ -2172,7 +2236,7 @@ func (p *PersistentDiskVolumeProvider) inspectVolumeAttachment(ctx context.Conte
 		return nil, fmt.Errorf("failed to inspect image %d attachment metadata: %w", volumeID, err)
 	}
 	if imageInfo.ID != volumeID || imageInfo.Name != volume {
-		return nil, fmt.Errorf("image attachment metadata returned a different identity")
+		return nil, fmt.Errorf("%w: image attachment metadata returned a different identity", ErrConflictingAttachmentEvidence)
 	}
 
 	imageState := fmt.Sprintf("UNKNOWN_%d", imageInfo.StateRaw)
@@ -2197,43 +2261,42 @@ func (p *PersistentDiskVolumeProvider) inspectVolumeAttachment(ctx context.Conte
 		return nil, fmt.Errorf("failed to list virtual machines while inspecting volume %d attachment metadata: %w", volumeID, err)
 	}
 	requestedNodeSeen := strings.TrimSpace(node) == ""
+	var incompleteDiskEvidence error
 	for _, vmInfo := range vmPool.VMs {
 		if vmInfo.ID == requestedNodeID {
 			requestedNodeSeen = true
 		}
 		disks := vmInfo.Template.GetDisks()
+		seen := false
 		for _, disk := range disks {
-			diskImageID, present, diskErr := diskImageReferenceForVolume(disk, volumeID, true)
-			if diskErr != nil {
-				return nil, diskErr
-			}
-			if !present || diskImageID != volumeID {
-				continue
-			}
-			record := VolumeDiskRecord{
-				NodeName: vmInfo.Name,
-				NodeID:   vmInfo.ID,
-				DiskID:   -1,
-			}
-			if diskID, diskIDErr := disk.GetI(shared.DiskID); diskIDErr == nil {
-				if err := validateUniqueVMDiskSlot(disks, diskID); err != nil {
+			matches, err := attachmentDiskImage(disk, volumeID)
+			if err != nil {
+				if errors.Is(err, ErrConflictingAttachmentEvidence) {
 					return nil, err
 				}
-				record.DiskID = diskID
+				incompleteDiskEvidence = err
 			}
-			if target, targetErr := disk.Get(shared.TargetDisk); targetErr == nil {
-				record.Target = target
+			if !matches {
+				continue
 			}
-			if serial, serialErr := disk.Get(shared.Serial); serialErr == nil {
-				record.Serial = serial
+			record, err := attachmentDiskRecord(&vmInfo, disks, disk)
+			if err != nil {
+				return nil, err
 			}
 			if requestedNodeID > 0 && vmInfo.ID == requestedNodeID {
+				if seen {
+					return nil, fmt.Errorf("%w: image %d has multiple disks on VM %d", ErrConflictingAttachmentEvidence, volumeID, vmInfo.ID)
+				}
+				seen = true
 				metadata.AttachedToRequestedNode = true
 			}
 			metadata.DiskRecords = append(metadata.DiskRecords, record)
 		}
 	}
 
+	if incompleteDiskEvidence != nil {
+		return nil, incompleteDiskEvidence
+	}
 	if !requestedNodeSeen {
 		return nil, fmt.Errorf("requested VM was absent from the attachment inspection")
 	}
@@ -2277,6 +2340,9 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 			})
 		}
 	}
+	loadDatastorePool := sync.OnceValues(func() (*datastoreSchema.Pool, error) {
+		return p.ctrl.Datastores().InfoContext(ctx)
+	})
 	imageCache := map[int]struct {
 		name    string
 		backend string
@@ -2304,8 +2370,12 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 			}
 			imageMeta.name = imageInfo.Name
 			if imageInfo.DatastoreID != nil {
-				var backendErr error
-				imageMeta.backend, backendErr = p.attachmentImageBackend(ctx, *imageInfo.DatastoreID)
+				pool, backendErr := loadDatastorePool()
+				if backendErr == nil {
+					var datastore Datastore
+					datastore, backendErr = attachmentDatastoreFromPool(pool.Datastores, *imageInfo.DatastoreID)
+					imageMeta.backend = datastore.Backend
+				}
 				if backendErr != nil {
 					klog.V(2).InfoS("Attachment inventory backend is unknown", "imageID", imageID, "err", backendErr)
 				}
@@ -2330,25 +2400,24 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeDatastore(ctx context.Contex
 	return p.attachmentDatastore(ctx, *image.DatastoreID)
 }
 
-func (p *PersistentDiskVolumeProvider) attachmentImageBackend(ctx context.Context, datastoreID int) (string, error) {
-	datastore, err := p.attachmentDatastore(ctx, datastoreID)
-	return datastore.Backend, err
-}
-
 func (p *PersistentDiskVolumeProvider) attachmentDatastore(ctx context.Context, datastoreID int) (Datastore, error) {
 	pool, err := p.ctrl.Datastores().InfoContext(ctx)
 	if err != nil {
 		return Datastore{}, fmt.Errorf("cannot inspect attachment datastore %d: %w", datastoreID, err)
 	}
+	return attachmentDatastoreFromPool(pool.Datastores, datastoreID)
+}
+
+func attachmentDatastoreFromPool(datastores []datastoreSchema.Datastore, datastoreID int) (Datastore, error) {
 	matchesID := func(datastore datastoreSchema.Datastore) bool { return datastore.ID == datastoreID }
-	match := slices.IndexFunc(pool.Datastores, matchesID)
+	match := slices.IndexFunc(datastores, matchesID)
 	if match < 0 {
 		return Datastore{}, &datastoreConfigError{message: fmt.Sprintf("datastore %d was not found", datastoreID)}
 	}
-	if slices.ContainsFunc(pool.Datastores[match+1:], matchesID) {
+	if slices.ContainsFunc(datastores[match+1:], matchesID) {
 		return Datastore{}, &datastoreConfigError{message: fmt.Sprintf("datastore %d is ambiguous", datastoreID)}
 	}
-	datastore := pool.Datastores[match]
+	datastore := datastores[match]
 	observed := datastoreFromSchema(datastore)
 	if observed.Category != string(datastoreSchema.Image) {
 		return Datastore{}, &datastoreConfigError{message: fmt.Sprintf("datastore %d is not an image datastore", datastoreID)}

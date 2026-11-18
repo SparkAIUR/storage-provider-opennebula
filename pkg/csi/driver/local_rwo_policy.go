@@ -514,13 +514,18 @@ func (state *VolumeHistoryRecord) observeSuccessfulAttachment(observation succes
 	state.LastSuccessfulDeviceSerial = firstNonEmpty(observation.serial, state.LastSuccessfulDeviceSerial)
 }
 
-func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target, adoptedSerial string) (successfulAttachmentObservation, error) {
-	var metadata *opennebula.VolumeAttachmentMetadata
-	if inspector, ok := s.volumeProvider.(opennebula.VolumeAttachmentInspector); ok {
-		if inspected, err := inspector.InspectVolumeAttachment(ctx, volumeID, requestedNode); err == nil {
-			metadata = inspected
-		}
+func (s *ControllerServer) publishNodeIdentity(ctx context.Context, nodeName string) (KubernetesNodeIdentity, error) {
+	if s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
+		return KubernetesNodeIdentity{}, nil
 	}
+	identity, err := s.driver.kubeRuntime.NodeIdentity(ctx, nodeName)
+	if err != nil || identity.Deleting {
+		return identity, attachmentEvidenceUnavailable("publish Kubernetes Node identity is unverified", err)
+	}
+	return identity, nil
+}
+
+func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target, adoptedSerial string, admittedNode KubernetesNodeIdentity) (successfulAttachmentObservation, error) {
 	observation := successfulAttachmentObservation{
 		nodeName: strings.TrimSpace(requestedNode), target: strings.TrimSpace(target),
 		imageID: imageID, vmID: vmID, diskID: -1, serial: firstNonEmpty(adoptedSerial, fmt.Sprintf("onecsi-%d", imageID)),
@@ -528,7 +533,17 @@ func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volume
 	if observation.target == "" || imageID <= 0 || vmID <= 0 {
 		return observation, attachmentEvidenceUnavailable("publish attachment identity is incomplete", nil)
 	}
-	if metadata != nil {
+
+	var metadata *opennebula.VolumeAttachmentMetadata
+	var censusErr error
+	if inspector, ok := s.volumeProvider.(opennebula.VolumeAttachmentInspector); ok {
+		metadata, censusErr = inspector.InspectVolumeAttachment(ctx, volumeID, requestedNode)
+		if errors.Is(censusErr, opennebula.ErrConflictingAttachmentEvidence) || (censusErr != nil && adoptedSerial != "") {
+			return observation, attachmentEvidenceUnavailable("publish attachment census is inconsistent or unverified", censusErr)
+		}
+	}
+	var disks []opennebula.VolumeDiskRecord
+	if metadata != nil && censusErr == nil {
 		if metadata.ImageID != imageID || metadata.RequestedNodeID != vmID ||
 			strings.TrimSpace(metadata.RequestedNode) != observation.nodeName ||
 			(metadata.ImageName != "" && metadata.ImageName != volumeID) ||
@@ -538,31 +553,42 @@ func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volume
 		if adoptedSerial != "" && len(metadata.ConflictingOwnerVMIDs()) != 0 {
 			return observation, attachmentEvidenceUnavailable("publish adoption has conflicting attachment owners", nil)
 		}
-		for _, disk := range metadata.DiskRecords {
-			if disk.NodeID != vmID {
-				continue
-			}
-			matchingTarget := strings.TrimSpace(disk.Target) == observation.target
-			if serial := strings.TrimSpace(disk.Serial); (matchingTarget || adoptedSerial != "") && serial != "" && !strings.EqualFold(serial, observation.serial) {
-				return observation, attachmentEvidenceUnavailable("publish disk serial conflicts with the verified target", nil)
-			}
-			if !matchingTarget {
-				continue
-			}
-			if observation.diskID >= 0 {
-				return observation, attachmentEvidenceUnavailable("publish verified target has conflicting disk slots", nil)
-			}
-			observation.diskID = max(0, disk.DiskID)
-		}
-		if adoptedSerial == "" && (!metadata.AttachedToRequestedNode || observation.diskID < 0) {
+		if adoptedSerial == "" && !metadata.AttachedToRequestedNode {
 			return observation, attachmentEvidenceUnavailable("publish attachment target changed", nil)
 		}
-	} else if adoptedSerial == "" {
-		currentTarget, err := s.volumeProvider.GetVolumeInNode(ctx, imageID, vmID)
-		if err != nil || strings.TrimSpace(currentTarget) != observation.target {
-			return observation, attachmentEvidenceUnavailable("publish attachment target changed or is unverified", err)
+		disks = metadata.DiskRecords
+	} else {
+		reader, ok := s.volumeProvider.(opennebula.VolumeDiskInspector)
+		if !ok {
+			return observation, attachmentEvidenceUnavailable("publish disk evidence is unavailable", censusErr)
+		}
+		disk, err := reader.InspectVolumeDisk(ctx, imageID, vmID)
+		if err == nil && disk.NodeID == vmID {
+			disks = []opennebula.VolumeDiskRecord{disk}
+		} else if adoptedSerial == "" || !errors.Is(err, opennebula.ErrAttachmentNotFound) {
+			return observation, attachmentEvidenceUnavailable("publish disk evidence is unverified", err)
 		}
 	}
+	seen := false
+	for _, disk := range disks {
+		if disk.NodeID != vmID {
+			continue
+		}
+		if seen || disk.DiskID < 0 || strings.TrimSpace(disk.Target) == "" {
+			return observation, attachmentEvidenceUnavailable("publish disk slot or target is ambiguous or invalid", nil)
+		}
+		seen = true
+		if serial := strings.TrimSpace(disk.Serial); serial != "" && !strings.EqualFold(serial, observation.serial) {
+			return observation, attachmentEvidenceUnavailable("publish disk serial conflicts with the verified target", nil)
+		}
+		if strings.TrimSpace(disk.Target) == observation.target {
+			observation.diskID = disk.DiskID
+		}
+	}
+	if adoptedSerial == "" && observation.diskID < 0 {
+		return observation, attachmentEvidenceUnavailable("publish attachment target changed", nil)
+	}
+
 	currentImage, _, err := s.volumeProvider.VolumeExists(ctx, volumeID)
 	if err != nil || currentImage != imageID {
 		return observation, attachmentEvidenceUnavailable("publish image identity changed or is unverified", err)
@@ -571,12 +597,14 @@ func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volume
 	if err != nil || currentVM != vmID {
 		return observation, attachmentEvidenceUnavailable("publish VM identity changed or is unverified", err)
 	}
-	if s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
-		if identity, err := s.driver.kubeRuntime.NodeIdentity(ctx, requestedNode); err == nil {
-			observation.nodeUID = identity.UID
-		}
+	currentNode, err := s.publishNodeIdentity(ctx, requestedNode)
+	if err != nil {
+		return observation, err
 	}
-	observation.diskID = max(0, observation.diskID)
+	if currentNode.UID != admittedNode.UID || currentNode.Exists != admittedNode.Exists {
+		return observation, attachmentEvidenceUnavailable("publish Kubernetes Node identity changed", nil)
+	}
+	observation.nodeUID = admittedNode.UID
 	return observation, ctx.Err()
 }
 
@@ -584,6 +612,7 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 	if s == nil || s.driver == nil || s.driver.volumeHistory == nil || strings.TrimSpace(volumeID) == "" {
 		return
 	}
+	observation.diskID = max(0, observation.diskID)
 	now := time.Now().UTC()
 	_, err := s.driver.volumeHistory.Upsert(ctx, volumeID, func(state *VolumeHistoryRecord) {
 		state.PVName = firstNonEmpty(state.PVName, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVName }), strings.TrimSpace(sourceContext[paramPVName]))
@@ -606,6 +635,7 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 		state.BootstrappedAt = time.Time{}
 		state.BootstrappedFields = nil
 		state.observeSuccessfulAttachment(observation)
+		state.LastSuccessfulNodeUID = observation.nodeUID
 		state.LastSuccessfulPublishTime = now
 	})
 	if err == nil {

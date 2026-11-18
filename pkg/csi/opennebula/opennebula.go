@@ -150,6 +150,10 @@ type VolumeAttachmentInspector interface {
 	InspectVolumeAttachment(ctx context.Context, volume string, node string) (*VolumeAttachmentMetadata, error)
 }
 
+type VolumeDiskInspector interface {
+	InspectVolumeDisk(ctx context.Context, imageID, vmID int) (VolumeDiskRecord, error)
+}
+
 type VolumeLookupInspector interface {
 	InspectVolumeLookup(ctx context.Context, volume string, requestedNode string) (*VolumeLookupResult, error)
 }

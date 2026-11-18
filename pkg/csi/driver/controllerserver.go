@@ -820,6 +820,10 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return &csi.ControllerPublishVolumeResponse{PublishContext: publishContext}, nil
 	}
 
+	publishNode, err := s.publishNodeIdentity(ctx, req.NodeId)
+	if err != nil {
+		return nil, err
+	}
 	lookup, _, runtimeCtx, lookupErr := s.lookupVolumeForPublish(ctx, req.VolumeId, req.NodeId)
 	if lookupErr != nil {
 		outcome := "not_found"
@@ -884,7 +888,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			return nil, status.Error(codes.FailedPrecondition, message)
 		}
 		if manualTarget != "" {
-			observation, err := s.verifyPublishedAttachment(ctx, req.VolumeId, req.NodeId, volumeID, nodeID, manualTarget, recoveryControl.ConfirmedDeviceSerial)
+			observation, err := s.verifyPublishedAttachment(ctx, req.VolumeId, req.NodeId, volumeID, nodeID, manualTarget, recoveryControl.ConfirmedDeviceSerial, publishNode)
 			if err != nil {
 				return nil, err
 			}
@@ -987,7 +991,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 				s.driver.metrics.RecordControllerPublishDuration("disk", "unavailable", time.Since(started))
 				return localErr
 			}
-			observation, err := s.verifyPublishedAttachment(queueCtx, req.VolumeId, req.NodeId, volumeID, nodeID, target, "")
+			observation, err := s.verifyPublishedAttachment(queueCtx, req.VolumeId, req.NodeId, volumeID, nodeID, target, "", publishNode)
 			if err != nil {
 				return err
 			}
@@ -1009,7 +1013,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			return status.Errorf(codes.Unavailable, "attachment state is unknown: %v", err)
 		}
 
-		if handled, freshResponse, freshErr := s.precheckPublishHotplug(queueCtx, req, volumeID, nodeID, runtimeCtx, &protection); handled {
+		if handled, freshResponse, freshErr := s.precheckPublishHotplug(queueCtx, req, volumeID, nodeID, publishNode, runtimeCtx, &protection); handled {
 			if freshErr != nil {
 				return freshErr
 			}
@@ -1017,7 +1021,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			return nil
 		}
 
-		if reused, observed, reuseErr := s.reuseStickyAttachment(queueCtx, req, volumeID, nodeID); reused {
+		if reused, observed, reuseErr := s.reuseStickyAttachment(queueCtx, req, volumeID, nodeID, publishNode); reused {
 			if reuseErr != nil {
 				return reuseErr
 			}
@@ -1077,7 +1081,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(queueCtx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), runtimeCtx); localErr != nil {
 			return localErr
 		}
-		observation, err := s.verifyPublishedAttachment(queueCtx, req.VolumeId, req.NodeId, volumeID, nodeID, target, "")
+		observation, err := s.verifyPublishedAttachment(queueCtx, req.VolumeId, req.NodeId, volumeID, nodeID, target, "", publishNode)
 		if err != nil {
 			return err
 		}
@@ -2057,7 +2061,7 @@ func (s *ControllerServer) restoreVolumeCapacity(ctx context.Context, volume str
 	}
 }
 
-func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.ControllerPublishVolumeRequest, volumeID, nodeID int, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision) (bool, *csi.ControllerPublishVolumeResponse, error) {
+func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.ControllerPublishVolumeRequest, volumeID, nodeID int, publishNode KubernetesNodeIdentity, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision) (bool, *csi.ControllerPublishVolumeResponse, error) {
 	if s == nil || req == nil {
 		return false, nil, nil
 	}
@@ -2091,7 +2095,7 @@ func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.
 		if adopted {
 			adoptedSerial = control.ConfirmedDeviceSerial
 		}
-		observation, err := s.verifyPublishedAttachment(ctx, req.VolumeId, req.NodeId, volumeID, nodeID, target, adoptedSerial)
+		observation, err := s.verifyPublishedAttachment(ctx, req.VolumeId, req.NodeId, volumeID, nodeID, target, adoptedSerial, publishNode)
 		if err != nil {
 			return true, nil, err
 		}
@@ -2706,7 +2710,7 @@ func (s *ControllerServer) startDetachGrace(ctx context.Context, runtimeCtx *Vol
 	return nil
 }
 
-func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.ControllerPublishVolumeRequest, volumeID, nodeID int) (bool, *successfulAttachmentObservation, error) {
+func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.ControllerPublishVolumeRequest, volumeID, nodeID int, publishNode KubernetesNodeIdentity) (bool, *successfulAttachmentObservation, error) {
 	if s == nil || s.driver == nil || s.driver.stickyAttachments == nil {
 		return false, nil, nil
 	}
@@ -2731,7 +2735,7 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), nil); localErr != nil {
 			return true, nil, localErr
 		}
-		observation, err := s.verifyPublishedAttachment(ctx, req.VolumeId, req.NodeId, volumeID, nodeID, target, "")
+		observation, err := s.verifyPublishedAttachment(ctx, req.VolumeId, req.NodeId, volumeID, nodeID, target, "", publishNode)
 		if err != nil {
 			return true, nil, err
 		}
