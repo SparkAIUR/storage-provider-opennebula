@@ -336,7 +336,7 @@ func (s *ControllerServer) checkDetachAbsenceTarget(ctx context.Context, volume,
 		return attachmentEvidenceUnavailable("detach absence VM identity changed", err)
 	}
 	currentImage, _, err := s.volumeProvider.VolumeExists(ctx, volume)
-	if err != nil || imageID <= 0 || currentImage != imageID {
+	if err != nil || imageID < 0 || currentImage != imageID {
 		return attachmentEvidenceUnavailable("detach absence image identity is unverified", err)
 	}
 	return status.FromContextError(ctx.Err()).Err()

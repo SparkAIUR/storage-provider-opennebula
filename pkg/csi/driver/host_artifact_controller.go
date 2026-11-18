@@ -12,6 +12,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/klog/v2"
 )
 
@@ -29,11 +30,23 @@ func (s *ControllerServer) rejectIfHostArtifactQuarantineActive(ctx context.Cont
 	if controlErr == nil {
 		s.recordRecoveryModeExpiryWarning(ctx, runtimeCtx, recoveryControl)
 	}
-	if len(s.driver.hostArtifactQuarantine.Snapshot()) == 0 {
-		return nil
-	}
 	inspector, ok := s.volumeProvider.(opennebula.HostArtifactAttachmentTargetInspector)
 	if !ok {
+		return nil
+	}
+	manager := s.driver.hostArtifactQuarantine
+	if manager.runtime != nil && manager.runtime.enabled {
+		cm, err := manager.runtime.GetConfigMap(ctx, manager.namespace, hostArtifactStateConfigMapName)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return attachmentEvidenceUnavailable("host artifact quarantine is unverified", err)
+		}
+		if len(cm.Data) == 0 {
+			return nil
+		}
+	} else if len(manager.Snapshot()) == 0 {
 		return nil
 	}
 	target, err := inspector.InspectHostArtifactAttachmentTarget(ctx, req.VolumeId, req.NodeId, req.GetVolumeContext())

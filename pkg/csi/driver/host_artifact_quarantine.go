@@ -3,8 +3,8 @@ package driver
 import (
 	"context"
 	"encoding/json"
-	stderrors "errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -172,12 +172,16 @@ func (m *HostArtifactQuarantineManager) RefreshVolume(ctx context.Context, volum
 	updated := map[string]HostArtifactQuarantineState{}
 	now := time.Now().UTC()
 	for key, raw := range cm.Data {
+		unrelated, err := hostArtifactRecordRoutesElsewhere(key, raw, volumeID, opennebula.HostArtifactAttachmentTarget{})
+		if err != nil {
+			return err
+		}
+		if unrelated {
+			continue
+		}
 		var state HostArtifactQuarantineState
 		if err := unmarshalAuthorityJSON(raw, &state); err != nil {
-			if stderrors.Is(err, errDuplicateAuthorityKey) {
-				return err
-			}
-			continue
+			return err
 		}
 		if strings.TrimSpace(state.Key) == "" {
 			state.Key = key
@@ -201,6 +205,30 @@ func (m *HostArtifactQuarantineManager) RefreshVolume(ctx context.Context, volum
 	}
 	m.mu.Unlock()
 	return nil
+}
+
+func hostArtifactRecordRoutesElsewhere(key, raw, volumeID string, target opennebula.HostArtifactAttachmentTarget) (bool, error) {
+	var route struct {
+		Key      string `json:"key"`
+		VolumeID string `json:"volumeID"`
+		VMID     int    `json:"vmID"`
+		NodeName string `json:"nodeName"`
+		DiskID   int    `json:"diskID"`
+		ImageID  int    `json:"imageID"`
+	}
+	if err := unmarshalAuthorityRoute(raw, &route, "key", "volumeID", "vmID", "nodeName", "diskID", "imageID"); err != nil {
+		return false, err
+	}
+	recordTarget := opennebula.HostArtifactAttachmentTarget{VMID: route.VMID, NodeName: route.NodeName, DiskID: route.DiskID}
+	expectedKey := firstNonEmpty(recordTarget.Key(), route.VolumeID)
+	if strings.TrimSpace(route.VolumeID) == "" || route.VolumeID == volumeID || key == volumeID ||
+		key != expectedKey || (route.Key != "" && route.Key != key) ||
+		(route.ImageID > 0 && route.ImageID == target.ImageID) {
+		return false, nil
+	}
+	targetKeys := hostArtifactTargetQuarantineKeys(target)
+	nodeKey := (opennebula.HostArtifactAttachmentTarget{NodeName: route.NodeName, DiskID: route.DiskID}).Key()
+	return !slices.Contains(targetKeys, key) && !slices.Contains(targetKeys, nodeKey), nil
 }
 
 func (m *HostArtifactQuarantineManager) MarkFailure(ctx context.Context, state HostArtifactQuarantineState, threshold int, ttl time.Duration) (HostArtifactQuarantineState, bool, error) {

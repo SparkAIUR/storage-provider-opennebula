@@ -64,6 +64,7 @@ type nodeAttachmentProtocol struct {
 	imageDatastoreID  int
 	extraImages       string
 	imageInfoByID     map[int]string
+	prependImageID    bool
 	imageTransfer     string
 	diskTransfer      string
 	diskTarget        string
@@ -177,6 +178,9 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				body += state.extraImages + "</IMAGE_POOL>"
 			case "one.image.info":
 				body = imageXML()
+				if state.prependImageID {
+					body = strings.Replace(body, "<IMAGE>", "<IMAGE><ID>8</ID>", 1)
+				}
 				switch {
 				case number(1) == 8 && state.duplicateImage:
 					body = strings.Replace(body, "<ID>7</ID>", "<ID>8</ID>", 1)
@@ -1079,6 +1083,75 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 				if mode == "duplicate-image" || mode == "replacement-image" || mode == "late-duplicate-image" {
 					require.True(t, state.replacementDisk)
 				}
+			})
+		}
+	}
+}
+
+func TestLiveImageZeroProvesOrdinaryAttachmentAbsence(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, mode := range []string{"unpublish", "omitted-id", "sticky-expiry", "stale-va"} {
+			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "local"})
+				pv.ResourceVersion = "1"
+				node := newReadyNode("node-old", true)
+				objects := []kruntime.Object{pv, pvc, node}
+				va := &storagev1.VolumeAttachment{
+					ObjectMeta: metav1.ObjectMeta{Name: "zero-image-va", UID: "zero-image-va-uid", ResourceVersion: "1"},
+					Spec:       storagev1.VolumeAttachmentSpec{Attacher: DefaultDriverName, NodeName: node.Name, Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name}},
+					Status:     storagev1.VolumeAttachmentStatus{Attached: true, AttachmentMetadata: map[string]string{publishContextOpenNebulaImageID: "0", publishContextDeviceSerial: "onecsi-0"}},
+				}
+				if mode == "stale-va" {
+					objects = append(objects, va)
+				}
+				driver := newStickyTestDriver(t, objects...)
+				provider, wire := nodeAttachmentProvider(t)
+				wire.mu.Lock()
+				wire.zeroImage = true
+				delete(wire.disks, 41)
+				if mode == "omitted-id" {
+					wire.imageInfoByID = map[int]string{0: `<IMAGE><NAME>volume-test</NAME><STATE>1</STATE><SIZE>128</SIZE><DATASTORE_ID>100</DATASTORE_ID></IMAGE>`}
+				}
+				wire.mu.Unlock()
+				server := NewControllerServer(driver, provider, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+				}
+				switch mode {
+				case "sticky-expiry":
+					state := StickyAttachmentState{VolumeID: volume, NodeID: node.Name, Backend: "local", StartedAt: time.Now().Add(-2 * time.Minute), ExpiresAt: time.Now().Add(-time.Minute)}
+					require.NoError(t, driver.stickyAttachments.StartGrace(state))
+					server.expireStickyDetach(ctx, state)
+					_, held := driver.stickyAttachments.Get(volume)
+					require.False(t, held)
+				case "stale-va":
+					r := NewAttachmentReconciler(server)
+					r.staleVAGrace = time.Nanosecond
+					require.NoError(t, r.ReconcileOnce(ctx))
+					require.NoError(t, r.ReconcileOnce(ctx))
+					_, err := driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(ctx, va.Name, metav1.GetOptions{})
+					require.True(t, apierrors.IsNotFound(err), "%v", err)
+				default:
+					reply, err := reviewControllerClient(t, server).ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+					if mode == "omitted-id" {
+						require.Equal(t, codes.Unavailable, status.Code(err))
+						require.Nil(t, reply)
+					} else {
+						require.NoError(t, err)
+						require.NotNil(t, reply)
+					}
+				}
+				history, err := server.readAttachmentHistory(ctx, volume)
+				require.NoError(t, err)
+				require.Zero(t, history.LastSuccessfulImageID)
+				require.True(t, history.LastSuccessfulPublishTime.IsZero())
+				require.Equal(t, mode == "unpublish" || mode == "sticky-expiry", !history.LastSafeDetachTime.IsZero())
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				require.Empty(t, wire.mutations)
 			})
 		}
 	}
@@ -2172,6 +2245,7 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 		{false, true, ""}, {true, true, ""}, {false, false, ""}, {true, false, ""},
 		{false, false, "duplicate-image"}, {true, false, "duplicate-image"},
 		{false, false, "system-datastore"}, {true, false, "system-datastore"},
+		{false, false, "late-duplicate-id"}, {true, false, "late-duplicate-id"},
 	} {
 		t.Run(fmt.Sprintf("queued=%t/stage=%t/drift=%s", tc.queued, tc.stage, tc.drift), func(t *testing.T) {
 			ctx := context.Background()
@@ -2192,7 +2266,17 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 			driver.PluginConfig.OverrideVal(config.StuckAttachmentReconcilerEnabledVar, true)
 			driver.PluginConfig.OverrideVal(config.NodeDeviceRescanOnMissEnabledVar, false)
 			driver.PluginConfig.OverrideVal(config.NodeDeviceUdevSettleTimeoutSecondsVar, 0)
-			provider, wire := nodeAttachmentProvider(t)
+			var protocol *nodeAttachmentProtocol
+			var unpublishActive atomic.Bool
+			var imageReads atomic.Int32
+			provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+				if tc.drift == "late-duplicate-id" && unpublishActive.Load() && method == "one.image.info" && imageReads.Add(1) == 4 {
+					protocol.mu.Lock()
+					protocol.prependImageID = true
+					protocol.mu.Unlock()
+				}
+			})
+			protocol = wire
 			wire.mu.Lock()
 			wire.ceph, wire.version = true, "7.4.0"
 			wire.disks[41], wire.marker = 128, 128*1024*1024
@@ -2315,6 +2399,7 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 				wire.imageDatastoreID = 200
 			}
 			wire.mu.Unlock()
+			unpublishActive.Store(true)
 			response, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
 			if tc.drift != "" {
 				require.Equal(t, codes.Unavailable, status.Code(err))
@@ -2324,6 +2409,10 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 				require.Equal(t, history, after)
 				wire.mu.Lock()
 				defer wire.mu.Unlock()
+				if tc.drift == "late-duplicate-id" {
+					require.True(t, wire.prependImageID)
+					require.EqualValues(t, 4, imageReads.Load())
+				}
 				require.Empty(t, wire.mutations)
 				require.Equal(t, map[int]int{41: 128}, wire.disks)
 				return

@@ -17,6 +17,38 @@ func unmarshalAuthorityJSON(raw string, target any) error {
 	return json.Unmarshal([]byte(raw), target)
 }
 
+func unmarshalAuthorityRoute(raw string, target any, fields ...string) error {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token == json.Delim('{') {
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			token, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key := token.(string)
+			for _, field := range fields {
+				if strings.EqualFold(key, field) {
+					if _, duplicate := seen[field]; duplicate {
+						return fmt.Errorf("%w: %q", errDuplicateAuthorityKey, key)
+					}
+					seen[field] = struct{}{}
+					break
+				}
+			}
+			var value json.RawMessage
+			if err := decoder.Decode(&value); err != nil {
+				return err
+			}
+		}
+	}
+	return json.Unmarshal([]byte(raw), target)
+}
+
 func requireUniqueAuthorityKeys(raw string) error {
 	decoder := json.NewDecoder(strings.NewReader(raw))
 	decoder.UseNumber()

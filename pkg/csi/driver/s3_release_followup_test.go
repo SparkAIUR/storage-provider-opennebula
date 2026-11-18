@@ -147,6 +147,7 @@ func TestLookupVolumeForPublishObservedHistoryWinsOverBootstrap(t *testing.T) {
 	driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-observed", true), newReadyNode("node-from-annotation", true))
 	_, err := driver.volumeHistory.Upsert(context.Background(), "vol-observed-wins", func(state *VolumeHistoryRecord) {
 		state.Backend = "local"
+		state.EvidenceSource = volumeHistoryEvidenceSourceObserved
 		state.LastSuccessfulNodeName = "node-observed"
 		state.LastSuccessfulPublishTime = time.Now().UTC()
 	})

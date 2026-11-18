@@ -1921,12 +1921,12 @@ func (p *PersistentDiskVolumeProvider) waitForDetachState(ctx context.Context, t
 }
 
 func (p *PersistentDiskVolumeProvider) observeDetachDisk(ctx context.Context, volume string, volumeID, vmID int, expectedBackend *string, target string) (int, int64, error) {
-	image, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
+	image, err := p.readImageInfo(ctx, volumeID)
 	if err != nil {
 		return 0, 0, err
 	}
 	size, err := effectiveImageSize(image)
-	if err != nil || size <= 0 || image.ID != volumeID || image.Name != volume {
+	if err != nil || size <= 0 || volumeID < 0 || image.ID != volumeID || image.Name != volume {
 		return 0, 0, fmt.Errorf("durable capacity or identity is unverified for image %d: %v", volumeID, err)
 	}
 	info, err := p.ctrl.VM(vmID).InfoContext(ctx, true)

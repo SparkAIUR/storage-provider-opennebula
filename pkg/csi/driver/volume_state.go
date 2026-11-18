@@ -432,35 +432,55 @@ func localDeviceReportKeyNode(key, volumeID string) (string, bool) {
 	return node, matches && len(validation.IsDNS1123Subdomain(node)) == 0
 }
 
-func decodeLocalDeviceReport(key, raw, volumeID string) (LocalDeviceMissingReport, error) {
-	var report LocalDeviceMissingReport
+func localDeviceReportRoutesElsewhere(key, raw, volumeID string) (bool, error) {
 	var identity struct {
 		Node     string `json:"node"`
 		VolumeID string `json:"volumeID"`
 	}
-	err := unmarshalAuthorityJSON(raw, &identity)
+	err := unmarshalAuthorityRoute(raw, &identity, "node", "volumeID")
 	if stderrors.Is(err, errDuplicateAuthorityKey) {
-		return report, err
+		return false, err
 	}
 	identityIncomplete := strings.TrimSpace(identity.Node) == "" || strings.TrimSpace(identity.VolumeID) == ""
 	keyTargetsVolume := volumeID != "" && strings.HasSuffix(key, "."+sanitizeLocalDeviceReportKey(volumeID))
 	if volumeID != "" && identity.VolumeID != volumeID && (err != nil || identityIncomplete) && !keyTargetsVolume {
 		node, handle, split := strings.Cut(key, ".")
 		if split && handle != "" && len(validation.IsDNS1123Subdomain(node)) == 0 && len(validation.IsConfigMapKey(key)) == 0 {
-			return report, nil
+			return true, nil
 		}
 	}
 	if err != nil {
-		return report, err
+		return false, err
 	}
 	if identityIncomplete || key != localDeviceReportKey(identity.Node, identity.VolumeID) {
-		return report, fmt.Errorf("node device report identity is invalid")
+		return false, fmt.Errorf("node device report identity is invalid")
 	}
 	if volumeID != "" && identity.VolumeID != volumeID {
 		if key == localDeviceReportKey(identity.Node, volumeID) {
-			return report, fmt.Errorf("node device report key is ambiguous")
+			return false, fmt.Errorf("node device report key is ambiguous")
 		}
-		return report, nil
+		return true, nil
+	}
+	return false, nil
+}
+
+func rejectLocalDeviceKeyCollision(ctx context.Context, runtime *KubeRuntime, key, volumeID string) error {
+	if node, matches := localDeviceReportKeyNode(key, volumeID); matches {
+		identity, err := runtime.NodeIdentity(ctx, node)
+		if err != nil {
+			return err
+		}
+		if identity.Exists {
+			return fmt.Errorf("node device report key is ambiguous")
+		}
+	}
+	return nil
+}
+
+func decodeLocalDeviceReport(key, raw, volumeID string) (LocalDeviceMissingReport, error) {
+	var report LocalDeviceMissingReport
+	if unrelated, err := localDeviceReportRoutesElsewhere(key, raw, volumeID); err != nil || unrelated {
+		return report, err
 	}
 	if err := decodeCephRetentionProtection(raw, &report); err != nil {
 		return report, err
@@ -528,14 +548,8 @@ func (m *VolumeRepairStateManager) GetCurrent(ctx context.Context, volumeID stri
 			return VolumeRepairState{}, false, err
 		}
 		if report.VolumeID == "" {
-			if node, matches := localDeviceReportKeyNode(key, volumeID); matches {
-				identity, err := m.runtime.NodeIdentity(ctx, node)
-				if err != nil {
-					return VolumeRepairState{}, false, err
-				}
-				if identity.Exists {
-					return VolumeRepairState{}, false, fmt.Errorf("node device report key is ambiguous")
-				}
+			if err := rejectLocalDeviceKeyCollision(ctx, m.runtime, key, volumeID); err != nil {
+				return VolumeRepairState{}, false, err
 			}
 			continue
 		}
@@ -786,12 +800,7 @@ func normalizeVolumeHistoryRecord(state *VolumeHistoryRecord) {
 	state.LastSuccessfulDeviceSerial = strings.TrimSpace(state.LastSuccessfulDeviceSerial)
 	state.LastSafeDetachNodeName = strings.TrimSpace(state.LastSafeDetachNodeName)
 	state.BootstrappedFields = compactSortedStrings(state.BootstrappedFields)
-	if volumeHistoryHasObservedSuccess(*state) {
-		state.EvidenceSource = volumeHistoryEvidenceSourceObserved
-		state.Bootstrapped = false
-		state.BootstrappedAt = time.Time{}
-		state.BootstrappedFields = nil
-	} else if state.Bootstrapped && state.EvidenceSource == "" {
+	if state.Bootstrapped && state.EvidenceSource == "" {
 		state.EvidenceSource = volumeHistoryEvidenceSourceBootstrap
 	}
 	normalizeLocalDiskIdentity(state.LastHealthyIdentity)

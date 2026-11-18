@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -111,6 +113,62 @@ func TestControllerUnpublishCephObservedHistoryAuthority(t *testing.T) {
 					require.Error(t, err)
 					require.Nil(t, response)
 				}
+				f.requireNoProviderMutation(t)
+			})
+		}
+	}
+}
+
+func TestControllerManualUnpublishPreservesUnobservedProvenance(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, source := range []string{volumeHistoryEvidenceSourceBootstrap, "unknown-provenance"} {
+			t.Run(fmt.Sprintf("queued=%t/%s", queued, source), func(t *testing.T) {
+				ctx := context.Background()
+				f := newCephRestartTestFixture(t, queued)
+				f.pvc.Annotations[annotationRecoveryMode] = recoveryModeManual
+				f.syncObjects(t)
+				driver := f.server.driver
+				record, _ := driver.volumeHistory.Get(cephRestartVolume)
+				record.EvidenceSource = source
+				record.Bootstrapped = source == volumeHistoryEvidenceSourceBootstrap
+				if record.Bootstrapped {
+					record.BootstrappedAt = time.Date(2026, 11, 16, 0, 0, 0, 0, time.UTC)
+					record.BootstrappedFields = []string{"lastSuccessfulNodeName"}
+				}
+				raw, err := json.Marshal(record)
+				require.NoError(t, err)
+				require.NoError(t, driver.kubeRuntime.UpsertConfigMapData(ctx, "default", volumeHistoryStateConfigMapName, map[string]string{cephRestartVolume: string(raw)}))
+
+				_, err = f.unpublish(t)
+				require.NoError(t, err)
+				detached, err := f.server.readAttachmentHistory(ctx, cephRestartVolume)
+				require.NoError(t, err)
+				require.False(t, detached.LastSafeDetachTime.IsZero())
+				require.Equal(t, f.node.Name, detached.LastSafeDetachNodeName)
+				record.LastSafeDetachTime, record.LastSafeDetachNodeName = detached.LastSafeDetachTime, detached.LastSafeDetachNodeName
+				require.Equal(t, record, detached)
+
+				delete(f.pvc.Annotations, annotationRecoveryMode)
+				f.syncObjects(t)
+				response, err := f.unpublish(t)
+				require.Error(t, err)
+				require.Nil(t, response)
+				require.Zero(t, f.provider.inspections.Load())
+
+				client := reviewControllerClient(t, f.server)
+				published, err := client.ControllerPublishVolume(ctx, newPublishReq(cephRestartVolume, f.node.Name))
+				require.NoError(t, err)
+				require.Equal(t, "vdb", published.GetPublishContext()["volumeName"])
+				observed, err := f.server.readAttachmentHistory(ctx, cephRestartVolume)
+				require.NoError(t, err)
+				require.Equal(t, volumeHistoryEvidenceSourceObserved, observed.EvidenceSource)
+				require.False(t, observed.Bootstrapped)
+				require.Empty(t, observed.BootstrappedFields)
+				require.True(t, observed.LastSuccessfulPublishTime.After(detached.LastSuccessfulPublishTime))
+
+				response, err = client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: cephRestartVolume, NodeId: f.node.Name})
+				require.NoError(t, err)
+				require.NotNil(t, response)
 				f.requireNoProviderMutation(t)
 			})
 		}
@@ -896,6 +954,11 @@ func TestControllerUnpublishRejectsDuplicateProtectionEvidence(t *testing.T) {
 			fmt.Sprintf(`{"node":"node-a","volumeID":%q,"VolumeId":"other-volume","failureClass":"wrong_device_identity","firstObservedAt":%q,"lastObservedAt":%q,"attempts":1}`, cephRestartVolume, observed, observed),
 			"cannot verify current volume repair state",
 		},
+		{
+			"aliased host routing identity", hostArtifactStateConfigMapName, "vm-999",
+			fmt.Sprintf(`{"key":"vm-999","vmID":575,"VMId":999,"volumeID":"other-volume","failureCount":1,%s}`, times),
+			"host artifact quarantine is malformed",
+		},
 	} {
 		for _, tcPath := range []struct{ queued, physical bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
 			t.Run(fmt.Sprintf("%s/queued=%t/physical=%t", tc.name, tcPath.queued, tcPath.physical), func(t *testing.T) {
@@ -919,6 +982,66 @@ func TestControllerUnpublishRejectsDuplicateProtectionEvidence(t *testing.T) {
 				persisted, err := runtime.GetConfigMap(ctx, "default", tc.configMap)
 				require.NoError(t, err)
 				require.Equal(t, tc.record, persisted.Data[tc.key])
+			})
+		}
+	}
+}
+
+func TestAttachmentProtectionRoutesUnrelatedMalformedRecords(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, auto := range []bool{false, true} {
+			t.Run(fmt.Sprintf("queued=%t/auto=%t", queued, auto), func(t *testing.T) {
+				ctx := context.Background()
+				const report = `{"node":"node-b","volumeID":"volume-b","attempts":5,"Attempts":0}`
+				const quarantine = `{"key":"vm-999","vmID":999,"volumeID":"volume-b","expiresAt":"invalid","ExpiresAt":null}`
+				reportKey := localDeviceReportKey("node-b", "volume-b")
+				var driver *Driver
+				var check func()
+				if auto {
+					f := newCephRestartTestFixture(t, queued)
+					driver = f.server.driver
+					check = func() {
+						reply, err := f.unpublish(t)
+						require.NoError(t, err)
+						require.NotNil(t, reply)
+						require.EqualValues(t, 2, f.provider.inspections.Load())
+						f.requireNoProviderMutation(t)
+					}
+				} else {
+					const volume = "volume-test"
+					pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "local"})
+					node := newReadyNode("node-old", true)
+					driver = newStickyTestDriver(t, pv, pvc, node)
+					driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+					provider, wire := nodeAttachmentProvider(t)
+					server := NewControllerServer(driver, provider, nil)
+					if queued {
+						driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+						driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+					}
+					check = func() {
+						client := reviewControllerClient(t, server)
+						published, err := client.ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
+						require.NoError(t, err)
+						require.Equal(t, "vdb", published.GetPublishContext()["volumeName"])
+						reply, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+						require.NoError(t, err)
+						require.NotNil(t, reply)
+						wire.mu.Lock()
+						defer wire.mu.Unlock()
+						require.Equal(t, []string{"detach:41"}, wire.mutations)
+					}
+				}
+				runtime := driver.kubeRuntime
+				require.NoError(t, runtime.UpsertConfigMapData(ctx, "default", localDeviceStateConfigMapName, map[string]string{reportKey: report}))
+				require.NoError(t, runtime.UpsertConfigMapData(ctx, "default", hostArtifactStateConfigMapName, map[string]string{"vm-999": quarantine}))
+				check()
+				reports, err := runtime.GetConfigMap(ctx, "default", localDeviceStateConfigMapName)
+				require.NoError(t, err)
+				require.Equal(t, map[string]string{reportKey: report}, reports.Data)
+				quarantines, err := runtime.GetConfigMap(ctx, "default", hostArtifactStateConfigMapName)
+				require.NoError(t, err)
+				require.Equal(t, map[string]string{"vm-999": quarantine}, quarantines.Data)
 			})
 		}
 	}

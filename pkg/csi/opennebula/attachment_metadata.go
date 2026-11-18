@@ -54,7 +54,7 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 	if record.NodeID != metadata.RequestedNodeID || record.DiskID < 0 || strings.TrimSpace(record.Target) == "" || strings.TrimSpace(record.Serial) == "" {
 		return deny("VM disk identity is incomplete")
 	}
-	image, err := p.ctrl.Image(metadata.ImageID).InfoContext(ctx, true)
+	image, err := p.readImageInfo(ctx, metadata.ImageID)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
 	}
@@ -133,11 +133,11 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 }
 
 func (p *PersistentDiskVolumeProvider) VerifyAttachmentBackend(ctx context.Context, volume string, imageID, vmID int, expected string) error {
-	image, err := p.ctrl.Image(imageID).InfoContext(ctx, true)
+	image, err := p.readImageInfo(ctx, imageID)
 	if err != nil {
 		return err
 	}
-	if image.ID != imageID || image.Name != volume {
+	if imageID < 0 || image.ID != imageID || image.Name != volume {
 		return fmt.Errorf("attachment image identity changed")
 	}
 	info, err := p.ctrl.VM(vmID).InfoContext(ctx, true)

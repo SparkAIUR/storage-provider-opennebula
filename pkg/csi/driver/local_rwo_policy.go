@@ -386,7 +386,17 @@ func (s *ControllerServer) latestLocalDeviceReport(ctx context.Context, volumeID
 		return LocalDeviceMissingReport{}, false, nil
 	}
 	var latest LocalDeviceMissingReport
-	for _, raw := range cm.Data {
+	for key, raw := range cm.Data {
+		unrelated, err := localDeviceReportRoutesElsewhere(key, raw, volumeID)
+		if err != nil {
+			return LocalDeviceMissingReport{}, false, attachmentEvidenceUnavailable("node device report is malformed", err)
+		}
+		if unrelated {
+			if err := rejectLocalDeviceKeyCollision(ctx, s.driver.kubeRuntime, key, volumeID); err != nil {
+				return LocalDeviceMissingReport{}, false, attachmentEvidenceUnavailable("node device report key is unverified", err)
+			}
+			continue
+		}
 		var report LocalDeviceMissingReport
 		if err := unmarshalAuthorityJSON(raw, &report); err != nil {
 			if errors.Is(err, errDuplicateAuthorityKey) {
@@ -792,7 +802,7 @@ func (s *ControllerServer) lookupVolumeForPublish(ctx context.Context, volumeID,
 		}
 		switch result.Status {
 		case opennebula.VolumeLookupPresent:
-			if result.ImageID <= 0 {
+			if result.ImageID < 0 {
 				return result, history, runtimeCtx, status.Error(codes.Unavailable, "volume identity is unknown")
 			}
 			return result, history, runtimeCtx, nil
@@ -830,7 +840,7 @@ func (s *ControllerServer) lookupVolumeForPublish(ctx context.Context, volumeID,
 		}
 		return result, history, runtimeCtx, s.classifyRepairRequiredLookup(ctx, volumeID, requestedNode, runtimeCtx, history, result)
 	}
-	if imageID <= 0 {
+	if imageID < 0 {
 		return nil, history, runtimeCtx, status.Error(codes.Unavailable, "volume identity is unknown")
 	}
 	return &opennebula.VolumeLookupResult{
@@ -936,10 +946,7 @@ func (s *ControllerServer) activeHostArtifactQuarantine(ctx context.Context, vol
 		return false, nil
 	}
 	if err := s.driver.hostArtifactQuarantine.RefreshVolume(ctx, volumeID); err != nil {
-		if errors.Is(err, errDuplicateAuthorityKey) {
-			return false, attachmentEvidenceUnavailable("host artifact quarantine is malformed", err)
-		}
-		klog.V(3).InfoS("Failed to refresh host artifact quarantine state", "volumeID", volumeID, "err", err)
+		return false, attachmentEvidenceUnavailable("host artifact quarantine is unverified", err)
 	}
 	for _, state := range s.driver.hostArtifactQuarantine.Snapshot() {
 		if strings.TrimSpace(state.VolumeID) == strings.TrimSpace(volumeID) && (state.ExpiresAt.IsZero() || state.ExpiresAt.After(time.Now().UTC())) {

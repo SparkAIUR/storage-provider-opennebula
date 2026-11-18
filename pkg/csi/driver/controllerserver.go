@@ -1166,7 +1166,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId)
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
-	if volumeID <= 0 || (history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != volumeID) {
+	if volumeID < 0 || (history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != volumeID) {
 		return nil, attachmentEvidenceUnavailable("live volume identity differs from the expected image", nil)
 	}
 
@@ -2823,7 +2823,7 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 
 		volumeID, _, volumeErr := s.volumeProvider.VolumeExists(queueCtx, confirmed.VolumeID)
 		nodeID, nodeErr := s.volumeProvider.NodeExists(queueCtx, confirmed.NodeID)
-		if volumeErr != nil || nodeErr != nil || volumeID <= 0 || nodeID <= 0 {
+		if volumeErr != nil || nodeErr != nil || volumeID < 0 || nodeID <= 0 {
 			return attachmentEvidenceUnavailable("attachment identity is unknown", errors.Join(volumeErr, nodeErr))
 		}
 		if _, attachedErr := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID); attachedErr != nil {

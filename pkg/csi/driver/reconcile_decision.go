@@ -192,7 +192,7 @@ func (s *ControllerServer) evaluateVolumeReconcile(ctx context.Context, node, op
 		return decision.with(VolumeReconcileReject, queueReasonRecoveryControlInvalid, codes.FailedPrecondition, recoveryControl.Message)
 	}
 
-	if evidence.OpenNebulaImageID > 0 && evidence.OpenNebulaNodeID > 0 {
+	if lookup != nil && evidence.OpenNebulaImageID >= 0 && evidence.OpenNebulaNodeID > 0 {
 		target, attachedErr := s.volumeProvider.GetVolumeInNode(ctx, evidence.OpenNebulaImageID, evidence.OpenNebulaNodeID)
 		evidence.AttachedTarget = strings.TrimSpace(target)
 		evidence.AttachedErr = attachedErr

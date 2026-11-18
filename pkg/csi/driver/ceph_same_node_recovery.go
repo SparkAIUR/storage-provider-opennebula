@@ -334,6 +334,13 @@ func (s *ControllerServer) attachmentProtectionChecks(ctx context.Context, volum
 	targetKeys := hostArtifactTargetQuarantineKeys(target)
 	if err == nil {
 		for key, raw := range cm.Data {
+			unrelated, err := hostArtifactRecordRoutesElsewhere(key, raw, volumeID, target)
+			if err != nil {
+				return attachmentEvidenceUnavailable("host artifact quarantine is malformed", err)
+			}
+			if unrelated {
+				continue
+			}
 			var state HostArtifactQuarantineState
 			if decodeErr := decodeAttachmentQuarantine(raw, &state); decodeErr != nil {
 				return attachmentEvidenceUnavailable("host artifact quarantine is malformed", decodeErr)
@@ -452,7 +459,7 @@ func isCephBackend(backend string) bool {
 func validateAttachmentImageAssertions(metadata map[string]string, imageID int) error {
 	if raw, present := metadata[publishContextOpenNebulaImageID]; present {
 		observed, err := strconv.Atoi(strings.TrimSpace(raw))
-		if err != nil || observed <= 0 || observed != imageID {
+		if err != nil || observed < 0 || observed != imageID {
 			return fmt.Errorf("VolumeAttachment image identity does not match")
 		}
 	}

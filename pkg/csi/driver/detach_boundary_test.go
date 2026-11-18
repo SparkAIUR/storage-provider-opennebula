@@ -61,6 +61,55 @@ func TestProviderLegacyDetachAfterVerifiedExpansion(t *testing.T) {
 	require.NotContains(t, state.mutations, "resize:41:256")
 }
 
+func TestProviderDetachRejectsLateConflictingImageID(t *testing.T) {
+	for _, retry := range []bool{false, true} {
+		t.Run(fmt.Sprintf("retry=%t", retry), func(t *testing.T) {
+			var imageReads int
+			var protocol *nodeAttachmentProtocol
+			provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+				if method != "one.image.info" {
+					return
+				}
+				protocol.mu.Lock()
+				defer protocol.mu.Unlock()
+				imageReads++
+				if (!retry && imageReads == 3) || (retry && protocol.detachAttempts == 1) {
+					protocol.prependImageID = true
+				}
+			})
+			protocol = wire
+			wire.mu.Lock()
+			wire.rejectFirstDetach = retry
+			wire.mu.Unlock()
+
+			accepted, err := provider.DetachVolumeWithAuthority(context.Background(), "volume-test", "node-old", 41, "local", nil, nil)
+			require.ErrorContains(t, err, "detach disk identity or completed capacity is unverified")
+			require.False(t, accepted)
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			require.True(t, wire.prependImageID)
+			require.Empty(t, wire.mutations)
+			require.Contains(t, wire.disks, 41)
+			if retry {
+				require.Equal(t, 1, wire.detachAttempts)
+			} else {
+				require.Zero(t, wire.detachAttempts)
+			}
+		})
+	}
+}
+
+func TestProviderLocalAttachmentBackendRejectsConflictingImageID(t *testing.T) {
+	provider, wire := nodeAttachmentProvider(t)
+	wire.mu.Lock()
+	wire.prependImageID = true
+	wire.mu.Unlock()
+	require.ErrorContains(t, provider.VerifyAttachmentBackend(context.Background(), "volume-test", 7, 41, "local"), "image identity changed")
+	wire.mu.Lock()
+	defer wire.mu.Unlock()
+	require.Empty(t, wire.mutations)
+}
+
 func TestControllerUnpublishFilesystemDatastoreTransfer(t *testing.T) {
 	for _, queued := range []bool{false, true} {
 		for _, tc := range []struct {
