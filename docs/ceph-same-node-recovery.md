@@ -40,11 +40,18 @@ before dispatch and again before completing Publish. The attach template
 carries an opaque `CSI_ATTACH_ATTEMPT` value and keeps the existing device
 serial. A restarted controller can complete Publish when the sole selected
 disk carries that exact value and the original admission still matches.
-An unresolved attempt remains held across timeouts and restarts. The controller
-can retire the matching attempt when the same operation proves it never sent
-the attach or OpenNebula definitively refused dispatch. Elapsed time and an
-idle snapshot alone cannot establish that an earlier request is out of flight. The attempt supplies no authority for Stage,
-retention, physical detach, or DeleteVolume.
+A prepared attempt can be resumed after a restart. Only the caller that
+successfully advances it to dispatch-possible with an exact conditional update
+and reads it back may send the attach. Once dispatch is possible, the controller
+holds an unresolved attempt across timeouts and restarts. The same operation
+can retire it with proof that it never sent the attach or that OpenNebula
+definitively refused dispatch. Elapsed time and an idle snapshot alone cannot
+establish that an earlier request is out of flight.
+
+If demand disappears, ordinary Unpublish or reconciler cleanup can detach the
+abandoned disk after verifying its exact marker and current release. Verified
+detach readback retires the matching attempt and preserves the original Publish
+history. The attempt supplies no authority for Stage, retention, or DeleteVolume.
 
 ## Validation and rollout
 

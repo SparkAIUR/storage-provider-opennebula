@@ -2,6 +2,7 @@ package opennebula
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -67,17 +68,14 @@ func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context
 
 func (p *PersistentDiskVolumeProvider) observeGrowthTarget(ctx context.Context, vmID, diskID, imageID int, vmName string) (string, *shared.Disk, error) {
 	restoring := vmName != ""
-	var censusName string
+	var censusDisk VolumeDiskRecord
 	if restoring {
 		var err error
-		censusName, err = p.verifyRestorationCensus(ctx, vmID, diskID, imageID)
+		censusDisk, err = p.verifyRestorationCensus(ctx, vmID, diskID, imageID)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return "", nil, ctxErr
 			}
-			return "", nil, err
-		}
-		if err := p.verifyGrowthImage(ctx, imageID, true); err != nil {
 			return "", nil, err
 		}
 	}
@@ -97,15 +95,19 @@ func (p *PersistentDiskVolumeProvider) observeGrowthTarget(ctx context.Context, 
 	}
 	var selected *shared.Disk
 	if restoring {
-		if censusName != vmName {
+		if censusDisk.NodeName != vmName {
 			return "", nil, fmt.Errorf("restoration VM name differs from the census")
 		}
-		if err := verifyVMName(info, censusName); err != nil {
+		if err := verifyVMName(info, censusDisk.NodeName); err != nil {
 			return "", nil, err
 		}
 		slot, disk, err := publishDiskFromVM(info, imageID, vmID)
 		if err != nil || slot != diskID {
 			return "", nil, fmt.Errorf("restoration attachment or disk slot is unverified")
+		}
+		observed, err := attachmentDiskRecord(info, info.Template.GetDisks(), *disk)
+		if err != nil || observed != censusDisk {
+			return "", nil, fmt.Errorf("restoration disk differs from the owner census")
 		}
 		selected = disk
 	} else {
@@ -132,7 +134,7 @@ func (p *PersistentDiskVolumeProvider) observeGrowthTarget(ctx context.Context, 
 		return "", nil, fmt.Errorf("disk growth remains pending")
 	}
 	if !restoring {
-		if err := p.verifyGrowthImage(ctx, imageID, false); err != nil {
+		if err := p.verifyGrowthImage(ctx, imageID); err != nil {
 			return "", nil, err
 		}
 	}
@@ -152,8 +154,8 @@ func (p *PersistentDiskVolumeProvider) observeGrowthTarget(ctx context.Context, 
 	return target, selected, nil
 }
 
-func (p *PersistentDiskVolumeProvider) verifyGrowthImage(ctx context.Context, imageID int, restoring bool) error {
-	image, err := p.readResizeImage(ctx, imageID, restoring)
+func (p *PersistentDiskVolumeProvider) verifyGrowthImage(ctx context.Context, imageID int) error {
+	image, err := p.readOrdinaryImageInfo(ctx, imageID)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
 	}
@@ -166,30 +168,43 @@ func (p *PersistentDiskVolumeProvider) verifyGrowthImage(ctx context.Context, im
 	return nil
 }
 
-func (p *PersistentDiskVolumeProvider) verifyRestorationCensus(ctx context.Context, vmID, diskID, imageID int) (string, error) {
+func (p *PersistentDiskVolumeProvider) verifyRestorationCensus(ctx context.Context, vmID, diskID, imageID int) (VolumeDiskRecord, error) {
+	image, err := p.readAttachmentImageInfo(ctx, imageID)
+	if err != nil {
+		return VolumeDiskRecord{}, err
+	}
+	if image.ID != imageID || image.Persistent == nil || *image.Persistent != 1 {
+		return VolumeDiskRecord{}, fmt.Errorf("restoration image identity or persistence is unverified")
+	}
 	vms, err := p.readAttachmentVMs(ctx, imageID, vmID)
 	if err != nil {
-		return "", err
+		return VolumeDiskRecord{}, err
 	}
-	name := ""
+	metadata := VolumeAttachmentMetadata{ImageStateRaw: image.StateRaw, ImageRunningVMs: image.RunningVMs,
+		ImageVMIDs: image.VMs.ID, RequestedNodeID: vmID, AttachedToRequestedNode: true}
+	var selected VolumeDiskRecord
 	for _, info := range vms {
-		if info.ID != vmID {
+		slot, disk, err := publishDiskFromVM(&info, imageID, info.ID)
+		if errors.Is(err, ErrAttachmentNotFound) {
 			continue
 		}
-		if name != "" {
-			return "", fmt.Errorf("restoration VM identity is ambiguous")
-		}
-		slot, _, err := publishDiskFromVM(&info, imageID, vmID)
 		if err != nil {
-			return "", err
+			return VolumeDiskRecord{}, err
 		}
-		if slot != diskID {
-			return "", fmt.Errorf("restoration disk slot differs from the VM census")
+		record, err := attachmentDiskRecord(&info, info.Template.GetDisks(), *disk)
+		if err != nil {
+			return VolumeDiskRecord{}, err
 		}
-		name = info.Name
+		metadata.DiskRecords = append(metadata.DiskRecords, record)
+		if info.ID == vmID && slot == diskID {
+			selected = record
+		}
 	}
-	if name == "" {
-		return "", fmt.Errorf("restoration VM identity is absent from the census")
+	if err := metadata.VerifyOwnership(); err != nil {
+		return VolumeDiskRecord{}, err
 	}
-	return name, nil
+	if selected.NodeID == 0 {
+		return VolumeDiskRecord{}, fmt.Errorf("restoration disk slot differs from the owner census")
+	}
+	return selected, nil
 }

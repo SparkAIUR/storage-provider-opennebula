@@ -50,7 +50,7 @@ func growthCompatibilityFixture(t *testing.T, version string, restoring bool, op
 		if cfg.imagePersistent != "" {
 			persistenceXML = "<PERSISTENT>" + cfg.imagePersistent + "</PERSISTENT>"
 		}
-		return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE>%s<UID>9</UID><GID>10</GID><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES><PROTECTED>YES</PROTECTED></TEMPLATE></IMAGE>`, persistenceXML, st.marker.Load())
+		return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><RUNNING_VMS>1</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS><ID>11</ID></VMS>%s<UID>9</UID><GID>10</GID><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES><PROTECTED>YES</PROTECTED></TEMPLATE></IMAGE>`, persistenceXML, st.marker.Load())
 	}
 	vmXML := func() string {
 		markers := ""

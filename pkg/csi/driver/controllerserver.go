@@ -987,7 +987,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		if err != nil {
 			return err
 		}
-		if attempt := history.PendingReplacementAttach; attempt != nil {
+		if attempt := history.PendingReplacementAttach; attempt != nil && !attempt.prepared() {
 			if attempt.ImageID != volumeID || attempt.VMID != nodeID {
 				return attachmentEvidenceUnavailable("replacement Ceph attach provider identity changed", nil)
 			}
@@ -1000,6 +1000,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		}
 		target, err := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
 		if err == nil {
+			if history.PendingReplacementAttach != nil {
+				return attachmentEvidenceUnavailable("prepared replacement Ceph attach requires settled provider absence", nil)
+			}
 			if err := s.restoreRetainedVolumeCapacity(queueCtx, req, nodeID, volumeID, publishNode); err != nil {
 				return err
 			}
@@ -1032,24 +1035,26 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			return status.Errorf(codes.Unavailable, "attachment state is unknown: %v", err)
 		}
 
-		if handled, freshResponse, freshErr := s.precheckPublishHotplug(queueCtx, req, volumeID, nodeID, publishNode, runtimeCtx, &protection); handled {
-			if freshErr != nil {
-				return freshErr
+		if history.PendingReplacementAttach == nil {
+			if handled, freshResponse, freshErr := s.precheckPublishHotplug(queueCtx, req, volumeID, nodeID, publishNode, runtimeCtx, &protection); handled {
+				if freshErr != nil {
+					return freshErr
+				}
+				response = freshResponse
+				return nil
 			}
-			response = freshResponse
-			return nil
-		}
 
-		if reused, observed, reuseErr := s.reuseStickyAttachment(queueCtx, req, volumeID, nodeID, publishNode); reused {
-			if reuseErr != nil {
-				return reuseErr
+			if reused, observed, reuseErr := s.reuseStickyAttachment(queueCtx, req, volumeID, nodeID, publishNode); reused {
+				if reuseErr != nil {
+					return reuseErr
+				}
+				if err := s.recordSuccessfulLocalVolumePublish(queueCtx, req.VolumeId, *observed, req.GetVolumeContext(), runtimeCtx, &protection); err != nil {
+					return err
+				}
+				s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
+				response = &csi.ControllerPublishVolumeResponse{PublishContext: s.publishContextForVolume(queueCtx, req.VolumeId, *observed, 0, req.GetVolumeContext())}
+				return nil
 			}
-			if err := s.recordSuccessfulLocalVolumePublish(queueCtx, req.VolumeId, *observed, req.GetVolumeContext(), runtimeCtx, &protection); err != nil {
-				return err
-			}
-			s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
-			response = &csi.ControllerPublishVolumeResponse{PublishContext: s.publishContextForVolume(queueCtx, req.VolumeId, *observed, 0, req.GetVolumeContext())}
-			return nil
 		}
 
 		if driftErr := s.rejectIfOpenNebulaMetadataDrift(queueCtx, req); driftErr != nil {

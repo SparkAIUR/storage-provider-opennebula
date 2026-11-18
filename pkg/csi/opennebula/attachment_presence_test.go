@@ -46,7 +46,7 @@ func TestAttachRetryRequiresConsistentAbsence(t *testing.T) {
 			}
 			attaches := 0
 			provider := &PersistentDiskVolumeProvider{}
-			err := provider.waitForAttachState(context.Background(), time.Second, time.Millisecond, func() (bool, bool, error) {
+			err := provider.waitForAttachState(context.Background(), time.Second, time.Millisecond, func(context.Context) (bool, bool, error) {
 				if lookupErr != nil {
 					return false, true, lookupErr
 				}

@@ -77,7 +77,7 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 			var reject atomic.Bool
 			reject.Store(true)
 			var resizes atomic.Int32
-			image := fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, desired)
+			image := fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><RUNNING_VMS>1</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS><ID>11</ID></VMS><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, desired)
 			vmXML := func() string {
 				return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE></DISK></TEMPLATE></VM>`, size.Load())
 			}
@@ -220,7 +220,7 @@ func TestControllerPublishAndExpandSerializeVerifiedCapacity(t *testing.T) {
 				defer resume()
 				var paused atomic.Bool
 				imageXML := func() string {
-					return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, marker.Load())
+					return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><RUNNING_VMS>1</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS><ID>11</ID></VMS><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, marker.Load())
 				}
 				vmXML := func() string {
 					return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE></DISK></TEMPLATE></VM>`, size.Load())
@@ -389,7 +389,7 @@ func TestControllerProviderGrowthCompatibilityFailedPrecondition(t *testing.T) {
 				if path != "expand" {
 					imageCapacity = "268435456"
 				}
-				image := `<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>` + imageCapacity + `</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`
+				image := `<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><RUNNING_VMS>1</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS><ID>11</ID></VMS><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>` + imageCapacity + `</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`
 				vmXML := `<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>128</SIZE><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>` + target + `</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM></DISK></TEMPLATE></VM>`
 				endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					var call struct {

@@ -2,7 +2,6 @@ package opennebula
 
 import (
 	"context"
-	"encoding/xml"
 	"fmt"
 	"strconv"
 	"strings"
@@ -143,37 +142,12 @@ func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, 
 	if err := p.ctrl.Image(id).UpdateContext(ctx, tpl.String(), parameters.Merge); err != nil {
 		return err
 	}
-	if !restoring {
-		response, err := p.ctrl.Client.ImageInfo(ctx, id, true)
-		if err != nil {
-			return err
-		}
-		var readback struct {
-			XMLName xml.Name `xml:"IMAGE"`
-			imageIdentityXML
-			Templates []struct {
-				Markers []string `xml:"CSI_REQUESTED_SIZE_BYTES"`
-			} `xml:"TEMPLATE"`
-		}
-		if err := xml.Unmarshal([]byte(response.Body()), &readback); err != nil {
-			return err
-		}
-		imageID, valid := readback.imageID()
-		if !valid || imageID != id || len(readback.Templates) != 1 {
-			return fmt.Errorf("verified size metadata readback failed for image %d", id)
-		}
-		markers := readback.Templates[0].Markers
-		if len(markers) != 1 || markers[0] != strconv.FormatInt(size, 10) {
-			return fmt.Errorf("verified size metadata readback failed for image %d", id)
-		}
-		return nil
-	}
-	info, err = p.readImageInfo(ctx, id)
+	info, err = p.readResizeImage(ctx, id, restoring)
 	if err != nil {
 		return err
 	}
-	raw, err := info.Template.GetStr(requestedSizeTag)
-	if err != nil || info.ID != id || raw != strconv.FormatInt(size, 10) {
+	markers := info.Template.GetStrs(requestedSizeTag)
+	if info.ID != id || len(markers) != 1 || markers[0] != strconv.FormatInt(size, 10) {
 		return fmt.Errorf("verified size metadata readback failed for image %d", id)
 	}
 	return nil

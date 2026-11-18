@@ -19,8 +19,14 @@ import (
 	"k8s.io/klog/v2"
 )
 
+const (
+	replacementAttachPrepared = "prepared"
+	replacementAttachArmed    = "dispatch-possible"
+)
+
 type replacementAttachAttempt struct {
 	Version           int    `json:"version"`
+	Phase             string `json:"phase,omitempty"`
 	ID                string `json:"id"`
 	PVUID             string `json:"pvUID"`
 	PVCUID            string `json:"pvcUID"`
@@ -55,16 +61,24 @@ func replacementHistoryGeneration(history VolumeHistoryRecord) string {
 	return hex.EncodeToString(digest[:])
 }
 
+func (attempt replacementAttachAttempt) prepared() bool {
+	return attempt.Version == 2 && attempt.Phase == replacementAttachPrepared
+}
+
+func (attempt replacementAttachAttempt) dispatchPossible() bool {
+	return attempt.Version == 1 && attempt.Phase == "" || attempt.Version == 2 && attempt.Phase == replacementAttachArmed
+}
+
 func (attempt replacementAttachAttempt) matchesHistory(history VolumeHistoryRecord) bool {
 	originalVM := attempt.VMID
 	if attempt.OriginalVMID != 0 || attempt.OriginalVMName != "" {
-		if attempt.OriginalVMID <= 0 || attempt.OriginalVMID == attempt.VMID || attempt.OriginalVMName == "" {
+		if attempt.OriginalVMID <= 0 || attempt.OriginalVMID == attempt.VMID || (attempt.Version == 1 && attempt.OriginalVMName == "") {
 			return false
 		}
 		originalVM = attempt.OriginalVMID
 	}
 	token, err := hex.DecodeString(attempt.ID)
-	return err == nil && len(token) == 32 && attempt.Version == 1 && attempt.PVUID != "" && attempt.PVCUID != "" &&
+	return err == nil && len(token) == 32 && (attempt.prepared() || attempt.dispatchPossible()) && attempt.PVUID != "" && attempt.PVCUID != "" &&
 		attempt.Driver != "" && attempt.VolumeID == history.VolumeID && attempt.Node != "" &&
 		attempt.Node == history.LastSuccessfulNodeName && attempt.OriginalNodeUID != "" && attempt.ReplacementUID != "" &&
 		attempt.OriginalNodeUID != attempt.ReplacementUID && attempt.OriginalNodeUID == history.LastSuccessfulNodeUID &&
@@ -199,18 +213,12 @@ func (s *ControllerServer) verifyReplacementAttempt(ctx context.Context, req *cs
 	if attempt.Driver != s.driver.name || attempt.VolumeID != req.VolumeId || attempt.Node != req.NodeId {
 		return nil, attachmentEvidenceUnavailable("replacement Ceph attach scope changed", nil)
 	}
-	inspector, ok := s.volumeProvider.(opennebula.ReplacementAttachInspector)
-	if !ok {
-		return nil, attachmentEvidenceUnavailable("replacement Ceph attach inspection is unavailable", nil)
+	if !attempt.dispatchPossible() {
+		return nil, attachmentEvidenceUnavailable("replacement Ceph attach was not authorized to dispatch", nil)
 	}
-	disk, err := inspector.InspectReplacementAttach(ctx, attempt.VolumeID, attempt.Node, attempt.ImageID, attempt.VMID, attempt.ID)
-	if err != nil || (disk != nil) != attached {
-		return nil, attachmentEvidenceUnavailable("replacement Ceph attach outcome is unverified", err)
-	}
-	if attempt.OriginalVMID != 0 {
-		if _, err := inspector.InspectReplacementRelease(ctx, attempt.ImageID, attempt.OriginalVMID, attempt.OriginalVMName); err != nil {
-			return nil, attachmentEvidenceUnavailable("original Ceph attachment release is unverified", err)
-		}
+	disk, err := s.inspectReplacementDisk(ctx, attempt, attached)
+	if err != nil {
+		return nil, err
 	}
 	history, err := s.readAttachmentHistory(ctx, req.VolumeId)
 	if err != nil || history.PendingReplacementAttach == nil || *history.PendingReplacementAttach != attempt || !attempt.matchesHistory(history) {
@@ -224,9 +232,33 @@ func (s *ControllerServer) verifyReplacementAttempt(ctx context.Context, req *cs
 	return disk, err
 }
 
+func (s *ControllerServer) inspectReplacementDisk(ctx context.Context, attempt replacementAttachAttempt, attached bool) (*opennebula.VolumeDiskRecord, error) {
+	inspector, ok := s.volumeProvider.(opennebula.ReplacementAttachInspector)
+	if !ok {
+		return nil, attachmentEvidenceUnavailable("replacement Ceph attach inspection is unavailable", nil)
+	}
+	disk, err := inspector.InspectReplacementAttach(ctx, attempt.VolumeID, attempt.Node, attempt.ImageID, attempt.VMID, attempt.ID)
+	if err != nil || (disk != nil) != attached {
+		return nil, attachmentEvidenceUnavailable("replacement Ceph attach outcome is unverified", err)
+	}
+	if attempt.OriginalVMID != 0 {
+		if name, err := inspector.InspectReplacementRelease(ctx, attempt.ImageID, attempt.OriginalVMID, attempt.OriginalVMName); err != nil || (name != "" && name != attempt.OriginalVMName) {
+			return nil, attachmentEvidenceUnavailable("original Ceph attachment release is unverified", err)
+		}
+	}
+	return disk, nil
+}
+
 func (s *ControllerServer) retireIdleReplacementAttach(ctx context.Context, attempt replacementAttachAttempt) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
+	err := s.retireReplacementAttach(ctx, attempt)
+	if err != nil {
+		klog.V(2).InfoS("Could not retire idle replacement Ceph attach", "volumeID", attempt.VolumeID, "err", err)
+	}
+}
+
+func (s *ControllerServer) retireReplacementAttach(ctx context.Context, attempt replacementAttachAttempt) error {
 	_, err := s.driver.volumeHistory.updateHistory(ctx, attempt.VolumeID, true, func(current *VolumeHistoryRecord) error {
 		if current.PendingReplacementAttach == nil || *current.PendingReplacementAttach != attempt || !attempt.matchesHistory(*current) {
 			return fmt.Errorf("replacement Ceph attach retirement does not match current history")
@@ -234,9 +266,7 @@ func (s *ControllerServer) retireIdleReplacementAttach(ctx context.Context, atte
 		current.PendingReplacementAttach = nil
 		return nil
 	})
-	if err != nil {
-		klog.V(2).InfoS("Could not retire idle replacement Ceph attach", "volumeID", attempt.VolumeID, "err", err)
-	}
+	return err
 }
 
 func (s *ControllerServer) beginReplacementAttach(ctx context.Context, req *csi.ControllerPublishVolumeRequest, history VolumeHistoryRecord, imageID, vmID int, node KubernetesNodeIdentity) (*replacementAttachAttempt, error) {
@@ -244,46 +274,84 @@ func (s *ControllerServer) beginReplacementAttach(ctx context.Context, req *csi.
 	if !ok {
 		return nil, attachmentEvidenceUnavailable("replacement Ceph attach inspection is unavailable", nil)
 	}
-	attempt := replacementAttachAttempt{Version: 1, Driver: s.driver.name, VolumeID: req.VolumeId, Node: req.NodeId,
+	attempt := replacementAttachAttempt{Version: 2, Phase: replacementAttachPrepared, Driver: s.driver.name, VolumeID: req.VolumeId, Node: req.NodeId,
 		OriginalNodeUID: history.LastSuccessfulNodeUID, ReplacementUID: node.UID, ImageID: imageID, VMID: vmID,
 		HistoryGeneration: replacementHistoryGeneration(history)}
-	token := make([]byte, 32)
-	if _, err := rand.Read(token); err != nil {
-		return nil, attachmentEvidenceUnavailable("replacement Ceph attach identifier is unavailable", err)
+	existing := history.PendingReplacementAttach
+	if existing != nil {
+		if !existing.prepared() || !existing.matchesHistory(history) || existing.VolumeID != attempt.VolumeID ||
+			existing.Node != attempt.Node || existing.Driver != attempt.Driver || existing.ReplacementUID != attempt.ReplacementUID ||
+			existing.ImageID != imageID || existing.VMID != vmID {
+			return nil, attachmentEvidenceUnavailable("prepared replacement Ceph attach scope changed", nil)
+		}
+		attempt = *existing
+	} else {
+		token := make([]byte, 32)
+		if _, err := rand.Read(token); err != nil {
+			return nil, attachmentEvidenceUnavailable("replacement Ceph attach identifier is unavailable", err)
+		}
+		attempt.ID = hex.EncodeToString(token)
 	}
-	attempt.ID = hex.EncodeToString(token)
 	disk, err := inspector.InspectReplacementAttach(ctx, req.VolumeId, req.NodeId, imageID, vmID, "")
 	if err != nil || disk != nil {
 		return nil, attachmentEvidenceUnavailable("replacement Ceph attach requires settled provider absence", err)
 	}
 	if vmID != history.LastSuccessfulOpenNebulaVMID {
 		attempt.OriginalVMID = history.LastSuccessfulOpenNebulaVMID
-		attempt.OriginalVMName, err = inspector.InspectReplacementRelease(ctx, imageID, attempt.OriginalVMID, "")
-		if err != nil {
+		name, err := inspector.InspectReplacementRelease(ctx, imageID, attempt.OriginalVMID, attempt.OriginalVMName)
+		if err != nil || (existing != nil && name != "" && name != attempt.OriginalVMName) {
 			return nil, attachmentEvidenceUnavailable("original Ceph attachment release is unverified", err)
+		}
+		if existing == nil {
+			attempt.OriginalVMName = name
 		}
 	}
 	attempt, err = s.verifyReplacementBinding(ctx, req, history, attempt, -1)
 	if err != nil {
 		return nil, err
 	}
-	_, err = s.driver.volumeHistory.updateHistory(ctx, req.VolumeId, true, func(current *VolumeHistoryRecord) error {
-		if current.PendingReplacementAttach != nil || !attempt.matchesHistory(*current) {
-			return fmt.Errorf("replacement Ceph attach history changed")
+	if existing == nil {
+		_, err = s.driver.volumeHistory.updateHistory(ctx, req.VolumeId, true, func(current *VolumeHistoryRecord) error {
+			if current.PendingReplacementAttach != nil || !attempt.matchesHistory(*current) {
+				return fmt.Errorf("replacement Ceph attach history changed")
+			}
+			current.PendingReplacementAttach = &attempt
+			return nil
+		})
+		if err != nil {
+			s.retireIdleReplacementAttach(ctx, attempt)
+			return nil, attachmentEvidenceUnavailable("replacement Ceph attach admission could not be persisted", err)
 		}
-		current.PendingReplacementAttach = &attempt
+	}
+	if err := s.checkReplacementAttemptReadback(ctx, attempt); err != nil {
+		s.retireIdleReplacementAttach(ctx, attempt)
+		return nil, err
+	}
+	armed := attempt
+	armed.Phase = replacementAttachArmed
+	_, err = s.driver.volumeHistory.updateHistory(ctx, req.VolumeId, true, func(current *VolumeHistoryRecord) error {
+		if current.PendingReplacementAttach == nil || *current.PendingReplacementAttach != attempt || !attempt.matchesHistory(*current) {
+			return fmt.Errorf("prepared replacement Ceph attach changed")
+		}
+		current.PendingReplacementAttach = &armed
 		return nil
 	})
 	if err != nil {
-		s.retireIdleReplacementAttach(ctx, attempt)
-		return nil, attachmentEvidenceUnavailable("replacement Ceph attach admission could not be persisted", err)
+		return nil, attachmentEvidenceUnavailable("replacement Ceph dispatch authorization is unverified", err)
 	}
-	observed, err := s.readAttachmentHistory(ctx, req.VolumeId)
+	if err := s.checkReplacementAttemptReadback(ctx, armed); err != nil {
+		s.retireIdleReplacementAttach(ctx, armed)
+		return nil, err
+	}
+	return &armed, nil
+}
+
+func (s *ControllerServer) checkReplacementAttemptReadback(ctx context.Context, attempt replacementAttachAttempt) error {
+	observed, err := s.readAttachmentHistory(ctx, attempt.VolumeID)
 	if err != nil || observed.PendingReplacementAttach == nil || *observed.PendingReplacementAttach != attempt || !attempt.matchesHistory(observed) {
-		s.retireIdleReplacementAttach(ctx, attempt)
-		return nil, attachmentEvidenceUnavailable("replacement Ceph attach admission readback failed", err)
+		return attachmentEvidenceUnavailable("replacement Ceph attach admission readback failed", err)
 	}
-	return &attempt, nil
+	return nil
 }
 
 func (s *ControllerServer) completeReplacementAttach(ctx context.Context, req *csi.ControllerPublishVolumeRequest, attempt replacementAttachAttempt, node KubernetesNodeIdentity, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision) (successfulAttachmentObservation, error) {

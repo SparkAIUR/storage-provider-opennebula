@@ -308,7 +308,7 @@ func TestComputeHotplugTimeoutClampsToMax(t *testing.T) {
 func TestWaitForAttachStateReturnsHotplugTimeoutError(t *testing.T) {
 	provider := &PersistentDiskVolumeProvider{}
 
-	err := provider.waitForAttachState(context.Background(), 5*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForAttachState(context.Background(), 5*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		return false, false, nil
 	}, nil, "vol-a", "node-a")
 
@@ -350,7 +350,7 @@ func TestWaitForAttachStateRetriesAfterNodeBecomesReady(t *testing.T) {
 	retryCount := 0
 	attached := false
 
-	err := provider.waitForAttachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForAttachState(context.Background(), 50*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		if retryCount == 0 {
 			return false, true, nil
 		}
@@ -372,7 +372,7 @@ func TestWaitForAttachStateRetriesHotplugUntilSuccess(t *testing.T) {
 	provider := &PersistentDiskVolumeProvider{}
 	retryCount := 0
 
-	err := provider.waitForAttachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForAttachState(context.Background(), 50*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		if retryCount >= 2 {
 			return true, true, nil
 		}
@@ -392,7 +392,7 @@ func TestWaitForAttachStateRetriesHotplugUntilSuccess(t *testing.T) {
 func TestWaitForAttachStateFailsOnNonHotplugRetryError(t *testing.T) {
 	provider := &PersistentDiskVolumeProvider{}
 
-	err := provider.waitForAttachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForAttachState(context.Background(), 50*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		return false, true, nil
 	}, func() error {
 		return fmt.Errorf("permission denied")

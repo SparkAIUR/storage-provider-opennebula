@@ -166,5 +166,9 @@ func (p *PersistentDiskVolumeProvider) InspectReplacementRelease(ctx context.Con
 		}
 		return info.Name, ctx.Err()
 	}
+	_, err = p.readVMInfo(ctx, vmID, vmDisks|vmState)
+	if IsAuthoritativeVolumeAbsence(err) && ctx.Err() == nil {
+		return "", nil
+	}
 	return deny()
 }

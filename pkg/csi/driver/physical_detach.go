@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -24,6 +25,8 @@ type physicalDetachIdentity struct {
 	cephSingleWriter      bool
 	backend               string
 	attachments           map[string]detachAttachmentAuthority
+	replacement           *replacementAttachAttempt
+	replacementDisk       opennebula.VolumeDiskRecord
 }
 
 type detachAttachmentAuthority struct {
@@ -63,7 +66,7 @@ func (s *ControllerServer) recheckDetachVolumeAttachments(ctx context.Context, p
 	return status.FromContextError(ctx.Err()).Err()
 }
 
-func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, volume, nodeName string, identity *physicalDetachIdentity) error {
+func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, volume, nodeName string, identity *physicalDetachIdentity, readback bool) error {
 	if err := ctx.Err(); err != nil {
 		return status.FromContextError(err).Err()
 	}
@@ -108,15 +111,31 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if identity.background && identity.cephSingleWriter != (isCephBackend(backend) && hasSingleWriterAccessMode(pv.Spec.AccessModes)) {
 		return attachmentEvidenceUnavailable("background detach scope changed", nil)
 	}
-	attachments, err := s.detachVolumeAttachments(ctx, pv.Name, nodeName)
+	history, err := s.readAttachmentHistory(ctx, volume)
+	if err != nil {
+		return attachmentEvidenceUnavailable("detach history is unreadable", err)
+	}
+	attempt := history.PendingReplacementAttach
+	replacementDetach := attempt != nil && history.LastSuccessfulNodeName == nodeName
+	if identity.replacement != nil && (!replacementDetach || *identity.replacement != *attempt) {
+		return attachmentEvidenceUnavailable("replacement detach attempt changed", nil)
+	}
+	attachmentNode := nodeName
+	if replacementDetach {
+		attachmentNode = ""
+	}
+	attachments, err := s.detachVolumeAttachments(ctx, pv.Name, attachmentNode)
 	if err != nil {
 		return err
 	}
 	if identity.attachments != nil && !reflect.DeepEqual(identity.attachments, attachments) {
 		return attachmentEvidenceUnavailable("VolumeAttachment deletion authority changed before detach attempt", nil)
 	}
+	if replacementDetach && len(attachments) > 1 {
+		return attachmentEvidenceUnavailable("replacement detach has conflicting VolumeAttachments", nil)
+	}
 	for _, va := range attachments {
-		if va.attacher != s.driver.name || va.uid == "" || !va.deleting {
+		if va.attacher != s.driver.name || va.uid == "" || !va.deleting || (replacementDetach && va.node != nodeName) {
 			return status.Error(codes.Unavailable, "current VolumeAttachment does not authorize physical detach")
 		}
 		if err := validateAttachmentImageAssertions(va.metadata, identity.imageID); err != nil {
@@ -139,9 +158,29 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		runtimeCtx.PVCAnnotations = pvc.Annotations
 	}
 
-	history, err := s.readAttachmentHistory(ctx, volume)
-	if err != nil {
-		return attachmentEvidenceUnavailable("detach history is unreadable", err)
+	if replacementDetach {
+		if !attempt.dispatchPossible() || !attempt.matchesHistory(history) || attempt.Driver != s.driver.name ||
+			attempt.Node != nodeName || attempt.ImageID != identity.imageID || attempt.VMID != identity.vmID ||
+			attempt.ReplacementUID != string(identity.nodeUID) || attempt.PVUID != string(pv.UID) ||
+			pv.Name != history.PVName || pv.Status.Phase != corev1.VolumeBound || !cephRetentionAccessMode(pv.Spec.AccessModes) ||
+			!isCephBackend(backend) || replacement || pvc == nil || attempt.PVCUID != string(pvc.UID) ||
+			pvc.Namespace != history.PVCNamespace || pvc.Name != history.PVCName || pvc.Status.Phase != corev1.ClaimBound ||
+			!slices.Equal(pv.Spec.AccessModes, pvc.Spec.AccessModes) {
+			return attachmentEvidenceUnavailable("replacement detach binding or identity is unverified", nil)
+		}
+		disk, err := s.inspectReplacementDisk(ctx, *attempt, !readback)
+		if err != nil {
+			return err
+		}
+		if disk != nil {
+			if (identity.diskID >= 0 && identity.diskID != disk.DiskID) ||
+				(identity.replacement != nil && identity.replacementDisk != *disk) {
+				return attachmentEvidenceUnavailable("replacement detach disk changed", nil)
+			}
+			identity.diskID = disk.DiskID
+			identity.replacementDisk = *disk
+		}
+		identity.replacement = attempt
 	}
 	if history.Backend != "" && (identity.backendInferred || isCephBackend(history.Backend) || isCephBackend(backend)) && !strings.EqualFold(history.Backend, backend) {
 		return status.Error(codes.Unavailable, "detach backend contradicts observed history")
@@ -149,10 +188,10 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != identity.imageID {
 		return status.Error(codes.Unavailable, "detach image differs from observed history")
 	}
-	if history.LastSuccessfulNodeName == nodeName && history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != identity.vmID {
+	if !replacementDetach && history.LastSuccessfulNodeName == nodeName && history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != identity.vmID {
 		return status.Error(codes.Unavailable, "detach VM differs from observed history")
 	}
-	if history.LastSuccessfulNodeName == nodeName && history.LastSuccessfulDiskID != nil && identity.diskID >= 0 && *history.LastSuccessfulDiskID != identity.diskID {
+	if !replacementDetach && history.LastSuccessfulNodeName == nodeName && history.LastSuccessfulDiskID != nil && identity.diskID >= 0 && *history.LastSuccessfulDiskID != identity.diskID {
 		return status.Error(codes.Unavailable, "detach disk slot differs from observed history")
 	}
 	control := resolvedRecoveryControlState(volume, runtimeCtx, VolumeRecoveryControlState{})
@@ -200,7 +239,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 				terminalOnNode = terminalOnNode || pod.Spec.NodeName == nodeName
 				continue
 			}
-			if pod.Spec.NodeName == "" || pod.Spec.NodeName == nodeName {
+			if replacementDetach || pod.Spec.NodeName == "" || pod.Spec.NodeName == nodeName {
 				return attachmentEvidenceUnavailable("a current Pod still references the volume on the detach node", nil)
 			}
 			if identity.background {
@@ -211,14 +250,19 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			}
 		}
 	}
-	if desired.desiresNode(nodeName) {
+	if desired.desiresNode(nodeName) || (replacementDetach && (desired.Desired || desired.MultipleNodes)) {
 		return attachmentEvidenceUnavailable("current volume release is unverified", nil)
+	}
+	if replacementDetach {
+		if err := s.checkReplacementAttemptReadback(ctx, *attempt); err != nil {
+			return err
+		}
 	}
 	node, err := runtime.client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil || node == nil || node.UID != identity.nodeUID || node.DeletionTimestamp != nil {
 		return attachmentEvidenceUnavailable("detach node identity is unverified", err)
 	}
-	if history.LastSuccessfulNodeName == nodeName && history.LastSuccessfulNodeUID != "" && history.LastSuccessfulNodeUID != string(node.UID) {
+	if !replacementDetach && history.LastSuccessfulNodeName == nodeName && history.LastSuccessfulNodeUID != "" && history.LastSuccessfulNodeUID != string(node.UID) {
 		return status.Error(codes.Unavailable, "detach node identity differs from observed history")
 	}
 	ready := false
@@ -236,7 +280,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			return status.Error(codes.Unavailable, "detach node still reports the volume in use")
 		}
 	}
-	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, nodeName, attachments); err != nil {
+	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, attachmentNode, attachments); err != nil {
 		return err
 	}
 	identity.attachments = attachments
@@ -427,9 +471,9 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 		}
 		attempt := identity
 		attempt.diskID = diskID
-		return s.checkPhysicalDetachAuthority(ctx, volume, node, &attempt)
+		return s.checkPhysicalDetachAuthority(ctx, volume, node, &attempt, false)
 	}
-	if err := s.checkPhysicalDetachAuthority(ctx, volume, node, &identity); err != nil {
+	if err := s.checkPhysicalDetachAuthority(ctx, volume, node, &identity, false); err != nil {
 		if parentErr := ctx.Err(); parentErr != nil {
 			return false, parentErr
 		}
@@ -460,6 +504,18 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 			}
 			retiredRequired = true
 		}
+	}
+	if identity.replacement != nil {
+		if !accepted || retiredRequired {
+			return false, attachmentEvidenceUnavailable("replacement detach outcome is unverified", nil)
+		}
+		if err := s.checkPhysicalDetachAuthority(ctx, volume, node, &identity, true); err != nil {
+			return false, err
+		}
+		if err := s.retireReplacementAttach(ctx, *identity.replacement); err != nil {
+			return false, attachmentEvidenceUnavailable("replacement detach retirement is unverified", err)
+		}
+		return true, nil
 	}
 	if err := s.checkDetachAbsenceTarget(ctx, volume, node, identity.imageID, identity.vmID, identity.nodeUID, retiredRequired); err != nil {
 		return false, err

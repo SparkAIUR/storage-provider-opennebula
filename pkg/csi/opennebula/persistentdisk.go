@@ -825,7 +825,7 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		}
 	}
 
-	if err := p.waitForAttachState(ctx, hotplugTimeout, p.hotplugPollWait, func() (bool, bool, error) {
+	if err := p.waitForAttachState(ctx, hotplugTimeout, p.hotplugPollWait, func(ctx context.Context) (bool, bool, error) {
 		metadata, inspectErr := p.InspectVolumeAttachment(ctx, volume, node)
 		if inspectErr != nil {
 			return false, false, inspectErr
@@ -1725,6 +1725,7 @@ var ErrCloneConflict = errors.New("incompatible or uncertain clone target")
 // These errors mean absence observed through a successful provider response, never transport failure.
 var ErrVolumeNotFound = errors.New("volume not found")
 var ErrAttachmentNotFound = errors.New("volume attachment not found")
+var errAttachmentOwnershipLag = errors.New("attachment ownership has not converged")
 var ErrConflictingAttachmentEvidence = errors.New("attachment evidence is contradictory or malformed")
 
 func (p *PersistentDiskVolumeProvider) lookupImageID(ctx context.Context, name string) (int, error) {
@@ -2093,7 +2094,7 @@ func (p *PersistentDiskVolumeProvider) nodeReadyContext(ctx context.Context, nod
 	return vmLCMState == vm.Running, nil
 }
 
-func (p *PersistentDiskVolumeProvider) waitForAttachState(ctx context.Context, timeout, pollInterval time.Duration, observe func() (bool, bool, error), retryAttach func() error, volume, node string) error {
+func (p *PersistentDiskVolumeProvider) waitForAttachState(ctx context.Context, timeout, pollInterval time.Duration, observe func(context.Context) (bool, bool, error), retryAttach func() error, volume, node string) error {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
@@ -2112,18 +2113,27 @@ func (p *PersistentDiskVolumeProvider) waitForAttachState(ctx context.Context, t
 	retryPending := retryAttach != nil
 
 	for {
-		attached, ready, err := observe()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		attached, ready, err := observe(deadlineCtx)
 		if err != nil {
-			return fmt.Errorf("failed while waiting for attach of volume %s on node %s: %w", volume, node, err)
+			if parentErr := ctx.Err(); parentErr != nil {
+				return parentErr
+			}
+			if deadlineCtx.Err() == nil && (retryPending || !errors.Is(err, errAttachmentOwnershipLag)) {
+				return fmt.Errorf("failed while waiting for attach of volume %s on node %s: %w", volume, node, err)
+			}
+			attached, ready = false, false
 		}
 
 		lastAttached = attached
 		lastReady = ready
-		if attached && ready {
+		if attached && ready && deadlineCtx.Err() == nil {
 			return nil
 		}
 
-		if retryPending && ready && !attached {
+		if retryPending && ready && !attached && deadlineCtx.Err() == nil {
 			retryErr := retryAttach()
 			if retryErr != nil {
 				if !isHotplugStateError(retryErr) || status.Code(retryErr) == codes.Unavailable || status.Code(retryErr) == codes.FailedPrecondition {
@@ -2339,14 +2349,14 @@ func (metadata *VolumeAttachmentMetadata) VerifyOwnership() error {
 		owners[disk.NodeID] = true
 	}
 	if metadata.ImageRunningVMs != len(owners) || len(metadata.ImageVMIDs) != len(owners) {
-		return fmt.Errorf("%w: image usage differs from observed VM attachments", ErrConflictingAttachmentEvidence)
+		return fmt.Errorf("%w: %w: image usage differs from observed VM attachments", ErrConflictingAttachmentEvidence, errAttachmentOwnershipLag)
 	}
 	if owners[metadata.RequestedNodeID] != metadata.AttachedToRequestedNode {
 		return fmt.Errorf("%w: requested-node attachment observations contradict one another", ErrConflictingAttachmentEvidence)
 	}
 	for _, id := range metadata.ImageVMIDs {
 		if !owners[id] {
-			return fmt.Errorf("%w: image usage contradicts observed VM attachments", ErrConflictingAttachmentEvidence)
+			return fmt.Errorf("%w: %w: image usage contradicts observed VM attachments", ErrConflictingAttachmentEvidence, errAttachmentOwnershipLag)
 		}
 		delete(owners, id)
 	}
@@ -2355,6 +2365,9 @@ func (metadata *VolumeAttachmentMetadata) VerifyOwnership() error {
 
 func verifyImageOwnershipState(state img.State, owners int) error {
 	if owners == 0 && !idleImageState(state) || owners > 0 && !usedImageState(state) {
+		if state == img.Ready || usedImageState(state) {
+			return fmt.Errorf("%w: %w: image state disagrees with ownership", ErrConflictingAttachmentEvidence, errAttachmentOwnershipLag)
+		}
 		return fmt.Errorf("%w: image state disagrees with attachment ownership", ErrConflictingAttachmentEvidence)
 	}
 	return nil
