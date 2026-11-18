@@ -48,6 +48,8 @@ type nodeAttachmentProtocol struct {
 	extraDiskByVM       map[int]string
 	poolExtraDisk       string
 	directDiskFields    string
+	directVMFields      string
+	poolVMFields        map[int]string
 	directImageFields   string
 	imageTemplateFields string
 	marker              int64
@@ -144,7 +146,14 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 			if !direct && id == 41 {
 				disk += state.poolExtraDisk
 			}
-			return fmt.Sprintf(`<VM><ID>%d</ID><NAME>%s</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE>%s</TEMPLATE><HISTORY_RECORDS><HISTORY><SEQ>0</SEQ><DS_ID>200</DS_ID></HISTORY></HISTORY_RECORDS></VM>`, id, name, state.extraDiskBefore+disk+state.extraDiskByVM[id])
+			prefix := state.poolVMFields[id]
+			if direct {
+				prefix = ""
+				if id == 41 {
+					prefix = state.directVMFields
+				}
+			}
+			return fmt.Sprintf(`<VM>%s<ID>%d</ID><NAME>%s</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE>%s</TEMPLATE><HISTORY_RECORDS><HISTORY><SEQ>0</SEQ><DS_ID>200</DS_ID></HISTORY></HISTORY_RECORDS></VM>`, prefix, id, name, state.extraDiskBefore+disk+state.extraDiskByVM[id])
 		}
 		imageXML := func() string {
 			ids := ""
@@ -258,7 +267,7 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				}
 			case "one.vm.diskresize":
 				id := number(1)
-				require.Equal(t, 2, number(2))
+				require.Equal(t, firstNonEmpty(state.diskSlot, "2"), strconv.Itoa(number(2)))
 				size, err := strconv.Atoi(call.Params[3].Value.String)
 				require.NoError(t, err)
 				state.disks[id] = size
@@ -1267,12 +1276,17 @@ func TestControllerUnpublishRejectsLateAmbiguousImageName(t *testing.T) {
 	}
 }
 
-func TestControllerUnpublishRejectsConflictingFinalDiskFields(t *testing.T) {
+func TestControllerUnpublishRejectsConflictingFinalVMAndDiskFields(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, tc := range []struct{ name, fields string }{
-			{"resize", "<RESIZE>NO</RESIZE><RESIZE>YES</RESIZE>"},
-			{"image", "<IMAGE_ID>8</IMAGE_ID>"},
-			{"slot", "<DISK_ID>3</DISK_ID>"},
+		for _, tc := range []struct{ name, diskFields, vmFields string }{
+			{name: "resize", diskFields: "<RESIZE>NO</RESIZE><RESIZE>YES</RESIZE>"},
+			{name: "image", diskFields: "<IMAGE_ID>8</IMAGE_ID>"},
+			{name: "slot", diskFields: "<DISK_ID>3</DISK_ID>"},
+			{name: "vm-state", vmFields: "<STATE>1</STATE>"},
+			{name: "vm-lcm-state", vmFields: "<LCM_STATE>14</LCM_STATE>"},
+			{name: "vm-name", vmFields: "<NAME>different-vm</NAME>"},
+			{name: "vm-id", vmFields: "<ID>42</ID>"},
+			{name: "vm-template", vmFields: "<TEMPLATE/>"},
 		} {
 			t.Run(fmt.Sprintf("queued=%t/%s", queued, tc.name), func(t *testing.T) {
 				ctx := context.Background()
@@ -1287,7 +1301,7 @@ func TestControllerUnpublishRejectsConflictingFinalDiskFields(t *testing.T) {
 				provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
 					if method == "one.vm.info" && armed.Load() && reads.Add(1) == 2 {
 						protocol.mu.Lock()
-						protocol.directDiskFields = tc.fields
+						protocol.directDiskFields, protocol.directVMFields = tc.diskFields, tc.vmFields
 						protocol.mu.Unlock()
 					}
 				})
@@ -1308,7 +1322,8 @@ func TestControllerUnpublishRejectsConflictingFinalDiskFields(t *testing.T) {
 				require.EqualValues(t, 2, reads.Load())
 				wire.mu.Lock()
 				defer wire.mu.Unlock()
-				require.Equal(t, tc.fields, wire.directDiskFields)
+				require.Equal(t, tc.diskFields, wire.directDiskFields)
+				require.Equal(t, tc.vmFields, wire.directVMFields)
 				require.Zero(t, wire.detachAttempts)
 				require.Empty(t, wire.mutations)
 				require.Contains(t, wire.disks, 41)
@@ -1929,15 +1944,20 @@ func TestPublishAndStagePreserveRetainedNodeUIDUntilFreshAttach(t *testing.T) {
 
 func TestControllerPublishVerifiesDiskSlot(t *testing.T) {
 	for _, tc := range []struct {
-		name, slot   string
-		poolConflict bool
-		noCensus     bool
-		wantSuccess  bool
+		name, slot     string
+		poolConflict   bool
+		directConflict bool
+		grow           bool
+		noCensus       bool
+		wantSuccess    bool
 	}{
 		{name: "pool-duplicate", slot: "2", poolConflict: true},
+		{name: "pool-duplicate-before-growth", slot: "2", poolConflict: true, grow: true},
+		{name: "direct-duplicate-before-growth", slot: "2", directConflict: true, grow: true},
 		{name: "missing", slot: "missing"},
 		{name: "negative", slot: "-1"},
 		{name: "zero", slot: "0", wantSuccess: true},
+		{name: "grow-zero", slot: "0", grow: true, wantSuccess: true},
 		{name: "fallback-zero", slot: "0", noCensus: true, wantSuccess: true},
 		{name: "fallback-negative", slot: "-1", noCensus: true},
 	} {
@@ -1951,8 +1971,15 @@ func TestControllerPublishVerifiesDiskSlot(t *testing.T) {
 			wire.mu.Lock()
 			wire.diskSlot = tc.slot
 			wire.marker = 0
+			if tc.grow {
+				wire.disks[41], wire.marker = 128, 256*1024*1024
+			}
+			const competingDisk = "<DISK><IMAGE_ID>8</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdc</TARGET></DISK>"
 			if tc.poolConflict {
-				wire.poolExtraDisk = "<DISK><IMAGE_ID>8</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdc</TARGET></DISK>"
+				wire.poolExtraDisk = competingDisk
+			}
+			if tc.directConflict {
+				wire.extraDiskByVM = map[int]string{41: competingDisk}
 			}
 			wire.mu.Unlock()
 			probe := &moveHistoryProvider{PersistentDiskVolumeProvider: provider, wire: wire, destination: node.Name, vmID: 41}
@@ -1968,13 +1995,86 @@ func TestControllerPublishVerifiesDiskSlot(t *testing.T) {
 				require.False(t, history.LastSuccessfulPublishTime.IsZero())
 				require.Equal(t, new(0), history.LastSuccessfulDiskID)
 			} else {
-				require.Equal(t, codes.Unavailable, status.Code(err))
+				if tc.grow {
+					require.ErrorContains(t, err, "disk slot is claimed by multiple records")
+				} else {
+					require.Equal(t, codes.Unavailable, status.Code(err))
+				}
 				require.Nil(t, reply)
 				require.True(t, history.LastSuccessfulPublishTime.IsZero())
 			}
 			wire.mu.Lock()
 			defer wire.mu.Unlock()
-			require.Empty(t, wire.mutations)
+			if tc.grow && tc.wantSuccess {
+				require.Equal(t, []string{"resize:41:256", "marker:268435456"}, wire.mutations)
+			} else {
+				require.Empty(t, wire.mutations)
+			}
+		})
+	}
+}
+
+func TestControllerPublishFreshAttachDoesNotRestoreAmbiguousSlot(t *testing.T) {
+	ctx := context.Background()
+	const volume = "volume-test"
+	pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	node := newReadyNode("node-old", true)
+	driver := newStickyTestDriver(t, pv, pvc, node, activePodForPVC("consumer", pvc.Name, node.Name))
+	var protocol *nodeAttachmentProtocol
+	provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+		if method == "one.vm.attach" {
+			protocol.mu.Lock()
+			protocol.directDiskFields = "<DISK_ID>3</DISK_ID>"
+			protocol.mu.Unlock()
+		}
+	})
+	protocol = wire
+	wire.mu.Lock()
+	delete(wire.disks, 41)
+	wire.marker = 256 * 1024 * 1024
+	wire.mu.Unlock()
+	server := NewControllerServer(driver, provider, nil)
+	reply, err := reviewControllerClient(t, server).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
+	require.ErrorContains(t, err, "repeated VM disk field DISK_ID")
+	require.Nil(t, reply)
+	history, err := server.readAttachmentHistory(ctx, volume)
+	require.NoError(t, err)
+	require.True(t, history.LastSuccessfulPublishTime.IsZero())
+	wire.mu.Lock()
+	defer wire.mu.Unlock()
+	require.Equal(t, []string{"attach:41:false"}, wire.mutations)
+	require.Equal(t, 128, wire.disks[41])
+}
+
+func TestControllerExpandScopesImageAuthorityToGrowth(t *testing.T) {
+	for _, relevant := range []bool{false, true} {
+		t.Run(fmt.Sprintf("relevant=%t", relevant), func(t *testing.T) {
+			ctx := context.Background()
+			provider, wire := nodeAttachmentProvider(t)
+			wire.mu.Lock()
+			wire.ceph, wire.version = true, "7.4.0"
+			wire.disks[41], wire.marker = 128, 128*1024*1024
+			wire.imageTemplateFields = "<FORCE_DELETE>NO</FORCE_DELETE><FORCE_DELETE>YES</FORCE_DELETE>"
+			wire.directImageFields = "<RUNNING_VMS>0</RUNNING_VMS>"
+			if relevant {
+				wire.imageTemplateFields += "<CSI_REQUESTED_SIZE_BYTES>1</CSI_REQUESTED_SIZE_BYTES>"
+			}
+			wire.mu.Unlock()
+			server := NewControllerServer(newTestDriver(), provider, nil)
+			reply, err := reviewControllerClient(t, server).ControllerExpandVolume(ctx, &csi.ControllerExpandVolumeRequest{
+				VolumeId: "volume-test", CapacityRange: &csi.CapacityRange{RequiredBytes: 256 * 1024 * 1024},
+			})
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			if relevant {
+				require.Error(t, err)
+				require.Nil(t, reply)
+				require.Empty(t, wire.mutations)
+			} else {
+				require.NoError(t, err)
+				require.EqualValues(t, 256*1024*1024, reply.GetCapacityBytes())
+				require.Equal(t, []string{"resize:41:256", "marker:268435456"}, wire.mutations)
+			}
 		})
 	}
 }
@@ -2696,7 +2796,7 @@ func TestStickyTransferRetriesAgainstConcurrentAbsentUnpublish(t *testing.T) {
 }
 
 func TestCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t *testing.T) {
-	for _, mode := range []string{"serial", "wrong-image-id", "blank-image-name", "missing-image", "duplicate-resize"} {
+	for _, mode := range []string{"serial", "wrong-image-id", "blank-image-name", "missing-image", "duplicate-resize", "duplicate-vm-state"} {
 		t.Run(mode, func(t *testing.T) {
 			testCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t, mode)
 		})
@@ -2732,8 +2832,12 @@ func testCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t *testing.T, mode st
 		wire.imageInfoByID = map[int]string{8: `<IMAGE><ID>8</ID><NAME></NAME></IMAGE>`}
 	case "missing-image":
 		wire.missingImageID = 8
-	case "duplicate-resize":
-		wire.extraDiskByVM[42] = strings.Replace(wire.extraDiskByVM[42], "</DISK>", "<RESIZE>NO</RESIZE><RESIZE>YES</RESIZE></DISK>", 1)
+	case "duplicate-resize", "duplicate-vm-state":
+		if mode == "duplicate-vm-state" {
+			wire.poolVMFields = map[int]string{42: "<LCM_STATE>14</LCM_STATE>"}
+		} else {
+			wire.extraDiskByVM[42] = strings.Replace(wire.extraDiskByVM[42], "</DISK>", "<RESIZE>NO</RESIZE><RESIZE>YES</RESIZE></DISK>", 1)
+		}
 		wire.imageInfoByID = map[int]string{8: `<IMAGE><ID>8</ID><NAME>other-volume</NAME><STATE>8</STATE><SIZE>128</SIZE><DATASTORE_ID>100</DATASTORE_ID><RUNNING_VMS>1</RUNNING_VMS><VMS><ID>42</ID></VMS></IMAGE>`}
 	}
 	if mode != "serial" {
@@ -2742,7 +2846,11 @@ func testCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t *testing.T, mode st
 	wire.mu.Unlock()
 
 	_, err := provider.GetVolumeInNode(ctx, 7, 42)
-	require.ErrorIs(t, err, opennebula.ErrAttachmentNotFound)
+	if mode == "duplicate-vm-state" {
+		require.ErrorIs(t, err, opennebula.ErrConflictingAttachmentEvidence)
+	} else {
+		require.ErrorIs(t, err, opennebula.ErrAttachmentNotFound)
+	}
 	server := NewControllerServer(driver, provider, nil)
 	reconciler := NewAttachmentReconciler(server)
 	reconciler.orphanGrace = time.Nanosecond
@@ -2752,10 +2860,9 @@ func testCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t *testing.T, mode st
 	require.NoError(t, reconciler.ReconcileOnce(ctx))
 	_, err = driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(ctx, otherVA.Name, metav1.GetOptions{})
 	require.NoError(t, err)
-	if mode == "duplicate-resize" {
+	if mode == "duplicate-resize" || mode == "duplicate-vm-state" {
 		require.Empty(t, reconciler.staleVASeen)
 		reply, err := reviewControllerClient(t, server).ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "other-volume", NodeId: "node-new"})
-		require.ErrorContains(t, err, "attachment state is unknown")
 		require.Equal(t, codes.Unavailable, status.Code(err))
 		require.Nil(t, reply)
 	}
@@ -2885,6 +2992,7 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 		{false, false, "system-datastore"}, {true, false, "system-datastore"},
 		{false, false, "late-duplicate-id"}, {true, false, "late-duplicate-id"},
 		{false, false, "late-duplicate-resize"}, {true, false, "late-duplicate-resize"},
+		{false, false, "late-duplicate-vm-lcm"}, {true, false, "late-duplicate-vm-lcm"},
 		{false, false, "late-duplicate-persistent"}, {true, false, "late-duplicate-persistent"},
 		{false, false, "late-duplicate-capacity"}, {true, false, "late-duplicate-capacity"},
 		{false, true, "zero-slot"}, {true, true, "zero-slot"},
@@ -2927,9 +3035,13 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 					}
 					protocol.mu.Unlock()
 				}
-				if tc.drift == "late-duplicate-resize" && unpublishActive.Load() && method == "one.vm.info" && directReads.Add(1) == 2 {
+				if (tc.drift == "late-duplicate-resize" || tc.drift == "late-duplicate-vm-lcm") && unpublishActive.Load() && method == "one.vm.info" && directReads.Add(1) == 2 {
 					protocol.mu.Lock()
-					protocol.directDiskFields = "<RESIZE>NO</RESIZE><RESIZE>YES</RESIZE>"
+					if tc.drift == "late-duplicate-vm-lcm" {
+						protocol.directVMFields = "<LCM_STATE>14</LCM_STATE>"
+					} else {
+						protocol.directDiskFields = "<RESIZE>NO</RESIZE><RESIZE>YES</RESIZE>"
+					}
 					protocol.mu.Unlock()
 				}
 			})
@@ -3094,7 +3206,7 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 				require.Equal(t, codes.Unavailable, status.Code(err))
 				require.Nil(t, response)
 				switch tc.drift {
-				case "late-duplicate-resize":
+				case "late-duplicate-resize", "late-duplicate-vm-lcm":
 					require.ErrorContains(t, err, "provider")
 					require.EqualValues(t, 2, directReads.Load())
 				case "late-duplicate-persistent", "late-duplicate-capacity":

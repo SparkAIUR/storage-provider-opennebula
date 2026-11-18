@@ -2030,6 +2030,73 @@ func TestControllerPublishVolumeBlocksActiveHostArtifactQuarantine(t *testing.T)
 	provider.AssertExpectations(t)
 }
 
+func TestControllerPublishRedactsPersistedSlotQuarantine(t *testing.T) {
+	for _, mode := range []string{"same-volume", "other-volume", "observe-other-volume"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			const volume = "vol-request"
+			const generic = "host artifact quarantine is active for the requested attachment slot"
+			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			if mode == "observe-other-volume" {
+				pv.Annotations[annotationRecoveryMode] = recoveryModeObserve
+			}
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-161", true))
+			owner := "different-tenant-volume"
+			if mode == "same-volume" {
+				owner = volume
+			}
+			now := time.Now().UTC()
+			state := HostArtifactQuarantineState{
+				Key: "vm-161.disk-2", VolumeID: owner, VMID: 161, DiskID: 2, FailureCount: 1,
+				FirstObservedAt: now, LastObservedAt: now, ExpiresAt: now.Add(time.Hour),
+				Message: "private provider error lv-one-161-2", RepairHint: "private repair hint",
+			}
+			payload, err := json.Marshal(state)
+			require.NoError(t, err)
+			require.NoError(t, driver.kubeRuntime.UpsertConfigMapData(ctx, "default", hostArtifactStateConfigMapName, map[string]string{state.Key: string(payload)}))
+			require.Empty(t, driver.hostArtifactQuarantine.Snapshot())
+			provider := new(MockOpenNebulaVolumeProviderTestify)
+			provider.On("VolumeExists", mock.Anything, volume).Return(233, volumeSize, nil)
+			provider.On("NodeExists", mock.Anything, "node-161").Return(161, nil)
+			provider.On("InspectHostArtifactAttachmentTarget", mock.Anything, volume, "node-161", mock.Anything).
+				Return(&opennebula.HostArtifactAttachmentTarget{VMID: 161, DiskID: 2}, nil).Once()
+			if mode == "observe-other-volume" {
+				provider.On("GetVolumeInNode", mock.Anything, 233, 161).Return("vdb", nil)
+			}
+			client := reviewControllerClient(t, NewControllerServer(driver, provider, nil))
+			reply, err := client.ControllerPublishVolume(ctx, newPublishReq(volume, "node-161"))
+			events, eventErr := driver.kubeRuntime.client.CoreV1().Events(pvc.Namespace).List(ctx, metav1.ListOptions{})
+			require.NoError(t, eventErr)
+			var warnings []string
+			for _, event := range events.Items {
+				if event.Reason == eventReasonHostArtifactQuarantined {
+					require.Equal(t, pvc.UID, event.InvolvedObject.UID)
+					warnings = append(warnings, event.Message)
+				}
+			}
+			switch mode {
+			case "same-volume":
+				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				require.Nil(t, reply)
+				require.ErrorContains(t, err, state.Message)
+				require.ErrorContains(t, err, state.RepairHint)
+				require.Equal(t, []string{status.Convert(err).Message()}, warnings)
+			case "other-volume":
+				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				require.Nil(t, reply)
+				require.Equal(t, generic, status.Convert(err).Message())
+				require.Equal(t, []string{generic}, warnings)
+			case "observe-other-volume":
+				require.NoError(t, err)
+				require.NotNil(t, reply)
+				require.Equal(t, []string{generic}, warnings)
+			}
+			provider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+			provider.AssertExpectations(t)
+		})
+	}
+}
+
 func TestControllerUnpublishVolumeClassifiesDetachMetadataDrift(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-detach-drift", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 	pvc.Spec.VolumeName = pv.Name
@@ -2408,7 +2475,7 @@ func TestControllerUnpublishVolumeBypassesStickyDetachWhenNodeNotReady(t *testin
 }
 
 func TestControllerUnpublishVolumePausesHotplugAfterUnhealthyNodeFailures(t *testing.T) {
-	node := newReadyNode("node-1", true)
+	node := newReadyNode("node-1", false)
 	pv, pvc := newLocalPVAndPVC("vol-pause", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 	driver := newStickyTestDriver(t, pv, pvc, node)
 	driver.PluginConfig.OverrideVal(config.NodeHotplugGuardEnabledVar, true)
@@ -2422,14 +2489,14 @@ func TestControllerUnpublishVolumePausesHotplugAfterUnhealthyNodeFailures(t *tes
 		Node:                 "node-1",
 		Timeout:              time.Second,
 		LastObservedAttached: true,
-		LastObservedReady:    false,
+		LastObservedReady:    true,
 		Cause:                errors.New("wrong state HOTPLUG"),
 	}
 	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
 	mockProvider.On("VolumeExists", mock.Anything, "vol-pause").Return(1, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdb", nil).Times(5)
-	mockProvider.On("NodeReady", mock.Anything, "node-1").Return(false, nil).Times(3)
+	mockProvider.On("NodeReady", mock.Anything, "node-1").Return(true, nil).Times(3)
 	mockProvider.On("DetachVolume", mock.Anything, "vol-pause", "node-1").Return(timeoutErr).Twice()
 
 	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
@@ -2451,6 +2518,9 @@ func TestControllerUnpublishVolumePausesHotplugAfterUnhealthyNodeFailures(t *tes
 	require.True(t, ok)
 	assert.True(t, state.PauseUntilReady)
 	assert.Equal(t, 2, state.FailureCount)
+	assert.Equal(t, "kubernetes_node_not_ready", state.Reason)
+	assert.False(t, state.KubernetesReady)
+	assert.True(t, state.OpenNebulaReady)
 	mockProvider.AssertExpectations(t)
 }
 

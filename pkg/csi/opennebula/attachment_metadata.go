@@ -82,7 +82,7 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 	if imageSize <= 0 || effectiveSize != imageSize {
 		return deny("image capacity is unknown or requires restoration")
 	}
-	info, err := p.ctrl.VM(metadata.RequestedNodeID).InfoContext(ctx, true)
+	info, err := p.readVMInfo(ctx, metadata.RequestedNodeID)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
 	}
@@ -140,7 +140,7 @@ func (p *PersistentDiskVolumeProvider) VerifyAttachmentBackend(ctx context.Conte
 	if imageID < 0 || image.ID != imageID || image.Name != volume {
 		return fmt.Errorf("attachment image identity changed")
 	}
-	info, err := p.ctrl.VM(vmID).InfoContext(ctx, true)
+	info, err := p.readVMInfo(ctx, vmID)
 	if err != nil {
 		return err
 	}

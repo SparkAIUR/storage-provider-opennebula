@@ -15,11 +15,19 @@ var supportedGrowthVersion = regexp.MustCompile(`^7\.4\.(0|[1-9][0-9]*)$`)
 
 // authorizePersistentDiskGrowth is operation-specific. Probe and satisfied-capacity
 // retries retain 7.4.0 support. No result is cached across growth attempts.
-func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context.Context, vmID, diskID, imageID int) error {
+func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context.Context, vmID, diskID, imageID int, restoring bool) error {
 	deny := func(reason string) error {
 		return &datastoreConfigError{message: fmt.Sprintf("persistent disk growth requires verified OpenNebula 7.4.1+ metadata support for non-NONE transfer targets: %s", reason)}
 	}
-	info, err := p.ctrl.VM(vmID).InfoContext(ctx, true)
+	if restoring {
+		if err := p.verifyRestorationCensus(ctx, vmID, diskID, imageID); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return deny(err.Error())
+		}
+	}
+	info, err := p.readResizeVM(ctx, vmID, restoring)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
 	}
@@ -34,17 +42,25 @@ func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context
 		return deny("VM is not in a terminal eligible growth state")
 	}
 	var selected *shared.Disk
-	for _, disk := range info.Template.GetDisks() {
-		iid, ie := disk.GetI(shared.ImageID)
-		did, de := disk.GetI(shared.DiskID)
-		if ie != nil || de != nil || iid != imageID || did != diskID {
-			continue
+	if restoring {
+		slot, disk, err := publishDiskFromVM(info, imageID, vmID)
+		if err != nil || slot != diskID {
+			return deny("restoration attachment or disk slot is unverified")
 		}
-		if selected != nil {
-			return deny("ambiguous attachment identity")
+		selected = disk
+	} else {
+		for _, disk := range info.Template.GetDisks() {
+			iid, ie := disk.GetI(shared.ImageID)
+			did, de := disk.GetI(shared.DiskID)
+			if ie != nil || de != nil || iid != imageID || did != diskID {
+				continue
+			}
+			if selected != nil {
+				return deny("ambiguous attachment identity")
+			}
+			copyDisk := disk
+			selected = &copyDisk
 		}
-		copyDisk := disk
-		selected = &copyDisk
 	}
 	if selected == nil {
 		return deny("attachment identity changed")
@@ -55,7 +71,7 @@ func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context
 	if marker, _ := selected.Get("RESIZE"); marker != "" && marker != "NO" && marker != "0" && marker != "false" {
 		return deny("disk growth remains pending")
 	}
-	image, err := p.readImageInfo(ctx, imageID)
+	image, err := p.readResizeImage(ctx, imageID, restoring)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
 	}
@@ -96,6 +112,34 @@ func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context
 	}
 	if target != "NONE" && patch < 1 {
 		return deny(fmt.Sprintf("provider %s lacks persistent %s-target detach metadata support", version, target))
+	}
+	return nil
+}
+
+func (p *PersistentDiskVolumeProvider) verifyRestorationCensus(ctx context.Context, vmID, diskID, imageID int) error {
+	vms, err := p.readAttachmentVMs(ctx, imageID, vmID)
+	if err != nil {
+		return err
+	}
+	seen := false
+	for _, info := range vms {
+		if info.ID != vmID {
+			continue
+		}
+		if seen {
+			return fmt.Errorf("restoration VM identity is ambiguous")
+		}
+		slot, _, err := publishDiskFromVM(&info, imageID, vmID)
+		if err != nil {
+			return err
+		}
+		if slot != diskID {
+			return fmt.Errorf("restoration disk slot differs from the VM census")
+		}
+		seen = true
+	}
+	if !seen {
+		return fmt.Errorf("restoration VM identity is absent from the census")
 	}
 	return nil
 }

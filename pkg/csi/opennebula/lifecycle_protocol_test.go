@@ -147,7 +147,7 @@ func TestLifecycleResizeOptimisticMetadataIsPending(t *testing.T) {
 			p := lifecycleFixture(t, func(string) (bool, string, int) {
 				return true, `<VM><ID>11</ID><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><SIZE>256</SIZE>` + marker + `</DISK></TEMPLATE></VM>`, 0
 			})
-			size, err := p.completedDiskSize(context.Background(), 11, 2, 7)
+			size, err := p.completedDiskSize(context.Background(), 11, 2, 7, false)
 			require.NoError(t, err)
 			require.Zero(t, size)
 		})
@@ -157,7 +157,7 @@ func TestLifecycleResizeOptimisticMetadataIsPending(t *testing.T) {
 func TestLifecycleResizeRejectsWrongStateOrIdentity(t *testing.T) {
 	for _, vmXML := range []string{`<VM><ID>11</ID><STATE>3</STATE><LCM_STATE>16</LCM_STATE></VM>`, `<VM><ID>11</ID><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>8</IMAGE_ID><DISK_ID>2</DISK_ID><SIZE>256</SIZE></DISK></TEMPLATE></VM>`} {
 		p := lifecycleFixture(t, func(string) (bool, string, int) { return true, vmXML, 0 })
-		size, err := p.completedDiskSize(context.Background(), 11, 2, 7)
+		size, err := p.completedDiskSize(context.Background(), 11, 2, 7, false)
 		require.Error(t, err)
 		require.Zero(t, size)
 	}

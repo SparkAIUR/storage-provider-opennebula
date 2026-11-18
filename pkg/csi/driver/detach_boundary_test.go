@@ -104,7 +104,7 @@ func TestProviderLocalAttachmentBackendRejectsConflictingImageID(t *testing.T) {
 	wire.mu.Lock()
 	wire.prependImageID = true
 	wire.mu.Unlock()
-	require.ErrorContains(t, provider.VerifyAttachmentBackend(context.Background(), "volume-test", 7, 41, "local"), "image identity changed")
+	require.ErrorIs(t, provider.VerifyAttachmentBackend(context.Background(), "volume-test", 7, 41, "local"), opennebula.ErrConflictingAttachmentEvidence)
 	wire.mu.Lock()
 	defer wire.mu.Unlock()
 	require.Empty(t, wire.mutations)

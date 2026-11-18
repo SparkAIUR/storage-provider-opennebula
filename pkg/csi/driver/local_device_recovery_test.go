@@ -208,6 +208,42 @@ func TestLocalDeviceRecoveryRequiresProvenAttachmentAbsence(t *testing.T) {
 	}
 }
 
+func TestLocalDeviceRecoveryRedactsPersistedSlotQuarantine(t *testing.T) {
+	driver, ns, server, provider, report := recoveryReviewFixture(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	state := HostArtifactQuarantineState{
+		Key: "vm-208.disk-2", VolumeID: "other-volume", VMID: 208, DiskID: 2, FailureCount: 1,
+		FirstObservedAt: now, LastObservedAt: now, ExpiresAt: now.Add(time.Hour),
+		Message: "private provider error lv-one-208-2", RepairHint: "private repair hint",
+	}
+	payload, err := json.Marshal(state)
+	require.NoError(t, err)
+	require.NoError(t, driver.kubeRuntime.UpsertConfigMapData(ctx, namespaceFromServiceAccount(), hostArtifactStateConfigMapName, map[string]string{state.Key: string(payload)}))
+	require.Empty(t, driver.hostArtifactQuarantine.Snapshot())
+	provider.On("NodeReady", mock.Anything, report.Node).Return(true, nil).Once()
+	provider.On("VolumeExists", mock.Anything, report.VolumeID).Return(394, 1, nil).Once()
+	provider.On("NodeExists", mock.Anything, report.Node).Return(208, nil).Once()
+	provider.On("InspectHostArtifactAttachmentTarget", mock.Anything, report.VolumeID, report.Node, mock.Anything).
+		Return(&opennebula.HostArtifactAttachmentTarget{VMID: 208, DiskID: 2}, nil).Once()
+
+	require.NoError(t, server.recoverLocalDeviceReport(ctx, localDeviceReportKey(report.Node, report.VolumeID), report))
+	current, ok := ns.currentLocalDeviceReport(ctx, report.VolumeID)
+	require.True(t, ok)
+	require.Contains(t, current.LastRecoveryError, "host artifact quarantine is active for the requested attachment slot")
+	require.NotContains(t, current.LastRecoveryError, "private")
+	require.NotContains(t, current.LastRecoveryError, "208")
+	events, err := driver.kubeRuntime.client.CoreV1().Events(report.PVCNamespace).List(ctx, metav1.ListOptions{})
+	require.NoError(t, err)
+	require.NotEmpty(t, events.Items)
+	for _, event := range events.Items {
+		require.NotContains(t, event.Message, "private")
+		require.NotContains(t, event.Message, "lv-one-208-2")
+	}
+	provider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	provider.AssertExpectations(t)
+}
+
 func TestLocalDeviceRecoveryPersistsHostArtifactQuarantineOnReattachConflict(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-device-artifact", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 	pvc.Spec.VolumeName = pv.Name

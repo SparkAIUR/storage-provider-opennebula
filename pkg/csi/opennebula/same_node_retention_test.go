@@ -319,7 +319,7 @@ func TestDiskLookupDistinguishesBlankAndMalformedImageReferences(t *testing.T) {
 			attachments, _, err := p.ListCurrentAttachments(ctx)
 			require.ErrorContains(t, err, "malformed VM disk image identity")
 			require.Empty(t, attachments)
-			size, err := p.completedDiskSize(ctx, 11, 2, 7)
+			size, err := p.completedDiskSize(ctx, 11, 2, 7, false)
 			require.NoError(t, err)
 			require.EqualValues(t, 1_073_741_824, size)
 			require.Zero(t, mutations.Load())

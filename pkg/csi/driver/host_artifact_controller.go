@@ -64,11 +64,16 @@ func (s *ControllerServer) rejectIfHostArtifactQuarantineActive(ctx context.Cont
 	if !active {
 		return nil
 	}
+	message := "host artifact quarantine is active for the requested attachment slot"
+	observeMessage := message
+	if strings.TrimSpace(state.VolumeID) == strings.TrimSpace(req.VolumeId) {
+		message = hostArtifactQuarantineMessage(state)
+		observeMessage = state.Message
+	}
 	if recoveryControl.Active() && recoveryControl.SuppressRepairActions {
-		s.recordHostArtifactWarning(ctx, req.VolumeId, req.GetVolumeContext(), eventReasonHostArtifactQuarantined, state.Message)
+		s.recordHostArtifactWarning(ctx, req.VolumeId, req.GetVolumeContext(), eventReasonHostArtifactQuarantined, observeMessage)
 		return nil
 	}
-	message := hostArtifactQuarantineMessage(state)
 	s.driver.metrics.RecordHostArtifactQuarantine(state.Classification, "active")
 	s.recordHostArtifactWarning(ctx, req.VolumeId, req.GetVolumeContext(), eventReasonHostArtifactQuarantined, message)
 	return status.Error(codes.FailedPrecondition, message)

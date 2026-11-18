@@ -29,12 +29,36 @@ func effectiveImageSize(info *img.Image) (int64, error) {
 }
 
 // A disk's requested SIZE is optimistic while RESIZE/SIZE_PREV or resize LCM state remains.
-func (p *PersistentDiskVolumeProvider) completedDiskSize(ctx context.Context, vmID, diskID, imageID int) (int64, error) {
-	info, err := p.ctrl.VM(vmID).InfoContext(ctx, true)
+func (p *PersistentDiskVolumeProvider) completedDiskSize(ctx context.Context, vmID, diskID, imageID int, restoring bool) (int64, error) {
+	info, err := p.readResizeVM(ctx, vmID, restoring)
 	if err != nil {
 		return 0, err
 	}
+	if restoring {
+		selectedID, disk, err := publishDiskFromVM(info, imageID, vmID)
+		if err != nil {
+			return 0, err
+		}
+		if selectedID != diskID {
+			return 0, fmt.Errorf("restoration disk slot changed from %d to %d", diskID, selectedID)
+		}
+		return completedSelectedDiskSize(info, *disk)
+	}
 	return completedDiskSizeFromVM(info, diskID, imageID)
+}
+
+func (p *PersistentDiskVolumeProvider) readResizeVM(ctx context.Context, vmID int, restoring bool) (*vm.VM, error) {
+	if restoring {
+		return p.readVMInfo(ctx, vmID)
+	}
+	return p.ctrl.VM(vmID).InfoContext(ctx, true)
+}
+
+func (p *PersistentDiskVolumeProvider) readResizeImage(ctx context.Context, imageID int, restoring bool) (*img.Image, error) {
+	if restoring {
+		return p.readImageInfo(ctx, imageID)
+	}
+	return p.readExpansionImageInfo(ctx, imageID)
 }
 
 func completedDiskSizeFromVM(info *vm.VM, diskID, imageID int) (int64, error) {
@@ -72,8 +96,8 @@ func completedSelectedDiskSize(info *vm.VM, disk shared.Disk) (int64, error) {
 	return diskSizeBytesFromTemplate(disk)
 }
 
-func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, id int, size int64) error {
-	info, err := p.readImageInfo(ctx, id)
+func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, id int, size int64, restoring bool) error {
+	info, err := p.readResizeImage(ctx, id, restoring)
 	if err != nil {
 		return err
 	}
@@ -94,7 +118,7 @@ func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, 
 	if err := p.ctrl.Image(id).UpdateContext(ctx, tpl.String(), parameters.Merge); err != nil {
 		return err
 	}
-	info, err = p.readImageInfo(ctx, id)
+	info, err = p.readResizeImage(ctx, id, restoring)
 	if err != nil {
 		return err
 	}
@@ -121,16 +145,20 @@ func (p *PersistentDiskVolumeProvider) RestoreVolumeCapacity(ctx context.Context
 	if err != nil {
 		return err
 	}
-	disk, _, err := p.volumeDiskInVM(ctx, imageID, vmID)
+	vmInfo, err := p.readVMInfo(ctx, vmID)
 	if err != nil {
 		return err
 	}
-	actual, err := p.completedDiskSize(ctx, vmID, disk, imageID)
+	slot, _, err := publishDiskFromVM(vmInfo, imageID, vmID)
+	if err != nil {
+		return err
+	}
+	actual, err := p.completedDiskSize(ctx, vmID, slot, imageID, true)
 	if err != nil {
 		return err
 	}
 	if actual < desired {
-		_, err = p.expandAttachedDisk(ctx, vmID, disk, imageID, desired)
+		_, err = p.expandAttachedDisk(ctx, vmID, slot, imageID, desired, true)
 		return err
 	}
 	return nil
