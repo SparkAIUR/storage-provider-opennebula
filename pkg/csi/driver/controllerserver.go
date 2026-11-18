@@ -33,7 +33,6 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
@@ -594,23 +593,13 @@ func (s *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 		return &csi.DeleteVolumeResponse{}, nil
 	}
 
-	var identityErr error
-	ctx, identityErr = s.pinKnownVolumeIdentity(ctx, req.VolumeId)
-	if identityErr != nil {
-		return nil, status.Error(codes.Unavailable, identityErr.Error())
+	release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
+	defer release()
+	ctx, err := s.prepareVolumeDeletion(ctx, req.VolumeId)
+	if err != nil {
+		return nil, err
 	}
-	if manager := s.driver.volumeQuarantine; manager != nil && manager.runtime != nil && manager.runtime.enabled {
-		cm, e := manager.runtime.GetConfigMap(ctx, manager.namespace, volumeQuarantineStateConfigMapName)
-		if e != nil && !apierrors.IsNotFound(e) {
-			return nil, status.Error(codes.Unavailable, "cannot inspect cleanup quarantine")
-		}
-		if e == nil {
-			if _, exists := cm.Data[req.VolumeId]; exists {
-				return nil, status.Error(codes.FailedPrecondition, "volume has unresolved cleanup quarantine; external verification required")
-			}
-		}
-	}
-	err := s.volumeProvider.DeleteVolume(ctx, req.VolumeId)
+	err = s.volumeProvider.DeleteVolume(ctx, req.VolumeId)
 	if err == opennebula.ErrVolumeNotFound {
 		err = s.verifyUnpinnedVolumeAbsence(ctx, req.VolumeId)
 	}
@@ -1389,7 +1378,7 @@ func (s *ControllerServer) confirmMissingUnpublish(ctx context.Context, volume, 
 		if err := s.verifyUnpinnedVolumeAbsence(ctx, volume); err != nil {
 			return attachmentEvidenceUnavailable("missing volume ownership is unverified", err)
 		}
-		return s.verifyDetachAbsenceNode(ctx, node, history, "")
+		return s.verifyDetachAbsenceNode(ctx, node, history, "", false)
 	}
 	verifier, ok := s.volumeProvider.(opennebula.VolumeAbsenceVerifier)
 	if !ok {
@@ -1411,20 +1400,16 @@ func (s *ControllerServer) confirmMissingUnpublish(ctx context.Context, volume, 
 	if err := verifier.VerifyVolumeAbsent(ctx, volume, history.LastSuccessfulImageID, vmIDs...); err != nil {
 		return attachmentEvidenceUnavailable("missing volume ownership is unverified", err)
 	}
-	return s.verifyDetachAbsenceNode(ctx, node, history, "")
+	return s.verifyDetachAbsenceNode(ctx, node, history, "", true)
 }
 
 func (s *ControllerServer) verifyUnpinnedVolumeAbsence(ctx context.Context, volume string) error {
-	if runtime := s.driver.kubeRuntime; runtime != nil && runtime.enabled {
-		pvs, err := runtime.client.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return err
-		}
-		for _, pv := range pvs.Items {
-			if csi := pv.Spec.CSI; csi != nil && csi.Driver == s.driver.name && csi.VolumeHandle == volume {
-				return fmt.Errorf("owned PV has no image identity to verify absence")
-			}
-		}
+	pv, err := s.ownedDeletionPV(ctx, volume)
+	if err != nil {
+		return err
+	}
+	if pv != nil {
+		return fmt.Errorf("owned PV has no image identity to verify absence")
 	}
 	return ctx.Err()
 }
@@ -3056,18 +3041,4 @@ func hasSingleWriterAccessMode(modes []corev1.PersistentVolumeAccessMode) bool {
 		}
 	}
 	return false
-}
-
-func (s *ControllerServer) pinKnownVolumeIdentity(ctx context.Context, volume string) (context.Context, error) {
-	if s.driver.volumeHistory == nil {
-		return ctx, nil
-	}
-	if err := s.driver.volumeHistory.RefreshEntry(ctx, volume); err != nil {
-		return ctx, err
-	}
-	if record, ok := s.driver.volumeHistory.Get(volume); ok && record.LastSuccessfulImageID > 0 {
-		ctx = opennebula.WithExpectedImageID(ctx, record.LastSuccessfulImageID)
-		return opennebula.WithExpectedDeletionVMID(ctx, record.LastSuccessfulOpenNebulaVMID), nil
-	}
-	return ctx, nil
 }

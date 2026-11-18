@@ -53,6 +53,7 @@ type nodeAttachmentProtocol struct {
 	imageName         string
 	duplicateImage    bool
 	missingImage      bool
+	missingImageID    int
 	allowImageDelete  bool
 	hideImageName     bool
 	omitOriginalVM    bool
@@ -165,7 +166,7 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				switch {
 				case number(1) == 8 && state.duplicateImage:
 					body = strings.Replace(body, "<ID>7</ID>", "<ID>8</ID>", 1)
-				case state.missingImage:
+				case state.missingImage || (state.missingImageID > 0 && number(1) == state.missingImageID):
 					ok, body, code = 0, "image not found", 0x400
 				case state.imageInfoByID[number(1)] != "":
 					body = state.imageInfoByID[number(1)]
@@ -941,7 +942,7 @@ func TestProviderDetachRetryRespectsHotplugDeadline(t *testing.T) {
 
 func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"same-node", "replacement-uid", "replacement-vm", "vm-changed-before-dispatch", "duplicate-image", "replacement-image", "late-duplicate-image", "missing-image", "missing-image-replacement-uid", "hidden-handle", "missing-image-retained-disk", "missing-image-unknown-ownership", "missing-image-malformed-disk", "owner-omitted", "owner-omitted-released", "owner-omitted-gone", "owner-omitted-unreadable"} {
+		for _, mode := range []string{"same-node", "replacement-uid", "replacement-vm", "vm-changed-before-dispatch", "duplicate-image", "replacement-image", "late-duplicate-image", "missing-image", "missing-image-replacement-uid", "hidden-handle", "missing-image-retained-disk", "missing-image-unknown-ownership", "missing-image-malformed-disk", "owner-omitted", "owner-omitted-released", "owner-omitted-gone", "owner-omitted-unreadable", "retired-node", "live-image-retired-node", "missing-image-unreadable-node"} {
 			t.Run(fmt.Sprintf("queued=%v/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
@@ -951,6 +952,14 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 					node.UID = "replacement-uid"
 				}
 				driver := newStickyTestDriver(t, pv, pvc, node, newReadyNode("node-new", true))
+				switch mode {
+				case "retired-node", "live-image-retired-node":
+					require.NoError(t, driver.kubeRuntime.client.CoreV1().Nodes().Delete(ctx, node.Name, metav1.DeleteOptions{}))
+				case "missing-image-unreadable-node":
+					driver.kubeRuntime.client.(*fake.Clientset).PrependReactor("get", "nodes", func(ktesting.Action) (bool, kruntime.Object, error) {
+						return true, nil, fmt.Errorf("Node read unavailable")
+					})
+				}
 				before, err := driver.volumeHistory.Upsert(ctx, "volume-test", func(record *VolumeHistoryRecord) {
 					record.Backend = "ceph"
 					record.LastSuccessfulPublishTime = time.Now().UTC().Add(-time.Hour)
@@ -980,9 +989,9 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 				switch mode {
 				case "replacement-vm":
 					state.vmNames = map[int]string{41: "retired-vm", 42: "node-old"}
-				case "same-node", "replacement-uid", "late-duplicate-image":
+				case "same-node", "replacement-uid", "late-duplicate-image", "live-image-retired-node":
 					delete(state.disks, 41)
-				case "duplicate-image", "replacement-image", "missing-image", "missing-image-replacement-uid":
+				case "duplicate-image", "replacement-image", "missing-image", "missing-image-replacement-uid", "missing-image-unreadable-node":
 					delete(state.disks, 41)
 					state.missingImage = mode != "duplicate-image"
 					state.duplicateImage = mode == "duplicate-image" || mode == "replacement-image"
@@ -998,12 +1007,12 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 					}
 				case "hidden-handle":
 					state.hideImageName = true
-				case "owner-omitted", "owner-omitted-released", "owner-omitted-gone", "owner-omitted-unreadable":
+				case "owner-omitted", "owner-omitted-released", "owner-omitted-gone", "owner-omitted-unreadable", "retired-node":
 					state.missingImage, state.omitOriginalVM = true, true
 					switch mode {
-					case "owner-omitted-released", "owner-omitted-gone":
+					case "owner-omitted-released", "owner-omitted-gone", "retired-node":
 						delete(state.disks, 41)
-						state.missingOriginalVM = mode == "owner-omitted-gone"
+						state.missingOriginalVM = mode != "owner-omitted-released"
 					case "owner-omitted-unreadable":
 						state.failMethod = "one.vm.info"
 					}
@@ -1023,7 +1032,7 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 					require.NoError(t, err)
 					require.NotNil(t, response)
 					require.False(t, history.LastSafeDetachTime.IsZero())
-				case "missing-image", "owner-omitted-released", "owner-omitted-gone":
+				case "missing-image", "owner-omitted-released", "owner-omitted-gone", "retired-node":
 					require.NoError(t, err)
 					require.NotNil(t, response)
 					require.Equal(t, before, history)
@@ -1518,6 +1527,46 @@ func TestControllerPublishDistinguishesBlankAndMalformedImageReferences(t *testi
 	}
 }
 
+func TestControllerPublishWithImageLessDiskOnTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name, facts string
+		allowed     bool
+	}{
+		{"empty CDROM", "<TYPE>CDROM</TYPE><SOURCE/>", true},
+		{"volatile filesystem", "<TYPE>FS</TYPE><FORMAT>raw</FORMAT>", true},
+		{"ambiguous", "<TYPE>DISK</TYPE>", false},
+		{"backed CDROM", "<TYPE>CDROM</TYPE><SOURCE>/fixture/image.iso</SOURCE>", false},
+		{"CSI serial", "<TYPE>CDROM</TYPE><SERIAL>onecsi-7</SERIAL>", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			const volume = "volume-test"
+			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			node := newReadyNode("node-old", true)
+			driver := newStickyTestDriver(t, pv, pvc, node)
+			provider, wire := nodeAttachmentProvider(t)
+			wire.mu.Lock()
+			delete(wire.disks, 41)
+			wire.marker = 128 * 1024 * 1024
+			wire.extraDiskBefore = "<DISK><DISK_ID>4</DISK_ID><IMAGE_ID/>" + tc.facts + "</DISK>"
+			wire.mu.Unlock()
+
+			reply, err := reviewControllerClient(t, NewControllerServer(driver, provider, nil)).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			if tc.allowed {
+				require.NoError(t, err)
+				require.Equal(t, "vdb", reply.GetPublishContext()["volumeName"])
+				require.Equal(t, []string{"attach:41:false"}, wire.mutations)
+			} else {
+				require.Error(t, err)
+				require.Nil(t, reply)
+				require.Empty(t, wire.mutations)
+			}
+		})
+	}
+}
+
 func TestDetachNoOpRejectsReplacementVMWithoutHistory(t *testing.T) {
 	for _, action := range []string{"unpublish", "queued-unpublish", "expiry", "transfer", "orphan-decision"} {
 		t.Run(action, func(t *testing.T) {
@@ -1904,7 +1953,7 @@ func TestStickyTransferRetriesAgainstConcurrentAbsentUnpublish(t *testing.T) {
 }
 
 func TestCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t *testing.T) {
-	for _, mode := range []string{"serial", "wrong-image-id", "blank-image-name"} {
+	for _, mode := range []string{"serial", "wrong-image-id", "blank-image-name", "missing-image"} {
 		t.Run(mode, func(t *testing.T) {
 			testCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t, mode)
 		})
@@ -1930,6 +1979,7 @@ func testCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t *testing.T, mode st
 	wire.ceph = true
 	wire.disks[41] = 128
 	wire.marker = 128 * 1024 * 1024
+	wire.extraDiskBefore = `<DISK><DISK_ID>4</DISK_ID><TYPE>CDROM</TYPE><IMAGE_ID/><SOURCE/></DISK>`
 	wire.extraDiskByVM = map[int]string{42: `<DISK><IMAGE_ID>8</IMAGE_ID><DISK_ID>2</DISK_ID><SERIAL>onecsi-9</SERIAL><TARGET>vdc</TARGET></DISK>`}
 	wire.extraImages = `<IMAGE><ID>8</ID><NAME>other-volume</NAME></IMAGE>`
 	switch mode {
@@ -1937,6 +1987,8 @@ func testCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t *testing.T, mode st
 		wire.imageInfoByID = map[int]string{8: `<IMAGE><ID>9</ID><NAME>other-volume</NAME></IMAGE>`}
 	case "blank-image-name":
 		wire.imageInfoByID = map[int]string{8: `<IMAGE><ID>8</ID><NAME></NAME></IMAGE>`}
+	case "missing-image":
+		wire.missingImageID = 8
 	}
 	if mode != "serial" {
 		wire.extraDiskByVM[42] = strings.Replace(wire.extraDiskByVM[42], "onecsi-9", "onecsi-8", 1)

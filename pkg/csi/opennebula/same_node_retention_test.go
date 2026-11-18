@@ -77,7 +77,7 @@ func retentionProtocolFixture(t *testing.T, modify func(*retentionProtocolCase))
 
 func TestSameNodeRetentionReadOnlyEvidence(t *testing.T) {
 	p, mutations := retentionProtocolFixture(t, func(c *retentionProtocolCase) {
-		c.extraDisk = `<DISK><DISK_ID>0</DISK_ID><TYPE>CDROM</TYPE></DISK>`
+		c.extraDisk = `<DISK><DISK_ID>0</DISK_ID><TYPE>CDROM</TYPE><IMAGE_ID/><SOURCE/></DISK>`
 		c.datastoreType, c.datastoreTemplateType = "0", "IMAGE_DS"
 		c.datastoreDiskType = "3"
 	})

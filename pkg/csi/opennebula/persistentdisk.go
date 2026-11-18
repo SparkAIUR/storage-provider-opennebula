@@ -176,10 +176,34 @@ func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume 
 	if err != nil {
 		return err
 	}
+	if volumeID <= 0 {
+		return fmt.Errorf("provider image identity is unverified for deletion")
+	}
 	if expectedID > 0 && volumeID != expectedID {
 		return fmt.Errorf("live image differs from the expected deletion identity")
 	}
 	ctx = WithExpectedImageID(ctx, volumeID)
+	if err := p.checkVolumeDeletion(ctx, volume, volumeID, vmID); err != nil {
+		return err
+	}
+	if authorize, ok := ctx.Value(volumeDeletionAuthorization{}).(func(context.Context, int) error); ok {
+		if err := authorize(ctx, volumeID); err != nil {
+			return err
+		}
+		if err := p.checkVolumeDeletion(ctx, volume, volumeID, vmID); err != nil {
+			return err
+		}
+	}
+	if err := p.ctrl.Image(volumeID).DeleteContext(ctx); err != nil {
+		return fmt.Errorf("delete image %d: %w", volumeID, err)
+	}
+	if err := p.waitForResourceStatusContext(ctx, volumeID, p.hotplugPolicy.BaseTimeout, p.volumeDeletedContext); err != nil {
+		return err
+	}
+	return p.VerifyVolumeAbsent(ctx, volume, volumeID, vmID)
+}
+
+func (p *PersistentDiskVolumeProvider) checkVolumeDeletion(ctx context.Context, volume string, volumeID, vmID int) error {
 	info, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
 	if err != nil {
 		return fmt.Errorf("cannot establish deletion authority for image %d: %w", volumeID, err)
@@ -217,10 +241,7 @@ func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume 
 	if liveID != volumeID {
 		return fmt.Errorf("live image identity changed before deletion")
 	}
-	if err := p.ctrl.Image(volumeID).DeleteContext(ctx); err != nil {
-		return fmt.Errorf("delete image %d: %w", volumeID, err)
-	}
-	return p.waitForResourceStatusContext(ctx, volumeID, p.hotplugPolicy.BaseTimeout, p.volumeDeletedContext)
+	return ctx.Err()
 }
 
 func (p *PersistentDiskVolumeProvider) VerifyVolumeAbsent(ctx context.Context, volume string, imageID int, vmIDs ...int) error {
@@ -1314,15 +1335,14 @@ func (*diskImageConflict) Error() string {
 
 func diskImageReference(disk shared.Disk, allowBlank bool) (int, bool, error) {
 	raw, err := disk.Get(shared.ImageID)
-	present := err == nil
+	blank := err == nil && strings.TrimSpace(raw) == ""
+	present := err == nil && !blank
 	var id int
-	if present && (!allowBlank || strings.TrimSpace(raw) != "") {
+	if present {
 		id, err = strconv.Atoi(raw)
 		if err != nil || id < 0 {
 			return 0, false, fmt.Errorf("malformed VM disk image identity")
 		}
-	} else {
-		present = false
 	}
 	if !allowBlank {
 		serial, _ := disk.Get(shared.Serial)
@@ -1335,8 +1355,33 @@ func diskImageReference(disk shared.Disk, allowBlank bool) (int, bool, error) {
 				return 0, false, &diskImageConflict{imageID: id, serialID: serialID}
 			}
 		}
+		if blank && !isImageLessDisk(disk, serial) {
+			return 0, false, fmt.Errorf("malformed VM disk image identity")
+		}
 	}
 	return id, present, nil
+}
+
+func isImageLessDisk(disk shared.Disk, serial string) bool {
+	if strings.HasPrefix(strings.TrimSpace(serial), "onecsi-") {
+		return false
+	}
+	kind, _ := disk.Get("TYPE")
+	switch strings.ToUpper(strings.TrimSpace(kind)) {
+	case "CDROM", "FS", "SWAP":
+	default:
+		volatile, _ := disk.Get("VOLATILE")
+		if !strings.EqualFold(strings.TrimSpace(volatile), "YES") {
+			return false
+		}
+	}
+	for _, key := range []shared.DiskKeys{"IMAGE", "IMAGE_UNAME", "IMAGE_UID", "SOURCE", "ORIGINAL_SOURCE"} {
+		if value, _ := disk.Get(key); strings.TrimSpace(value) != "" {
+			return false
+		}
+	}
+	persistent, _ := disk.Get("PERSISTENT")
+	return strings.TrimSpace(persistent) == "" || strings.EqualFold(strings.TrimSpace(persistent), "NO")
 }
 
 func diskImageReferenceForVolume(disk shared.Disk, volumeID int, requireComplete bool) (int, bool, error) {
@@ -1420,6 +1465,12 @@ func diskSizeBytesFromTemplate(disk shared.Disk) (int64, error) {
 type expectedImageIdentity struct{}
 
 type expectedDeletionVMIdentity struct{}
+
+type volumeDeletionAuthorization struct{}
+
+func WithVolumeDeletionAuthorization(ctx context.Context, authorize func(context.Context, int) error) context.Context {
+	return context.WithValue(ctx, volumeDeletionAuthorization{}, authorize)
+}
 
 func WithExpectedDeletionVMID(ctx context.Context, vmID int) context.Context {
 	return context.WithValue(ctx, expectedDeletionVMIdentity{}, vmID)
@@ -2147,6 +2198,10 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 		imageMeta, ok := imageCache[imageID]
 		if !ok {
 			imageInfo, imageErr := p.ctrl.Image(imageID).InfoContext(ctx, true)
+			if IsAuthoritativeVolumeAbsence(imageErr) {
+				conflictedImages[imageID] = true
+				continue
+			}
 			if imageErr != nil {
 				return nil, nil, fmt.Errorf("failed to inspect image %d while listing attachments: %w", imageID, imageErr)
 			}

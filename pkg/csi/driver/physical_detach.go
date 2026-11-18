@@ -316,7 +316,7 @@ func (s *ControllerServer) verifyDetachAbsenceTarget(ctx context.Context, volume
 		if history.LastSuccessfulNodeName == node && history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != vmID {
 			return attachmentEvidenceUnavailable("detach absence VM differs from history", nil)
 		}
-		if err := s.verifyDetachAbsenceNode(ctx, node, history, nodeUID); err != nil {
+		if err := s.verifyDetachAbsenceNode(ctx, node, history, nodeUID, false); err != nil {
 			return err
 		}
 	}
@@ -331,7 +331,7 @@ func (s *ControllerServer) verifyDetachAbsenceTarget(ctx context.Context, volume
 	return status.FromContextError(ctx.Err()).Err()
 }
 
-func (s *ControllerServer) verifyDetachAbsenceNode(ctx context.Context, node string, history VolumeHistoryRecord, nodeUID types.UID) error {
+func (s *ControllerServer) verifyDetachAbsenceNode(ctx context.Context, node string, history VolumeHistoryRecord, nodeUID types.UID, allowMissing bool) error {
 	if history.LastSuccessfulNodeName == node && history.LastSuccessfulNodeUID != "" {
 		if nodeUID != "" && string(nodeUID) != history.LastSuccessfulNodeUID {
 			return attachmentEvidenceUnavailable("detach absence node differs from history", nil)
@@ -340,6 +340,9 @@ func (s *ControllerServer) verifyDetachAbsenceNode(ctx context.Context, node str
 	}
 	if runtime := s.driver.kubeRuntime; runtime != nil && runtime.enabled && nodeUID != "" {
 		current, err := runtime.NodeIdentity(ctx, node)
+		if err == nil && !current.Exists && allowMissing {
+			return status.FromContextError(ctx.Err()).Err()
+		}
 		if err != nil || !current.Exists || current.Deleting || current.UID != string(nodeUID) {
 			return attachmentEvidenceUnavailable("detach absence node identity changed", err)
 		}

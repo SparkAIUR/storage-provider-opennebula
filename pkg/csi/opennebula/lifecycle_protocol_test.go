@@ -109,6 +109,9 @@ func TestLifecycleDeleteUsesPinnedIDAndNonforce(t *testing.T) {
 	p := lifecycleFixture(t, func(method string) (bool, string, int) {
 		switch method {
 		case "one.imagepool.info":
+			if deleted {
+				return true, "<IMAGE_POOL/>", 0
+			}
 			return true, `<IMAGE_POOL><IMAGE><ID>7</ID><NAME>volume-test</NAME></IMAGE></IMAGE_POOL>`, 0
 		case "one.vmpool.info":
 			return true, `<VM_POOL/>`, 0

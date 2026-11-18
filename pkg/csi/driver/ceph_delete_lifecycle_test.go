@@ -19,6 +19,9 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 type cephDeletionProtocolProvider struct {
@@ -34,6 +37,8 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 	for _, queued := range []bool{false, true} {
 		t.Run(fmt.Sprint(queued), func(t *testing.T) {
 			f := newCephRestartTestFixture(t, queued)
+			f.pv.ResourceVersion = "1"
+			f.syncObjects(t)
 			_, err := f.server.driver.volumeHistory.Upsert(context.Background(), cephRestartVolume, func(record *VolumeHistoryRecord) {
 				record.LastSuccessfulOpenNebulaVMID = 575
 			})
@@ -67,6 +72,9 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 				switch call.Method {
 				case "one.imagepool.info":
 					body = "<IMAGE_POOL>" + image + "</IMAGE_POOL>"
+					if deleted.Load() {
+						body = "<IMAGE_POOL/>"
+					}
 				case "one.image.info":
 					body = image
 					if imageReads.Add(1) == 3 {
@@ -98,10 +106,10 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 					require.GreaterOrEqual(t, len(call.Params), 2)
 					id := call.Params[1].Value
 					require.Equal(t, 575, id.Int+id.I4+id.I8)
-					switch mode.Load() {
-					case 8:
+					switch {
+					case mode.Load() == 8 || (mode.Load() == 10 && deleted.Load()):
 						body = `<VM><ID>575</ID><NAME>node-a</NAME><TEMPLATE><DISK><IMAGE_ID>3137</IMAGE_ID><DISK_ID>1</DISK_ID><TARGET>vdb</TARGET><SERIAL>onecsi-3137</SERIAL></DISK></TEMPLATE></VM>`
-					case 9:
+					case mode.Load() == 9:
 						ok, code, body = false, 0x200, "pinned VM unavailable"
 					default:
 						body = `<VM><ID>575</ID><NAME>node-a</NAME><TEMPLATE/></VM>`
@@ -137,8 +145,17 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 				require.Nil(t, response)
 				require.Zero(t, deletes.Load())
 			}
+			request := &csi.DeleteVolumeRequest{VolumeId: cephRestartVolume}
+			mode.Store(10)
+			response, err := client.DeleteVolume(context.Background(), request)
+			require.Equal(t, codes.FailedPrecondition, status.Code(err))
+			require.Nil(t, response)
+			require.EqualValues(t, 1, deletes.Load())
+			response, err = client.DeleteVolume(context.Background(), request)
+			require.Equal(t, codes.FailedPrecondition, status.Code(err))
+			require.Nil(t, response)
 			mode.Store(4)
-			response, err := client.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: cephRestartVolume})
+			response, err = client.DeleteVolume(context.Background(), request)
 			require.NoError(t, err)
 			require.NotNil(t, response)
 			require.EqualValues(t, 1, deletes.Load())
@@ -211,7 +228,7 @@ func TestControllerDeleteCephVerifiesMissingImageOwnership(t *testing.T) {
 	}
 }
 
-func TestUnpinnedDeleteRetryAfterLostReplyRemainsBlocked(t *testing.T) {
+func TestUnpinnedDeleteRetryAfterLostReplyUsesPVIdentity(t *testing.T) {
 	ctx := context.Background()
 	const volume = "volume-test"
 	driver := newStickyTestDriver(t)
@@ -236,6 +253,7 @@ func TestUnpinnedDeleteRetryAfterLostReplyRemainsBlocked(t *testing.T) {
 	require.Equal(t, string(pvc.UID), provisioned.Volume.VolumeContext[volumeContextUUID])
 
 	pv.Finalizers = []string{"external-provisioner.volume.kubernetes.io/finalizer"}
+	pv.ResourceVersion = "1"
 	pv.Spec.CSI.VolumeHandle = provisioned.Volume.VolumeId
 	pv.Spec.CSI.VolumeAttributes = provisioned.Volume.VolumeContext
 	kube := driver.kubeRuntime.client
@@ -251,11 +269,12 @@ func TestUnpinnedDeleteRetryAfterLostReplyRemainsBlocked(t *testing.T) {
 	restarted.kubeRuntime.client = kube
 	server := NewControllerServer(restarted, provider, nil)
 	response, err := reviewControllerClient(t, server).DeleteVolume(ctx, request)
-	require.Equal(t, codes.FailedPrecondition, status.Code(err))
-	require.Nil(t, response)
+	require.NoError(t, err)
+	require.NotNil(t, response)
 	current, err := kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Equal(t, pv.Finalizers, current.Finalizers)
+	require.JSONEq(t, fmt.Sprintf(`{"version":1,"pvUID":%q,"driver":%q,"handle":%q,"imageID":7}`, pv.UID, DefaultDriverName, volume), current.Annotations[annotationDeleteVolumeIdentity])
 	history, err := server.readAttachmentHistory(ctx, volume)
 	require.NoError(t, err)
 	require.Zero(t, history)
@@ -263,6 +282,127 @@ func TestUnpinnedDeleteRetryAfterLostReplyRemainsBlocked(t *testing.T) {
 	defer wire.mu.Unlock()
 	require.True(t, wire.missingImage)
 	require.Equal(t, []string{"image-delete:7"}, wire.mutations)
+}
+
+func TestDeleteVolumeRechecksLiveImageWithExistingPVIdentity(t *testing.T) {
+	ctx := context.Background()
+	const volume = "volume-test"
+	pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv.ResourceVersion = "1"
+	pv.Finalizers = []string{"external-provisioner.volume.kubernetes.io/finalizer"}
+	raw := fmt.Sprintf(`{"version":1,"pvUID":%q,"driver":%q,"handle":%q,"imageID":7}`, pv.UID, DefaultDriverName, volume)
+	pv.Annotations[annotationDeleteVolumeIdentity] = raw
+	driver := newStickyTestDriver(t, pv, pvc)
+	provider, wire := nodeAttachmentProvider(t)
+	wire.mu.Lock()
+	wire.allowImageDelete = true
+	wire.mu.Unlock()
+	server := NewControllerServer(driver, provider, nil)
+	client := reviewControllerClient(t, server)
+	request := &csi.DeleteVolumeRequest{VolumeId: volume}
+	reply, err := client.DeleteVolume(ctx, request)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Nil(t, reply)
+	wire.mu.Lock()
+	require.Empty(t, wire.mutations)
+	delete(wire.disks, 41)
+	wire.mu.Unlock()
+
+	reply, err = client.DeleteVolume(ctx, request)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+	current, err := driver.kubeRuntime.client.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, raw, current.Annotations[annotationDeleteVolumeIdentity])
+	require.Equal(t, pv.Finalizers, current.Finalizers)
+	wire.mu.Lock()
+	defer wire.mu.Unlock()
+	require.Equal(t, []string{"image-delete:7"}, wire.mutations)
+}
+
+func TestControllerDeleteVolumeRejectsUnverifiedPVIdentity(t *testing.T) {
+	for _, mode := range []string{"uid-drift", "resource-version-drift", "binding-drift", "patch-refused", "readback-refused",
+		"wrong-readback", "provider-identity-drift", "provider-ownership-drift", "malformed-marker", "marker-other-pv",
+		"marker-conflicts-with-history", "marker-conflicts-with-provider", "repair-required"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			const volume = "volume-test"
+			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			pv.ResourceVersion = "1"
+			pv.Finalizers = []string{"external-provisioner.volume.kubernetes.io/finalizer"}
+			switch mode {
+			case "malformed-marker":
+				pv.Annotations[annotationDeleteVolumeIdentity] = "null"
+			case "marker-other-pv":
+				pv.Annotations[annotationDeleteVolumeIdentity] = fmt.Sprintf(`{"version":1,"pvUID":"different-uid","driver":%q,"handle":%q,"imageID":7}`, DefaultDriverName, volume)
+			case "marker-conflicts-with-history", "marker-conflicts-with-provider":
+				pv.Annotations[annotationDeleteVolumeIdentity] = fmt.Sprintf(`{"version":1,"pvUID":%q,"driver":%q,"handle":%q,"imageID":8}`, pv.UID, DefaultDriverName, volume)
+			}
+			driver := newStickyTestDriver(t, pv, pvc)
+			if mode == "marker-conflicts-with-history" {
+				_, err := driver.volumeHistory.Upsert(ctx, volume, func(record *VolumeHistoryRecord) {
+					record.LastSuccessfulImageID = 7
+				})
+				require.NoError(t, err)
+			}
+			if mode == "repair-required" {
+				_, err := driver.volumeRepairState.Mark(ctx, VolumeRepairState{VolumeID: volume, Classification: "wrong_device_identity", RequestedNode: "node-old"})
+				require.NoError(t, err)
+			}
+			provider, wire := nodeAttachmentProvider(t)
+			wire.mu.Lock()
+			delete(wire.disks, 41)
+			wire.mu.Unlock()
+
+			kube := driver.kubeRuntime.client.(*fake.Clientset)
+			patchAttempted := false
+			kube.PrependReactor("patch", "persistentvolumes", func(action ktesting.Action) (bool, kruntime.Object, error) {
+				patchAttempted = true
+				switch mode {
+				case "patch-refused":
+					return true, nil, fmt.Errorf("patch refused")
+				case "uid-drift", "resource-version-drift", "binding-drift":
+					replacement := pv.DeepCopy()
+					switch mode {
+					case "uid-drift":
+						replacement.UID = "replacement-uid"
+					case "resource-version-drift":
+						replacement.ResourceVersion = "2"
+					case "binding-drift":
+						replacement.Spec.CSI.VolumeHandle = "replacement-handle"
+					}
+					require.NoError(t, kube.Tracker().Update(action.GetResource(), replacement, ""))
+				case "wrong-readback":
+					return true, pv.DeepCopy(), nil
+				case "provider-identity-drift", "provider-ownership-drift":
+					wire.mu.Lock()
+					defer wire.mu.Unlock()
+					if mode == "provider-identity-drift" {
+						wire.imageName = "replacement-image"
+					} else {
+						wire.disks[41] = 128
+					}
+				}
+				return false, nil, nil
+			})
+			kube.PrependReactor("list", "persistentvolumes", func(ktesting.Action) (bool, kruntime.Object, error) {
+				if mode == "readback-refused" && patchAttempted {
+					return true, nil, fmt.Errorf("readback refused")
+				}
+				return false, nil, nil
+			})
+
+			response, err := reviewControllerClient(t, NewControllerServer(driver, provider, nil)).DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: volume})
+			require.Error(t, err)
+			require.Nil(t, response)
+			current, err := kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, pv.Finalizers, current.Finalizers)
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			require.Empty(t, wire.mutations)
+		})
+	}
 }
 
 func TestMissingImageRejectsMalformedOrUnpinnedOwnedHistory(t *testing.T) {
