@@ -36,7 +36,7 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 			_, err := f.unpublish(t)
 			require.NoError(t, err)
 			f.requireNoProviderMutation(t)
-			var mode, deletes, otherMutations atomic.Int32
+			var mode, imageReads, deletes, otherMutations atomic.Int32
 			var deleted atomic.Bool
 			endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var call struct {
@@ -57,6 +57,16 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 					body = "<IMAGE_POOL>" + image + "</IMAGE_POOL>"
 				case "one.image.info":
 					body = image
+					if imageReads.Add(1) == 3 {
+						switch mode.Load() {
+						case 5:
+							body = strings.Replace(body, "<ID>3137</ID>", "<ID>3138</ID>", 1)
+						case 6:
+							body = strings.Replace(body, "<ID>3137</ID>", "", 1)
+						case 7:
+							body = strings.Replace(body, "<NAME>"+cephRestartVolume+"</NAME>", "<NAME>different-volume</NAME>", 1)
+						}
+					}
 					if deleted.Load() {
 						ok, code, body = false, 0x400, "not present"
 					}
@@ -69,7 +79,7 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 					if mode.Load() == 2 {
 						ok, code, body = false, 0x200, "inventory unavailable"
 					}
-					if mode.Load() == 4 {
+					if mode.Load() >= 4 {
 						body = "<VM_POOL/>"
 					}
 				case "one.image.delete":
@@ -95,8 +105,9 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 			require.NoError(t, err)
 			f.server.volumeProvider = &cephDeletionProtocolProvider{cephRetentionTestProvider: f.provider, deleteProvider: provider}
 			client := reviewControllerClient(t, f.server)
-			for i := int32(0); i < 4; i++ {
+			for _, i := range []int32{0, 1, 2, 3, 5, 6, 7} {
 				mode.Store(i)
+				imageReads.Store(0)
 				response, err := client.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: cephRestartVolume})
 				require.Error(t, err, "unresolved or unobservable VM ownership must retain the deletion finalizer")
 				require.Nil(t, response)
@@ -113,7 +124,7 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 }
 
 func TestControllerDeleteCephVerifiesMissingImageOwnership(t *testing.T) {
-	for _, mode := range []string{"retained-disk", "serial-reference", "unknown-ownership", "replacement-image", "hidden-handle", "confirmed-absent"} {
+	for _, mode := range []string{"retained-disk", "serial-reference", "unknown-ownership", "replacement-image", "hidden-handle", "confirmed-absent", "owner-omitted", "owner-omitted-released", "owner-omitted-gone"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			const volume = "volume-test"
@@ -125,6 +136,7 @@ func TestControllerDeleteCephVerifiesMissingImageOwnership(t *testing.T) {
 			history, err := driver.volumeHistory.Upsert(ctx, volume, func(record *VolumeHistoryRecord) {
 				record.Backend = "ceph"
 				record.LastSuccessfulImageID = 7
+				record.LastSuccessfulOpenNebulaVMID = 41
 				record.LastSuccessfulPublishTime = time.Now().UTC().Add(-time.Hour)
 			})
 			require.NoError(t, err)
@@ -143,14 +155,21 @@ func TestControllerDeleteCephVerifiesMissingImageOwnership(t *testing.T) {
 				wire.missingImage = false
 			case "confirmed-absent":
 				delete(wire.disks, 41)
+			case "owner-omitted", "owner-omitted-released", "owner-omitted-gone":
+				wire.omitOriginalVM = true
+				if mode != "owner-omitted" {
+					delete(wire.disks, 41)
+					wire.missingOriginalVM = mode == "owner-omitted-gone"
+				}
 			}
 			wire.mu.Unlock()
 
 			response, err := reviewControllerClient(t, server).DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: volume})
-			if mode == "confirmed-absent" {
+			switch mode {
+			case "confirmed-absent", "owner-omitted-released", "owner-omitted-gone":
 				require.NoError(t, err)
 				require.NotNil(t, response)
-			} else {
+			default:
 				require.Equal(t, codes.FailedPrecondition, status.Code(err), "%v", err)
 				require.Nil(t, response)
 			}
@@ -165,5 +184,74 @@ func TestControllerDeleteCephVerifiesMissingImageOwnership(t *testing.T) {
 			require.Empty(t, wire.mutations)
 			require.Zero(t, wire.detachAttempts)
 		})
+	}
+}
+
+func TestMissingImageRejectsMalformedOrUnpinnedOwnedHistory(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, mode := range []string{"empty", "null", "unknown", "malformed", "no-pin", "unowned"} {
+			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+				pv.Finalizers = []string{"external-provisioner.volume.kubernetes.io/finalizer"}
+				node := newReadyNode("node-old", true)
+				driver := newStickyTestDriver(t, pv, pvc, node)
+				provider, wire := nodeAttachmentProvider(t)
+				server := NewControllerServer(driver, provider, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+				}
+				raw, malformed := map[string]string{
+					"empty": "", "null": "null", "unknown": `{"volumeID":"volume-test","version":1,"unknownImageID":7}`,
+					"malformed": `{"volumeID":"volume-test","version":1,"lastSuccessfulImageID":"bad"}`,
+				}[mode]
+				if malformed {
+					require.NoError(t, driver.kubeRuntime.UpsertConfigMapData(ctx, "default", volumeHistoryStateConfigMapName, map[string]string{volume: raw}))
+				}
+				wire.mu.Lock()
+				wire.ceph, wire.missingImage = true, true
+				if mode == "unowned" {
+					delete(wire.disks, 41)
+				}
+				wire.mu.Unlock()
+				if mode == "unowned" {
+					require.NoError(t, driver.kubeRuntime.client.CoreV1().PersistentVolumes().Delete(ctx, pv.Name, metav1.DeleteOptions{}))
+				}
+
+				client := reviewControllerClient(t, server)
+				unpublished, unpublishErr := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+				deleted, deleteErr := client.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: volume})
+				if mode == "unowned" {
+					require.NoError(t, unpublishErr)
+					require.NotNil(t, unpublished)
+					require.NoError(t, deleteErr)
+					require.NotNil(t, deleted)
+				} else {
+					require.Equal(t, codes.Unavailable, status.Code(unpublishErr))
+					require.Nil(t, unpublished)
+					wantDelete := codes.FailedPrecondition
+					if malformed {
+						wantDelete = codes.Unavailable
+					}
+					require.Equal(t, wantDelete, status.Code(deleteErr))
+					require.Nil(t, deleted)
+					current, err := driver.kubeRuntime.client.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+					require.NoError(t, err)
+					require.Equal(t, pv.Finalizers, current.Finalizers)
+				}
+				if malformed {
+					cm, err := driver.kubeRuntime.GetConfigMap(ctx, "default", volumeHistoryStateConfigMapName)
+					require.NoError(t, err)
+					require.Contains(t, cm.Data, volume)
+					require.Equal(t, raw, cm.Data[volume])
+				}
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				require.Empty(t, wire.mutations)
+				require.Zero(t, wire.detachAttempts)
+			})
+		}
 	}
 }

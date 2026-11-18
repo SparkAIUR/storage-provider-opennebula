@@ -168,9 +168,10 @@ func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume 
 	volumeID, err := p.lookupImageID(ctx, volume)
 	if errors.Is(err, ErrVolumeNotFound) {
 		if expectedID > 0 {
-			return p.VerifyVolumeAbsent(ctx, volume, expectedID)
+			vmID, _ := ctx.Value(expectedDeletionVMIdentity{}).(int)
+			return p.VerifyVolumeAbsent(ctx, volume, expectedID, vmID)
 		}
-		return nil
+		return ErrVolumeNotFound
 	}
 	if err != nil {
 		return err
@@ -222,7 +223,7 @@ func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume 
 	return p.waitForResourceStatusContext(ctx, volumeID, p.hotplugPolicy.BaseTimeout, p.volumeDeletedContext)
 }
 
-func (p *PersistentDiskVolumeProvider) VerifyVolumeAbsent(ctx context.Context, volume string, imageID int) error {
+func (p *PersistentDiskVolumeProvider) VerifyVolumeAbsent(ctx context.Context, volume string, imageID int, vmIDs ...int) error {
 	if imageID <= 0 {
 		return fmt.Errorf("image identity is required to verify volume absence")
 	}
@@ -245,6 +246,21 @@ func (p *PersistentDiskVolumeProvider) VerifyVolumeAbsent(ctx context.Context, v
 			if present && id == imageID {
 				return fmt.Errorf("pinned image still has a VM disk reference")
 			}
+		}
+	}
+	for _, vmID := range vmIDs {
+		if vmID <= 0 {
+			continue
+		}
+		info, err := p.ctrl.VM(vmID).InfoContext(ctx, true)
+		if IsAuthoritativeVolumeAbsence(err) && !slices.ContainsFunc(pool.VMs, func(info vm.VM) bool { return info.ID == vmID }) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("cannot verify pinned VM disk absence: %w", err)
+		}
+		if _, _, err := volumeDiskFromVM(info, imageID, vmID, true); !errors.Is(err, ErrAttachmentNotFound) {
+			return fmt.Errorf("pinned VM disk absence is unverified: %v", err)
 		}
 	}
 	if _, err := p.lookupImageID(ctx, volume); !errors.Is(err, ErrVolumeNotFound) {
@@ -1393,6 +1409,12 @@ func diskSizeBytesFromTemplate(disk shared.Disk) (int64, error) {
 
 type expectedImageIdentity struct{}
 
+type expectedDeletionVMIdentity struct{}
+
+func WithExpectedDeletionVMID(ctx context.Context, vmID int) context.Context {
+	return context.WithValue(ctx, expectedDeletionVMIdentity{}, vmID)
+}
+
 func WithExpectedImageID(ctx context.Context, id int) context.Context {
 	return context.WithValue(ctx, expectedImageIdentity{}, id)
 }
@@ -1903,6 +1925,9 @@ func (p *PersistentDiskVolumeProvider) getVolumeInNode(ctx context.Context, volu
 	if err != nil {
 		return "", err
 	}
+	if info.ID != volumeID || strings.TrimSpace(info.Name) == "" {
+		return "", fmt.Errorf("image identity is unverified while checking attachment absence")
+	}
 	metadata, err := p.InspectVolumeAttachment(ctx, info.Name, vmInfo.Name)
 	if err != nil {
 		return "", err
@@ -1952,12 +1977,17 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeLookup(ctx context.Context, 
 		}
 		return nil, fmt.Errorf("failed to inspect OpenNebula image %d for volume %s: %w", imgID, volume, err)
 	}
+	if imageInfo.ID != imgID || imageInfo.Name != volume {
+		result.Status = VolumeLookupProviderInconsistent
+		result.Message = "image lookup returned a different identity"
+		return result, nil
+	}
 
 	result.Status = VolumeLookupPresent
 	result.ImageID = imgID
 	result.SizeBytes = int64(imageInfo.Size) * sizeConversion
 	metadata, metadataErr := p.InspectVolumeAttachment(ctx, volume, requestedNode)
-	if metadataErr == nil {
+	if metadataErr == nil && metadata.ImageID == imgID {
 		result.AttachmentMetadata = metadata
 	}
 	return result, nil
@@ -1984,6 +2014,9 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Conte
 	if err != nil {
 		return nil, fmt.Errorf("failed to inspect image %d attachment metadata: %w", volumeID, err)
 	}
+	if imageInfo.ID != volumeID || imageInfo.Name != volume {
+		return nil, fmt.Errorf("image attachment metadata returned a different identity")
+	}
 
 	imageState := fmt.Sprintf("UNKNOWN_%d", imageInfo.StateRaw)
 	if parsed, stateErr := imageInfo.StateString(); stateErr == nil {
@@ -1992,7 +2025,7 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Conte
 
 	metadata := &VolumeAttachmentMetadata{
 		VolumeHandle:    volume,
-		ImageID:         volumeID,
+		ImageID:         imageInfo.ID,
 		ImageName:       imageInfo.Name,
 		ImageState:      imageState,
 		ImageStateRaw:   imageInfo.StateRaw,
@@ -2097,6 +2130,9 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 			imageInfo, imageErr := p.ctrl.Image(imageID).InfoContext(ctx, true)
 			if imageErr != nil {
 				return nil, nil, fmt.Errorf("failed to inspect image %d while listing attachments: %w", imageID, imageErr)
+			}
+			if imageInfo.ID != imageID || strings.TrimSpace(imageInfo.Name) == "" {
+				return nil, nil, fmt.Errorf("image identity is unverified while listing attachments")
 			}
 			imageMeta.name = imageInfo.Name
 			if imageInfo.DatastoreID != nil {

@@ -139,7 +139,7 @@ type VolumeDatastoreInspector interface {
 }
 
 type VolumeAbsenceVerifier interface {
-	VerifyVolumeAbsent(ctx context.Context, volume string, imageID int) error
+	VerifyVolumeAbsent(ctx context.Context, volume string, imageID int, vmIDs ...int) error
 }
 
 type VolumeAttachmentInspector interface {

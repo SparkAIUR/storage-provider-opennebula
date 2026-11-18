@@ -475,6 +475,10 @@ func (s *ControllerServer) readAttachmentHistory(ctx context.Context, volumeID s
 	if !present {
 		return VolumeHistoryRecord{}, nil
 	}
+	return decodeAttachmentHistory(raw, volumeID)
+}
+
+func decodeAttachmentHistory(raw, volumeID string) (VolumeHistoryRecord, error) {
 	var history VolumeHistoryRecord
 	if err := decodeCephRetentionProtection(raw, &history); err != nil {
 		return VolumeHistoryRecord{}, err

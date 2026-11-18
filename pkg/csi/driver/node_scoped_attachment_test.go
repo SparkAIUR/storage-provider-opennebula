@@ -54,6 +54,8 @@ type nodeAttachmentProtocol struct {
 	duplicateImage    bool
 	missingImage      bool
 	hideImageName     bool
+	omitOriginalVM    bool
+	missingOriginalVM bool
 	replacementDisk   bool
 	imageDatastoreID  int
 	imageTransfer     string
@@ -164,13 +166,20 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 					ok, body, code = 0, "image not found", 0x400
 				}
 			case "one.vmpool.info":
-				body = "<VM_POOL>" + vmXML(41, false) + vmXML(42, false)
+				body = "<VM_POOL>"
+				if !state.omitOriginalVM {
+					body += vmXML(41, false)
+				}
+				body += vmXML(42, false)
 				if _, present := state.disks[43]; present {
 					body += vmXML(43, false)
 				}
 				body += "</VM_POOL>"
 			case "one.vm.info":
 				body = vmXML(number(1), true)
+				if number(1) == 41 && state.missingOriginalVM {
+					ok, body, code = 0, "VM not found", 0x400
+				}
 			case "one.datastorepool.info":
 				body = `<DATASTORE_POOL><DATASTORE><ID>100</ID><NAME>images</NAME><TYPE>IMAGE</TYPE><DS_MAD>fs</DS_MAD><TM_MAD>ssh</TM_MAD><STATE>0</STATE><TOTAL_MB>20000</TOTAL_MB><FREE_MB>10000</FREE_MB></DATASTORE><DATASTORE><ID>200</ID><NAME>system</NAME><TYPE>SYSTEM</TYPE><TM_MAD>ssh</TM_MAD><STATE>0</STATE></DATASTORE></DATASTORE_POOL>`
 				if state.ceph {
@@ -921,7 +930,7 @@ func TestProviderDetachRetryRespectsHotplugDeadline(t *testing.T) {
 
 func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"same-node", "replacement-uid", "replacement-vm", "vm-changed-before-dispatch", "duplicate-image", "replacement-image", "late-duplicate-image", "missing-image", "hidden-handle", "missing-image-retained-disk", "missing-image-unknown-ownership", "missing-image-malformed-disk"} {
+		for _, mode := range []string{"same-node", "replacement-uid", "replacement-vm", "vm-changed-before-dispatch", "duplicate-image", "replacement-image", "late-duplicate-image", "missing-image", "hidden-handle", "missing-image-retained-disk", "missing-image-unknown-ownership", "missing-image-malformed-disk", "owner-omitted", "owner-omitted-released", "owner-omitted-gone", "owner-omitted-unreadable"} {
 			t.Run(fmt.Sprintf("queued=%v/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
@@ -977,6 +986,15 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 					}
 				case "hidden-handle":
 					state.hideImageName = true
+				case "owner-omitted", "owner-omitted-released", "owner-omitted-gone", "owner-omitted-unreadable":
+					state.missingImage, state.omitOriginalVM = true, true
+					switch mode {
+					case "owner-omitted-released", "owner-omitted-gone":
+						delete(state.disks, 41)
+						state.missingOriginalVM = mode == "owner-omitted-gone"
+					case "owner-omitted-unreadable":
+						state.failMethod = "one.vm.info"
+					}
 				}
 				state.mu.Unlock()
 				controller := NewControllerServer(driver, provider, nil)
@@ -993,7 +1011,7 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 					require.NoError(t, err)
 					require.NotNil(t, response)
 					require.False(t, history.LastSafeDetachTime.IsZero())
-				case "missing-image":
+				case "missing-image", "owner-omitted-released", "owner-omitted-gone":
 					require.NoError(t, err)
 					require.NotNil(t, response)
 					require.Equal(t, before, history)
@@ -1005,7 +1023,7 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 				state.mu.Lock()
 				defer state.mu.Unlock()
 				require.Empty(t, state.mutations)
-				if strings.Contains(mode, "vm") || mode == "missing-image-retained-disk" {
+				if strings.Contains(mode, "vm") || mode == "missing-image-retained-disk" || mode == "owner-omitted" {
 					require.Contains(t, state.disks, 41)
 				}
 				if mode == "duplicate-image" || mode == "replacement-image" || mode == "late-duplicate-image" {

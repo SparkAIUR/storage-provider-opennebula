@@ -307,19 +307,16 @@ func (m *VolumeHistoryManager) RefreshEntry(ctx context.Context, volumeID string
 		}
 		return err
 	}
-	raw := strings.TrimSpace(cm.Data[volumeID])
-	if raw == "" {
+	raw, present := cm.Data[volumeID]
+	if !present {
 		m.mu.Lock()
 		delete(m.entries, volumeID)
 		m.mu.Unlock()
 		return nil
 	}
-	var state VolumeHistoryRecord
-	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+	state, err := decodeAttachmentHistory(raw, volumeID)
+	if err != nil {
 		return err
-	}
-	if strings.TrimSpace(state.VolumeID) == "" {
-		state.VolumeID = volumeID
 	}
 	normalizeVolumeHistoryRecord(&state)
 	m.mu.Lock()
