@@ -39,6 +39,9 @@ type nodeAttachmentProtocol struct {
 	hideDiskInfo        bool
 	rejectFirstDetach   bool
 	rejectFirstAttach   bool
+	loseAttachReply     bool
+	attachDiskTemplate  string
+	attachAttempt       string
 	attachAttempts      int
 	detachAttempts      int
 	ignoreMarkerWrite   bool
@@ -141,6 +144,9 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				if state.diskTransfer != "" {
 					disk = strings.Replace(disk, "<TM_MAD>ssh</TM_MAD>", "<TM_MAD>"+state.diskTransfer+"</TM_MAD>", 1)
 				}
+				if id == 41 && state.attachAttempt != "" {
+					disk = strings.TrimSuffix(disk, "</DISK>") + "<CSI_ATTACH_ATTEMPT>" + state.attachAttempt + "</CSI_ATTACH_ATTEMPT></DISK>"
+				}
 				if direct && id == 41 && state.directDiskFields != "" {
 					disk = strings.TrimSuffix(disk, "</DISK>") + state.directDiskFields + "</DISK>"
 				}
@@ -191,7 +197,7 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 			if datastoreID == 0 {
 				datastoreID = 100
 			}
-			return fmt.Sprintf(`<IMAGE><ID>%d</ID><NAME>%s</NAME><STATE>%d</STATE><SIZE>128</SIZE><DATASTORE_ID>%d</DATASTORE_ID><SOURCE>/fixture/disk</SOURCE><PERSISTENT>1</PERSISTENT><FORMAT>raw</FORMAT><RUNNING_VMS>%d</RUNNING_VMS><VMS>%s</VMS><TEMPLATE><PERSISTENT_TYPE>SHAREABLE</PERSISTENT_TYPE>%s</TEMPLATE></IMAGE>`, imageID, firstNonEmpty(state.imageName, "volume-test"), imageState, datastoreID, count, ids, tag)
+			return fmt.Sprintf(`<IMAGE><ID>%d</ID><NAME>%s</NAME><STATE>%d</STATE><SIZE>128</SIZE><DATASTORE_ID>%d</DATASTORE_ID><SOURCE>/fixture/disk</SOURCE><PERSISTENT>1</PERSISTENT><FORMAT>raw</FORMAT><RUNNING_VMS>%d</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS>%s</VMS><TEMPLATE><PERSISTENT_TYPE>SHAREABLE</PERSISTENT_TYPE>%s</TEMPLATE></IMAGE>`, imageID, firstNonEmpty(state.imageName, "volume-test"), imageState, datastoreID, count, ids, tag)
 		}
 		ok, body, code := 1, "", 0
 		if call.Method == state.failMethod {
@@ -266,8 +272,15 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				}
 				id := number(1)
 				require.Contains(t, call.Params[2].Value.String, `IMAGE_ID="7"`)
+				state.attachDiskTemplate = call.Params[2].Value.String
+				if _, tail, found := strings.Cut(state.attachDiskTemplate, `CSI_ATTACH_ATTEMPT="`); found {
+					state.attachAttempt, _, _ = strings.Cut(tail, `"`)
+				}
 				state.disks[id] = 128
 				state.mutations = append(state.mutations, fmt.Sprintf("attach:%d:%t", id, strings.Contains(call.Params[2].Value.String, `READONLY="YES"`)))
+				if state.loseAttachReply {
+					panic(http.ErrAbortHandler)
+				}
 				body = strconv.Itoa(id)
 			case "one.vm.detach":
 				id := number(1)
@@ -278,6 +291,9 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 					break
 				}
 				delete(state.disks, id)
+				if id == 41 {
+					state.attachAttempt = ""
+				}
 				state.mutations = append(state.mutations, fmt.Sprintf("detach:%d", id))
 				body = strconv.Itoa(id)
 			case "one.system.version":
@@ -1901,6 +1917,8 @@ func TestPublishAndStagePreserveRetainedNodeUIDUntilFreshAttach(t *testing.T) {
 			ctx := context.Background()
 			const volume = "volume-test"
 			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+			pv.Status.Phase, pvc.Status.Phase = corev1.VolumeBound, corev1.ClaimBound
+			pvc.Spec.AccessModes = pv.Spec.AccessModes
 			node := newReadyNode("node-old", true)
 			driver := newStickyTestDriver(t, pv, pvc, node)
 			driver.nodeID = node.Name
@@ -1909,7 +1927,7 @@ func TestPublishAndStagePreserveRetainedNodeUIDUntilFreshAttach(t *testing.T) {
 			driver.PluginConfig.OverrideVal(config.NodeDeviceUdevSettleTimeoutSecondsVar, 0)
 			provider, wire := nodeAttachmentProvider(t)
 			wire.mu.Lock()
-			wire.ceph, wire.disks[41], wire.marker = true, 128, 128*1024*1024
+			wire.ceph, wire.disks[41], wire.marker, wire.version = true, 128, 128*1024*1024, "7.4.0"
 			wire.mu.Unlock()
 			server := NewControllerServer(driver, provider, nil)
 			if queued {
@@ -1929,6 +1947,7 @@ func TestPublishAndStagePreserveRetainedNodeUIDUntilFreshAttach(t *testing.T) {
 			require.NoError(t, nodes.Delete(ctx, node.Name, metav1.DeleteOptions{}))
 			replacement := node.DeepCopy()
 			replacement.UID = "replacement-uid"
+			replacement.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Minute))
 			_, err = nodes.Create(ctx, replacement, metav1.CreateOptions{})
 			require.NoError(t, err)
 
@@ -1959,6 +1978,9 @@ func TestPublishAndStagePreserveRetainedNodeUIDUntilFreshAttach(t *testing.T) {
 			wire.mu.Unlock()
 			require.Empty(t, unchangedMutations)
 			consumer := activePodForPVC("fresh-consumer", pvc.Name, node.Name)
+			consumer.UID = "fresh-consumer"
+			consumer.CreationTimestamp = metav1.Now()
+			setReplacementHistoryVersion(t, driver)
 			_, err = driver.kubeRuntime.client.CoreV1().Pods(consumer.Namespace).Create(ctx, consumer, metav1.CreateOptions{})
 			require.NoError(t, err)
 			fresh, err := client.ControllerPublishVolume(ctx, publish)
@@ -3735,7 +3757,7 @@ func TestLegacyDiskCleanupVerifiesUndeclaredBackend(t *testing.T) {
 }
 
 func TestControllerPublishRechecksNodeAtProviderMutations(t *testing.T) {
-	for _, mutation := range []string{"attach", "retry-attach", "resize", "post-attach-resize", "marker", "image-drift", "vm-drift"} {
+	for _, mutation := range []string{"attach", "retry-attach", "resize", "post-attach-resize", "marker", "image-drift", "vm-drift", "slot-relocation", "slot-replacement", "marker-slot-relocation", "resize-final-read", "marker-final-read"} {
 		t.Run(mutation, func(t *testing.T) {
 			ctx := context.Background()
 			const volume = "volume-test"
@@ -3744,9 +3766,15 @@ func TestControllerPublishRechecksNodeAtProviderMutations(t *testing.T) {
 			driver := newStickyTestDriver(t, pv, pvc, node)
 			var wire *nodeAttachmentProtocol
 			var replaced atomic.Bool
+			var finalRead atomic.Bool
 			provider, state := nodeAttachmentProvider(t, func(method string, _ context.Context) {
 				wire.mu.Lock()
-				replace := (mutation == "attach" && method == "one.datastorepool.info") ||
+				if (mutation == "resize-final-read" && method == "one.system.version") ||
+					(mutation == "marker-final-read" && method == "one.image.info" && len(wire.mutations) == 1) {
+					finalRead.Store(true)
+				}
+				replace := (finalRead.Load() && method == "one.vm.info") ||
+					(mutation == "attach" && method == "one.datastorepool.info") ||
 					(mutation == "retry-attach" && method == "one.vm.info" && wire.attachAttempts == 1) ||
 					((mutation == "resize" || mutation == "post-attach-resize") && method == "one.system.version") ||
 					(mutation == "marker" && method == "one.image.info" && len(wire.mutations) == 1)
@@ -3756,6 +3784,17 @@ func TestControllerPublishRechecksNodeAtProviderMutations(t *testing.T) {
 					} else {
 						wire.vmNames = map[int]string{41: "node-other"}
 					}
+					replaced.Store(true)
+				}
+				if method == "one.system.version" && (mutation == "slot-relocation" || mutation == "slot-replacement") {
+					wire.diskSlot = "3"
+					if mutation == "slot-replacement" {
+						wire.extraDiskByVM = map[int]string{41: "<DISK><IMAGE_ID>9</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdc</TARGET></DISK>"}
+					}
+					replaced.Store(true)
+				}
+				if mutation == "marker-slot-relocation" && method == "one.image.info" && len(wire.mutations) == 1 {
+					wire.diskSlot = "3"
 					replaced.Store(true)
 				}
 				wire.mu.Unlock()
@@ -3782,13 +3821,21 @@ func TestControllerPublishRechecksNodeAtProviderMutations(t *testing.T) {
 			before, err := server.readAttachmentHistory(ctx, volume)
 			require.NoError(t, err)
 			reply, err := reviewControllerClient(t, server).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
-			require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
 			switch mutation {
+			case "slot-replacement", "slot-relocation":
+				require.Equal(t, codes.FailedPrecondition, status.Code(err), "%v", err)
+				require.ErrorContains(t, err, "restoration disk slot differs")
+			case "marker-slot-relocation":
+				require.ErrorContains(t, err, "restoration disk slot differs")
+
 			case "image-drift":
+				require.Equal(t, codes.Unavailable, status.Code(err))
 				require.ErrorContains(t, err, "publish mutation image identity is unverified")
 			case "vm-drift":
+				require.Equal(t, codes.Unavailable, status.Code(err))
 				require.ErrorContains(t, err, "publish mutation VM identity is unverified")
 			default:
+				require.Equal(t, codes.Unavailable, status.Code(err))
 				require.ErrorContains(t, err, "publish Kubernetes Node identity changed")
 			}
 			require.Nil(t, reply)
@@ -3799,7 +3846,7 @@ func TestControllerPublishRechecksNodeAtProviderMutations(t *testing.T) {
 			wire.mu.Lock()
 			defer wire.mu.Unlock()
 			switch mutation {
-			case "marker":
+			case "marker", "marker-slot-relocation", "marker-final-read":
 				require.Equal(t, []string{"resize:41:256"}, wire.mutations)
 			case "post-attach-resize":
 				require.Equal(t, []string{"attach:41:false"}, wire.mutations)
@@ -3808,6 +3855,303 @@ func TestControllerPublishRechecksNodeAtProviderMutations(t *testing.T) {
 			}
 			if mutation == "retry-attach" {
 				require.Equal(t, 1, wire.attachAttempts)
+			}
+		})
+	}
+}
+
+func setReplacementHistoryVersion(t *testing.T, driver *Driver) {
+	t.Helper()
+	ctx := context.Background()
+	cms := driver.kubeRuntime.client.CoreV1().ConfigMaps(driver.volumeHistory.namespace)
+	cm, err := cms.Get(ctx, volumeHistoryStateConfigMapName, metav1.GetOptions{})
+	require.NoError(t, err)
+	cm.ResourceVersion = "101"
+	_, err = cms.Update(ctx, cm, metav1.UpdateOptions{})
+	require.NoError(t, err)
+}
+
+func TestControllerPublishReplacementAttachRetry(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "unknown", "write-conflict", "readback-failed", "terminating-old-consumer"} {
+			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+				pv.Status.Phase, pvc.Status.Phase = corev1.VolumeBound, corev1.ClaimBound
+				pvc.Spec.AccessModes = pv.Spec.AccessModes
+				node := newReadyNode("node-old", true)
+				driver := newStickyTestDriver(t, pv, pvc, node)
+				kube := driver.kubeRuntime.client.(*fake.Clientset)
+				provider, wire := nodeAttachmentProvider(t)
+				wire.mu.Lock()
+				wire.ceph, wire.version, wire.marker, wire.disks[41] = true, "7.4.0", 128*1024*1024, 128
+				wire.mu.Unlock()
+				makeClient := func(d *Driver) csi.ControllerClient {
+					server := NewControllerServer(d, provider, nil)
+					if queued {
+						d.hotplugQueue = NewHotplugQueueManager(nil, "default", d.metrics, 5*time.Second, time.Second)
+						d.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+					}
+					return reviewControllerClient(t, server)
+				}
+				client := makeClient(driver)
+				publish := newPublishReq(volume, node.Name)
+				_, err := client.ControllerPublishVolume(ctx, publish)
+				require.NoError(t, err)
+				setReplacementHistoryVersion(t, driver)
+				nodes := kube.CoreV1().Nodes()
+				require.NoError(t, nodes.Delete(ctx, node.Name, metav1.DeleteOptions{}))
+				replacement := node.DeepCopy()
+				replacement.UID = "replacement"
+				replacement.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Minute))
+				_, err = nodes.Create(ctx, replacement, metav1.CreateOptions{})
+				require.NoError(t, err)
+				consumer := activePodForPVC("new-pod", pvc.Name, node.Name)
+				consumer.UID, consumer.CreationTimestamp = "new-pod", metav1.Now()
+				_, err = kube.CoreV1().Pods(pvc.Namespace).Create(ctx, consumer, metav1.CreateOptions{})
+				require.NoError(t, err)
+				if mode == "terminating-old-consumer" {
+					old := activePodForPVC("old-pod", pvc.Name, node.Name)
+					now := metav1.Now()
+					old.UID, old.DeletionTimestamp = "old-pod", &now
+					_, err := kube.CoreV1().Pods(pvc.Namespace).Create(ctx, old, metav1.CreateOptions{})
+					require.NoError(t, err)
+				}
+				wire.mu.Lock()
+				if mode != "external-disk" {
+					delete(wire.disks, 41)
+				}
+				wire.loseAttachReply = true
+				wire.rejectFirstAttach = mode == "unknown"
+				wire.mu.Unlock()
+				var pendingWritten atomic.Bool
+				if mode == "write-conflict" || mode == "readback-failed" {
+					kube.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+						cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
+						if cm.Name != volumeHistoryStateConfigMapName {
+							return false, nil, nil
+						}
+						var fields map[string]json.RawMessage
+						require.NoError(t, json.Unmarshal([]byte(cm.Data[volume]), &fields))
+						if fields["pendingReplacementAttach"] == nil {
+							return false, nil, nil
+						}
+						if mode == "write-conflict" {
+							return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), cm.Name, errors.New("competing update"))
+						}
+						pendingWritten.Store(true)
+						return false, nil, nil
+					})
+					kube.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+						if action.(ktesting.GetAction).GetName() == volumeHistoryStateConfigMapName && pendingWritten.Load() {
+							return true, nil, errors.New("independent history read unavailable")
+						}
+						return false, nil, nil
+					})
+				}
+				reply, err := client.ControllerPublishVolume(ctx, publish)
+				require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+				require.Nil(t, reply)
+				if mode == "write-conflict" || mode == "readback-failed" || mode == "external-disk" || mode == "terminating-old-consumer" {
+					wire.mu.Lock()
+					defer wire.mu.Unlock()
+					require.Zero(t, wire.attachAttempts)
+					require.Empty(t, wire.mutations)
+					return
+				}
+				stored, err := NewControllerServer(driver, provider, nil).readAttachmentHistory(ctx, volume)
+				require.NoError(t, err)
+				require.Equal(t, string(node.UID), stored.LastSuccessfulNodeUID)
+				require.NotNil(t, stored.PendingReplacementAttach)
+				wire.mu.Lock()
+				switch mode {
+				case "foreign-marker":
+					wire.attachAttempt = strings.Repeat("f", 64)
+				case "duplicate-marker":
+					wire.directDiskFields = "<CSI_ATTACH_ATTEMPT>" + wire.attachAttempt + "</CSI_ATTACH_ATTEMPT>"
+				case "ambiguous-target":
+					wire.extraDiskByVM = map[int]string{41: "<DISK><IMAGE_ID>9</IMAGE_ID><DISK_ID>3</DISK_ID><TARGET>vdb</TARGET></DISK>"}
+				case "malformed-target":
+					wire.diskTarget = "../vdb"
+				}
+				wire.mu.Unlock()
+				switch mode {
+				case "node-changed":
+					require.NoError(t, nodes.Delete(ctx, node.Name, metav1.DeleteOptions{}))
+					replacement.UID = "third-node"
+					_, err = nodes.Create(ctx, replacement, metav1.CreateOptions{})
+				case "pv-changed":
+					require.NoError(t, kube.CoreV1().PersistentVolumes().Delete(ctx, pv.Name, metav1.DeleteOptions{}))
+					pv.UID = "replacement-pv"
+					_, err = kube.CoreV1().PersistentVolumes().Create(ctx, pv, metav1.CreateOptions{})
+				case "history-changed":
+					_, err = driver.volumeHistory.Upsert(ctx, volume, func(history *VolumeHistoryRecord) {
+						history.LastSafeDetachTime = time.Now().UTC()
+					})
+				}
+				require.NoError(t, err)
+				driver.volumeHistory = NewVolumeHistoryManager(driver.kubeRuntime, driver.volumeHistory.namespace)
+				restarted := makeClient(driver)
+				reply, err = restarted.ControllerPublishVolume(ctx, publish)
+				current, historyErr := NewControllerServer(driver, provider, nil).readAttachmentHistory(ctx, volume)
+				require.NoError(t, historyErr)
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				require.Equal(t, 1, wire.attachAttempts)
+				if mode == "unknown" {
+					require.Empty(t, wire.mutations)
+				} else {
+					require.Equal(t, []string{"attach:41:false"}, wire.mutations)
+					require.Contains(t, wire.attachDiskTemplate, `SERIAL="onecsi-7"`)
+					require.Equal(t, 1, strings.Count(wire.attachDiskTemplate, "CSI_ATTACH_ATTEMPT="))
+				}
+				if mode == "lost-reply" {
+					require.NoError(t, err)
+					require.Equal(t, "onecsi-7", reply.GetPublishContext()[publishContextDeviceSerial])
+					require.Equal(t, "replacement", current.LastSuccessfulNodeUID)
+					require.Nil(t, current.PendingReplacementAttach)
+				} else {
+					require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+					require.Nil(t, reply)
+					require.Equal(t, string(node.UID), current.LastSuccessfulNodeUID)
+					require.Equal(t, stored.PendingReplacementAttach, current.PendingReplacementAttach)
+				}
+			})
+		}
+	}
+}
+
+func TestControllerPublishRechecksQuarantineForActualAttach(t *testing.T) {
+	for _, mode := range []string{"during-inspection", "during-retry", "retry-read-failed"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			const volume = "volume-test"
+			node := newReadyNode("node-old", true)
+			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			driver := newStickyTestDriver(t, pv, pvc, node)
+			manager := driver.hostArtifactQuarantine
+			kube := driver.kubeRuntime.client.(*fake.Clientset)
+			now := time.Now().UTC()
+			persist := func(vmid, slot int) {
+				state := hostArtifactStateFromConflict("other-volume", &opennebula.HostArtifactConflictError{
+					Target:     opennebula.HostArtifactAttachmentTarget{VMID: vmid, DiskID: slot},
+					RawMessage: "private provider details",
+				})
+				state.FailureCount, state.FirstObservedAt, state.LastObservedAt, state.ExpiresAt = 1, now, now, now.Add(time.Hour)
+				payload, err := json.Marshal(state)
+				require.NoError(t, err)
+				require.NoError(t, driver.kubeRuntime.UpsertConfigMapData(ctx, manager.namespace, hostArtifactStateConfigMapName, map[string]string{state.Key: string(payload)}))
+			}
+			persist(98, 1)
+			var later atomic.Bool
+			var wire *nodeAttachmentProtocol
+			provider, state := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+				wire.mu.Lock()
+				attempts := wire.attachAttempts
+				wire.mu.Unlock()
+				if method == "one.datastorepool.info" && mode == "during-inspection" && later.CompareAndSwap(false, true) {
+					persist(41, 1)
+				}
+				if method == "one.vmpool.info" && attempts == 1 && mode != "during-inspection" && !later.Load() {
+					persist(41, 1)
+					later.Store(true)
+				}
+			})
+			wire = state
+			wire.mu.Lock()
+			delete(wire.disks, 41)
+			wire.marker = 128 * 1024 * 1024
+			wire.rejectFirstAttach = mode != "during-inspection"
+			wire.extraDiskByVM = map[int]string{41: "<DISK><DISK_ID>0</DISK_ID><TYPE>SWAP</TYPE></DISK>"}
+			wire.alterDatastorePool = func(body string) string {
+				return strings.Replace(body, "<TYPE>SYSTEM</TYPE><TM_MAD>ssh</TM_MAD>", "<TYPE>SYSTEM</TYPE><TM_MAD>fs_lvm_ssh</TM_MAD>", 1)
+			}
+			wire.mu.Unlock()
+			if mode == "retry-read-failed" {
+				kube.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+					if action.(ktesting.GetAction).GetName() == hostArtifactStateConfigMapName && later.Load() {
+						return true, nil, errors.New("fresh quarantine observation unavailable")
+					}
+					return false, nil, nil
+				})
+			}
+
+			reply, err := reviewControllerClient(t, NewControllerServer(driver, provider, nil)).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
+			require.Nil(t, reply)
+			require.True(t, later.Load())
+			if mode == "retry-read-failed" {
+				require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+			} else {
+				require.Equal(t, codes.FailedPrecondition, status.Code(err), "%v", err)
+				require.ErrorContains(t, err, hostArtifactSlotBlocked)
+			}
+			require.NotContains(t, err.Error(), "private")
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			require.Empty(t, wire.mutations)
+			if mode == "during-inspection" {
+				require.Zero(t, wire.attachAttempts)
+			} else {
+				require.Equal(t, 1, wire.attachAttempts)
+			}
+		})
+	}
+}
+
+func TestControllerPublishRequiresUnambiguousPlacement(t *testing.T) {
+	for _, mode := range []string{"zero-system-datastore", "missing-datastore", "duplicate-datastore", "duplicate-history", "duplicate-latest-sequence", "duplicate-pool-name", "duplicate-secret"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			const volume = "volume-test"
+			node := newReadyNode("node-old", true)
+			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+			driver := newStickyTestDriver(t, pv, pvc, node)
+			provider, wire := nodeAttachmentProvider(t)
+			wire.mu.Lock()
+			wire.ceph, wire.version, wire.marker = true, "7.4.0", 128*1024*1024
+			delete(wire.disks, 41)
+			wire.alterDirectVM = func(body string) string {
+				switch mode {
+				case "zero-system-datastore":
+					return strings.Replace(body, "<DS_ID>200</DS_ID>", "<DS_ID>0</DS_ID>", 1)
+				case "missing-datastore":
+					return strings.Replace(body, "<DS_ID>200</DS_ID>", "", 1)
+				case "duplicate-datastore":
+					return strings.Replace(body, "<DS_ID>200</DS_ID>", "<DS_ID>200</DS_ID><DS_ID>0</DS_ID>", 1)
+				case "duplicate-history":
+					return strings.Replace(body, "</VM>", "<HISTORY_RECORDS><HISTORY><SEQ>1</SEQ><DS_ID>0</DS_ID></HISTORY></HISTORY_RECORDS></VM>", 1)
+				case "duplicate-latest-sequence":
+					return strings.Replace(body, "</HISTORY_RECORDS>", "<HISTORY><SEQ>0</SEQ><DS_ID>0</DS_ID></HISTORY></HISTORY_RECORDS>", 1)
+				default:
+					return body
+				}
+			}
+			wire.alterDatastorePool = func(body string) string {
+				switch mode {
+				case "zero-system-datastore", "missing-datastore", "duplicate-datastore", "duplicate-history", "duplicate-latest-sequence":
+					return strings.NewReplacer("<ID>200</ID>", "<ID>0</ID>", "<COMPATIBLE_SYS_DS>200", "<COMPATIBLE_SYS_DS>0").Replace(body)
+				case "duplicate-pool-name":
+					return strings.Replace(body, "<POOL_NAME>fixture</POOL_NAME>", "<POOL_NAME>other</POOL_NAME><POOL_NAME>fixture</POOL_NAME>", 1)
+				default:
+					return strings.Replace(body, "<CEPH_SECRET>fixture</CEPH_SECRET>", "<CEPH_SECRET>private-credential</CEPH_SECRET><CEPH_SECRET>fixture</CEPH_SECRET>", 1)
+				}
+			}
+			wire.mu.Unlock()
+
+			reply, err := reviewControllerClient(t, NewControllerServer(driver, provider, nil)).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			if mode == "zero-system-datastore" {
+				require.NoError(t, err)
+				require.NotNil(t, reply)
+				require.Equal(t, []string{"attach:41:false"}, wire.mutations)
+			} else {
+				require.Error(t, err)
+				require.Nil(t, reply)
+				require.NotContains(t, err.Error(), "private-credential")
+				require.Zero(t, wire.attachAttempts)
+				require.Empty(t, wire.mutations)
 			}
 		})
 	}

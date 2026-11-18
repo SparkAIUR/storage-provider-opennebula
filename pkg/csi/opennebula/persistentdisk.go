@@ -675,9 +675,6 @@ func (p *PersistentDiskVolumeProvider) expandAttachedDisk(ctx context.Context, v
 		if size%sizeConversion != 0 {
 			mb++
 		}
-		if err := p.verifyPublishMutation(ctx, vmID, id, vmName); err != nil {
-			return 0, err
-		}
 		if err := p.ctrl.VM(vmID).Disk(diskID).ResizeContext(ctx, strconv.FormatInt(mb, 10)); err != nil {
 			return 0, fmt.Errorf("resize outcome uncertain; retry after observing completion: %w", err)
 		}
@@ -694,7 +691,7 @@ func (p *PersistentDiskVolumeProvider) expandAttachedDisk(ctx context.Context, v
 	if err != nil {
 		return 0, err
 	}
-	if err := p.persistVerifiedSize(ctx, vmID, id, completed, vmName); err != nil {
+	if err := p.persistVerifiedSize(ctx, vmID, diskID, id, completed, vmName); err != nil {
 		return 0, err
 	}
 	return completed, nil
@@ -741,16 +738,15 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 			klog.Warningf("volume %s attach validation warning: %s", volume, warning)
 		}
 	}
-	hostArtifactTarget, targetErr := p.hostArtifactAttachmentTargetForResolved(ctx, volume, node, volumeID, nodeID, vmName, params, report)
-	if targetErr != nil {
-		klog.V(3).InfoS("Failed to predict host artifact attachment target",
-			"volume", volume,
-			"node", node,
-			"err", targetErr)
-	}
+	var hostArtifactTarget *HostArtifactAttachmentTarget
+	authorize, _ := ctx.Value(attachAuthorizationKey{}).(func(context.Context, *HostArtifactAttachmentTarget) error)
 	disk := shared.NewDisk()
 	disk.Add(shared.ImageID, volumeID)
 	disk.Add(shared.Serial, fmt.Sprintf("onecsi-%d", volumeID))
+	attempt, _ := ctx.Value(replacementAttachKey{}).(string)
+	if attempt != "" {
+		disk.Add(attachAttemptField, attempt)
+	}
 	addDiskParams(disk, params)
 	if immutable {
 		disk.Add("READONLY", "YES")
@@ -762,8 +758,21 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		"timeout", hotplugTimeout)
 
 	attachDisk := func() error {
-		if err := p.verifyPublishMutation(ctx, nodeID, volumeID, vmName); err != nil {
+		err := p.verifyPublishMutation(ctx, nodeID, volumeID, vmName, func() error {
+			var err error
+			hostArtifactTarget, err = p.hostArtifactAttachmentTargetForResolved(ctx, volume, node, volumeID, nodeID, vmName, params, report)
+			if err != nil {
+				return status.Error(codes.Unavailable, "host artifact attachment target is unverified")
+			}
+			return nil
+		})
+		if err != nil {
 			return err
+		}
+		if authorize != nil {
+			if err := authorize(ctx, hostArtifactTarget); err != nil {
+				return err
+			}
 		}
 		return p.ctrl.VM(nodeID).DiskAttachContext(ctx, disk.String())
 	}
@@ -772,10 +781,13 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if status.Code(attachErr) == codes.Unavailable {
+	if status.Code(attachErr) == codes.Unavailable || status.Code(attachErr) == codes.FailedPrecondition {
 		return attachErr
 	}
 	if attachErr != nil && !isHotplugStateError(attachErr) {
+		if attempt != "" {
+			return status.Error(codes.Unavailable, "replacement attach outcome is unverified")
+		}
 		if conflict, ok := p.classifyHostArtifactConflict(ctx, nodeID, report, hostArtifactTarget, attachErr); ok {
 			return conflict
 		}
@@ -785,7 +797,17 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 
 	var retryAttach func() error
 	if attachErr != nil {
-		retryAttach = attachDisk
+		if attempt != "" {
+			return status.Error(codes.Unavailable, "replacement attach outcome is unverified")
+		}
+		retryAttach = func() error {
+			var err error
+			report, err = p.inspectAttachmentEnvironment(ctx, volumeID, nodeID, vmName)
+			if err != nil {
+				return status.Error(codes.Unavailable, "retry attachment environment is unverified")
+			}
+			return attachDisk()
+		}
 	}
 
 	if err := p.waitForAttachState(ctx, hotplugTimeout, p.hotplugPollWait, func() (bool, bool, error) {
@@ -803,7 +825,7 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		}
 		return attached, ready, nil
 	}, retryAttach, volume, node); err != nil {
-		if status.Code(err) == codes.Unavailable || ctx.Err() != nil {
+		if status.Code(err) == codes.Unavailable || status.Code(err) == codes.FailedPrecondition || ctx.Err() != nil {
 			return err
 		}
 		if conflict, ok := p.classifyHostArtifactConflict(ctx, nodeID, report, hostArtifactTarget, err); ok {
@@ -816,6 +838,9 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 			return fmt.Errorf("%w (initial attach error: %v)", err, attachErr)
 		}
 		return err
+	}
+	if attempt != "" {
+		return nil
 	}
 	return p.RestoreVolumeCapacity(ctx, volume, nodeID, volumeID)
 }
@@ -851,6 +876,10 @@ func (p *PersistentDiskVolumeProvider) hostArtifactAttachmentTargetForResolved(c
 		return nil, err
 	}
 
+	history := latestHistoryRecord(vmInfo)
+	if history == nil || history.DSID != report.SystemDatastore.ID {
+		return nil, fmt.Errorf("%w: VM system datastore history changed", ErrConflictingAttachmentEvidence)
+	}
 	diskID := nextAvailableDiskID(vmInfo)
 	target := nextAvailableDiskTarget(vmInfo, params)
 	candidate := &HostArtifactAttachmentTarget{
@@ -869,10 +898,8 @@ func (p *PersistentDiskVolumeProvider) hostArtifactAttachmentTargetForResolved(c
 		candidate.SystemDatastoreName = report.SystemDatastore.Name
 		candidate.SystemDatastoreTM = report.SystemDatastore.TMMad
 	}
-	if history := latestHistoryRecord(vmInfo); history != nil {
-		candidate.HostID = history.HID
-		candidate.HostName = history.Hostname
-	}
+	candidate.HostID = history.HID
+	candidate.HostName = history.Hostname
 	return candidate, nil
 }
 
@@ -1601,6 +1628,12 @@ type expectedImageIdentity struct{}
 
 type expectedDeletionVMIdentity struct{}
 
+type attachAuthorizationKey struct{}
+
+func WithAttachAuthorization(ctx context.Context, authorize func(context.Context, *HostArtifactAttachmentTarget) error) context.Context {
+	return context.WithValue(ctx, attachAuthorizationKey{}, authorize)
+}
+
 type publishMutationKey struct{}
 
 type publishMutationAdmission struct {
@@ -1613,10 +1646,10 @@ func WithPublishMutationAuthorization(ctx context.Context, volume, node string, 
 	return context.WithValue(ctx, publishMutationKey{}, publishMutationAdmission{volume, node, vmID, imageID, verifyNode})
 }
 
-func (p *PersistentDiskVolumeProvider) verifyPublishMutation(ctx context.Context, vmID, imageID int, vmName string) error {
+func (p *PersistentDiskVolumeProvider) verifyPublishMutation(ctx context.Context, vmID, imageID int, vmName string, verifyTarget func() error) error {
 	admitted, ok := ctx.Value(publishMutationKey{}).(publishMutationAdmission)
 	if !ok {
-		return ctx.Err()
+		return verifyTarget()
 	}
 	if admitted.vmID != vmID || admitted.imageID != imageID {
 		return status.Error(codes.Unavailable, "publish mutation target differs from admission")
@@ -1641,6 +1674,9 @@ func (p *PersistentDiskVolumeProvider) verifyPublishMutation(ctx context.Context
 	}
 	if err != nil || currentVM != vmID || (vmName != "" && vmName != currentName) {
 		return status.Error(codes.Unavailable, "publish mutation VM identity is unverified")
+	}
+	if err := verifyTarget(); err != nil {
+		return err
 	}
 	return admitted.verifyNode(ctx)
 }
@@ -1722,9 +1758,10 @@ func (info imageIdentityXML) imageID() (int, bool) {
 
 type imageAuthorityField struct {
 	XMLName xml.Name
+	Value   string `xml:",chardata"`
 }
 
-func validateImageAuthorityXML(data []byte, expansion bool) error {
+func validateImageAuthorityXML(data []byte, expansion bool, required ...string) error {
 	var image struct {
 		XMLName   xml.Name              `xml:"IMAGE"`
 		Fields    []imageAuthorityField `xml:",any"`
@@ -1750,7 +1787,18 @@ func validateImageAuthorityXML(data []byte, expansion bool) error {
 		if seen[key] {
 			return fmt.Errorf("%w: repeated image field %s", ErrConflictingAttachmentEvidence, key)
 		}
+		if slices.Contains(required, key) && key != "VMS" {
+			value, err := strconv.Atoi(strings.TrimSpace(field.Value))
+			if err != nil || value < 0 {
+				return fmt.Errorf("%w: required image field %s is invalid", ErrConflictingAttachmentEvidence, key)
+			}
+		}
 		seen[key] = true
+	}
+	for _, field := range required {
+		if !seen[field] {
+			return fmt.Errorf("%w: required image field %s is missing", ErrConflictingAttachmentEvidence, field)
+		}
 	}
 	if len(image.Templates) > 1 {
 		return fmt.Errorf("%w: repeated image field TEMPLATE", ErrConflictingAttachmentEvidence)
@@ -1778,13 +1826,13 @@ func (p *PersistentDiskVolumeProvider) readExpansionImageInfo(ctx context.Contex
 	return p.readScopedImageInfo(ctx, imageID, true)
 }
 
-func (p *PersistentDiskVolumeProvider) readScopedImageInfo(ctx context.Context, imageID int, expansion bool) (*img.Image, error) {
+func (p *PersistentDiskVolumeProvider) readScopedImageInfo(ctx context.Context, imageID int, expansion bool, required ...string) (*img.Image, error) {
 	response, err := p.ctrl.Client.ImageInfo(ctx, imageID, true)
 	if err != nil {
 		return nil, err
 	}
 	data := []byte(response.Body())
-	if err := validateImageAuthorityXML(data, expansion); err != nil {
+	if err := validateImageAuthorityXML(data, expansion, required...); err != nil {
 		return nil, err
 	}
 	var info struct {
@@ -2020,7 +2068,7 @@ func (p *PersistentDiskVolumeProvider) waitForAttachState(ctx context.Context, t
 		if retryPending && ready && !attached {
 			retryErr := retryAttach()
 			if retryErr != nil {
-				if status.Code(retryErr) == codes.Unavailable || !isHotplugStateError(retryErr) {
+				if !isHotplugStateError(retryErr) || status.Code(retryErr) == codes.Unavailable || status.Code(retryErr) == codes.FailedPrecondition {
 					return fmt.Errorf("failed to retry attach of volume %s on node %s: %w", volume, node, retryErr)
 				}
 			} else {

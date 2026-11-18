@@ -983,6 +983,21 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
 		defer release()
 
+		history, replacement, err := s.replacementPublishHistory(queueCtx, req, runtimeCtx, publishNode)
+		if err != nil {
+			return err
+		}
+		if attempt := history.PendingReplacementAttach; attempt != nil {
+			if attempt.ImageID != volumeID || attempt.VMID != nodeID {
+				return attachmentEvidenceUnavailable("replacement Ceph attach provider identity changed", nil)
+			}
+			observation, err := s.completeReplacementAttach(queueCtx, req, *attempt, publishNode, runtimeCtx, &protection)
+			if err != nil {
+				return err
+			}
+			response = &csi.ControllerPublishVolumeResponse{PublishContext: s.publishContextForVolume(queueCtx, req.VolumeId, observation, 0, req.GetVolumeContext())}
+			return nil
+		}
 		target, err := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
 		if err == nil {
 			if err := s.restoreRetainedVolumeCapacity(queueCtx, req, nodeID, volumeID, publishNode); err != nil {
@@ -1056,7 +1071,21 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		klog.V(3).InfoS("Attaching volume to node",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "sizeBytes", sizeBytes, "hotplugTimeout", hotplugTimeout, "deviceDiscoveryTimeout", deviceDiscoveryTimeout)
 		attachStarted := time.Now()
-		attachCtx := s.publishMutationContext(queueCtx, req, nodeID, volumeID, publishNode, true)
+		attachCtx := s.authorizeHostArtifactAttach(s.publishMutationContext(queueCtx, req, nodeID, volumeID, publishNode, true), req)
+		var attempt *replacementAttachAttempt
+		if replacement {
+			attempt, err = s.beginReplacementAttach(queueCtx, req, history, volumeID, nodeID, publishNode)
+			if err != nil {
+				return err
+			}
+			attachCtx = opennebula.WithReplacementAttachAttempt(attachCtx, attempt.ID)
+			attachCtx = opennebula.WithAttachAuthorization(attachCtx, func(ctx context.Context, target *opennebula.HostArtifactAttachmentTarget) error {
+				if _, err := s.verifyReplacementAttempt(ctx, req, *attempt, false); err != nil {
+					return err
+				}
+				return s.checkHostArtifactAttachTarget(ctx, req, target, nil)
+			})
+		}
 		err = s.volumeProvider.AttachVolume(attachCtx, req.VolumeId, req.NodeId, immutableVolume, params)
 		if ctxErr := queueCtx.Err(); ctxErr != nil {
 			return ctxErr
@@ -1067,7 +1096,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			}
 			s.handleHotplugTimeout(queueCtx, req.NodeId, req.VolumeId, params, "attach", "disk", err)
 			switch {
-			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), status.Code(err) == codes.Unavailable:
+			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), status.Code(err) == codes.Unavailable, status.Code(err) == codes.FailedPrecondition:
 				return err
 			case opennebula.IsDatastoreConfigError(err):
 				return status.Error(codes.FailedPrecondition, err.Error())
@@ -1075,6 +1104,14 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 				return status.Error(codes.ResourceExhausted, err.Error())
 			}
 			return status.Errorf(codes.Internal, "failed to attach volume: %v", err)
+		}
+		if attempt != nil {
+			observation, err := s.completeReplacementAttach(queueCtx, req, *attempt, publishNode, runtimeCtx, &protection)
+			if err != nil {
+				return err
+			}
+			response = &csi.ControllerPublishVolumeResponse{PublishContext: s.publishContextForVolume(queueCtx, req.VolumeId, observation, deviceDiscoveryTimeout, params)}
+			return nil
 		}
 		klog.V(3).InfoS("Checking if volume is attached",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID)

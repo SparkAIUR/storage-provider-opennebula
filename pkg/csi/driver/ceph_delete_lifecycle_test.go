@@ -344,7 +344,7 @@ func TestControllerDeleteVolumeRefreshesPinnedAdmission(t *testing.T) {
 				patches.Add(1)
 				return true, nil, fmt.Errorf("PV patch denied")
 			})
-			injectAt := map[string]int32{"before-rpc": 2, "after-rpc": 3, "already-missing": 1}[mode]
+			injectAt := map[string]int32{"before-rpc": 1, "after-rpc": 2, "already-missing": 1}[mode]
 			provider, wire := nodeAttachmentProvider(t, func(method string, ctx context.Context) {
 				if method == "one.vmpool.info" && censusReads.Add(1) == injectAt {
 					_, active, err := driver.volumeQuarantine.MarkFailure(ctx, VolumeQuarantineState{VolumeID: volume, Reason: "ownership drift"}, 1, time.Hour)
@@ -366,6 +366,11 @@ func TestControllerDeleteVolumeRefreshesPinnedAdmission(t *testing.T) {
 				require.Equal(t, codes.FailedPrecondition, status.Code(err), "%v", err)
 				require.Nil(t, response)
 			}
+			expectedCensusReads := int32(1)
+			if mode == "read-only-success" || mode == "after-rpc" {
+				expectedCensusReads = 2
+			}
+			require.Equal(t, expectedCensusReads, censusReads.Load())
 			require.Zero(t, patches.Load())
 			current, err := kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
 			require.NoError(t, err)

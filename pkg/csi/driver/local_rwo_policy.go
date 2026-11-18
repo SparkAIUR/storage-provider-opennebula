@@ -478,11 +478,19 @@ type successfulAttachmentObservation struct {
 	nodeName, nodeUID, target, serial string
 	vmID, imageID, diskID             int
 	newAttachment                     bool
+	replacementAttempt                *replacementAttachAttempt
 }
 
 var errRetainedAttachmentNodeChanged = errors.New("current Kubernetes Node UID does not match the retained attachment")
 
 func (state VolumeHistoryRecord) checkAttachmentNode(observation successfulAttachmentObservation) error {
+	if state.PendingReplacementAttach != nil || observation.replacementAttempt != nil {
+		if state.PendingReplacementAttach == nil || observation.replacementAttempt == nil ||
+			*state.PendingReplacementAttach != *observation.replacementAttempt || !observation.replacementAttempt.matchesHistory(state) ||
+			observation.nodeUID != observation.replacementAttempt.ReplacementUID {
+			return errRetainedAttachmentNodeChanged
+		}
+	}
 	if !observation.newAttachment && !state.Bootstrapped && volumeHistoryHasObservedSuccess(state) &&
 		state.LastSuccessfulNodeName == observation.nodeName && state.LastSuccessfulNodeUID != "" &&
 		state.LastSuccessfulNodeUID != observation.nodeUID {
@@ -643,7 +651,7 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 		return nil
 	}
 	now := time.Now().UTC()
-	_, err := s.driver.volumeHistory.upsert(ctx, volumeID, func(state *VolumeHistoryRecord) error {
+	_, err := s.driver.volumeHistory.updateHistory(ctx, volumeID, observation.replacementAttempt != nil, func(state *VolumeHistoryRecord) error {
 		if err := state.checkAttachmentNode(observation); err != nil {
 			return err
 		}
@@ -666,12 +674,27 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 		state.Bootstrapped = false
 		state.BootstrappedAt = time.Time{}
 		state.BootstrappedFields = nil
+		state.PendingReplacementAttach = nil
 		state.observeSuccessfulAttachment(observation)
 		state.LastSuccessfulPublishTime = now
 		return nil
 	})
 	if errors.Is(err, errRetainedAttachmentNodeChanged) {
 		return status.Error(codes.Unavailable, err.Error())
+	}
+	if observation.replacementAttempt != nil {
+		if err != nil {
+			return attachmentEvidenceUnavailable("replacement Ceph attach completion could not be persisted", err)
+		}
+		current, err := s.readAttachmentHistory(ctx, volumeID)
+		if err != nil || current.PendingReplacementAttach != nil ||
+			current.LastSuccessfulNodeUID != observation.nodeUID || current.LastSuccessfulNodeName != observation.nodeName ||
+			current.LastSuccessfulImageID != observation.imageID || current.LastSuccessfulOpenNebulaVMID != observation.vmID ||
+			current.LastSuccessfulDiskID == nil || *current.LastSuccessfulDiskID != observation.diskID ||
+			current.LastSuccessfulTarget != observation.target || current.LastSuccessfulDeviceSerial != observation.serial ||
+			!current.LastSuccessfulPublishTime.Equal(now) {
+			return attachmentEvidenceUnavailable("replacement Ceph attach completion readback failed", err)
+		}
 	}
 	if err == nil {
 		s.driver.metrics.RecordVolumeHistory("publish", "persisted")

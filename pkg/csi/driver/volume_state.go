@@ -68,31 +68,32 @@ type LocalDiskObservedIdentity struct {
 }
 
 type VolumeHistoryRecord struct {
-	Version                      int                `json:"version"`
-	VolumeID                     string             `json:"volumeID"`
-	PVName                       string             `json:"pvName,omitempty"`
-	PVCNamespace                 string             `json:"pvcNamespace,omitempty"`
-	PVCName                      string             `json:"pvcName,omitempty"`
-	Backend                      string             `json:"backend,omitempty"`
-	DatastoreID                  int                `json:"datastoreID,omitempty"`
-	DatastoreName                string             `json:"datastoreName,omitempty"`
-	RestartOptimization          string             `json:"restartOptimization,omitempty"`
-	EvidenceSource               string             `json:"evidenceSource,omitempty"`
-	Bootstrapped                 bool               `json:"bootstrapped,omitempty"`
-	BootstrappedAt               time.Time          `json:"bootstrappedAt,omitempty"`
-	BootstrappedFields           []string           `json:"bootstrappedFields,omitempty"`
-	LastSuccessfulNodeName       string             `json:"lastSuccessfulNodeName,omitempty"`
-	LastSuccessfulNodeUID        string             `json:"lastSuccessfulNodeUID,omitempty"`
-	LastSuccessfulOpenNebulaVMID int                `json:"lastSuccessfulOpenNebulaVMID,omitempty"`
-	LastSuccessfulImageID        int                `json:"lastSuccessfulImageID,omitempty"`
-	LastSuccessfulDiskID         *int               `json:"lastSuccessfulDiskID,omitempty"`
-	LastSuccessfulTarget         string             `json:"lastSuccessfulTarget,omitempty"`
-	LastSuccessfulDeviceSerial   string             `json:"lastSuccessfulDeviceSerial,omitempty"`
-	LastSuccessfulPublishTime    time.Time          `json:"lastSuccessfulPublishTime,omitempty"`
-	LastSuccessfulStageTime      time.Time          `json:"lastSuccessfulStageTime,omitempty"`
-	LastSafeDetachNodeName       string             `json:"lastSafeDetachNodeName,omitempty"`
-	LastSafeDetachTime           time.Time          `json:"lastSafeDetachTime,omitempty"`
-	LastHealthyIdentity          *LocalDiskIdentity `json:"lastHealthyIdentity,omitempty"`
+	PendingReplacementAttach     *replacementAttachAttempt `json:"pendingReplacementAttach,omitempty"`
+	Version                      int                       `json:"version"`
+	VolumeID                     string                    `json:"volumeID"`
+	PVName                       string                    `json:"pvName,omitempty"`
+	PVCNamespace                 string                    `json:"pvcNamespace,omitempty"`
+	PVCName                      string                    `json:"pvcName,omitempty"`
+	Backend                      string                    `json:"backend,omitempty"`
+	DatastoreID                  int                       `json:"datastoreID,omitempty"`
+	DatastoreName                string                    `json:"datastoreName,omitempty"`
+	RestartOptimization          string                    `json:"restartOptimization,omitempty"`
+	EvidenceSource               string                    `json:"evidenceSource,omitempty"`
+	Bootstrapped                 bool                      `json:"bootstrapped,omitempty"`
+	BootstrappedAt               time.Time                 `json:"bootstrappedAt,omitempty"`
+	BootstrappedFields           []string                  `json:"bootstrappedFields,omitempty"`
+	LastSuccessfulNodeName       string                    `json:"lastSuccessfulNodeName,omitempty"`
+	LastSuccessfulNodeUID        string                    `json:"lastSuccessfulNodeUID,omitempty"`
+	LastSuccessfulOpenNebulaVMID int                       `json:"lastSuccessfulOpenNebulaVMID,omitempty"`
+	LastSuccessfulImageID        int                       `json:"lastSuccessfulImageID,omitempty"`
+	LastSuccessfulDiskID         *int                      `json:"lastSuccessfulDiskID,omitempty"`
+	LastSuccessfulTarget         string                    `json:"lastSuccessfulTarget,omitempty"`
+	LastSuccessfulDeviceSerial   string                    `json:"lastSuccessfulDeviceSerial,omitempty"`
+	LastSuccessfulPublishTime    time.Time                 `json:"lastSuccessfulPublishTime,omitempty"`
+	LastSuccessfulStageTime      time.Time                 `json:"lastSuccessfulStageTime,omitempty"`
+	LastSafeDetachNodeName       string                    `json:"lastSafeDetachNodeName,omitempty"`
+	LastSafeDetachTime           time.Time                 `json:"lastSafeDetachTime,omitempty"`
+	LastHealthyIdentity          *LocalDiskIdentity        `json:"lastHealthyIdentity,omitempty"`
 }
 
 type VolumeRepairState struct {
@@ -187,6 +188,10 @@ func (m *VolumeHistoryManager) Upsert(ctx context.Context, volumeID string, muta
 }
 
 func (m *VolumeHistoryManager) upsert(ctx context.Context, volumeID string, mutate func(*VolumeHistoryRecord) error) (VolumeHistoryRecord, error) {
+	return m.updateHistory(ctx, volumeID, false, mutate)
+}
+
+func (m *VolumeHistoryManager) updateHistory(ctx context.Context, volumeID string, conditional bool, mutate func(*VolumeHistoryRecord) error) (VolumeHistoryRecord, error) {
 	if m == nil || strings.TrimSpace(volumeID) == "" {
 		return VolumeHistoryRecord{}, nil
 	}
@@ -217,7 +222,7 @@ func (m *VolumeHistoryManager) upsert(ctx context.Context, volumeID string, muta
 		return state, nil
 	}
 	cmClient := m.runtime.client.CoreV1().ConfigMaps(m.namespace)
-	err = retryOnConflict(retry.DefaultRetry, func() error {
+	update := func() error {
 		cm, err := cmClient.Get(ctx, volumeHistoryStateConfigMapName, metav1.GetOptions{})
 		missing := errors.IsNotFound(err)
 		if err != nil && !missing {
@@ -227,7 +232,15 @@ func (m *VolumeHistoryManager) upsert(ctx context.Context, volumeID string, muta
 			cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: volumeHistoryStateConfigMapName, Namespace: m.namespace}}
 		}
 		state = VolumeHistoryRecord{}
-		if raw := strings.TrimSpace(cm.Data[volumeID]); raw != "" {
+		if conditional {
+			if missing || cm.ResourceVersion == "" {
+				return fmt.Errorf("conditional volume history resource version is unavailable")
+			}
+			state, err = decodeAttachmentHistory(cm.Data[volumeID], volumeID)
+			if err != nil {
+				return err
+			}
+		} else if raw := strings.TrimSpace(cm.Data[volumeID]); raw != "" {
 			if err := unmarshalAuthorityJSON(raw, &state); err != nil {
 				return err
 			}
@@ -252,7 +265,12 @@ func (m *VolumeHistoryManager) upsert(ctx context.Context, volumeID string, muta
 			_, err = cmClient.Update(ctx, cm, metav1.UpdateOptions{})
 		}
 		return err
-	})
+	}
+	if conditional {
+		err = update()
+	} else {
+		err = retryOnConflict(retry.DefaultRetry, update)
+	}
 	if err != nil {
 		return state, err
 	}

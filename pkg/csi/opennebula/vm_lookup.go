@@ -262,15 +262,70 @@ func (p *PersistentDiskVolumeProvider) readVMInfo(ctx context.Context, vmID int,
 		return nil, fmt.Errorf("%w: requested VM %d identity differs from response %d", ErrConflictingAttachmentEvidence, vmID, info.ID)
 	}
 	if required&vmHistory != 0 {
-		var history struct {
-			Records []vmSchema.HistoryRecord `xml:"HISTORY_RECORDS>HISTORY"`
-		}
-		if err := xml.Unmarshal(data, &history); err != nil {
+		record, err := decodeVMHistoryAuthority(data)
+		if err != nil {
 			return nil, err
 		}
-		info.HistoryRecords = history.Records
+		info.HistoryRecords = []vmSchema.HistoryRecord{record}
 	}
 	return &info, nil
+}
+
+func decodeVMHistoryAuthority(data []byte) (vmSchema.HistoryRecord, error) {
+	type row struct {
+		Seq       []string `xml:"SEQ"`
+		Datastore []string `xml:"DS_ID"`
+		Host      []string `xml:"HID"`
+		Hostname  []string `xml:"HOSTNAME"`
+	}
+	var history struct {
+		Groups []struct {
+			Rows []row `xml:"HISTORY"`
+		} `xml:"HISTORY_RECORDS"`
+	}
+	var record vmSchema.HistoryRecord
+	conflict := fmt.Errorf("%w: VM system datastore history is unverified", ErrConflictingAttachmentEvidence)
+	if err := xml.Unmarshal(data, &history); err != nil || len(history.Groups) != 1 {
+		return record, conflict
+	}
+	number := func(fields []string) (int, bool) {
+		if len(fields) != 1 {
+			return 0, false
+		}
+		id, err := strconv.Atoi(strings.TrimSpace(fields[0]))
+		return id, err == nil && id >= 0
+	}
+	maxSeq := -1
+	var latest row
+	unique := false
+	for _, candidate := range history.Groups[0].Rows {
+		seq, ok := number(candidate.Seq)
+		if !ok {
+			return record, conflict
+		}
+		switch {
+		case seq > maxSeq:
+			latest, maxSeq, unique = candidate, seq, true
+		case seq == maxSeq:
+			unique = false
+		}
+	}
+	datastoreID, ok := number(latest.Datastore)
+	if !unique || !ok || len(latest.Hostname) > 1 {
+		return record, conflict
+	}
+	record.SEQ, record.DSID = maxSeq, datastoreID
+	if len(latest.Host) != 0 {
+		hostID, ok := number(latest.Host)
+		if !ok {
+			return record, conflict
+		}
+		record.HID = hostID
+	}
+	if len(latest.Hostname) == 1 {
+		record.Hostname = latest.Hostname[0]
+	}
+	return record, nil
 }
 
 func verifyVMName(info *vmSchema.VM, expected string) error {

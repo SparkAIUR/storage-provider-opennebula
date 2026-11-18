@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2032,18 +2033,22 @@ func TestControllerPublishVolumeBlocksActiveHostArtifactQuarantine(t *testing.T)
 }
 
 func TestControllerPublishRedactsPersistedSlotQuarantine(t *testing.T) {
-	for _, mode := range []string{"same-volume", "other-volume", "observe-other-volume", "refresh-unavailable", "target-unavailable", "empty-slot"} {
+	for _, mode := range []string{"same-handle-rebound", "observe-same-handle-rebound", "other-volume", "observe-other-volume", "refresh-unavailable", "target-unavailable", "empty-slot"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			const volume = "vol-request"
 			const generic = "host artifact quarantine is active for the requested attachment slot"
 			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
-			if mode == "observe-other-volume" {
+			if strings.HasPrefix(mode, "observe-") {
 				pv.Annotations[annotationRecoveryMode] = recoveryModeObserve
+			}
+			if strings.HasSuffix(mode, "rebound") {
+				pvc.Namespace, pvc.UID = "new-tenant", "new-claim"
+				pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.UID = pvc.Namespace, pvc.UID
 			}
 			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-161", true))
 			owner := "different-tenant-volume"
-			if mode == "same-volume" {
+			if strings.HasSuffix(mode, "rebound") {
 				owner = volume
 			}
 			now := time.Now().UTC()
@@ -2092,13 +2097,7 @@ func TestControllerPublishRedactsPersistedSlotQuarantine(t *testing.T) {
 				}
 			}
 			switch mode {
-			case "same-volume":
-				require.Equal(t, codes.FailedPrecondition, status.Code(err))
-				require.Nil(t, reply)
-				require.ErrorContains(t, err, state.Message)
-				require.ErrorContains(t, err, state.RepairHint)
-				require.Equal(t, []string{status.Convert(err).Message()}, warnings)
-			case "other-volume", "refresh-unavailable":
+			case "same-handle-rebound", "other-volume", "refresh-unavailable":
 				require.Equal(t, codes.FailedPrecondition, status.Code(err))
 				require.Nil(t, reply)
 				require.Equal(t, generic, status.Convert(err).Message())
@@ -2108,6 +2107,11 @@ func TestControllerPublishRedactsPersistedSlotQuarantine(t *testing.T) {
 				require.Nil(t, reply)
 				require.NotContains(t, err.Error(), "provider-private")
 				require.Empty(t, warnings)
+			case "observe-same-handle-rebound":
+				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				require.Nil(t, reply)
+				require.NotContains(t, err.Error(), "private")
+				require.Equal(t, []string{generic}, warnings)
 			case "observe-other-volume":
 				require.NoError(t, err)
 				require.NotNil(t, reply)

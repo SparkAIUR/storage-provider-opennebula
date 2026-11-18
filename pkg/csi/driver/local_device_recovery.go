@@ -14,6 +14,7 @@ import (
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -660,6 +661,13 @@ func (s *ControllerServer) executeLocalDeviceRecovery(ctx context.Context, repor
 			klog.V(3).InfoS("Confirmed local device recovery desired state", "volumeID", volumeID, "node", node, "reason", reason)
 		}
 
+		if s.driver.volumeHistory != nil {
+			history, err := s.readAttachmentHistory(queueCtx, volumeID)
+			if err != nil || history.PendingReplacementAttach != nil {
+				return attachmentEvidenceUnavailable("local recovery attachment history is unverified or replacement is pending", err)
+			}
+		}
+
 		if hostArtifactErr := s.rejectIfHostArtifactQuarantineActiveForVolumeNode(queueCtx, volumeID, node, params); hostArtifactErr != nil {
 			return hostArtifactErr
 		}
@@ -710,7 +718,8 @@ func (s *ControllerServer) executeLocalDeviceRecovery(ctx context.Context, repor
 		attempt.Method = localDeviceRecoveryMethodRuntimeRepublish
 
 		attachStarted := time.Now()
-		if err := s.volumeProvider.AttachVolume(queueCtx, volumeID, node, false, params); err != nil {
+		attachCtx := s.authorizeHostArtifactAttach(queueCtx, &csi.ControllerPublishVolumeRequest{VolumeId: volumeID, NodeId: node, VolumeContext: params})
+		if err := s.volumeProvider.AttachVolume(attachCtx, volumeID, node, false, params); err != nil {
 			if conflict, ok := opennebula.AsHostArtifactConflictError(err); ok {
 				return s.handleHostArtifactConflictForVolumeNode(queueCtx, volumeID, node, params, conflict)
 			}

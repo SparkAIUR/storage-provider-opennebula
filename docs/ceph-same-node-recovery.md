@@ -28,6 +28,20 @@ PV and PVC UID comparisons establish the current binding. The controller recheck
 
 The provider and Kubernetes observations are bounded checks. Controller locks serialize this controller's operations. External Kubernetes and OpenNebula actors can still change attachment state after the last read. Same-node physical retention does not prove an old process stopped, inspect guest mounts, revoke writer access or fence database writers. Database/operator fencing and the ordinary publish/node-stage identity checks remain necessary. Pending or terminal Pod phase alone is not proof that a disk is unmounted.
 
+## Publish after Node replacement
+
+A Publish to a replacement Kubernetes Node with the same name is a separate
+Ceph operation. On OpenNebula 7.4.0, the controller may record one pending
+attach attempt in the existing volume history after verifying the binding,
+demand, prior release, and settled provider absence. The attach template
+carries an opaque `CSI_ATTACH_ATTEMPT` value and keeps the existing device
+serial. A restarted controller can complete Publish when the sole selected
+disk carries that exact value and the original admission still matches.
+An unresolved attempt remains held across timeouts and restarts. Elapsed time
+and an idle snapshot alone cannot prove that a previously admitted request
+will never reach the provider. The attempt supplies no authority for Stage,
+retention, physical detach, or DeleteVolume.
+
 ## Validation and rollout
 
 Public CSI regressions cover both queue modes, positive retained ownership, history preservation, unknown and conflicting evidence, late identity/control changes, cancellation, explicit manual behavior, delayed old RPCs, and restart/orphan cleanup without another Unpublish request. Provider protocol tests exercise actual XML-RPC parsing and assert zero mutations for positive and denied observations.

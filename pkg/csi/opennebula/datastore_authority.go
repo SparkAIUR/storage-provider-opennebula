@@ -61,20 +61,33 @@ func selectDatastoreAuthority(rows []datastoreAuthorityXML, datastoreID int) (da
 		TMDrivers []string `xml:"TM_MAD"`
 		DiskTypes []string `xml:"DISK_TYPE"`
 		Templates []struct {
-			Types     []string `xml:"TYPE"`
-			DiskTypes []string `xml:"DISK_TYPE"`
+			Fields []struct{ XMLName xml.Name } `xml:",any"`
 		} `xml:"TEMPLATE"`
 	}
 	if err := xml.Unmarshal(data, &fields); err != nil {
 		return datastore, err
 	}
 	if len(fields.Names) > 1 || len(fields.Types) > 1 || len(fields.DSDrivers) > 1 ||
-		len(fields.TMDrivers) > 1 || len(fields.DiskTypes) > 1 || len(fields.Templates) > 1 ||
-		(len(fields.Templates) == 1 && (len(fields.Templates[0].Types) > 1 || len(fields.Templates[0].DiskTypes) > 1)) {
+		len(fields.TMDrivers) > 1 || len(fields.DiskTypes) > 1 || len(fields.Templates) > 1 {
 		return datastore, fmt.Errorf("%w: datastore %d has repeated authority fields", ErrConflictingAttachmentEvidence, datastoreID)
 	}
+	if len(fields.Templates) == 1 {
+		seen := make(map[string]bool)
+		for _, field := range fields.Templates[0].Fields {
+			name := field.XMLName.Local
+			switch name {
+			case "TYPE", cephAttrDiskType, compatibleSysDSAttr, sharedBackendAttr, cephAttrPoolName,
+				cephAttrHost, cephAttrUser, cephAttrSecret, cephAttrConf, cephAttrKey, cephAttrBridgeList,
+				cephAttrRBDFormat, cephAttrECPoolName:
+				if seen[name] {
+					return datastore, fmt.Errorf("%w: datastore %d has repeated template authority field %s", ErrConflictingAttachmentEvidence, datastoreID, name)
+				}
+				seen[name] = true
+			}
+		}
+	}
 	if err := xml.Unmarshal(data, &datastore); err != nil {
-		return datastore, err
+		return datastore, fmt.Errorf("%w: datastore %d contains invalid authority metadata", ErrConflictingAttachmentEvidence, datastoreID)
 	}
 	return datastore, nil
 }

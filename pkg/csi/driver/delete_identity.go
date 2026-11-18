@@ -91,16 +91,16 @@ func (s *ControllerServer) prepareVolumeDeletion(ctx context.Context, volume str
 	}
 	if pv != nil {
 		expectedVersion = pv.ResourceVersion
-		stage = func(ctx context.Context, actualImageID int) error {
-			if !marked && history.LastSuccessfulImageID <= 0 {
+		if !marked && history.LastSuccessfulImageID <= 0 {
+			stage = func(ctx context.Context, actualImageID int) error {
 				var err error
 				expectedVersion, raw, err = s.markPVDeletion(ctx, pv, volume, actualImageID)
 				if err != nil {
 					return err
 				}
 				marked = true
+				return verify(ctx, actualImageID)
 			}
-			return verify(ctx, actualImageID)
 		}
 	}
 	ctx = opennebula.WithVolumeDeletionAuthorization(ctx, stage, verify)

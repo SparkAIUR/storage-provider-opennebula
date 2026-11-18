@@ -99,7 +99,7 @@ func completedSelectedDiskSize(info *vm.VM, disk shared.Disk) (int64, error) {
 	return diskSizeBytesFromTemplate(disk)
 }
 
-func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, vmID, id int, size int64, vmName string) error {
+func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, vmID, diskID, id int, size int64, vmName string) error {
 	restoring := vmName != ""
 	info, err := p.readResizeImage(ctx, id, restoring)
 	if err != nil {
@@ -112,6 +112,7 @@ func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, 
 	if err != nil {
 		return err
 	}
+	completed := size
 	if existing > size {
 		size = existing
 	}
@@ -119,8 +120,24 @@ func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, 
 	if err := tpl.AddPair(requestedSizeTag, strconv.FormatInt(size, 10)); err != nil {
 		return err
 	}
-	if err := p.verifyPublishMutation(ctx, vmID, id, vmName); err != nil {
-		return err
+	if restoring {
+		err := p.verifyPublishMutation(ctx, vmID, id, vmName, func() error {
+			_, disk, err := p.observeGrowthTarget(ctx, vmID, diskID, id, vmName)
+			if err != nil {
+				return err
+			}
+			actual, err := diskSizeBytesFromTemplate(*disk)
+			if err != nil {
+				return err
+			}
+			if actual != completed {
+				return fmt.Errorf("restoration completed capacity changed before recording it")
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
 	}
 	if err := p.ctrl.Image(id).UpdateContext(ctx, tpl.String(), parameters.Merge); err != nil {
 		return err
