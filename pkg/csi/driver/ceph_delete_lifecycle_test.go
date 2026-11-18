@@ -67,7 +67,7 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 					state, running = 8, 1
 					owners = "<ID>575</ID>"
 				}
-				image := fmt.Sprintf(`<IMAGE><ID>3137</ID><NAME>%s</NAME><STATE>%d</STATE><SIZE>1024</SIZE><PERSISTENT>1</PERSISTENT><SOURCE>/ceph/retained</SOURCE><RUNNING_VMS>%d</RUNNING_VMS><VMS>%s</VMS></IMAGE>`, cephRestartVolume, state, running, owners)
+				image := fmt.Sprintf(`<IMAGE><ID>3137</ID><NAME>%s</NAME><STATE>%d</STATE><SIZE>1024</SIZE><PERSISTENT>1</PERSISTENT><SOURCE>/ceph/retained</SOURCE><RUNNING_VMS>%d</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS>%s</VMS></IMAGE>`, cephRestartVolume, state, running, owners)
 				body, code, ok := "", 0, true
 				switch call.Method {
 				case "one.imagepool.info":

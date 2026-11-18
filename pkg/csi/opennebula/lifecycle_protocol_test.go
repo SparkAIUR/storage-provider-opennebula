@@ -83,7 +83,7 @@ func TestLifecycleHistoricalForceNeverDeletes(t *testing.T) {
 		case "one.imagepool.info":
 			return true, `<IMAGE_POOL><IMAGE><ID>7</ID><NAME>volume-test</NAME></IMAGE></IMAGE_POOL>`, 0
 		case "one.image.info":
-			return true, `<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>1</STATE><SIZE>128</SIZE><SOURCE>/fixture/disk</SOURCE><TEMPLATE><FORCE_DELETE>YES</FORCE_DELETE></TEMPLATE></IMAGE>`, 0
+			return true, `<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>1</STATE><SIZE>128</SIZE><SOURCE>/fixture/disk</SOURCE><RUNNING_VMS>0</RUNNING_VMS><VMS/><CLONING_OPS>0</CLONING_OPS><TEMPLATE><FORCE_DELETE>YES</FORCE_DELETE></TEMPLATE></IMAGE>`, 0
 		default:
 			mutations++
 			return false, "unexpected mutation", 0x800
@@ -122,7 +122,7 @@ func TestLifecycleDeleteUsesPinnedIDAndNonforce(t *testing.T) {
 					return false, "not present", 0x400
 				}
 			}
-			return true, `<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>1</STATE><SIZE>128</SIZE><SOURCE>/fixture/disk</SOURCE><RUNNING_VMS>0</RUNNING_VMS></IMAGE>`, 0
+			return true, `<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>1</STATE><SIZE>128</SIZE><SOURCE>/fixture/disk</SOURCE><RUNNING_VMS>0</RUNNING_VMS><VMS/><CLONING_OPS>0</CLONING_OPS></IMAGE>`, 0
 		case "one.image.delete":
 			deleted = true
 			return true, "7", 0
@@ -228,7 +228,7 @@ func TestLifecycleExistingSnapshotDeleteWaitsAndUsesSnapshotCapacity(t *testing.
 	mutations := 0
 	snapshot := `<SNAPSHOTS><SNAPSHOT><ID>3</ID><NAME>old</NAME><SIZE>64</SIZE><DATE>1</DATE></SNAPSHOT></SNAPSHOTS>`
 	image := func(snap string) string {
-		return `<IMAGE><ID>7</ID><NAME>source</NAME><STATE>1</STATE><SIZE>256</SIZE><RUNNING_VMS>0</RUNNING_VMS>` + snap + `</IMAGE>`
+		return `<IMAGE><ID>7</ID><NAME>source</NAME><STATE>1</STATE><SIZE>256</SIZE><RUNNING_VMS>0</RUNNING_VMS><VMS/><CLONING_OPS>0</CLONING_OPS>` + snap + `</IMAGE>`
 	}
 	p := lifecycleFixture(t, func(method string) (bool, string, int) {
 		switch method {

@@ -3,7 +3,6 @@ package opennebula
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	img "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/image"
 	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/shared"
@@ -14,30 +13,53 @@ const attachAttemptField = "CSI_ATTACH_ATTEMPT"
 
 type replacementAttachKey struct{}
 
-func WithReplacementAttachAttempt(ctx context.Context, attempt string) context.Context {
-	return context.WithValue(ctx, replacementAttachKey{}, attempt)
+type ReplacementAttachDispatch struct {
+	attempt        string
+	definitelyIdle bool
+}
+
+func WithReplacementAttachAttempt(ctx context.Context, attempt string) (context.Context, *ReplacementAttachDispatch) {
+	dispatch := &ReplacementAttachDispatch{attempt: attempt}
+	return context.WithValue(ctx, replacementAttachKey{}, dispatch), dispatch
+}
+
+func (d *ReplacementAttachDispatch) DefinitelyIdle() bool {
+	return d != nil && d.definitelyIdle
 }
 
 type ReplacementAttachInspector interface {
+	VerifyReplacementRelease(context.Context, string, string, int, int, int) error
 	InspectReplacementAttach(context.Context, string, string, int, int, string) (*VolumeDiskRecord, error)
 }
 
 func (p *PersistentDiskVolumeProvider) InspectReplacementAttach(ctx context.Context, volume, node string, imageID, vmID int, attempt string) (*VolumeDiskRecord, error) {
+	version, err := p.ctrl.SystemVersionContext(ctx)
+	if err != nil || version != "7.4.0" {
+		return nil, fmt.Errorf("%w: replacement Ceph attach requires OpenNebula 7.4.0", ErrConflictingAttachmentEvidence)
+	}
+	return p.inspectReplacementAttachment(ctx, volume, node, imageID, vmID, 0, attempt)
+}
+
+func (p *PersistentDiskVolumeProvider) VerifyReplacementRelease(ctx context.Context, volume, node string, imageID, oldVMID, newVMID int) error {
+	if oldVMID <= 0 || oldVMID == newVMID {
+		return fmt.Errorf("%w: original VM identity is unverified", ErrConflictingAttachmentEvidence)
+	}
+	_, err := p.inspectReplacementAttachment(ctx, volume, node, imageID, newVMID, oldVMID, "")
+	return err
+}
+
+func (p *PersistentDiskVolumeProvider) inspectReplacementAttachment(ctx context.Context, volume, node string, imageID, vmID, oldVMID int, attempt string) (*VolumeDiskRecord, error) {
 	deny := func() (*VolumeDiskRecord, error) {
 		return nil, fmt.Errorf("%w: replacement Ceph attachment is unverified", ErrConflictingAttachmentEvidence)
 	}
-	version, err := p.ctrl.SystemVersionContext(ctx)
-	if err != nil || version != "7.4.0" {
-		return deny()
-	}
-	metadata, err := p.InspectVolumeAttachment(ctx, volume, node)
+	metadata, err := p.inspectVolumeAttachment(ctx, volume, node, oldVMID)
 	if err != nil {
 		return nil, err
 	}
 	if metadata.ImageID != imageID || metadata.RequestedNodeID != vmID {
 		return deny()
 	}
-	image, err := p.readScopedImageInfo(ctx, imageID, false, "STATE", "VMS", "RUNNING_VMS", "CLONING_OPS")
+	image, err := p.readAttachmentImageInfo(ctx, imageID)
 	if err != nil {
 		return nil, err
 	}
@@ -115,19 +137,7 @@ func (p *PersistentDiskVolumeProvider) InspectReplacementAttach(ctx context.Cont
 	size, err := completedSelectedDiskSize(info, *disk)
 	observed, recordErr := attachmentDiskRecord(info, info.Template.GetDisks(), *disk)
 	if err != nil || size <= 0 || recordErr != nil || observed != metadata.DiskRecords[0] ||
-		observed.Serial != fmt.Sprintf("onecsi-%d", imageID) || observed.Target == "" || observed.Target == "." ||
-		observed.Target == ".." || strings.ContainsAny(observed.Target, "/\\ \t\r\n") {
-		return deny()
-	}
-	targets := 0
-	for _, candidate := range info.Template.GetDisks() {
-		for _, field := range candidate.GetPairs(string(shared.TargetDisk)) {
-			if strings.TrimSpace(field.Value) == observed.Target {
-				targets++
-			}
-		}
-	}
-	if targets != 1 {
+		observed.Serial != fmt.Sprintf("onecsi-%d", imageID) {
 		return deny()
 	}
 	return &observed, ctx.Err()

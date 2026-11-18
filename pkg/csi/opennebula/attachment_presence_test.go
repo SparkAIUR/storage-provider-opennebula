@@ -3,6 +3,7 @@ package opennebula
 import (
 	"context"
 	"fmt"
+	img "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/image"
 	"github.com/stretchr/testify/require"
 	"testing"
 	"time"
@@ -11,7 +12,7 @@ import (
 func TestAttachRetryRequiresConsistentAbsence(t *testing.T) {
 	for _, scenario := range []string{"absent", "attached", "nil-metadata", "wrong-image", "wrong-vm", "missing-target", "another-vm", "image-usage", "image-vm-ids", "lookup-error"} {
 		t.Run(scenario, func(t *testing.T) {
-			metadata := &VolumeAttachmentMetadata{VolumeHandle: "volume", ImageID: 7, RequestedNodeID: 11}
+			metadata := &VolumeAttachmentMetadata{VolumeHandle: "volume", ImageID: 7, RequestedNodeID: 11, ImageStateRaw: int(img.Ready)}
 			var lookupErr error
 			switch scenario {
 			case "nil-metadata":
@@ -24,6 +25,7 @@ func TestAttachRetryRequiresConsistentAbsence(t *testing.T) {
 				metadata.AttachedToRequestedNode = true
 				metadata.DiskRecords = []VolumeDiskRecord{{NodeID: 11}}
 			case "another-vm":
+				metadata.ImageStateRaw = int(img.UsedPers)
 				metadata.DiskRecords = []VolumeDiskRecord{{NodeID: 12, Target: "sdd"}}
 				metadata.ImageVMIDs = []int{12}
 				metadata.ImageRunningVMs = 1

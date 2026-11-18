@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -15,6 +16,7 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
 )
 
 type replacementAttachAttempt struct {
@@ -33,8 +35,20 @@ type replacementAttachAttempt struct {
 }
 
 func replacementHistoryGeneration(history VolumeHistoryRecord) string {
-	history.PendingReplacementAttach = nil
-	payload, _ := json.Marshal(history)
+	payload, _ := json.Marshal(struct {
+		Version                                                                             int
+		Volume, PV, ClaimNamespace, Claim, Backend, Evidence, Node, NodeUID, Target, Serial string
+		VM, Image                                                                           int
+		Slot                                                                                *int
+		Published, Staged                                                                   time.Time
+	}{
+		Version: history.Version, Volume: history.VolumeID, PV: history.PVName, ClaimNamespace: history.PVCNamespace,
+		Claim: history.PVCName, Backend: history.Backend, Evidence: history.EvidenceSource,
+		Node: history.LastSuccessfulNodeName, NodeUID: history.LastSuccessfulNodeUID,
+		Target: history.LastSuccessfulTarget, Serial: history.LastSuccessfulDeviceSerial,
+		VM: history.LastSuccessfulOpenNebulaVMID, Image: history.LastSuccessfulImageID, Slot: history.LastSuccessfulDiskID,
+		Published: history.LastSuccessfulPublishTime, Staged: history.LastSuccessfulStageTime,
+	})
 	digest := sha256.Sum256(payload)
 	return hex.EncodeToString(digest[:])
 }
@@ -128,7 +142,15 @@ func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, req *cs
 		if !references || terminalPodMayBeReleased(pod) {
 			continue
 		}
-		if pod.DeletionTimestamp != nil || pod.UID == "" || pod.Spec.NodeName != req.NodeId || !pod.CreationTimestamp.After(node.CreationTimestamp.Time) {
+		if pod.DeletionTimestamp != nil || pod.UID == "" || pod.Spec.NodeName != req.NodeId {
+			return unavailable()
+		}
+		if start := pod.Status.StartTime; start != nil {
+			if !start.After(node.CreationTimestamp.Time) {
+				return unavailable()
+			}
+		} else if pod.Status.Phase != corev1.PodPending || len(pod.Status.ContainerStatuses) != 0 ||
+			len(pod.Status.InitContainerStatuses) != 0 || len(pod.Status.EphemeralContainerStatuses) != 0 {
 			return unavailable()
 		}
 		consumers++
@@ -188,6 +210,38 @@ func (s *ControllerServer) verifyReplacementAttempt(ctx context.Context, req *cs
 	return disk, err
 }
 
+func (s *ControllerServer) verifyDistinctVMReplacement(ctx context.Context, req *csi.ControllerPublishVolumeRequest, history VolumeHistoryRecord, binding replacementAttachAttempt) (replacementAttachAttempt, error) {
+	inspector, ok := s.volumeProvider.(opennebula.ReplacementAttachInspector)
+	if !ok || !cephHistoryHasObservedAuthority(history) || history.LastSuccessfulImageID != binding.ImageID ||
+		history.LastSuccessfulOpenNebulaVMID <= 0 || binding.VMID == history.LastSuccessfulOpenNebulaVMID {
+		return binding, attachmentEvidenceUnavailable("original Ceph attachment identity is unverified", nil)
+	}
+	if err := inspector.VerifyReplacementRelease(ctx, binding.VolumeID, binding.Node, binding.ImageID, history.LastSuccessfulOpenNebulaVMID, binding.VMID); err != nil {
+		return binding, attachmentEvidenceUnavailable("original Ceph attachment release is unverified", err)
+	}
+	current, err := s.readAttachmentHistory(ctx, binding.VolumeID)
+	if err != nil || current.PendingReplacementAttach != nil || !cephHistoryHasObservedAuthority(current) ||
+		replacementHistoryGeneration(current) != replacementHistoryGeneration(history) {
+		return binding, attachmentEvidenceUnavailable("original Ceph attachment history changed", err)
+	}
+	return s.verifyReplacementBinding(ctx, req, history, binding, -1)
+}
+
+func (s *ControllerServer) retireIdleReplacementAttach(ctx context.Context, attempt replacementAttachAttempt) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	_, err := s.driver.volumeHistory.updateHistory(ctx, attempt.VolumeID, true, func(current *VolumeHistoryRecord) error {
+		if current.PendingReplacementAttach == nil || *current.PendingReplacementAttach != attempt || !attempt.matchesHistory(*current) {
+			return fmt.Errorf("replacement Ceph attach retirement does not match current history")
+		}
+		current.PendingReplacementAttach = nil
+		return nil
+	})
+	if err != nil {
+		klog.V(2).InfoS("Could not retire idle replacement Ceph attach", "volumeID", attempt.VolumeID, "err", err)
+	}
+}
+
 func (s *ControllerServer) beginReplacementAttach(ctx context.Context, req *csi.ControllerPublishVolumeRequest, history VolumeHistoryRecord, imageID, vmID int, node KubernetesNodeIdentity) (*replacementAttachAttempt, error) {
 	inspector, ok := s.volumeProvider.(opennebula.ReplacementAttachInspector)
 	if !ok {
@@ -221,6 +275,7 @@ func (s *ControllerServer) beginReplacementAttach(ctx context.Context, req *csi.
 	}
 	observed, err := s.readAttachmentHistory(ctx, req.VolumeId)
 	if err != nil || observed.PendingReplacementAttach == nil || *observed.PendingReplacementAttach != attempt || !attempt.matchesHistory(observed) {
+		s.retireIdleReplacementAttach(ctx, attempt)
 		return nil, attachmentEvidenceUnavailable("replacement Ceph attach admission readback failed", err)
 	}
 	return &attempt, nil

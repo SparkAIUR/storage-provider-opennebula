@@ -653,6 +653,11 @@ func (s *ControllerServer) executeLocalDeviceRecovery(ctx context.Context, repor
 		volumeRelease := s.driver.operationLocks.Acquire(controllerVolumeLockKey(volumeID))
 		defer volumeRelease()
 
+		publishNode, err := s.publishNodeIdentity(queueCtx, node)
+		if err != nil || !publishNode.Exists || publishNode.UID == "" {
+			return attachmentEvidenceUnavailable("local recovery Node identity is unverified", err)
+		}
+
 		if desired, reason, err := s.driver.kubeRuntime.VolumeDesiredOnNode(queueCtx, volumeID, node); err != nil {
 			return fmt.Errorf("failed to confirm same-node desired state: %w", err)
 		} else if !desired {
@@ -718,7 +723,8 @@ func (s *ControllerServer) executeLocalDeviceRecovery(ctx context.Context, repor
 		attempt.Method = localDeviceRecoveryMethodRuntimeRepublish
 
 		attachStarted := time.Now()
-		attachCtx := s.authorizeHostArtifactAttach(queueCtx, &csi.ControllerPublishVolumeRequest{VolumeId: volumeID, NodeId: node, VolumeContext: params})
+		request := &csi.ControllerPublishVolumeRequest{VolumeId: volumeID, NodeId: node, VolumeContext: params}
+		attachCtx := s.authorizeHostArtifactAttach(s.publishMutationContext(queueCtx, request, nodeNumericID, volumeNumericID, publishNode, false), request)
 		if err := s.volumeProvider.AttachVolume(attachCtx, volumeID, node, false, params); err != nil {
 			if conflict, ok := opennebula.AsHostArtifactConflictError(err); ok {
 				return s.handleHostArtifactConflictForVolumeNode(queueCtx, volumeID, node, params, conflict)

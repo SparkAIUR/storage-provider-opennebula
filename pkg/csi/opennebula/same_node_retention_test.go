@@ -34,7 +34,7 @@ func retentionProtocolFixture(t *testing.T, modify func(*retentionProtocolCase))
 		if cfg.datastoreBackend != "" {
 			datastore = "<DATASTORE_ID>124</DATASTORE_ID>"
 		}
-		return fmt.Sprintf(`<IMAGE><ID>%d</ID><NAME>%s</NAME><STATE>%d</STATE><SIZE>%d</SIZE><PERSISTENT>%s</PERSISTENT>%s<RUNNING_VMS>1</RUNNING_VMS><VMS>%s</VMS><TEMPLATE>%s</TEMPLATE></IMAGE>`, cfg.imageID, cfg.imageName, cfg.imageState, cfg.imageSize, cfg.persistence, datastore, cfg.imageOwners, cfg.requestedSize)
+		return fmt.Sprintf(`<IMAGE><ID>%d</ID><NAME>%s</NAME><STATE>%d</STATE><SIZE>%d</SIZE><PERSISTENT>%s</PERSISTENT>%s<RUNNING_VMS>1</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS>%s</VMS><TEMPLATE>%s</TEMPLATE></IMAGE>`, cfg.imageID, cfg.imageName, cfg.imageState, cfg.imageSize, cfg.persistence, datastore, cfg.imageOwners, cfg.requestedSize)
 	}
 	disk := func() string {
 		return fmt.Sprintf(`<DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>%d</DISK_ID><TARGET>%s</TARGET><SERIAL>%s</SERIAL><SIZE>%d</SIZE>%s%s</DISK>`, cfg.diskID, cfg.target, cfg.serial, cfg.diskSize, cfg.diskFacts, cfg.resize)

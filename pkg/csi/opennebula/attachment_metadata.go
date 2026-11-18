@@ -55,7 +55,7 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 	if record.NodeID != metadata.RequestedNodeID || record.DiskID < 0 || strings.TrimSpace(record.Target) == "" || strings.TrimSpace(record.Serial) == "" {
 		return deny("VM disk identity is incomplete")
 	}
-	image, err := p.readImageInfo(ctx, metadata.ImageID)
+	image, err := p.readAttachmentImageInfo(ctx, metadata.ImageID)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
 	}
@@ -101,7 +101,7 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 	if err != nil {
 		return deny(err.Error())
 	}
-	target, targetErr := selected.Get(shared.TargetDisk)
+	target, targetErr := verifiedDiskTarget(info.Template.GetDisks(), *selected)
 	serial, serialErr := selected.Get(shared.Serial)
 	if targetErr != nil || serialErr != nil || diskID != record.DiskID || target != record.Target || serial != record.Serial {
 		return deny("fresh disk identity differs from the owner census")

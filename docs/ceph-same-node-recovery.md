@@ -37,9 +37,10 @@ demand, prior release, and settled provider absence. The attach template
 carries an opaque `CSI_ATTACH_ATTEMPT` value and keeps the existing device
 serial. A restarted controller can complete Publish when the sole selected
 disk carries that exact value and the original admission still matches.
-An unresolved attempt remains held across timeouts and restarts. Elapsed time
-and an idle snapshot alone cannot prove that a previously admitted request
-will never reach the provider. The attempt supplies no authority for Stage,
+An unresolved attempt remains held across timeouts and restarts. The controller
+can retire the matching attempt when the same operation proves it never sent
+the attach or OpenNebula definitively refused dispatch. Elapsed time and an
+idle snapshot alone cannot establish that an earlier request is out of flight. The attempt supplies no authority for Stage,
 retention, physical detach, or DeleteVolume.
 
 ## Validation and rollout
