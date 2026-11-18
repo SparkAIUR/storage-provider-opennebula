@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 )
@@ -107,6 +108,29 @@ func (attempt replacementAttachAttempt) matchesHistory(history VolumeHistoryReco
 		attempt.HistoryGeneration == replacementHistoryGeneration(history) && cephHistoryHasObservedAuthority(history)
 }
 
+func (s *ControllerServer) retireCompletedReplacement(ctx context.Context, history VolumeHistoryRecord) (bool, error) {
+	attempt := history.PendingReplacementAttach
+	if attempt == nil || !attempt.detached() || !attempt.matchesHistory(history) || attempt.Driver != s.driver.name {
+		return false, nil
+	}
+	runtime := s.driver.kubeRuntime
+	if runtime == nil || !runtime.enabled || runtime.client == nil {
+		return false, attachmentEvidenceUnavailable("completed replacement VolumeAttachment identity is unavailable", nil)
+	}
+	completion := attempt.DetachCompletion
+	va, err := runtime.client.StorageV1().VolumeAttachments().Get(ctx, completion.VAName, metav1.GetOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return false, attachmentEvidenceUnavailable("completed replacement VolumeAttachment identity is unverified", err)
+	}
+	if err == nil && (va.UID == "" || string(va.UID) == completion.VAUID) {
+		return false, nil
+	}
+	if err := s.retireVerifiedReplacement(ctx, *attempt); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *ControllerServer) replacementPublishHistory(ctx context.Context, req *csi.ControllerPublishVolumeRequest, runtimeCtx *VolumeRuntimeContext, node KubernetesNodeIdentity) (VolumeHistoryRecord, bool, error) {
 	if s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled || s.driver.volumeHistory == nil {
 		return VolumeHistoryRecord{}, false, nil
@@ -114,6 +138,16 @@ func (s *ControllerServer) replacementPublishHistory(ctx context.Context, req *c
 	history, err := s.readAttachmentHistory(ctx, req.VolumeId)
 	if err != nil {
 		return history, false, attachmentEvidenceUnavailable("publish attachment history is unverified", err)
+	}
+	retired, err := s.retireCompletedReplacement(ctx, history)
+	if err != nil {
+		return history, false, err
+	}
+	if retired {
+		history, err = s.readAttachmentHistory(ctx, req.VolumeId)
+		if err != nil {
+			return history, false, attachmentEvidenceUnavailable("publish attachment history is unverified", err)
+		}
 	}
 	if history.PendingReplacementAttach != nil {
 		return history, true, nil
@@ -362,11 +396,7 @@ func (s *ControllerServer) beginReplacementAttach(ctx context.Context, req *csi.
 		return nil
 	})
 	if err != nil {
-		if s.checkReplacementAttemptReadback(ctx, armed) == nil {
-			if _, bindingErr := s.verifyReplacementBinding(ctx, req, history, armed, -1); bindingErr == nil {
-				s.retireIdleReplacementAttach(ctx, armed)
-			}
-		}
+		s.retireIdleReplacementAttach(ctx, armed)
 		return nil, attachmentEvidenceUnavailable("replacement Ceph dispatch authorization is unverified", err)
 	}
 	if err := s.checkReplacementAttemptReadback(ctx, armed); err != nil {

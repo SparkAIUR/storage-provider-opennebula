@@ -258,15 +258,25 @@ func TestSupportBundleLocalRWOSnapshotIsReadOnly(t *testing.T) {
 				Status: storagev1.VolumeAttachmentStatus{Attached: true},
 			}
 			objects := []kruntime.Object{pv, pvc, node, held, maintenance, va}
+			var persistedHistory string
 			if tc.hasHistory {
 				record := VolumeHistoryRecord{VolumeID: "volume-test", Version: stateObjectVersion, Backend: "local",
 					LastSuccessfulNodeName: node.Name, LastSuccessfulPublishTime: time.Now().Add(-time.Hour).UTC(),
 					EvidenceSource: volumeHistoryEvidenceSourceObserved}
+				record.PendingReplacementAttach = &replacementAttachAttempt{
+					Version: 2, Phase: replacementAttachDetached, ID: strings.Repeat("a", 64),
+					Driver: DefaultDriverName, VolumeID: record.VolumeID, Node: node.Name,
+					PVUID: string(pv.UID), PVCUID: string(pvc.UID), OriginalNodeUID: string(node.UID),
+					ReplacementUID: "replacement-node", VMID: 42, ImageID: 7, OriginalVMID: 41,
+					OriginalVMName: "retired-vm", HistoryGeneration: replacementHistoryGeneration(record),
+					DetachCompletion: replacementDetachCompletion{VAName: "deleting-va", VAUID: "deleting-va-uid", DiskID: "2", Target: "vdb", Serial: "onecsi-7"},
+				}
 				data, err := json.Marshal(record)
 				require.NoError(t, err)
+				persistedHistory = string(data)
 				objects = append(objects, &corev1.ConfigMap{
 					ObjectMeta: metav1.ObjectMeta{Name: volumeHistoryStateConfigMapName, Namespace: held.Namespace},
-					Data:       map[string]string{"volume-test": string(data)},
+					Data:       map[string]string{"volume-test": persistedHistory},
 				})
 			}
 			client := fake.NewSimpleClientset(objects...)
@@ -316,6 +326,20 @@ func TestSupportBundleLocalRWOSnapshotIsReadOnly(t *testing.T) {
 			require.Contains(t, demand, "volume-test")
 			require.True(t, protection["volume-test"].Protected)
 			require.Equal(t, "node-old", protection["volume-test"].RequiredNode)
+			if tc.hasHistory {
+				var exported struct {
+					VolumeHistory      map[string]map[string]json.RawMessage
+					LastNodeProtection map[string]struct{ History map[string]json.RawMessage }
+				}
+				require.NoError(t, json.Unmarshal(output.Bytes(), &exported))
+				for _, fields := range []map[string]json.RawMessage{exported.VolumeHistory["volume-test"], exported.LastNodeProtection["volume-test"].History} {
+					require.Contains(t, fields, "lastSuccessfulNodeName")
+					require.NotContains(t, fields, "pendingReplacementAttach")
+				}
+				state, err := client.CoreV1().ConfigMaps(held.Namespace).Get(context.Background(), volumeHistoryStateConfigMapName, metav1.GetOptions{})
+				require.NoError(t, err)
+				require.Equal(t, persistedHistory, state.Data["volume-test"])
+			}
 			current, err := client.CoreV1().ConfigMaps(held.Namespace).Get(context.Background(), held.Name, metav1.GetOptions{})
 			require.NoError(t, err)
 			require.Equal(t, held.Data, current.Data)

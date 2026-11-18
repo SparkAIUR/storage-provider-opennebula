@@ -14,8 +14,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 )
 
 var errReplacementDetachPending = errors.New("replacement attachment requires verified absence and retirement")
@@ -536,30 +538,41 @@ func (s *ControllerServer) retireVerifiedReplacement(ctx context.Context, attemp
 }
 
 func (s *ControllerServer) completeVerifiedReplacementDetach(ctx context.Context, volume, node string, identity *physicalDetachIdentity) error {
-	if err := s.checkPhysicalDetachAuthority(ctx, volume, node, identity, true); err != nil {
-		return err
-	}
 	attempt := *identity.replacement
-	if len(identity.attachments) == 0 {
-		return s.retireVerifiedReplacement(ctx, attempt)
-	}
 	completed := attempt
 	completed.Phase = replacementAttachDetached
 	for name, va := range identity.attachments {
 		disk := identity.replacementDisk
 		completed.DetachCompletion = replacementDetachCompletion{VAName: name, VAUID: string(va.uid), DiskID: strconv.Itoa(disk.DiskID), Target: disk.Target, Serial: disk.Serial}
 	}
-	_, writeErr := s.driver.volumeHistory.updateHistory(ctx, volume, true, func(current *VolumeHistoryRecord) error {
-		if current.PendingReplacementAttach == nil || *current.PendingReplacementAttach != attempt || !completed.matchesHistory(*current) {
-			return fmt.Errorf("replacement attachment history changed before recording detach")
+	err := retryOnConflict(retry.DefaultRetry, func() error {
+		if err := s.checkPhysicalDetachAuthority(ctx, volume, node, identity, true); err != nil {
+			return err
 		}
-		current.PendingReplacementAttach = &completed
-		return nil
+		if len(identity.attachments) == 0 {
+			return s.retireReplacementAttach(ctx, attempt)
+		}
+		_, writeErr := s.driver.volumeHistory.updateHistory(ctx, volume, true, func(current *VolumeHistoryRecord) error {
+			if current.PendingReplacementAttach == nil || *current.PendingReplacementAttach != attempt || !completed.matchesHistory(*current) {
+				return fmt.Errorf("replacement attachment history changed before recording detach")
+			}
+			current.PendingReplacementAttach = &completed
+			return nil
+		})
+		if apierrors.IsConflict(writeErr) {
+			return writeErr
+		}
+		if err := s.checkReplacementAttemptReadback(ctx, completed); err != nil {
+			return attachmentEvidenceUnavailable("replacement detach completion is unverified", errors.Join(writeErr, err))
+		}
+		verified := *identity
+		verified.replacement = &completed
+		return s.checkPhysicalDetachAuthority(ctx, volume, node, &verified, true)
 	})
-	if err := s.checkReplacementAttemptReadback(ctx, completed); err != nil {
-		return attachmentEvidenceUnavailable("replacement detach completion is unverified", errors.Join(writeErr, err))
+	if status.Code(err) == codes.Unknown {
+		return attachmentEvidenceUnavailable("replacement detach completion is unverified", err)
 	}
-	return nil
+	return err
 }
 
 func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume, node string, identity physicalDetachIdentity) (bool, error) {

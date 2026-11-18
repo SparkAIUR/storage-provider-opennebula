@@ -4038,8 +4038,12 @@ func setReplacementHistoryVersion(t *testing.T, driver *Driver) {
 
 func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "safe-detach-updated", "unknown", "final-refusal", "write-conflict", "lost-write-reply", "readback-failed", "readback-unproven", "prepared-outage", "armed-outage", "armed-lost-ack", "competing-arm", "prepared-abandoned", "prepared-abandoned-quarantine", "prepared-abandoned-conflict", "prepared-abandoned-orphan", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
-			"distinct-vm-inflight", "same-vm-abandoned-replay", "distinct-vm-abandoned-replay", "distinct-vm-abandoned-replay-replaced-va", "distinct-vm-abandoned-replay-protection", "distinct-vm-abandoned-completion-lost-ack", "distinct-vm-abandoned", "distinct-vm-orphan", "distinct-vm-abandoned-released", "distinct-vm-abandoned-rebound", "distinct-vm-orphan-released", "distinct-vm-abandoned-wrong-marker", "distinct-vm-abandoned-consumer",
+		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "safe-detach-updated", "unknown", "final-refusal", "write-conflict", "lost-write-reply", "readback-failed", "readback-unproven", "prepared-outage", "armed-outage", "armed-lost-ack", "armed-lost-ack-canceled", "armed-lost-ack-consumer-gone", "armed-lost-ack-retire-conflict", "competing-arm", "prepared-abandoned", "prepared-abandoned-quarantine", "prepared-abandoned-conflict", "prepared-abandoned-orphan", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
+			"distinct-vm-inflight", "same-vm-abandoned-replay", "distinct-vm-abandoned-replay",
+			"same-vm-abandoned-replay-worker-pv-gone", "distinct-vm-abandoned-replay-worker-pv-replaced",
+			"same-vm-abandoned-replay-publish-pv-replaced", "distinct-vm-abandoned-replay-publish-pv-replaced",
+			"same-vm-abandoned-replay-delete-pv-gone", "distinct-vm-abandoned-replay-delete-pv-replaced",
+			"distinct-vm-abandoned-replay-completion-conflict", "distinct-vm-abandoned-replay-completion-conflict-changed-va", "distinct-vm-abandoned-replay-replaced-va", "distinct-vm-abandoned-replay-protection", "distinct-vm-abandoned-completion-lost-ack", "distinct-vm-abandoned", "distinct-vm-orphan", "distinct-vm-abandoned-released", "distinct-vm-abandoned-rebound", "distinct-vm-orphan-released", "distinct-vm-abandoned-wrong-marker", "distinct-vm-abandoned-consumer",
 			"distinct-vm-abandoned-late-uid", "distinct-vm-abandoned-late-quarantine", "distinct-vm-abandoned-terminating", "distinct-vm-abandoned-readback", "distinct-vm-abandoned-no-disk-orphan", "distinct-vm-abandoned-no-disk-stale-va", "distinct-vm-abandoned-no-disk-original-owner", "distinct-vm-abandoned-detach-reply", "distinct-vm-abandoned-retire-conflict", "phase-less", "distinct-vm-still-owned", "distinct-vm-unreadable-original", "distinct-vm-original-changed", "distinct-vm-marker-mismatch", "distinct-vm-node-changed", "distinct-vm-destination-changed", "other-version"} {
 			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
@@ -4053,13 +4057,18 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				var pendingWritten, readbackFailed, apiOutage, outageInjected, abandoned atomic.Bool
 				var detachProofs atomic.Int32
 				abandonedPreparation := strings.HasPrefix(mode, "prepared-abandoned")
-				armError := mode == "armed-outage" || mode == "armed-lost-ack" || mode == "competing-arm"
+				lostArmAck := strings.HasPrefix(mode, "armed-lost-ack")
+				armError := mode == "armed-outage" || lostArmAck || mode == "competing-arm"
+				armRetired := lostArmAck && mode != "armed-lost-ack-retire-conflict"
+				publishCtx, cancelPublish := context.WithCancel(ctx)
+				defer cancelPublish()
+				retirementWrite := make(chan struct{}, 1)
 				interruptedAdmission := mode == "prepared-outage" || armError || abandonedPreparation || mode == "concurrent-prepared"
 				orphan := strings.HasPrefix(mode, "distinct-vm-orphan")
 				replay := strings.Contains(mode, "abandoned-replay") || mode == "distinct-vm-abandoned-completion-lost-ack"
 				cleanup := strings.HasPrefix(mode, "distinct-vm-abandoned") || orphan || replay
 				lostReadback := mode == "distinct-vm-abandoned-readback" || strings.HasPrefix(mode, "distinct-vm-abandoned-no-disk")
-				interruptedCleanup := lostReadback || mode == "distinct-vm-abandoned-detach-reply" || mode == "distinct-vm-abandoned-retire-conflict"
+				interruptedCleanup := lostReadback || mode == "distinct-vm-abandoned-detach-reply"
 				var lostWriteToken, preparedToken, proposedArmToken string
 				var wire *nodeAttachmentProtocol
 				var failBeforeDispatch atomic.Bool
@@ -4195,11 +4204,26 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 									cm.ResourceVersion = "102"
 								}
 								require.NoError(t, kube.Tracker().Update(gvr, cm.DeepCopy(), cm.Namespace))
-								apiOutage.Store(mode != "armed-lost-ack" && mode != "competing-arm")
+								apiOutage.Store(!lostArmAck && mode != "competing-arm")
+								if mode == "armed-lost-ack-canceled" {
+									cancelPublish()
+								}
+								if mode == "armed-lost-ack-consumer-gone" {
+									require.NoError(t, kube.Tracker().Delete(corev1.SchemeGroupVersion.WithResource("pods"), consumer.Namespace, consumer.Name))
+								}
 								return true, nil, errors.New("committed phase update reply lost")
 							}
 						}
 						if fields["pendingReplacementAttach"] == nil {
+							if mode == "armed-lost-ack-retire-conflict" {
+								return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), cm.Name, errors.New("arming history changed before retirement"))
+							}
+							if mode == "armed-lost-ack-canceled" {
+								select {
+								case retirementWrite <- struct{}{}:
+								default:
+								}
+							}
 							return false, nil, nil
 						}
 						if mode == "write-conflict" {
@@ -4223,7 +4247,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						return false, nil, nil
 					})
 				}
-				reply, err := client.ControllerPublishVolume(ctx, publish)
+				reply, err := client.ControllerPublishVolume(publishCtx, publish)
 				if mode == "distinct-vm" {
 					require.NoError(t, err)
 					require.Equal(t, "onecsi-7", reply.GetPublishContext()[publishContextDeviceSerial])
@@ -4239,7 +4263,14 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					require.Contains(t, wire.attachDiskTemplate, `SERIAL="onecsi-7"`)
 					return
 				}
-				if mode == "pre-dispatch" {
+				if mode == "armed-lost-ack-canceled" {
+					require.Equal(t, codes.Canceled, status.Code(err))
+					select {
+					case <-retirementWrite:
+					case <-time.After(4 * time.Second):
+						t.Fatal("canceled Publish did not retire its unsent dispatch ID")
+					}
+				} else if mode == "pre-dispatch" {
 					require.Error(t, err)
 				} else {
 					require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
@@ -4255,7 +4286,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					server := NewControllerServer(driver, provider, nil)
 					stored, err := server.readAttachmentHistory(ctx, volume)
 					require.NoError(t, err)
-					if mode == "armed-lost-ack" {
+					if armRetired {
 						require.Nil(t, stored.PendingReplacementAttach)
 					} else {
 						require.NotNil(t, stored.PendingReplacementAttach)
@@ -4266,8 +4297,14 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						require.NotEmpty(t, proposedArmToken)
 						require.NotEqual(t, preparedToken, proposedArmToken)
 					}
-					driver.volumeHistory = NewVolumeHistoryManager(driver.kubeRuntime, driver.volumeHistory.namespace)
-					restarted := makeClient(driver)
+					if mode == "armed-lost-ack-consumer-gone" {
+						_, err := kube.CoreV1().Pods(pvc.Namespace).Get(ctx, consumer.Name, metav1.GetOptions{})
+						require.True(t, apierrors.IsNotFound(err))
+						return
+					}
+					fresh := newStickyTestDriver(t)
+					fresh.kubeRuntime.client = kube
+					restarted := makeClient(fresh)
 					if abandonedPreparation {
 						require.NoError(t, kube.CoreV1().Pods(pvc.Namespace).Delete(ctx, consumer.Name, metav1.DeleteOptions{}))
 						if mode == "prepared-abandoned-quarantine" {
@@ -4330,7 +4367,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					retried, err := restarted.ControllerPublishVolume(ctx, publish)
 					wire.mu.Lock()
 					defer wire.mu.Unlock()
-					if mode == "armed-outage" || mode == "competing-arm" {
+					if mode == "armed-outage" || mode == "competing-arm" || mode == "armed-lost-ack-retire-conflict" {
 						require.Error(t, err)
 						current, err := server.readAttachmentHistory(ctx, volume)
 						require.NoError(t, err)
@@ -4347,7 +4384,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						require.Equal(t, 1, wire.attachAttempts)
 						require.Equal(t, []string{"attach:41:false"}, wire.mutations)
 						require.NotEqual(t, preparedToken, wire.attachAttempt)
-						if mode == "armed-lost-ack" {
+						if armRetired {
 							require.NotEqual(t, proposedArmToken, wire.attachAttempt)
 						} else if interruptedAdmission {
 							require.Equal(t, proposedArmToken, wire.attachAttempt)
@@ -4535,20 +4572,42 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						wire.loseDetachReply = true
 						wire.mu.Unlock()
 					}
-					if mode == "distinct-vm-abandoned-retire-conflict" {
-						rejected := false
+					const otherHistory = `{"volumeID":"other-volume","version":1,"backend":"local"}`
+					conflict := mode == "distinct-vm-abandoned-retire-conflict" || strings.Contains(mode, "replay-completion-conflict")
+					vaChanged := strings.HasSuffix(mode, "completion-conflict-changed-va")
+					var conflictInjected atomic.Bool
+					if conflict {
 						kube.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
 							cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
-							if cm.Name != volumeHistoryStateConfigMapName || rejected {
+							if cm.Name != volumeHistoryStateConfigMapName {
 								return false, nil, nil
 							}
-							var current VolumeHistoryRecord
-							require.NoError(t, json.Unmarshal([]byte(cm.Data[volume]), &current))
-							if current.PendingReplacementAttach != nil {
-								return false, nil, nil
+							gvr := corev1.SchemeGroupVersion.WithResource("configmaps")
+							tracked, err := kube.Tracker().Get(gvr, cm.Namespace, cm.Name)
+							require.NoError(t, err)
+							current := tracked.(*corev1.ConfigMap).DeepCopy()
+							if conflictInjected.CompareAndSwap(false, true) {
+								var proposed VolumeHistoryRecord
+								require.NoError(t, json.Unmarshal([]byte(cm.Data[volume]), &proposed))
+								if replay {
+									require.NotNil(t, proposed.PendingReplacementAttach)
+									require.True(t, proposed.PendingReplacementAttach.detached())
+								} else {
+									require.Nil(t, proposed.PendingReplacementAttach)
+								}
+								current.Data["other-volume"] = otherHistory
+								current.ResourceVersion = "102"
+								require.NoError(t, kube.Tracker().Update(gvr, current, cm.Namespace))
+								if vaChanged {
+									newVA := replayVA.DeepCopy()
+									newVA.UID = "replacement-during-conflict"
+									require.NoError(t, kube.Tracker().Update(storagev1.SchemeGroupVersion.WithResource("volumeattachments"), newVA, ""))
+								}
 							}
-							rejected = true
-							return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), cm.Name, errors.New("retirement resource version changed"))
+							if cm.ResourceVersion != current.ResourceVersion {
+								return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), cm.Name, errors.New("stale resource version"))
+							}
+							return false, nil, nil
 						})
 					}
 					abandoned.Store(true)
@@ -4566,6 +4625,22 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						reconcile()
 					} else {
 						err = unpublish(restarted)
+					}
+					if conflict {
+						require.True(t, conflictInjected.Load())
+						cm, readErr := kube.CoreV1().ConfigMaps(driver.volumeHistory.namespace).Get(ctx, volumeHistoryStateConfigMapName, metav1.GetOptions{})
+						require.NoError(t, readErr)
+						require.Equal(t, otherHistory, cm.Data["other-volume"])
+					}
+					if vaChanged {
+						require.Error(t, err)
+						current, historyErr := NewControllerServer(driver, provider, nil).readAttachmentHistory(ctx, volume)
+						require.NoError(t, historyErr)
+						require.Equal(t, stored, current)
+						wire.mu.Lock()
+						defer wire.mu.Unlock()
+						require.Equal(t, []string{"attach:42:false", "detach:42"}, wire.mutations)
+						return
 					}
 					if replay {
 						require.NoError(t, err)
@@ -4587,8 +4662,100 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						require.Equal(t, confirmed.PendingReplacementAttach, stillDeleting.PendingReplacementAttach)
 						fresh := newStickyTestDriver(t)
 						fresh.kubeRuntime.client = kube
+						fresh.PluginConfig.OverrideVal(config.StuckAttachmentReconcilerEnabledVar, false)
 						retry := makeClient(fresh)
 						require.NoError(t, unpublish(retry))
+
+						workerRetires := strings.Contains(mode, "-worker-pv-")
+						publishRetires := strings.Contains(mode, "-publish-pv-")
+						deleteRetires := strings.Contains(mode, "-delete-pv-")
+						if workerRetires || publishRetires || deleteRetires {
+							pvs := kube.CoreV1().PersistentVolumes()
+							require.NoError(t, pvs.Delete(ctx, pv.Name, metav1.DeleteOptions{}))
+							if strings.HasSuffix(mode, "-pv-replaced") {
+								replacementPV := pv.DeepCopy()
+								replacementPV.UID = "replacement-pv"
+								if deleteRetires {
+									replacementPV.Status.Phase = corev1.VolumeReleased
+									require.NoError(t, kube.CoreV1().PersistentVolumeClaims(pvc.Namespace).Delete(ctx, pvc.Name, metav1.DeleteOptions{}))
+								}
+								_, err = pvs.Create(ctx, replacementPV, metav1.CreateOptions{})
+								require.NoError(t, err)
+							}
+							require.Error(t, unpublish(retry))
+							if publishRetires {
+								_, err = kube.CoreV1().Pods(pvc.Namespace).Create(ctx, consumer, metav1.CreateOptions{})
+								require.NoError(t, err)
+							}
+							deleteVolume := &csi.DeleteVolumeRequest{VolumeId: volume}
+							switch {
+							case workerRetires:
+								reconcile()
+							case publishRetires:
+								_, err = retry.ControllerPublishVolume(ctx, publish)
+								require.Equal(t, codes.Unavailable, status.Code(err))
+							case deleteRetires:
+								_, err = retry.DeleteVolume(ctx, deleteVolume)
+								require.Equal(t, codes.Unavailable, status.Code(err))
+							}
+							current, err := s.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.Equal(t, confirmed, current)
+							vas := kube.StorageV1().VolumeAttachments()
+							require.NoError(t, vas.Delete(ctx, replayVA.Name, metav1.DeleteOptions{}))
+							if publishRetires || deleteRetires {
+								var unavailable atomic.Bool
+								unavailable.Store(true)
+								kube.PrependReactor("get", "volumeattachments", func(action ktesting.Action) (bool, kruntime.Object, error) {
+									if unavailable.Load() && action.(ktesting.GetAction).GetName() == replayVA.Name {
+										return true, nil, errors.New("VolumeAttachment read unavailable")
+									}
+									return false, nil, nil
+								})
+								if publishRetires {
+									_, err = retry.ControllerPublishVolume(ctx, publish)
+								} else {
+									_, err = retry.DeleteVolume(ctx, deleteVolume)
+								}
+								require.Equal(t, codes.Unavailable, status.Code(err))
+								current, err := s.readAttachmentHistory(ctx, volume)
+								require.NoError(t, err)
+								require.Equal(t, confirmed, current)
+								unavailable.Store(false)
+							}
+							expected := []string{fmt.Sprintf("attach:%d:false", vmID), fmt.Sprintf("detach:%d", vmID)}
+							wire.mu.Lock()
+							require.Equal(t, expected, wire.mutations)
+							require.Contains(t, wire.attachDiskTemplate, `SERIAL="onecsi-7"`)
+							wire.loseAttachReply = false
+							wire.allowImageDelete = deleteRetires
+							wire.mu.Unlock()
+							switch {
+							case workerRetires:
+								r := NewAttachmentReconciler(NewControllerServer(fresh, provider, nil))
+								require.NoError(t, r.ReconcileOnce(ctx))
+							case publishRetires:
+								reply, err := retry.ControllerPublishVolume(ctx, publish)
+								require.NoError(t, err)
+								require.Equal(t, "onecsi-7", reply.GetPublishContext()[publishContextDeviceSerial])
+								expected = append(expected, fmt.Sprintf("attach:%d:false", vmID))
+							case deleteRetires:
+								_, err := retry.DeleteVolume(ctx, deleteVolume)
+								require.NoError(t, err)
+								expected = append(expected, "image-delete:7")
+							}
+							current, err = s.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.Nil(t, current.PendingReplacementAttach)
+							if !publishRetires {
+								confirmed.PendingReplacementAttach = nil
+								require.Equal(t, confirmed, current)
+							}
+							wire.mu.Lock()
+							defer wire.mu.Unlock()
+							require.Equal(t, expected, wire.mutations)
+							return
+						}
 						if mode == "distinct-vm-abandoned-replay-protection" {
 							_, active, err := driver.volumeQuarantine.MarkFailure(ctx, VolumeQuarantineState{VolumeID: volume, Reason: "metadata drift"}, 1, time.Hour)
 							require.NoError(t, err)
@@ -4666,12 +4833,12 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					defer wire.mu.Unlock()
 					require.Equal(t, 1, wire.attachAttempts)
 					switch mode {
-					case "distinct-vm-abandoned", "distinct-vm-orphan", "distinct-vm-abandoned-released", "distinct-vm-orphan-released":
+					case "distinct-vm-abandoned", "distinct-vm-orphan", "distinct-vm-abandoned-released", "distinct-vm-orphan-released", "distinct-vm-abandoned-retire-conflict":
 						require.NoError(t, err)
 						require.Equal(t, []string{"attach:42:false", "detach:42"}, wire.mutations)
 						require.Nil(t, current.PendingReplacementAttach)
 					case "distinct-vm-abandoned-readback", "distinct-vm-abandoned-no-disk-orphan", "distinct-vm-abandoned-no-disk-stale-va",
-						"distinct-vm-abandoned-no-disk-original-owner", "distinct-vm-abandoned-detach-reply", "distinct-vm-abandoned-retire-conflict":
+						"distinct-vm-abandoned-no-disk-original-owner", "distinct-vm-abandoned-detach-reply":
 						require.Error(t, err)
 						require.Equal(t, []string{"attach:42:false", "detach:42"}, wire.mutations)
 						require.Equal(t, stored.PendingReplacementAttach, current.PendingReplacementAttach)

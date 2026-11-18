@@ -14,7 +14,6 @@ import (
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
@@ -346,23 +345,19 @@ func (r *AttachmentReconciler) reconcileReleasedReplacementAttempts(ctx context.
 		return
 	}
 	for volume, raw := range cm.Data {
-		pv := pvs[volume]
-		if pv == nil {
-			continue
-		}
 		history, err := decodeAttachmentHistory(raw, volume)
 		if err != nil || history.PendingReplacementAttach == nil {
 			continue
 		}
 		attempt := history.PendingReplacementAttach
-		if !attempt.matchesHistory(history) || attempt.Driver != s.driver.name || attempt.PVUID != string(pv.UID) {
+		if attempt.detached() {
+			r.retireCompletedReplacement(ctx, history)
 			continue
 		}
-		switch {
-		case attempt.detached():
-			r.retireCompletedReplacement(ctx, *attempt)
-		case attempt.prepared() && len(disks[volume]) == 0 && len(vas[volume]) == 0 && !unresolved[volume] &&
-			!r.skipDiskAttachmentReconcile(ctx, volume, pv):
+		pv := pvs[volume]
+		if attempt.prepared() && attempt.matchesHistory(history) && attempt.Driver == s.driver.name &&
+			pv != nil && attempt.PVUID == string(pv.UID) && len(disks[volume]) == 0 &&
+			len(vas[volume]) == 0 && !unresolved[volume] && !r.skipDiskAttachmentReconcile(ctx, volume, pv) {
 			key := volume + "@" + attempt.Node + "@" + string(pv.UID) + "@" + attempt.ID
 			currentOrphans[key] = struct{}{}
 			if r.due(r.orphanSeen, key, now, r.orphanGrace) {
@@ -389,18 +384,14 @@ func (r *AttachmentReconciler) retireAbandonedPreparation(ctx context.Context, a
 	}
 }
 
-func (r *AttachmentReconciler) retireCompletedReplacement(ctx context.Context, attempt replacementAttachAttempt) {
+func (r *AttachmentReconciler) retireCompletedReplacement(ctx context.Context, history VolumeHistoryRecord) {
 	s := r.server
+	attempt := history.PendingReplacementAttach
 	nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(attempt.Node))
 	defer nodeRelease()
 	volumeRelease := s.driver.operationLocks.Acquire(controllerVolumeLockKey(attempt.VolumeID))
 	defer volumeRelease()
-	completion := attempt.DetachCompletion
-	va, err := s.driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(ctx, completion.VAName, metav1.GetOptions{})
-	if !apierrors.IsNotFound(err) && (err != nil || va.UID == "" || string(va.UID) == completion.VAUID) {
-		return
-	}
-	if err := s.retireVerifiedReplacement(ctx, attempt); err != nil {
+	if _, err := s.retireCompletedReplacement(ctx, history); err != nil {
 		klog.V(2).InfoS("Completed replacement retirement is unverified", "volume", attempt.VolumeID, "node", attempt.Node, "err", err)
 	}
 }

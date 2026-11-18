@@ -76,8 +76,12 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 			size.Store(128)
 			var reject atomic.Bool
 			reject.Store(true)
-			var resizes atomic.Int32
-			image := fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><RUNNING_VMS>1</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS><ID>11</ID></VMS><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, desired)
+			var resizes, metadataWrites atomic.Int32
+			var marker atomic.Int64
+			marker.Store(desired)
+			image := func() string {
+				return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><RUNNING_VMS>1</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS><ID>11</ID></VMS><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, marker.Load())
+			}
 			vmXML := func() string {
 				return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE></DISK></TEMPLATE></VM>`, size.Load())
 			}
@@ -95,11 +99,12 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 				}
 				require.NoError(t, xml.NewDecoder(r.Body).Decode(&call))
 				ok, body, code := 1, "", 0
+				number := func(i int) int { v := call.Params[i].Value; return v.Int + v.I4 + v.I8 }
 				switch call.Method {
 				case "one.image.info":
-					body = image
+					body = image()
 				case "one.imagepool.info":
-					body = "<IMAGE_POOL>" + image + "</IMAGE_POOL>"
+					body = "<IMAGE_POOL>" + image() + "</IMAGE_POOL>"
 				case "one.vmpool.info":
 					body = "<VM_POOL>" + vmXML() + "</VM_POOL>"
 				case "one.vm.info":
@@ -108,21 +113,35 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 					body = "7.4.1"
 				case "one.vm.diskresize":
 					require.Len(t, call.Params, 4)
-					number := func(i int) int { v := call.Params[i].Value; return v.Int + v.I4 + v.I8 }
 					require.Equal(t, 11, number(1))
 					require.Equal(t, 2, number(2))
-					require.Equal(t, "256", call.Params[3].Value.String)
+					sizeMiB, err := strconv.ParseInt(call.Params[3].Value.String, 10, 64)
+					require.NoError(t, err)
+					require.EqualValues(t, 256, sizeMiB)
 					resizes.Add(1)
 					if reject.Load() {
 						ok, body, code = 0, "resize unavailable", 0x800
 					} else {
-						size.Store(256)
+						size.Store(sizeMiB)
+						marker.Store(128 * 1024 * 1024)
 						body = "11"
 					}
 				case "one.image.update":
 					require.Len(t, call.Params, 4)
-					id := call.Params[1].Value
-					require.Equal(t, 7, id.Int+id.I4+id.I8)
+					require.Equal(t, 7, number(1))
+					require.Equal(t, 1, number(3))
+					key, raw, found := strings.Cut(strings.TrimSpace(call.Params[2].Value.String), "=")
+					require.True(t, found)
+					require.Equal(t, "CSI_REQUESTED_SIZE_BYTES", strings.TrimSpace(key))
+					value, err := strconv.Unquote(strings.TrimSpace(raw))
+					require.NoError(t, err)
+					bytes, err := strconv.ParseInt(value, 10, 64)
+					require.NoError(t, err)
+					require.EqualValues(t, desired, bytes)
+					require.Equal(t, bytes, size.Load()*1024*1024)
+					require.EqualValues(t, 2, resizes.Load())
+					marker.Store(bytes)
+					metadataWrites.Add(1)
 					body = "7"
 				default:
 					t.Errorf("unexpected XML-RPC method %s", call.Method)
@@ -166,15 +185,19 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 			require.Nil(t, response)
 			require.EqualValues(t, 128, size.Load())
 			require.EqualValues(t, 1, resizes.Load())
+			require.Zero(t, metadataWrites.Load())
 			reject.Store(false)
 			response, err = client.ControllerPublishVolume(ctx, req)
 			require.NoError(t, err)
 			require.Equal(t, "vdb", response.PublishContext["volumeName"])
 			require.EqualValues(t, 256, size.Load())
 			require.EqualValues(t, 2, resizes.Load())
+			require.EqualValues(t, 1, metadataWrites.Load())
+			require.EqualValues(t, desired, marker.Load())
 			_, err = client.ControllerPublishVolume(ctx, req)
 			require.NoError(t, err)
 			require.EqualValues(t, 2, resizes.Load())
+			require.EqualValues(t, 1, metadataWrites.Load())
 			provider.AssertExpectations(t)
 		})
 	}

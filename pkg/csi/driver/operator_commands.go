@@ -1251,6 +1251,10 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 	historySnapshot := map[string]VolumeHistoryRecord{}
 	if driver.volumeHistory != nil {
 		historySnapshot = driver.volumeHistory.Snapshot()
+		for volume, history := range historySnapshot {
+			history.PendingReplacementAttach = nil
+			historySnapshot[volume] = history
+		}
 	}
 	repairSnapshot := map[string]VolumeRepairState{}
 	if driver.volumeRepairState != nil {
@@ -1299,6 +1303,7 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 			}
 			continue
 		}
+		decision.History.PendingReplacementAttach = nil
 		if decision.History.VolumeID != "" {
 			historySnapshot[pv.Spec.CSI.VolumeHandle] = decision.History
 		}

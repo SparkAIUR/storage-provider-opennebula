@@ -49,7 +49,8 @@ attempt ID in the conditional update that advances it to dispatch-possible.
 Only the acknowledged winner can send the attach, after reading back the exact
 record and rechecking current authority. If that update's reply is lost, the
 same caller can retire its exact ID after independent readback because it knows
-it has sent no attach. A prepared attempt can also retire after verified
+it has sent no attach. This retirement can finish after the request is canceled
+or demand ends. A prepared attempt can also retire after verified
 abandonment and a conditional update that rules out concurrent arming.
 
 If demand disappears after dispatch, Unpublish or the reconciler can detach
@@ -61,10 +62,18 @@ Unpublish and DeleteVolume stay blocked while that attempt is unresolved.
 After a verified physical detach for a deleting VolumeAttachment, the controller
 keeps completion in the same record. A retry for the exact still-deleting
 VolumeAttachment rechecks identity, release, protection and provider absence
-before acknowledging it. The reconciler retires completion after verifying
-that the original VolumeAttachment UID is gone. Cleanup without a
-VolumeAttachment retires the record after verified detach. The original
-Publish and Stage history is preserved.
+before acknowledging it. Publish, DeleteVolume and the reconciler can retire the
+completion after verifying that the original VolumeAttachment UID is gone,
+even when its PV has disappeared or been replaced. Cleanup without a
+VolumeAttachment retires the record after verified detach. Retirement preserves
+the original Publish and Stage history.
+
+The caller that verified the physical detach can retry a conflicting history
+write after rechecking the exact attempt, binding, release authority and provider
+absence. If the history write commits and its reply is lost, independent readback
+can confirm the exact completion. If the provider detach reply is lost without
+verified proof or the controller restarts before recording completion, a later
+caller holds the unresolved attempt even when both VMs appear idle.
 
 ## Validation and rollout
 

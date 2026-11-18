@@ -57,6 +57,18 @@ func (s *ControllerServer) prepareVolumeDeletion(ctx context.Context, volume str
 	}
 	history := s.currentVolumeHistory(volume)
 	if history.PendingReplacementAttach != nil {
+		retired, err := s.retireCompletedReplacement(ctx, history)
+		if err != nil {
+			return ctx, err
+		}
+		if retired {
+			history, err = s.readAttachmentHistory(ctx, volume)
+			if err != nil {
+				return ctx, attachmentEvidenceUnavailable("deletion history is unverified", err)
+			}
+		}
+	}
+	if history.PendingReplacementAttach != nil {
 		return ctx, attachmentEvidenceUnavailable("replacement attachment holds volume deletion", nil)
 	}
 	pv, err := s.ownedDeletionPV(ctx, volume)
