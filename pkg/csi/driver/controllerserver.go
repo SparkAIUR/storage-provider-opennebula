@@ -1454,6 +1454,9 @@ func (s *ControllerServer) confirmMissingUnpublish(ctx context.Context, volume, 
 		}
 		history = current
 	}
+	if history.PendingReplacementAttach != nil {
+		return attachmentEvidenceUnavailable("replacement attachment release is unresolved", nil)
+	}
 	if history.LastSuccessfulImageID <= 0 {
 		if err := s.verifyUnpinnedVolumeAbsence(ctx, volume); err != nil {
 			return attachmentEvidenceUnavailable("missing volume ownership is unverified", err)
@@ -1521,7 +1524,7 @@ func (s *ControllerServer) confirmUnpublishAbsence(ctx context.Context, req *csi
 		}
 	}
 	if !retiredRequired {
-		if handled, err := s.finishReplacementDetachAbsence(ctx, req.VolumeId, req.NodeId, physicalDetachIdentity{imageID: imageID, vmID: vmID, diskID: -1}); handled {
+		if handled, err := s.finishVerifiedReplacementAbsence(ctx, req.VolumeId, req.NodeId, physicalDetachIdentity{imageID: imageID, vmID: vmID, diskID: -1}); handled {
 			if err != nil {
 				return nil, err
 			}
@@ -2237,7 +2240,7 @@ func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *cs
 		if decision.Evidence.OpenNebulaImageID != imageID || decision.Evidence.OpenNebulaNodeID != vmID {
 			return true, nil, attachmentEvidenceUnavailable("replacement detach provider identity changed", nil)
 		}
-		handled, err := s.finishReplacementDetachAbsence(ctx, req.VolumeId, req.NodeId, physicalDetachIdentity{imageID: imageID, vmID: vmID, diskID: -1})
+		handled, err := s.finishVerifiedReplacementAbsence(ctx, req.VolumeId, req.NodeId, physicalDetachIdentity{imageID: imageID, vmID: vmID, diskID: -1})
 		if !handled {
 			return true, nil, attachmentEvidenceUnavailable("replacement detach attempt changed", nil)
 		}

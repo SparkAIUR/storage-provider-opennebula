@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -166,19 +167,21 @@ func TestLifecycleResizeRejectsWrongStateOrIdentity(t *testing.T) {
 func TestLifecycleReattachRestoresVerifiedCapacityAndWaitsPending(t *testing.T) {
 	for _, pending := range []bool{false, true} {
 		t.Run(fmt.Sprint(pending), func(t *testing.T) {
-			desired := int64(256 * sizeConversion)
-			resized := 0
-			reads := 0
-			image := fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><RUNNING_VMS>1</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS><ID>11</ID></VMS><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, desired)
+			const desired = int64(256 * sizeConversion)
+			resized, writes, reads := 0, 0, 0
+			marker, diskSize := desired, 128
+			image := func() string {
+				return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><RUNNING_VMS>1</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS><ID>11</ID></VMS><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, marker)
+			}
 			vmXML := func(marker string, size int) string {
 				return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE>%s</DISK></TEMPLATE></VM>`, size, marker)
 			}
 			p := lifecycleFixture(t, func(method string) (bool, string, int) {
 				switch method {
 				case "one.image.info":
-					return true, image, 0
+					return true, image(), 0
 				case "one.imagepool.info":
-					return true, "<IMAGE_POOL>" + image + "</IMAGE_POOL>", 0
+					return true, "<IMAGE_POOL>" + image() + "</IMAGE_POOL>", 0
 				case "one.vmpool.info":
 					return true, "<VM_POOL>" + vmXML("", 128) + "</VM_POOL>", 0
 				case "one.vm.info":
@@ -186,10 +189,10 @@ func TestLifecycleReattachRestoresVerifiedCapacityAndWaitsPending(t *testing.T) 
 					if pending && reads <= 3 {
 						return true, vmXML("<RESIZE>YES</RESIZE><SIZE_PREV>128</SIZE_PREV>", 256), 0
 					}
-					if resized > 0 || pending {
-						return true, vmXML("", 256), 0
+					if pending {
+						diskSize = 256
 					}
-					return true, vmXML("", 128), 0
+					return true, vmXML("", diskSize), 0
 				case "one.system.version":
 					return true, "7.4.1", 0
 				case "one.vm.diskresize":
@@ -201,9 +204,52 @@ func TestLifecycleReattachRestoresVerifiedCapacityAndWaitsPending(t *testing.T) 
 					t.Errorf("unexpected %s", method)
 					return false, "unexpected", 0x800
 				}
+			}, func(method string, raw []byte) {
+				if method != "one.vm.diskresize" && method != "one.image.update" {
+					return
+				}
+				var call struct {
+					Params []struct {
+						Value struct {
+							Int  int    `xml:"int"`
+							I4   int    `xml:"i4"`
+							I8   int    `xml:"i8"`
+							Text string `xml:"string"`
+						} `xml:"value"`
+					} `xml:"params>param"`
+				}
+				require.NoError(t, xml.Unmarshal(raw, &call))
+				require.Len(t, call.Params, 4)
+				number := func(i int) int {
+					value := call.Params[i].Value
+					return value.Int + value.I4 + value.I8
+				}
+				if method == "one.vm.diskresize" {
+					require.Equal(t, 11, number(1))
+					require.Equal(t, 2, number(2))
+					size, err := strconv.Atoi(call.Params[3].Value.Text)
+					require.NoError(t, err)
+					require.Equal(t, 256, size)
+					diskSize = size
+					return
+				}
+				require.Equal(t, 7, number(1))
+				require.Equal(t, 1, number(3))
+				key, value, found := strings.Cut(strings.TrimSpace(call.Params[2].Value.Text), "=")
+				require.True(t, found)
+				require.Equal(t, "CSI_REQUESTED_SIZE_BYTES", strings.TrimSpace(key))
+				unquoted, err := strconv.Unquote(strings.TrimSpace(value))
+				require.NoError(t, err)
+				capacity, err := strconv.ParseInt(unquoted, 10, 64)
+				require.NoError(t, err)
+				require.Equal(t, desired, capacity)
+				require.EqualValues(t, capacity, int64(diskSize)*sizeConversion)
+				marker = capacity
+				writes++
 			})
 			require.NoError(t, p.RestoreVolumeCapacity(context.Background(), "volume-test", 11, 7))
 			require.GreaterOrEqual(t, reads, 3)
+			require.Equal(t, 1, writes)
 			if pending {
 				require.Zero(t, resized)
 			} else {

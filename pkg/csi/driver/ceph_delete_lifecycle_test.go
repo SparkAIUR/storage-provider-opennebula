@@ -53,9 +53,10 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 					Method string `xml:"methodName"`
 					Params []struct {
 						Value struct {
-							Int int `xml:"int"`
-							I4  int `xml:"i4"`
-							I8  int `xml:"i8"`
+							Int   int   `xml:"int"`
+							I4    int   `xml:"i4"`
+							I8    int   `xml:"i8"`
+							Force *bool `xml:"boolean"`
 						} `xml:"value"`
 					} `xml:"params>param"`
 				}
@@ -117,6 +118,11 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 						body = `<VM><ID>575</ID><NAME>node-a</NAME><TEMPLATE/></VM>`
 					}
 				case "one.image.delete":
+					require.Len(t, call.Params, 3)
+					id := call.Params[1].Value
+					require.Equal(t, 3137, id.Int+id.I4+id.I8)
+					require.NotNil(t, call.Params[2].Value.Force)
+					require.False(t, *call.Params[2].Value.Force)
 					deletes.Add(1)
 					deleted.Store(true)
 					body = "3137"
@@ -325,7 +331,7 @@ func testUnpinnedDeleteRetryAfterLostReplyUsesPVIdentity(t *testing.T, imageID i
 }
 
 func TestControllerDeleteVolumeRefreshesPinnedAdmission(t *testing.T) {
-	for _, mode := range []string{"read-only-success", "before-rpc", "after-rpc", "already-missing"} {
+	for _, mode := range []string{"read-only-success", "before-rpc", "pending-before-rpc", "after-rpc", "already-missing"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			const volume = "volume-test"
@@ -344,9 +350,16 @@ func TestControllerDeleteVolumeRefreshesPinnedAdmission(t *testing.T) {
 				patches.Add(1)
 				return true, nil, fmt.Errorf("PV patch denied")
 			})
-			injectAt := map[string]int32{"before-rpc": 1, "after-rpc": 2, "already-missing": 1}[mode]
+			injectAt := map[string]int32{"before-rpc": 1, "pending-before-rpc": 1, "after-rpc": 2, "already-missing": 1}[mode]
 			provider, wire := nodeAttachmentProvider(t, func(method string, ctx context.Context) {
 				if method == "one.vmpool.info" && censusReads.Add(1) == injectAt {
+					if mode == "pending-before-rpc" {
+						_, err := driver.volumeHistory.Upsert(ctx, volume, func(history *VolumeHistoryRecord) {
+							history.PendingReplacementAttach = &replacementAttachAttempt{Version: 2, Phase: replacementAttachArmed}
+						})
+						require.NoError(t, err)
+						return
+					}
 					_, active, err := driver.volumeQuarantine.MarkFailure(ctx, VolumeQuarantineState{VolumeID: volume, Reason: "ownership drift"}, 1, time.Hour)
 					require.NoError(t, err)
 					require.True(t, active)

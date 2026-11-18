@@ -44,22 +44,27 @@ before dispatch and again before completing Publish. The attach template
 carries an opaque `CSI_ATTACH_ATTEMPT` value and keeps the existing device
 serial. A restarted controller can complete Publish when the sole selected
 disk carries that exact value and the original admission still matches.
-A prepared attempt can be resumed after a restart. Only the caller that
-successfully advances it to dispatch-possible with an exact conditional update
-and reads it back may send the attach. Once dispatch is possible, the controller
-holds an unresolved attempt across timeouts and restarts. The same operation
-can retire it with proof that it never sent the attach or that OpenNebula
-definitively refused dispatch. Elapsed time and an idle snapshot alone cannot
-establish that an earlier request is out of flight.
+A prepared attempt can resume after a restart. Each caller proposes a new
+attempt ID in the conditional update that advances it to dispatch-possible.
+Only the acknowledged winner can send the attach, after reading back the exact
+record and rechecking current authority. If that update's reply is lost, the
+same caller can retire its exact ID after independent readback because it knows
+it has sent no attach. A prepared attempt can also retire after verified
+abandonment and a conditional update that rules out concurrent arming.
 
-If demand disappears, ordinary Unpublish or reconciler cleanup can detach the
-abandoned disk after verifying its exact marker and current release. An owned
-Released PV can use its original claim reference even after that claim is gone.
-A retry can retire the matching attempt without another detach after independently
-verifying settled absence on both pinned VMs and current release. The reconciler
-can do this after restart when no VolumeAttachment remains. The original Publish
-history is preserved. The attempt supplies no authority for Stage, retention,
-or DeleteVolume.
+If demand disappears after dispatch, Unpublish or the reconciler can detach
+only the exact marked disk after verifying current release. An owned Released
+PV can use its original claim reference after the claim is gone. Idle snapshots
+alone do not prove that a possibly sent attach cannot still take effect.
+Unpublish and DeleteVolume stay blocked while that attempt is unresolved.
+
+After a verified physical detach for a deleting VolumeAttachment, the controller
+keeps completion in the same record. A retry for the exact still-deleting
+VolumeAttachment rechecks identity, release, protection and provider absence
+before acknowledging it. The reconciler retires completion after verifying
+that the original VolumeAttachment UID is gone. Cleanup without a
+VolumeAttachment retires the record after verified detach. The original
+Publish and Stage history is preserved.
 
 ## Validation and rollout
 

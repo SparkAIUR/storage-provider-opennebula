@@ -56,6 +56,9 @@ func (s *ControllerServer) prepareVolumeDeletion(ctx context.Context, volume str
 		}
 	}
 	history := s.currentVolumeHistory(volume)
+	if history.PendingReplacementAttach != nil {
+		return ctx, attachmentEvidenceUnavailable("replacement attachment holds volume deletion", nil)
+	}
 	pv, err := s.ownedDeletionPV(ctx, volume)
 	if err != nil {
 		return ctx, attachmentEvidenceUnavailable("deletion PV identity is unverified", err)
@@ -180,7 +183,7 @@ func (s *ControllerServer) verifyPVDeletion(ctx context.Context, pv *corev1.Pers
 		if err != nil {
 			return err
 		}
-		if currentHistory.LastSuccessfulImageID != history.LastSuccessfulImageID ||
+		if currentHistory.PendingReplacementAttach != nil || currentHistory.LastSuccessfulImageID != history.LastSuccessfulImageID ||
 			currentHistory.LastSuccessfulOpenNebulaVMID != history.LastSuccessfulOpenNebulaVMID ||
 			currentHistory.LastSuccessfulNodeName != history.LastSuccessfulNodeName ||
 			currentHistory.LastSuccessfulNodeUID != history.LastSuccessfulNodeUID {

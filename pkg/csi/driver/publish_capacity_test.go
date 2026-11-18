@@ -120,6 +120,9 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 						body = "11"
 					}
 				case "one.image.update":
+					require.Len(t, call.Params, 4)
+					id := call.Params[1].Value
+					require.Equal(t, 7, id.Int+id.I4+id.I8)
 					body = "7"
 				default:
 					t.Errorf("unexpected XML-RPC method %s", call.Method)

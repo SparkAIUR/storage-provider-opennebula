@@ -310,8 +310,23 @@ func (m *VolumeHistoryManager) Clear(ctx context.Context, volumeID string) error
 	}
 	defer release()
 	if m.runtime != nil && m.runtime.enabled {
-		if err := m.runtime.DeleteConfigMapKey(ctx, m.namespace, volumeHistoryStateConfigMapName, volumeID); err != nil {
+		cm, err := m.runtime.GetConfigMap(ctx, m.namespace, volumeHistoryStateConfigMapName)
+		if err != nil && !errors.IsNotFound(err) {
 			return err
+		}
+		if err == nil {
+			if raw, present := cm.Data[volumeID]; present {
+				history, err := decodeAttachmentHistory(raw, volumeID)
+				if err != nil {
+					return err
+				}
+				if history.PendingReplacementAttach != nil {
+					return fmt.Errorf("replacement attachment holds volume history")
+				}
+				if err := m.runtime.deleteConfigMapKeyIfCurrent(ctx, cm, volumeID, raw); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	m.mu.Lock()

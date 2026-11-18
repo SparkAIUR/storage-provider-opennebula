@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
@@ -22,24 +23,34 @@ import (
 const (
 	replacementAttachPrepared = "prepared"
 	replacementAttachArmed    = "dispatch-possible"
+	replacementAttachDetached = "detach-completed"
 )
 
+type replacementDetachCompletion struct {
+	VAName string `json:"vaName"`
+	VAUID  string `json:"vaUID"`
+	DiskID string `json:"diskID"`
+	Target string `json:"target"`
+	Serial string `json:"serial"`
+}
+
 type replacementAttachAttempt struct {
-	Version           int    `json:"version"`
-	Phase             string `json:"phase,omitempty"`
-	ID                string `json:"id"`
-	PVUID             string `json:"pvUID"`
-	PVCUID            string `json:"pvcUID"`
-	Driver            string `json:"driver"`
-	VolumeID          string `json:"volumeID"`
-	Node              string `json:"node"`
-	OriginalNodeUID   string `json:"originalNodeUID"`
-	ReplacementUID    string `json:"replacementUID"`
-	HistoryGeneration string `json:"historyGeneration"`
-	ImageID           int    `json:"imageID"`
-	VMID              int    `json:"vmID"`
-	OriginalVMID      int    `json:"originalVMID,omitempty"`
-	OriginalVMName    string `json:"originalVMName,omitempty"`
+	Version           int                         `json:"version"`
+	Phase             string                      `json:"phase,omitempty"`
+	ID                string                      `json:"id"`
+	PVUID             string                      `json:"pvUID"`
+	PVCUID            string                      `json:"pvcUID"`
+	Driver            string                      `json:"driver"`
+	VolumeID          string                      `json:"volumeID"`
+	Node              string                      `json:"node"`
+	OriginalNodeUID   string                      `json:"originalNodeUID"`
+	ReplacementUID    string                      `json:"replacementUID"`
+	HistoryGeneration string                      `json:"historyGeneration"`
+	ImageID           int                         `json:"imageID"`
+	VMID              int                         `json:"vmID"`
+	OriginalVMID      int                         `json:"originalVMID,omitempty"`
+	OriginalVMName    string                      `json:"originalVMName,omitempty"`
+	DetachCompletion  replacementDetachCompletion `json:"detachCompletion,omitzero"`
 }
 
 func replacementHistoryGeneration(history VolumeHistoryRecord) string {
@@ -69,6 +80,10 @@ func (attempt replacementAttachAttempt) dispatchPossible() bool {
 	return attempt.Version == 2 && attempt.Phase == replacementAttachArmed
 }
 
+func (attempt replacementAttachAttempt) detached() bool {
+	return attempt.Version == 2 && attempt.Phase == replacementAttachDetached
+}
+
 func (attempt replacementAttachAttempt) matchesHistory(history VolumeHistoryRecord) bool {
 	originalVM := attempt.VMID
 	if attempt.OriginalVMID != 0 || attempt.OriginalVMName != "" {
@@ -77,8 +92,13 @@ func (attempt replacementAttachAttempt) matchesHistory(history VolumeHistoryReco
 		}
 		originalVM = attempt.OriginalVMID
 	}
+	completion := attempt.DetachCompletion
+	diskID, diskErr := strconv.Atoi(completion.DiskID)
+	validPhase := (attempt.prepared() || attempt.dispatchPossible()) && completion == (replacementDetachCompletion{}) ||
+		attempt.detached() && completion.VAName != "" && completion.VAUID != "" && diskErr == nil && diskID >= 0 &&
+			completion.Target != "" && completion.Serial == fmt.Sprintf("onecsi-%d", attempt.ImageID)
 	token, err := hex.DecodeString(attempt.ID)
-	return err == nil && len(token) == 32 && (attempt.prepared() || attempt.dispatchPossible()) && attempt.PVUID != "" && attempt.PVCUID != "" &&
+	return err == nil && len(token) == 32 && validPhase && attempt.PVUID != "" && attempt.PVCUID != "" &&
 		attempt.Driver != "" && attempt.VolumeID == history.VolumeID && attempt.Node != "" &&
 		attempt.Node == history.LastSuccessfulNodeName && attempt.OriginalNodeUID != "" && attempt.ReplacementUID != "" &&
 		attempt.OriginalNodeUID != attempt.ReplacementUID && attempt.OriginalNodeUID == history.LastSuccessfulNodeUID &&
@@ -329,6 +349,11 @@ func (s *ControllerServer) beginReplacementAttach(ctx context.Context, req *csi.
 	}
 	armed := attempt
 	armed.Phase = replacementAttachArmed
+	token := make([]byte, 32)
+	if _, err := rand.Read(token); err != nil {
+		return nil, attachmentEvidenceUnavailable("replacement Ceph dispatch identifier is unavailable", err)
+	}
+	armed.ID = hex.EncodeToString(token)
 	_, err = s.driver.volumeHistory.updateHistory(ctx, req.VolumeId, true, func(current *VolumeHistoryRecord) error {
 		if current.PendingReplacementAttach == nil || *current.PendingReplacementAttach != attempt || !attempt.matchesHistory(*current) {
 			return fmt.Errorf("prepared replacement Ceph attach changed")
@@ -337,6 +362,11 @@ func (s *ControllerServer) beginReplacementAttach(ctx context.Context, req *csi.
 		return nil
 	})
 	if err != nil {
+		if s.checkReplacementAttemptReadback(ctx, armed) == nil {
+			if _, bindingErr := s.verifyReplacementBinding(ctx, req, history, armed, -1); bindingErr == nil {
+				s.retireIdleReplacementAttach(ctx, armed)
+			}
+		}
 		return nil, attachmentEvidenceUnavailable("replacement Ceph dispatch authorization is unverified", err)
 	}
 	if err := s.checkReplacementAttemptReadback(ctx, armed); err != nil {
