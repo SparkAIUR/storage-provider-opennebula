@@ -84,7 +84,7 @@ func resolveNodeVM(ctx context.Context, ctrl *goca.Controller, nodeName string) 
 	if ctrl == nil {
 		return -1, "", VMResolutionNotFound, errors.New("opennebula controller is nil")
 	}
-	observations, err := readVMAuthorityPool(ctx, ctrl)
+	observations, err := readVMPool(ctx, ctrl, false)
 	if err != nil {
 		return -1, "", VMResolutionNotFound, fmt.Errorf("failed to list OpenNebula VMs: %w", err)
 	}
@@ -199,8 +199,12 @@ func (raw vmAuthorityXML) attachmentImages() ([]int, bool) {
 	return ids, len(raw.Templates) != 0
 }
 
-func readVMAuthorityPool(ctx context.Context, ctrl *goca.Controller) ([]vmAuthorityXML, error) {
-	response, err := ctrl.Client.VMPoolInfo(ctx, parameters.PoolWhoAll, -1, -1, -1, "")
+func readVMPool(ctx context.Context, ctrl *goca.Controller, extended bool) ([]vmAuthorityXML, error) {
+	read := ctrl.Client.VMPoolInfo
+	if extended {
+		read = ctrl.Client.VMPoolInfoExtended
+	}
+	response, err := read(ctx, parameters.PoolWhoAll, -1, -1, -1, "")
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
 	}
@@ -216,7 +220,7 @@ func readVMAuthorityPool(ctx context.Context, ctrl *goca.Controller) ([]vmAuthor
 }
 
 func (p *PersistentDiskVolumeProvider) readAttachmentVMs(ctx context.Context, imageID int, vmIDs ...int) ([]vmSchema.VM, error) {
-	rows, err := readVMAuthorityPool(ctx, p.ctrl)
+	rows, err := readVMPool(ctx, p.ctrl, true)
 	if err != nil {
 		return nil, err
 	}

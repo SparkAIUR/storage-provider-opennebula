@@ -57,22 +57,26 @@ abandonment and a conditional update that rules out concurrent arming.
 If the marked attach takes effect and its reply is lost, a new waiting Pod
 on the admitted replacement Node can coexist with logical deletion of the
 exact pinned VolumeAttachment. After that attachment UID is gone, the same
-recovery can acknowledge the sole verified successor if it enters deletion.
+recovery can acknowledge the sole verified successor under the same name if
+it enters deletion.
 The controller rechecks the binding, demand
 and protections and observes the sole marked disk twice, including its serial,
 slot and completed capacity. This acknowledgement leaves the disk, pending
 attempt and successful history intact. Once the pinned attachment UID is gone,
 Publish can complete against an eligible owned successor on that Node after
 rechecking the same disk and current authority. If controller expansion has
-finished and the device matches the PV capacity, Publish can also proceed
-while kubelet is still waiting to resize the filesystem. Logical deletion
-continues to require completed capacity on the claim and device. Only verified
-Publish advances the successful attachment history. These recovery steps
+finished and the device matches the PV capacity, marked retention and successor
+Publish can proceed while kubelet is still waiting to resize the filesystem.
+Ordinary same-node retention still requires completed claim and device capacity.
+Only verified Publish advances the successful attachment history. These recovery steps
 leave provider state unchanged.
 [Kubernetes filesystem expansion](https://v1-35.docs.kubernetes.io/docs/concepts/storage/persistent-volumes/#resizing-a-volume-containing-a-file-system)
 
 If demand disappears after dispatch, Unpublish or the reconciler can detach
-only the exact marked disk after verifying current release. An owned Released
+only the exact marked disk after verifying current release. After the local
+attachment has retired, the reconciler can also release that disk for a single
+verified remote destination. Any destination attachment remains under its own
+Publish lifecycle. An owned Released
 PV can use its original claim reference after the claim is gone, including when
 a different claim UID has reused the name and is verifiably bound to another PV.
 Idle snapshots alone do not prove that a possibly sent attach cannot still take effect.

@@ -105,7 +105,7 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 					body = image()
 				case "one.imagepool.info":
 					body = "<IMAGE_POOL>" + image() + "</IMAGE_POOL>"
-				case "one.vmpool.info":
+				case "one.vmpool.info", "one.vmpool.infoextended":
 					body = "<VM_POOL>" + vmXML() + "</VM_POOL>"
 				case "one.vm.info":
 					body = vmXML()
@@ -271,7 +271,7 @@ func TestControllerPublishAndExpandSerializeVerifiedCapacity(t *testing.T) {
 						body = imageXML()
 					case "one.imagepool.info":
 						body = "<IMAGE_POOL>" + imageXML() + "</IMAGE_POOL>"
-					case "one.vmpool.info":
+					case "one.vmpool.info", "one.vmpool.infoextended":
 						body = "<VM_POOL>" + vmXML() + "</VM_POOL>"
 					case "one.vm.info":
 						body = vmXML()
@@ -429,7 +429,7 @@ func TestControllerProviderGrowthCompatibilityFailedPrecondition(t *testing.T) {
 						body = "<IMAGE_POOL>" + image + "</IMAGE_POOL>"
 					case "one.image.info":
 						body = image
-					case "one.vmpool.info":
+					case "one.vmpool.info", "one.vmpool.infoextended":
 						body = "<VM_POOL>" + vmXML + "</VM_POOL>"
 					case "one.vm.info":
 						body = vmXML

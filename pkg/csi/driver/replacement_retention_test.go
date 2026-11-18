@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -23,7 +24,7 @@ import (
 func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 	for _, queued := range []bool{false, true} {
 		for _, distinctVM := range []bool{false, true} {
-			for _, mode := range []string{"retained", "successor-deleted", "successor-expanded", "released-reused", "released-reused-no-va", "released-rebound", "released-unbound", "released-old-pod"} {
+			for _, mode := range []string{"retained", "successor-deleted", "successor-expanded", "remote-reschedule", "released-reused", "released-reused-no-va", "released-rebound", "released-unbound", "released-old-pod"} {
 				t.Run(fmt.Sprintf("queued=%t/distinctVM=%t/%s", queued, distinctVM, mode), func(t *testing.T) {
 					ctx := context.Background()
 					const volume = "volume-test"
@@ -178,6 +179,106 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 						return
 					}
 
+					if mode == "remote-reschedule" {
+						const remoteVM = 43
+						remote := newReadyNode("remote-node", true)
+						remote.UID = "remote-node-uid"
+						remote.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Minute))
+						_, err = nodes.Create(ctx, remote, metav1.CreateOptions{})
+						require.NoError(t, err)
+						demand := activePodForPVC("remote-consumer", pvc.Name, remote.Name)
+						demand.UID = "remote-consumer-uid"
+						demand.Status.Phase = corev1.PodPending
+						_, err = pods.Create(ctx, demand, metav1.CreateOptions{})
+						require.NoError(t, err)
+						wire.mu.Lock()
+						if wire.vmNames == nil {
+							wire.vmNames = make(map[int]string)
+						}
+						wire.vmNames[remoteVM] = remote.Name
+						wire.mu.Unlock()
+						remoteVA := replacementPublishVA(pv, remote)
+						remoteVA.Name = fmt.Sprintf("csi-%x", sha256.Sum256([]byte(volume+DefaultDriverName+remote.Name)))
+						remoteVA.UID = "remote-va-uid"
+						reconciler := NewAttachmentReconciler(server)
+						reconciler.orphanGrace = 0
+						reconcile := func() {
+							t.Helper()
+							require.NoError(t, reconciler.ReconcileOnce(ctx))
+							require.NoError(t, reconciler.ReconcileOnce(ctx))
+						}
+						reconcile()
+						assertWire(false)
+						require.NoError(t, vas.Delete(ctx, va.Name, metav1.DeleteOptions{}))
+						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+						require.Error(t, err, "foreground Unpublish cannot use the remote demand exception")
+						assertWire(false)
+
+						invalid := remoteVA.DeepCopy()
+						invalid.Status.Attached = true
+						_, err = vas.Create(ctx, invalid, metav1.CreateOptions{})
+						require.NoError(t, err)
+						reconcile()
+						assertWire(false)
+						invalid.Status.Attached = false
+						now := metav1.Now()
+						invalid.DeletionTimestamp = &now
+						_, err = vas.Update(ctx, invalid, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						reconcile()
+						assertWire(false)
+						require.NoError(t, vas.Delete(ctx, remoteVA.Name, metav1.DeleteOptions{}))
+
+						blocking := activePodForPVC("releasing-local-consumer", pvc.Name, node.Name)
+						blocking.UID = "releasing-local-uid"
+						blocking.DeletionTimestamp = &now
+						_, err = pods.Create(ctx, blocking, metav1.CreateOptions{})
+						require.NoError(t, err)
+						reconcile()
+						assertWire(false)
+						require.NoError(t, pods.Delete(ctx, blocking.Name, metav1.DeleteOptions{}))
+
+						if distinctVM {
+							_, err = vas.Create(ctx, remoteVA, metav1.CreateOptions{})
+							require.NoError(t, err)
+						}
+						wire.mu.Lock()
+						nonce := wire.attachAttempt
+						wire.attachAttempt = ""
+						wire.mu.Unlock()
+						reconcile()
+						assertWire(false)
+						wire.mu.Lock()
+						wire.attachAttempt = nonce
+						wire.mu.Unlock()
+
+						reconcile()
+						assertWire(true)
+						current, err := server.readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.Nil(t, current.PendingReplacementAttach)
+						require.Equal(t, before.LastSuccessfulNodeUID, current.LastSuccessfulNodeUID)
+						if distinctVM {
+							currentVA, err := vas.Get(ctx, remoteVA.Name, metav1.GetOptions{})
+							require.NoError(t, err)
+							require.Equal(t, remoteVA, currentVA)
+						} else {
+							_, err = vas.Create(ctx, remoteVA, metav1.CreateOptions{})
+							require.NoError(t, err)
+						}
+						wire.mu.Lock()
+						wire.loseAttachReply = false
+						wire.expectedAttachNonce = nil
+						wire.mu.Unlock()
+						reply, err := client.ControllerPublishVolume(ctx, newPublishReq(volume, remote.Name))
+						require.NoError(t, err)
+						require.Equal(t, "vdb", reply.GetPublishContext()["volumeName"])
+						wire.mu.Lock()
+						defer wire.mu.Unlock()
+						require.Equal(t, []string{fmt.Sprintf("attach:%d:false", target), fmt.Sprintf("detach:%d", target), "attach:43:false"}, wire.mutations)
+						return
+					}
+
 					waiting := activePodForPVC("waiting-consumer", pvc.Name, node.Name)
 					waiting.UID, waiting.Status.Phase, waiting.CreationTimestamp = "waiting-consumer-uid", corev1.PodPending, metav1.Now()
 					waiting.Spec.Containers = []corev1.Container{{Name: "app", Image: "app"}}
@@ -241,12 +342,18 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 					_, err = client.ControllerPublishVolume(ctx, publish)
 					require.Error(t, err, "the original pinned VA has not retired")
 					require.NoError(t, vas.Delete(ctx, va.Name, metav1.DeleteOptions{}))
-					if !distinctVM {
-						require.NoError(t, vas.Delete(ctx, successor.Name, metav1.DeleteOptions{}))
-						successor.Name = va.Name
-						_, err = vas.Create(ctx, successor, metav1.CreateOptions{})
-						require.NoError(t, err)
-					}
+					_, err = client.ControllerPublishVolume(ctx, publish)
+					require.Error(t, err, "the successor must reuse the pinned name")
+					now = metav1.Now()
+					successor.DeletionTimestamp = &now
+					_, err = vas.Update(ctx, successor, metav1.UpdateOptions{})
+					require.NoError(t, err)
+					_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+					require.Error(t, err, "a differently named deleting object cannot use the pinned attempt")
+					require.NoError(t, vas.Delete(ctx, successor.Name, metav1.DeleteOptions{}))
+					successor.Name, successor.DeletionTimestamp = va.Name, nil
+					_, err = vas.Create(ctx, successor, metav1.CreateOptions{})
+					require.NoError(t, err)
 					_, err = client.ControllerUnpublishVolume(ctx, unpublish)
 					require.Error(t, err, "a delayed Unpublish cannot acknowledge the successor")
 					if mode == "successor-deleted" {
@@ -383,6 +490,33 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 						block.VolumeCapability.AccessType = &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}}
 						_, err = client.ControllerPublishVolume(ctx, block)
 						require.Error(t, err, "a raw block request cannot use filesystem resize evidence")
+						now := metav1.Now()
+						successor.DeletionTimestamp = &now
+						_, err = vas.Update(ctx, successor, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						wire.mu.Lock()
+						wire.pending = true
+						wire.mu.Unlock()
+						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+						require.Error(t, err, "retention still requires a settled provider device")
+						wire.mu.Lock()
+						wire.pending = false
+						wire.mu.Unlock()
+						blockMode := corev1.PersistentVolumeBlock
+						pvc.Spec.VolumeMode = &blockMode
+						_, err = claims.Update(ctx, pvc, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+						require.Error(t, err, "retention cannot use filesystem resize evidence for a block claim")
+						pvc.Spec.VolumeMode = nil
+						_, err = claims.Update(ctx, pvc, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+						require.NoError(t, err)
+						require.NoError(t, vas.Delete(ctx, successor.Name, metav1.DeleteOptions{}))
+						successor.UID, successor.DeletionTimestamp = "post-expansion-uid", nil
+						_, err = vas.Create(ctx, successor, metav1.CreateOptions{})
+						require.NoError(t, err)
 						current, err := server.readAttachmentHistory(ctx, volume)
 						require.NoError(t, err)
 						require.Equal(t, lost, current)

@@ -114,7 +114,7 @@ func TestLifecycleDeleteUsesPinnedIDAndNonforce(t *testing.T) {
 				return true, "<IMAGE_POOL/>", 0
 			}
 			return true, `<IMAGE_POOL><IMAGE><ID>7</ID><NAME>volume-test</NAME></IMAGE></IMAGE_POOL>`, 0
-		case "one.vmpool.info":
+		case "one.vmpool.info", "one.vmpool.infoextended":
 			return true, `<VM_POOL/>`, 0
 		case "one.image.info":
 			if deleted {
@@ -182,7 +182,7 @@ func TestLifecycleReattachRestoresVerifiedCapacityAndWaitsPending(t *testing.T) 
 					return true, image(), 0
 				case "one.imagepool.info":
 					return true, "<IMAGE_POOL>" + image() + "</IMAGE_POOL>", 0
-				case "one.vmpool.info":
+				case "one.vmpool.info", "one.vmpool.infoextended":
 					return true, "<VM_POOL>" + vmXML("", 128) + "</VM_POOL>", 0
 				case "one.vm.info":
 					reads++
@@ -288,7 +288,7 @@ func TestLifecycleExistingSnapshotDeleteWaitsAndUsesSnapshotCapacity(t *testing.
 			return true, image(snapshot), 0
 		case "one.imagepool.info":
 			return true, "<IMAGE_POOL>" + image(snapshot) + "</IMAGE_POOL>", 0
-		case "one.vmpool.info":
+		case "one.vmpool.info", "one.vmpool.infoextended":
 			return true, "<VM_POOL/>", 0
 		case "one.image.snapshotdelete":
 			deleted = true

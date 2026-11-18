@@ -55,6 +55,8 @@ func retentionProtocolFixture(t *testing.T, modify func(*retentionProtocolCase))
 		case "one.image.info":
 			return true, image(), 0
 		case "one.vmpool.info":
+			return true, fmt.Sprintf(`<VM_POOL><VM><ID>%d</ID><NAME>node-test</NAME><TEMPLATE><DISK><DISK_ID>%d</DISK_ID><IMAGE_ID>7</IMAGE_ID><SIZE>%d</SIZE></DISK></TEMPLATE></VM></VM_POOL>`, cfg.vmID, cfg.diskID, cfg.diskSize), 0
+		case "one.vmpool.infoextended":
 			return true, "<VM_POOL>" + vmXML() + cfg.extraVM + "</VM_POOL>", 0
 		case "one.vm.info":
 			return true, vmXML(), 0
@@ -105,6 +107,13 @@ func TestSameNodeRetentionRejectsUncertainOrUnsafeEvidence(t *testing.T) {
 		"duplicate datastore ID":  func(c *retentionProtocolCase) { c.duplicateDatastore = true },
 		"unstable image":          func(c *retentionProtocolCase) { c.imageState = 9 },
 		"image capacity overflow": func(c *retentionProtocolCase) { c.imageSize = 1 << 50 },
+		"extended census disagrees with name discovery": func(c *retentionProtocolCase) {
+			c.beforeReply = func(method string) {
+				if method == "one.vmpool.infoextended" {
+					c.vmID = 12
+				}
+			}
+		},
 		"fresh VM identity changed": func(c *retentionProtocolCase) {
 			c.beforeReply = func(method string) {
 				if method == "one.vm.info" {
@@ -135,7 +144,7 @@ func TestSameNodeRetentionRejectsUncertainOrUnsafeEvidence(t *testing.T) {
 		},
 		"image lookup failure":   func(c *retentionProtocolCase) { c.failMethod = "one.imagepool.info" },
 		"image read failure":     func(c *retentionProtocolCase) { c.failMethod = "one.image.info" },
-		"owner census failure":   func(c *retentionProtocolCase) { c.failMethod = "one.vmpool.info" },
+		"owner census failure":   func(c *retentionProtocolCase) { c.failMethod = "one.vmpool.infoextended" },
 		"fresh VM failure":       func(c *retentionProtocolCase) { c.failMethod = "one.vm.info" },
 		"image identity changed": func(c *retentionProtocolCase) { c.imageName = "replacement" },
 		"nonpersistent":          func(c *retentionProtocolCase) { c.persistence = "0" },

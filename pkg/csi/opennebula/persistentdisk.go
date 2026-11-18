@@ -2761,7 +2761,7 @@ func (p *PersistentDiskVolumeProvider) inspectVolumeAttachment(ctx context.Conte
 }
 
 func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Context) ([]ObservedAttachment, VMNameInventory, error) {
-	rows, err := readVMAuthorityPool(ctx, p.ctrl)
+	rows, err := readVMPool(ctx, p.ctrl, true)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to list virtual machines: %w", err)
 	}

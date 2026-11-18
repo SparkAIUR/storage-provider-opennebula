@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"reflect"
@@ -33,6 +34,8 @@ type physicalDetachIdentity struct {
 	replacement           *replacementAttachAttempt
 	replacementDisk       opennebula.VolumeDiskRecord
 	replacementRetired    bool
+	remoteNodeUID         types.UID
+	remoteNodeName        string
 }
 
 type detachAttachmentAuthority struct {
@@ -147,13 +150,24 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if replacementDetach && (len(attachments) > 1 || (readback && identity.background && identity.replacementDisk.NodeID == 0 && len(attachments) != 0)) {
 		return attachmentEvidenceUnavailable("replacement detach has conflicting VolumeAttachments", nil)
 	}
-	for _, va := range attachments {
-		if va.attacher != s.driver.name || va.uid == "" || !va.deleting || (replacementDetach && va.node != nodeName) {
-			return status.Error(codes.Unavailable, "current VolumeAttachment does not authorize physical detach")
-		}
+	var localVAName, destinationVAName string
+	var localVA, destinationVA detachAttachmentAuthority
+	for name, va := range attachments {
 		if err := validateAttachmentImageAssertions(va.metadata, identity.imageID); err != nil {
 			return status.Error(codes.Unavailable, err.Error())
 		}
+		if replacementDetach && va.node != nodeName {
+			if identity.background && attempt.dispatchPossible() && va.attacher == s.driver.name &&
+				va.uid != "" && !va.deleting && !va.attached {
+				destinationVAName, destinationVA = name, va
+				continue
+			}
+			return status.Error(codes.Unavailable, "replacement detach has an unverified destination VolumeAttachment")
+		}
+		if va.attacher != s.driver.name || va.uid == "" || !va.deleting {
+			return status.Error(codes.Unavailable, "current VolumeAttachment does not authorize physical detach")
+		}
+		localVAName, localVA = name, va
 	}
 	pvc, replacement, err := runtime.attachmentClaim(ctx, pv)
 	if err != nil {
@@ -171,8 +185,6 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		runtimeCtx.PVCAnnotations = pvc.Annotations
 	}
 
-	var replacementVAName string
-	var replacementVA detachAttachmentAuthority
 	if replacementDetach {
 		phaseEligible := attempt.dispatchPossible()
 		if readback {
@@ -195,19 +207,16 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 				return err
 			}
 		}
-		for name, va := range attachments {
-			replacementVAName, replacementVA = name, va
-		}
-		if attempt.prepared() && replacementVAName != "" &&
-			(replacementVAName != attempt.VAName || string(replacementVA.uid) != attempt.VAUID) {
+		if attempt.prepared() && localVAName != "" &&
+			(localVAName != attempt.VAName || string(localVA.uid) != attempt.VAUID) {
 			return attachmentEvidenceUnavailable("prepared replacement detach attachment identity changed", nil)
 		}
 		if attempt.detached() {
 			completion := attempt.DetachCompletion
-			if replacementVAName != completion.VAName || string(replacementVA.uid) != completion.VAUID {
+			if localVAName != completion.VAName || string(localVA.uid) != completion.VAUID {
 				return attachmentEvidenceUnavailable("completed replacement detach attachment identity changed", nil)
 			}
-			if err := validateMarkedReplacementMetadata(replacementVA, pv, completion.Target, completion.Serial); err != nil {
+			if err := validateMarkedReplacementMetadata(localVA, pv, completion.Target, completion.Serial); err != nil {
 				return err
 			}
 			identity.diskID, _ = strconv.Atoi(completion.DiskID)
@@ -217,7 +226,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			return err
 		}
 		if disk != nil {
-			if err := validateMarkedReplacementMetadata(replacementVA, pv, disk.Target, disk.Serial); err != nil {
+			if err := validateMarkedReplacementMetadata(localVA, pv, disk.Target, disk.Serial); err != nil {
 				return err
 			}
 			if (identity.diskID >= 0 && identity.diskID != disk.DiskID) ||
@@ -255,6 +264,18 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if err != nil {
 		return attachmentEvidenceUnavailable("current volume release is unverified", err)
 	}
+	remoteReplacement := replacementDetach && identity.background && attempt.dispatchPossible() && localVAName == "" &&
+		pv.Status.Phase == corev1.VolumeBound && pv.DeletionTimestamp == nil && pvc != nil && !replacement &&
+		pvc.Status.Phase == corev1.ClaimBound && pvc.DeletionTimestamp == nil &&
+		desired.Desired && !desired.MultipleNodes && desired.DemandSource == volumeDemandSourceActivePod &&
+		desired.NodeName != "" && desired.NodeName != nodeName
+	if destinationVAName != "" && (!remoteReplacement || destinationVA.node != desired.NodeName ||
+		destinationVAName != fmt.Sprintf("csi-%x", sha256.Sum256([]byte(volume+s.driver.name+desired.NodeName)))) {
+		return attachmentEvidenceUnavailable("replacement detach destination differs from current demand", nil)
+	}
+	if identity.attachments != nil && remoteReplacement != (identity.remoteNodeUID != "") {
+		return attachmentEvidenceUnavailable("replacement detach demand changed", nil)
+	}
 	protection, err := s.localRWOProtectionProjection(ctx, volume, nodeName, runtimeCtx, false, true)
 	if err != nil || protection.Invalid {
 		return attachmentEvidenceUnavailable("detach protection is unverified", err)
@@ -269,12 +290,12 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	}
 	receipt := readback && replacementDetach && attempt.detached()
 	terminalOnNode := false
+	remoteConsumerNode := ""
 	if claim := pv.Spec.ClaimRef; claim != nil && (!receipt || replacement) {
 		pods, err := runtime.client.CoreV1().Pods(claim.Namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return attachmentEvidenceUnavailable("cannot verify Pod release", err)
 		}
-		remoteNode := ""
 		for _, pod := range pods.Items {
 			referencesPVC, err := podMayUseAttachmentClaim(&pod, claim, pvc, replacement)
 			if err != nil {
@@ -287,18 +308,20 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 				terminalOnNode = terminalOnNode || pod.Spec.NodeName == nodeName
 				continue
 			}
-			if replacementDetach || pod.Spec.NodeName == "" || pod.Spec.NodeName == nodeName {
+			if pod.Spec.NodeName == "" || pod.Spec.NodeName == nodeName ||
+				(replacementDetach && (!remoteReplacement || pod.Spec.NodeName != desired.NodeName ||
+					pod.DeletionTimestamp != nil || pod.UID == "")) {
 				return attachmentEvidenceUnavailable("a current Pod still references the volume on the detach node", nil)
 			}
 			if identity.background {
-				if !identity.cephSingleWriter || !cephHistoryHasObservedAuthority(history) || (remoteNode != "" && remoteNode != pod.Spec.NodeName) {
+				if !identity.cephSingleWriter || !cephHistoryHasObservedAuthority(history) || (remoteConsumerNode != "" && remoteConsumerNode != pod.Spec.NodeName) {
 					return attachmentEvidenceUnavailable("background detach is blocked by remote Pod demand", nil)
 				}
-				remoteNode = pod.Spec.NodeName
+				remoteConsumerNode = pod.Spec.NodeName
 			}
 		}
 	}
-	if !receipt && (desired.desiresNode(nodeName) || (replacementDetach && (desired.Desired || desired.MultipleNodes))) {
+	if !receipt && (desired.desiresNode(nodeName) || (replacementDetach && !remoteReplacement && (desired.Desired || desired.MultipleNodes))) {
 		return attachmentEvidenceUnavailable("current volume release is unverified", nil)
 	}
 	if identity.replacementRetired {
@@ -328,7 +351,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		return status.Error(codes.Unavailable, "detach node release observation is unavailable")
 	}
 	waiting := false
-	if receipt || identity.replacementRetired {
+	if receipt || identity.replacementRetired || remoteReplacement {
 		if err := s.checkReplacementMaintenance(ctx); err != nil {
 			return err
 		}
@@ -351,13 +374,28 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 				return err
 			}
 		}
-		if replacementVAName != "" && string(replacementVA.uid) != attempt.VAUID &&
-			(node.CreationTimestamp.IsZero() || !replacementVA.created.After(node.CreationTimestamp.Time)) {
+		if localVAName != "" && string(localVA.uid) != attempt.VAUID &&
+			(node.CreationTimestamp.IsZero() || !localVA.created.After(node.CreationTimestamp.Time)) {
 			return attachmentEvidenceUnavailable("deleting successor VolumeAttachment does not belong to the replacement node", nil)
 		}
-		if err := s.checkReplacementVAOrigin(ctx, *attempt, replacementVAName, string(replacementVA.uid)); err != nil {
+		if err := s.checkReplacementVAOrigin(ctx, *attempt, localVAName, string(localVA.uid)); err != nil {
 			return err
 		}
+	}
+	if remoteReplacement {
+		if remoteConsumerNode != desired.NodeName {
+			return attachmentEvidenceUnavailable("replacement detach destination demand changed", nil)
+		}
+		destination, err := runtime.client.CoreV1().Nodes().Get(ctx, remoteConsumerNode, metav1.GetOptions{})
+		if err != nil || destination.Name != remoteConsumerNode || destination.UID == "" || destination.DeletionTimestamp != nil ||
+			!slices.ContainsFunc(destination.Status.Conditions, func(c corev1.NodeCondition) bool {
+				return c.Type == corev1.NodeReady && c.Status == corev1.ConditionTrue
+			}) || (destinationVAName != "" && (destination.CreationTimestamp.IsZero() ||
+			!destinationVA.created.After(destination.CreationTimestamp.Time))) ||
+			(identity.remoteNodeUID != "" && (identity.remoteNodeUID != destination.UID || identity.remoteNodeName != destination.Name)) {
+			return attachmentEvidenceUnavailable("replacement detach destination node is unverified", err)
+		}
+		identity.remoteNodeUID, identity.remoteNodeName = destination.UID, destination.Name
 	}
 	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, attachmentNode, attachments); err != nil {
 		return err
@@ -592,12 +630,12 @@ func (s *ControllerServer) completeVerifiedReplacementDetach(ctx context.Context
 	attempt := *identity.replacement
 	completed := attempt
 	completed.Phase = replacementAttachDetached
-	for name, va := range identity.attachments {
+	if va, ok := identity.attachments[attempt.VAName]; ok {
 		disk := identity.replacementDisk
-		completed.DetachCompletion = replacementDetachCompletion{VAName: name, VAUID: string(va.uid), DiskID: strconv.Itoa(disk.DiskID), Target: disk.Target, Serial: disk.Serial}
+		completed.DetachCompletion = replacementDetachCompletion{VAName: attempt.VAName, VAUID: string(va.uid), DiskID: strconv.Itoa(disk.DiskID), Target: disk.Target, Serial: disk.Serial}
 	}
 	verified := *identity
-	if len(identity.attachments) == 0 {
+	if completed.DetachCompletion.VAUID == "" {
 		verified.replacementRetired = true
 	} else {
 		verified.replacement = &completed

@@ -294,7 +294,7 @@ func TestSupportBundleLocalRWOSnapshotIsReadOnly(t *testing.T) {
 				switch method {
 				case "one.imagepool.info", "one.image.info":
 					imageReads.Add(1)
-				case "one.vmpool.info":
+				case "one.vmpool.info", "one.vmpool.infoextended":
 					vmReads.Add(1)
 				default:
 					unexpectedRPCs.Add(1)

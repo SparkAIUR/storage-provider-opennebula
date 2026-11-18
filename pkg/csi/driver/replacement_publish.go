@@ -98,10 +98,9 @@ func (attempt replacementAttachAttempt) matchesHistory(history VolumeHistoryReco
 	completion := attempt.DetachCompletion
 	diskID, diskErr := strconv.Atoi(completion.DiskID)
 	validPhase := (attempt.prepared() || attempt.dispatchPossible()) && completion == (replacementDetachCompletion{}) ||
-		attempt.detached() && completion.VAName != "" && completion.VAUID != "" && diskErr == nil && diskID >= 0 &&
+		attempt.detached() && completion.VAName == attempt.VAName && completion.VAUID != "" && diskErr == nil && diskID >= 0 &&
 			completion.Target != "" && completion.Serial == fmt.Sprintf("onecsi-%d", attempt.ImageID)
-	validVA := attempt.VAName != "" && attempt.VAUID != "" &&
-		(completion.VAUID != attempt.VAUID || completion.VAName == attempt.VAName)
+	validVA := attempt.VAName != "" && attempt.VAUID != ""
 	token, err := hex.DecodeString(attempt.ID)
 	return err == nil && len(token) == 32 && validPhase && validVA && attempt.PVUID != "" && attempt.PVCUID != "" &&
 		attempt.Driver != "" && attempt.VolumeID == history.VolumeID && attempt.Node != "" &&
@@ -122,11 +121,8 @@ func (s *ControllerServer) retireCompletedReplacement(ctx context.Context, histo
 		return false, attachmentEvidenceUnavailable("completed replacement VolumeAttachment identity is unavailable", nil)
 	}
 	completion := attempt.DetachCompletion
-	gone, err := s.replacementVAGone(ctx, completion.VAName, completion.VAUID)
+	gone, err := s.replacementVAGone(ctx, attempt.VAName, attempt.VAUID, completion.VAUID)
 	if err != nil || !gone {
-		return false, err
-	}
-	if err := s.checkReplacementVAOrigin(ctx, *attempt, completion.VAName, completion.VAUID); err != nil {
 		return false, err
 	}
 	if err := s.retireVerifiedReplacement(ctx, *attempt); err != nil {

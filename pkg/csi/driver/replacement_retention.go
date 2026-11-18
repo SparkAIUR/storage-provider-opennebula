@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"reflect"
+	"slices"
 	"strings"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
@@ -25,7 +26,7 @@ type markedReplacementObservation struct {
 	pvcVersion string
 }
 
-func (s *ControllerServer) replacementVAGone(ctx context.Context, name, uid string) (bool, error) {
+func (s *ControllerServer) replacementVAGone(ctx context.Context, name string, uids ...string) (bool, error) {
 	va, err := s.driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return true, ctx.Err()
@@ -33,15 +34,15 @@ func (s *ControllerServer) replacementVAGone(ctx context.Context, name, uid stri
 	if err != nil || va.UID == "" {
 		return false, attachmentEvidenceUnavailable("pinned replacement VolumeAttachment identity is unverified", err)
 	}
-	return string(va.UID) != uid, ctx.Err()
+	return !slices.Contains(uids, string(va.UID)), ctx.Err()
 }
 
 func (s *ControllerServer) checkReplacementVAOrigin(ctx context.Context, attempt replacementAttachAttempt, name, uid string) error {
-	if uid == attempt.VAUID && name == attempt.VAName {
-		return ctx.Err()
+	if name != "" && name != attempt.VAName {
+		return attachmentEvidenceUnavailable("replacement VolumeAttachment name differs from the pinned name", nil)
 	}
-	if uid == attempt.VAUID {
-		return attachmentEvidenceUnavailable("pinned replacement VolumeAttachment name changed", nil)
+	if name == attempt.VAName && uid == attempt.VAUID {
+		return ctx.Err()
 	}
 	gone, err := s.replacementVAGone(ctx, attempt.VAName, attempt.VAUID)
 	if err != nil || !gone {
@@ -67,9 +68,8 @@ func validateMarkedReplacementMetadata(va detachAttachmentAuthority, pv *corev1.
 	return nil
 }
 
-func successorFilesystemResizePending(pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, capability *csi.VolumeCapability) bool {
-	if capability.GetMount() == nil ||
-		(pv.Spec.VolumeMode != nil && *pv.Spec.VolumeMode != corev1.PersistentVolumeFilesystem) ||
+func markedFilesystemResizePending(pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim) bool {
+	if (pv.Spec.VolumeMode != nil && *pv.Spec.VolumeMode != corev1.PersistentVolumeFilesystem) ||
 		(pvc.Spec.VolumeMode != nil && *pvc.Spec.VolumeMode != corev1.PersistentVolumeFilesystem) {
 		return false
 	}
@@ -134,7 +134,7 @@ func (s *ControllerServer) observeMarkedReplacement(ctx context.Context, attempt
 			return err
 		}
 		size, requested, ok := completedRetentionCapacity(pv, pvc)
-		if size != capacity.SizeBytes || (!ok && (publish == nil || !successorFilesystemResizePending(pv, pvc, publish.GetVolumeCapability()))) {
+		if size != capacity.SizeBytes || (!ok && (!markedFilesystemResizePending(pv, pvc) || (publish != nil && publish.GetVolumeCapability().GetMount() == nil))) {
 			return attachmentEvidenceUnavailable("marked replacement Ceph capacity is pending or inconsistent", nil)
 		}
 		if err := validateMarkedReplacementMetadata(va, pv, disk.Target, disk.Serial); err != nil {

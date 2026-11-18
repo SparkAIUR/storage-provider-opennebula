@@ -71,7 +71,7 @@ func growthCompatibilityFixture(t *testing.T, version string, restoring bool, op
 			return true, "<IMAGE_POOL>" + image() + "</IMAGE_POOL>", 0
 		case "one.image.info":
 			return true, image(), 0
-		case "one.vmpool.info":
+		case "one.vmpool.info", "one.vmpool.infoextended":
 			return true, "<VM_POOL>" + vmXML() + "</VM_POOL>", 0
 		case "one.vm.info":
 			return true, vmXML(), 0

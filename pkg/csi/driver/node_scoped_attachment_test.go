@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -139,6 +140,9 @@ func requireAttachDiskIdentity(t *testing.T, fields map[string]string, image int
 		require.NotContains(t, fields, "READONLY")
 	}
 }
+
+var shortVMDiskXML = regexp.MustCompile(`(?s)<DISK>.*?</DISK>`)
+var shortVMDiskFields = regexp.MustCompile(`(?s)<(?:DISK_ID|DATASTORE|DATASTORE_ID|IMAGE|IMAGE_ID|SIZE|TYPE|CLONE|CLONE_TARGET|LN_TARGET|DISK_SNAPSHOT_TOTAL_SIZE)(?:/>|>[^<]*</[^>]+>)`)
 
 // This fixture models durable shareable storage, not ephemeral cloned disks.
 // Image.cc emits PERSISTENT=YES/CLONE=NO/SAVE=YES and SHAREABLE=YES for a
@@ -302,7 +306,7 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				case state.imageInfoByID[number(1)] != "":
 					body = state.imageInfoByID[number(1)]
 				}
-			case "one.vmpool.info":
+			case "one.vmpool.info", "one.vmpool.infoextended":
 				body = "<VM_POOL>"
 				if !state.omitOriginalVM {
 					body += vmXML(41, false)
@@ -312,6 +316,12 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 					body += vmXML(43, false)
 				}
 				body += "</VM_POOL>"
+				if call.Method == "one.vmpool.info" {
+					body = shortVMDiskXML.ReplaceAllStringFunc(body, func(disk string) string {
+						fields := shortVMDiskFields.FindAllString(disk, -1)
+						return "<DISK>" + strings.Join(fields, "") + "</DISK>"
+					})
+				}
 			case "one.vm.info":
 				body = vmXML(number(1), true)
 				if number(1) == 41 && state.missingOriginalVM {
@@ -443,7 +453,7 @@ func TestProviderNodeScopedAbsenceAndGlobalOwnership(t *testing.T) {
 				state.failMethod = "one.vm.info"
 			}
 			if scenario == "failed-pool" {
-				state.failMethod = "one.vmpool.info"
+				state.failMethod = "one.vmpool.infoextended"
 			}
 			state.mu.Unlock()
 			_, err := provider.GetVolumeInNode(context.Background(), 7, 42)
@@ -716,7 +726,7 @@ func TestControllerDetachRejectsDriftInFinalProviderObservation(t *testing.T) {
 					switch method {
 					case "one.image.info":
 						imageReads++
-					case "one.vmpool.info":
+					case "one.vmpool.info", "one.vmpool.infoextended":
 						resolvedAttemptVM = imageReads >= 5 && (!retry || attempts > 0)
 					case "one.vm.detach":
 						attempts++
@@ -786,7 +796,7 @@ func TestCephRestartCleanupUsesVerifiedVMMapping(t *testing.T) {
 			var poolReads atomic.Int32
 			var protocol *nodeAttachmentProtocol
 			provider, state := nodeAttachmentProvider(t, func(method string, _ context.Context) {
-				if method == "one.vmpool.info" {
+				if method == "one.vmpool.info" || method == "one.vmpool.infoextended" {
 					poolReads.Add(1)
 				}
 				if mode == "dissent" && method == "one.image.info" && poolReads.Load() == 2 {
@@ -805,7 +815,7 @@ func TestCephRestartCleanupUsesVerifiedVMMapping(t *testing.T) {
 			case "ambiguous":
 				state.vmNames[41], state.vmNames[42] = "NODE-OLD", "Node-Old"
 			case "unavailable":
-				state.failMethod = "one.vmpool.info"
+				state.failMethod = "one.vmpool.infoextended"
 			}
 			state.mu.Unlock()
 			reconciler := NewAttachmentReconciler(NewControllerServer(driver, provider, nil))
@@ -918,7 +928,7 @@ func TestCephBackgroundDetachUsesFreshSoleOwnerAndRelease(t *testing.T) {
 				if method == "one.image.info" {
 					censusImageRead.Store(true)
 				}
-				if method != "one.vmpool.info" || !censusImageRead.Swap(false) {
+				if method != "one.vmpool.infoextended" || !censusImageRead.Swap(false) {
 					return
 				}
 				censusFinished.Store(true)
@@ -1179,7 +1189,7 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 				case "missing-image-retained-disk", "missing-image-unknown-ownership":
 					state.missingImage = true
 					if mode == "missing-image-unknown-ownership" {
-						state.failMethod = "one.vmpool.info"
+						state.failMethod = "one.vmpool.infoextended"
 					}
 				case "missing-image-malformed-disk":
 					delete(state.disks, 41)
@@ -3184,7 +3194,7 @@ func (p *moveHistoryProvider) InspectVolumeAttachment(ctx context.Context, volum
 		p.wire.mu.Unlock()
 		return p.PersistentDiskVolumeProvider.InspectVolumeAttachment(ctx, volume, node)
 	}
-	p.wire.failMethod = "one.vmpool.info"
+	p.wire.failMethod = "one.vmpool.infoextended"
 	p.wire.mu.Unlock()
 	defer func() {
 		p.wire.mu.Lock()
@@ -5347,7 +5357,7 @@ func TestControllerPublishRechecksQuarantineForActualAttach(t *testing.T) {
 				if method == "one.datastorepool.info" && mode == "during-inspection" && later.CompareAndSwap(false, true) {
 					persist(41, 1)
 				}
-				if method == "one.vmpool.info" && attempts == 1 && mode != "during-inspection" && !later.Load() {
+				if method == "one.vmpool.infoextended" && attempts == 1 && mode != "during-inspection" && !later.Load() {
 					persist(41, 1)
 					later.Store(true)
 				}

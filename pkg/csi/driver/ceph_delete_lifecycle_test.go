@@ -91,7 +91,7 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 					if deleted.Load() {
 						ok, code, body = false, 0x400, "not present"
 					}
-				case "one.vmpool.info":
+				case "one.vmpool.info", "one.vmpool.infoextended":
 					vmState := 3
 					if mode.Load() == 3 {
 						vmState = 8
@@ -205,7 +205,7 @@ func TestControllerDeleteCephVerifiesMissingImageOwnership(t *testing.T) {
 				delete(wire.disks, 41)
 				wire.extraDiskBefore = "<DISK><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SERIAL>onecsi-7</SERIAL></DISK>"
 			case "unknown-ownership":
-				wire.failMethod = "one.vmpool.info"
+				wire.failMethod = "one.vmpool.infoextended"
 			case "replacement-image":
 				wire.duplicateImage, wire.replacementDisk = true, true
 			case "hidden-handle":
@@ -352,7 +352,7 @@ func TestControllerDeleteVolumeRefreshesPinnedAdmission(t *testing.T) {
 			})
 			injectAt := map[string]int32{"before-rpc": 1, "pending-before-rpc": 1, "after-rpc": 2, "already-missing": 1}[mode]
 			provider, wire := nodeAttachmentProvider(t, func(method string, ctx context.Context) {
-				if method == "one.vmpool.info" && censusReads.Add(1) == injectAt {
+				if method == "one.vmpool.infoextended" && censusReads.Add(1) == injectAt {
 					if mode == "pending-before-rpc" {
 						_, err := driver.volumeHistory.Upsert(ctx, volume, func(history *VolumeHistoryRecord) {
 							history.PendingReplacementAttach = &replacementAttachAttempt{Version: 2, Phase: replacementAttachArmed}
