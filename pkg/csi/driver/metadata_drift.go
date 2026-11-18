@@ -37,7 +37,10 @@ func (s *ControllerServer) rejectIfOpenNebulaMetadataDrift(ctx context.Context, 
 		return nil
 	}
 
-	activeState, quarantined := s.activeVolumeQuarantine(ctx, req.VolumeId)
+	activeState, quarantined, err := s.activeVolumeQuarantine(ctx, req.VolumeId)
+	if err != nil {
+		return err
+	}
 	metadata, inspectErr := inspector.InspectVolumeAttachment(ctx, req.VolumeId, req.NodeId)
 	if inspectErr != nil {
 		if recoveryControl.Active() && recoveryControl.SuppressRepairActions {

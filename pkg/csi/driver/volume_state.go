@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -152,7 +153,7 @@ func (m *VolumeHistoryManager) LoadFromConfigMap(ctx context.Context) error {
 	loaded := map[string]VolumeHistoryRecord{}
 	for key, raw := range cm.Data {
 		var state VolumeHistoryRecord
-		if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		if err := unmarshalAuthorityJSON(raw, &state); err != nil {
 			klog.Warningf("failed to decode volume history state %s: %v", key, err)
 			continue
 		}
@@ -215,7 +216,7 @@ func (m *VolumeHistoryManager) Upsert(ctx context.Context, volumeID string, muta
 		}
 		state = VolumeHistoryRecord{}
 		if raw := strings.TrimSpace(cm.Data[volumeID]); raw != "" {
-			if err := json.Unmarshal([]byte(raw), &state); err != nil {
+			if err := unmarshalAuthorityJSON(raw, &state); err != nil {
 				return err
 			}
 		}
@@ -395,7 +396,7 @@ func (m *VolumeRepairStateManager) LoadFromConfigMap(ctx context.Context) error 
 	loaded := map[string]VolumeRepairState{}
 	for key, raw := range cm.Data {
 		var state VolumeRepairState
-		if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		if err := unmarshalAuthorityJSON(raw, &state); err != nil {
 			klog.Warningf("failed to decode volume repair state %s: %v", key, err)
 			continue
 		}
@@ -437,7 +438,10 @@ func decodeLocalDeviceReport(key, raw, volumeID string) (LocalDeviceMissingRepor
 		Node     string `json:"node"`
 		VolumeID string `json:"volumeID"`
 	}
-	err := json.Unmarshal([]byte(raw), &identity)
+	err := unmarshalAuthorityJSON(raw, &identity)
+	if stderrors.Is(err, errDuplicateAuthorityKey) {
+		return report, err
+	}
 	identityIncomplete := strings.TrimSpace(identity.Node) == "" || strings.TrimSpace(identity.VolumeID) == ""
 	keyTargetsVolume := volumeID != "" && strings.HasSuffix(key, "."+sanitizeLocalDeviceReportKey(volumeID))
 	if volumeID != "" && identity.VolumeID != volumeID && (err != nil || identityIncomplete) && !keyTargetsVolume {
@@ -584,7 +588,7 @@ func (m *VolumeRepairStateManager) ClearObserved(ctx context.Context, expected V
 			return nil
 		} else if expected.persistedRuntimeMarker != "" && raw != expected.persistedRuntimeMarker {
 			return nil
-		} else if err := json.Unmarshal([]byte(raw), &current); err != nil {
+		} else if err := unmarshalAuthorityJSON(raw, &current); err != nil {
 			return err
 		}
 		if !sameRepairStateObservation(current, expected) {

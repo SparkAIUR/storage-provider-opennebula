@@ -312,7 +312,7 @@ func (ns *NodeServer) readLocalDeviceReport(ctx context.Context, volumeID string
 		return LocalDeviceMissingReport{}, false, nil
 	}
 	var report LocalDeviceMissingReport
-	if err := json.Unmarshal([]byte(raw), &report); err != nil {
+	if err := unmarshalAuthorityJSON(raw, &report); err != nil {
 		return report, false, err
 	}
 	if report.Node != node || report.VolumeID != volumeID {
@@ -508,7 +508,7 @@ func (s *ControllerServer) reconcileLocalDeviceRecovery(ctx context.Context) {
 			continue
 		}
 		var report LocalDeviceMissingReport
-		if err := json.Unmarshal([]byte(raw), &report); err != nil {
+		if err := unmarshalAuthorityJSON(raw, &report); err != nil {
 			klog.V(2).InfoS("Skipping malformed local device recovery report", "key", key, "err", err)
 			continue
 		}
@@ -663,7 +663,9 @@ func (s *ControllerServer) executeLocalDeviceRecovery(ctx context.Context, repor
 		if hostArtifactErr := s.rejectIfHostArtifactQuarantineActiveForVolumeNode(queueCtx, volumeID, node, params); hostArtifactErr != nil {
 			return hostArtifactErr
 		}
-		if s.activeHostArtifactQuarantine(queueCtx, volumeID) {
+		if active, err := s.activeHostArtifactQuarantine(queueCtx, volumeID); err != nil {
+			return err
+		} else if active {
 			return fmt.Errorf("host artifact quarantine is active for volume %s", volumeID)
 		}
 
@@ -1024,7 +1026,7 @@ func updateLocalDeviceReportIf(ctx context.Context, runtime *KubeRuntime, namesp
 			current.Data = map[string]string{}
 		}
 		if raw := strings.TrimSpace(current.Data[key]); raw != "" {
-			if err := json.Unmarshal([]byte(raw), &report); err != nil {
+			if err := unmarshalAuthorityJSON(raw, &report); err != nil {
 				return fmt.Errorf("cannot mutate malformed local device report %s: %w", key, err)
 			}
 		}

@@ -914,7 +914,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		s.driver.metrics.RecordControllerPublishDuration("disk", "failed_precondition", time.Since(started))
 		return nil, repairErr
 	}
-	if quarantine, ok := s.activeVolumeQuarantine(ctx, req.VolumeId); ok {
+	if quarantine, ok, err := s.activeVolumeQuarantine(ctx, req.VolumeId); err != nil {
+		return nil, err
+	} else if ok {
 		message := volumeQuarantineMessage(quarantine)
 		s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonVolumeQuarantined, message)
 		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "failed_precondition", time.Since(started))
@@ -926,7 +928,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		s.driver.metrics.RecordControllerPublishDuration("disk", "failed_precondition", time.Since(started))
 		return nil, hostArtifactErr
 	}
-	if s.activeHostArtifactQuarantine(ctx, req.VolumeId) {
+	if active, err := s.activeHostArtifactQuarantine(ctx, req.VolumeId); err != nil {
+		return nil, err
+	} else if active {
 		message := fmt.Sprintf("host artifact quarantine is active for volume %s", req.VolumeId)
 		s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonHostArtifactQuarantined, message)
 		s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "failed_precondition", time.Since(started))

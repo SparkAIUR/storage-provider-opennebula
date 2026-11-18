@@ -1389,17 +1389,14 @@ func diskImageReference(disk shared.Disk, allowBlank bool) (int, bool, error) {
 	}
 	if !allowBlank {
 		serial, _ := disk.Get(shared.Serial)
-		if suffix, ok := strings.CutPrefix(strings.TrimSpace(serial), "onecsi-"); ok {
-			serialID, parseErr := strconv.Atoi(suffix)
-			if parseErr == nil && serialID >= 0 && (!present || serialID != id) {
-				if !present {
-					id = -1
-				}
-				return 0, false, &diskImageConflict{imageID: id, serialID: serialID}
-			}
-		}
 		if !present && (hasDiskBacking(disk, serial) || (blank && !isImageLessDisk(disk))) {
 			return 0, false, fmt.Errorf("malformed VM disk image identity")
+		}
+		if suffix, ok := strings.CutPrefix(strings.TrimSpace(serial), "onecsi-"); ok {
+			serialID, parseErr := strconv.Atoi(suffix)
+			if parseErr == nil && serialID >= 0 && serialID != id {
+				return 0, false, &diskImageConflict{imageID: id, serialID: serialID}
+			}
 		}
 	}
 	return id, present, nil
@@ -1598,7 +1595,7 @@ func (p *PersistentDiskVolumeProvider) readImageInfo(ctx context.Context, imageI
 	if !valid {
 		id = -1
 	}
-	info.Image.ID = id
+	info.ID = id
 	return &info.Image, nil
 }
 
@@ -2358,7 +2355,7 @@ func (p *PersistentDiskVolumeProvider) attachmentDatastore(ctx context.Context, 
 		}
 	}
 	switch backend := normalizeAllowedDatastoreType(observed.DSMad); observed.DSMad {
-	case "ceph", "fs", "local", "fs_lvm", "fs_lvm_ssh", "nfs", "nas":
+	case "ceph", "fs", "local", "fs_lvm", "fs_lvm_ssh":
 		if observed.Backend != backend || (observed.TMMad != "" && !attachmentTransferMatchesBackend(observed.TMMad, backend)) {
 			return Datastore{}, &datastoreConfigError{message: fmt.Sprintf("datastore %d drivers disagree with backend %q", datastoreID, observed.Backend)}
 		}

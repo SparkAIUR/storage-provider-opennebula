@@ -1194,7 +1194,7 @@ func localDeviceReportSnapshot(ctx context.Context, kubeClient kubernetes.Interf
 	}
 	for key, raw := range cm.Data {
 		var report LocalDeviceMissingReport
-		if err := json.Unmarshal([]byte(raw), &report); err != nil {
+		if err := unmarshalAuthorityJSON(raw, &report); err != nil {
 			continue
 		}
 		if strings.TrimSpace(report.VolumeID) == "" {

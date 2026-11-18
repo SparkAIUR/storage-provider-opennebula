@@ -65,6 +65,7 @@ type nodeAttachmentProtocol struct {
 	extraImages       string
 	imageInfoByID     map[int]string
 	imageTransfer     string
+	diskTransfer      string
 	diskTarget        string
 	ownerCount        int
 	ready             bool
@@ -120,6 +121,9 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				disk = fmt.Sprintf(`<DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><SAVE>YES</SAVE><SHAREABLE>YES</SHAREABLE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>ssh</TM_MAD><TM_MAD_SYSTEM>ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>%s</DISK_ID><TARGET>%s</TARGET><SIZE>%d</SIZE><SERIAL>onecsi-7</SERIAL>%s</DISK>`, slot, firstNonEmpty(state.diskTarget, "vdb"), size, marker)
 				if state.ceph {
 					disk = strings.NewReplacer("<LN_TARGET>SYSTEM</LN_TARGET>", "<LN_TARGET>NONE</LN_TARGET>", "<TM_MAD>ssh</TM_MAD>", "<TM_MAD>ceph</TM_MAD>", "<TM_MAD_SYSTEM>ssh</TM_MAD_SYSTEM>", "<TM_MAD_SYSTEM>ceph</TM_MAD_SYSTEM>").Replace(disk)
+				}
+				if state.diskTransfer != "" {
+					disk = strings.Replace(disk, "<TM_MAD>ssh</TM_MAD>", "<TM_MAD>"+state.diskTransfer+"</TM_MAD>", 1)
 				}
 			}
 			if id == 41 && state.replacementDisk {
@@ -204,7 +208,11 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 						"</DATASTORE>", rbdTemplate+"</DATASTORE>").Replace(body)
 				}
 				if state.imageTransfer != "" {
-					body = strings.Replace(body, "<TM_MAD>ceph</TM_MAD>", "<TM_MAD>"+state.imageTransfer+"</TM_MAD>", 1)
+					current := "ssh"
+					if state.ceph {
+						current = "ceph"
+					}
+					body = strings.Replace(body, "<TM_MAD>"+current+"</TM_MAD>", "<TM_MAD>"+state.imageTransfer+"</TM_MAD>", 1)
 				}
 			case "one.vm.attach":
 				id := number(1)
@@ -952,7 +960,7 @@ func TestProviderDetachRetryRespectsHotplugDeadline(t *testing.T) {
 
 func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"same-node", "replacement-uid", "replacement-vm", "vm-changed-before-dispatch", "duplicate-image", "replacement-image", "late-duplicate-image", "missing-image", "missing-image-replacement-uid", "hidden-handle", "missing-image-retained-disk", "missing-image-unknown-ownership", "missing-image-malformed-disk", "missing-image-backed-disk-without-id", "owner-omitted", "owner-omitted-released", "owner-omitted-gone", "owner-omitted-unreadable", "retired-node", "live-image-retired-node", "live-image-retired-node-gone", "live-image-retired-node-attached", "live-image-unreadable-node", "missing-image-unreadable-node"} {
+		for _, mode := range []string{"same-node", "replacement-uid", "replacement-vm", "vm-changed-before-dispatch", "duplicate-image", "replacement-image", "late-duplicate-image", "missing-image", "missing-image-replacement-uid", "hidden-handle", "missing-image-retained-disk", "missing-image-unknown-ownership", "missing-image-malformed-disk", "missing-image-backed-disk-without-id", "missing-image-backed-disk-conflicting-serial", "owner-omitted", "owner-omitted-released", "owner-omitted-gone", "owner-omitted-unreadable", "retired-node", "live-image-retired-node", "live-image-retired-node-gone", "live-image-retired-node-attached", "live-image-unreadable-node", "missing-image-unreadable-node"} {
 			t.Run(fmt.Sprintf("queued=%v/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
@@ -1009,19 +1017,23 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 					state.missingImage = mode != "duplicate-image"
 					state.duplicateImage = mode == "duplicate-image" || mode == "replacement-image"
 					state.replacementDisk = state.duplicateImage
-				case "missing-image-retained-disk", "missing-image-unknown-ownership", "missing-image-malformed-disk":
+				case "missing-image-retained-disk", "missing-image-unknown-ownership":
 					state.missingImage = true
 					if mode == "missing-image-unknown-ownership" {
 						state.failMethod = "one.vmpool.info"
 					}
-				case "missing-image-backed-disk-without-id":
+				case "missing-image-malformed-disk":
+					delete(state.disks, 41)
+					state.missingImage = true
+					state.extraDiskBefore = "<DISK><IMAGE_ID>invalid</IMAGE_ID></DISK>"
+				case "missing-image-backed-disk-without-id", "missing-image-backed-disk-conflicting-serial":
 					delete(state.disks, 41)
 					state.missingImage, state.omitOriginalVM = true, true
-					state.extraDiskByVM = map[int]string{41: `<DISK><DISK_ID>2</DISK_ID><IMAGE>volume-test</IMAGE><SOURCE>/fixture/disk</SOURCE><PERSISTENT>YES</PERSISTENT></DISK>`}
-					if mode == "missing-image-malformed-disk" {
-						delete(state.disks, 41)
-						state.extraDiskBefore = "<DISK><IMAGE_ID>invalid</IMAGE_ID></DISK>"
+					facts := "<DISK_ID>2</DISK_ID><IMAGE>volume-test</IMAGE><SOURCE>/fixture/disk</SOURCE><PERSISTENT>YES</PERSISTENT>"
+					if mode == "missing-image-backed-disk-conflicting-serial" {
+						facts += "<SERIAL>onecsi-8</SERIAL>"
 					}
+					state.extraDiskByVM = map[int]string{41: "<DISK>" + facts + "</DISK>"}
 				case "hidden-handle":
 					state.hideImageName = true
 				case "owner-omitted", "owner-omitted-released", "owner-omitted-gone", "owner-omitted-unreadable", "retired-node":
@@ -1858,9 +1870,17 @@ func TestUnpublishDeniesAbsenceWhenCSISerialIdentifiesTheDisk(t *testing.T) {
 			require.Nil(t, reply)
 			require.Equal(t, codes.Unavailable, status.Code(err))
 			_, err = provider.GetVolumeInNode(ctx, 7, 41)
-			require.ErrorContains(t, err, "CSI disk serial contradicts VM disk image identity")
+			if imageReference == "" {
+				require.ErrorContains(t, err, "malformed VM disk image identity")
+			} else {
+				require.ErrorContains(t, err, "CSI disk serial contradicts VM disk image identity")
+			}
 			attachments, _, err := provider.ListCurrentAttachments(ctx)
-			require.NoError(t, err)
+			if imageReference == "" {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
 			require.Empty(t, attachments)
 			require.Error(t, provider.DetachVolume(ctx, "volume-test", "node-old"))
 			history, _ := driver.volumeHistory.Get("volume-test")

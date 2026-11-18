@@ -166,7 +166,7 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 }
 
 func TestControllerDeleteCephVerifiesMissingImageOwnership(t *testing.T) {
-	for _, mode := range []string{"retained-disk", "backed-disk-without-id", "serial-reference", "unknown-ownership", "replacement-image", "hidden-handle", "confirmed-absent", "owner-omitted", "owner-omitted-released", "owner-omitted-gone"} {
+	for _, mode := range []string{"retained-disk", "backed-disk-without-id", "backed-disk-conflicting-serial", "backed-disk-blank-id-conflicting-serial", "serial-reference", "unknown-ownership", "replacement-image", "hidden-handle", "confirmed-absent", "unrelated-observed-conflict", "owner-omitted", "owner-omitted-released", "owner-omitted-gone"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			const volume = "volume-test"
@@ -185,9 +185,16 @@ func TestControllerDeleteCephVerifiesMissingImageOwnership(t *testing.T) {
 			wire.mu.Lock()
 			wire.ceph, wire.missingImage = true, true
 			switch mode {
-			case "backed-disk-without-id":
+			case "backed-disk-without-id", "backed-disk-conflicting-serial", "backed-disk-blank-id-conflicting-serial":
 				delete(wire.disks, 41)
-				wire.extraDiskBefore = "<DISK><DISK_ID>2</DISK_ID><IMAGE>volume-test</IMAGE><SOURCE>/fixture/disk</SOURCE><PERSISTENT>YES</PERSISTENT></DISK>"
+				facts := "<DISK_ID>2</DISK_ID><IMAGE>volume-test</IMAGE><SOURCE>/fixture/disk</SOURCE><PERSISTENT>YES</PERSISTENT>"
+				if mode != "backed-disk-without-id" {
+					facts += "<SERIAL>onecsi-8</SERIAL>"
+				}
+				if mode == "backed-disk-blank-id-conflicting-serial" {
+					facts += "<IMAGE_ID/>"
+				}
+				wire.extraDiskBefore = "<DISK>" + facts + "</DISK>"
 			case "serial-reference":
 				delete(wire.disks, 41)
 				wire.extraDiskBefore = "<DISK><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SERIAL>onecsi-7</SERIAL></DISK>"
@@ -200,6 +207,9 @@ func TestControllerDeleteCephVerifiesMissingImageOwnership(t *testing.T) {
 				wire.missingImage = false
 			case "confirmed-absent":
 				delete(wire.disks, 41)
+			case "unrelated-observed-conflict":
+				delete(wire.disks, 41)
+				wire.extraDiskByVM = map[int]string{42: "<DISK><DISK_ID>2</DISK_ID><IMAGE_ID>8</IMAGE_ID><SERIAL>onecsi-9</SERIAL></DISK>"}
 			case "owner-omitted", "owner-omitted-released", "owner-omitted-gone":
 				wire.omitOriginalVM = true
 				if mode != "owner-omitted" {
@@ -209,9 +219,14 @@ func TestControllerDeleteCephVerifiesMissingImageOwnership(t *testing.T) {
 			}
 			wire.mu.Unlock()
 
-			response, err := reviewControllerClient(t, server).DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: volume})
+			client := reviewControllerClient(t, server)
+			request := &csi.DeleteVolumeRequest{VolumeId: volume}
+			response, err := client.DeleteVolume(ctx, request)
 			switch mode {
-			case "confirmed-absent", "owner-omitted-released", "owner-omitted-gone":
+			case "confirmed-absent", "unrelated-observed-conflict", "owner-omitted-released", "owner-omitted-gone":
+				require.NoError(t, err)
+				require.NotNil(t, response)
+				response, err = client.DeleteVolume(ctx, request)
 				require.NoError(t, err)
 				require.NotNil(t, response)
 			default:
@@ -394,7 +409,7 @@ func TestDeleteVolumeRechecksLiveImageWithExistingPVIdentity(t *testing.T) {
 
 func TestControllerDeleteVolumeRejectsUnverifiedPVIdentity(t *testing.T) {
 	for _, mode := range []string{"uid-drift", "resource-version-drift", "binding-drift", "patch-refused", "readback-refused",
-		"wrong-readback", "provider-identity-drift", "provider-ownership-drift", "malformed-marker", "marker-other-pv", "marker-without-image-id", "pool-without-image-id", "info-without-image-id",
+		"wrong-readback", "provider-identity-drift", "provider-ownership-drift", "malformed-marker", "marker-other-pv", "marker-without-image-id", "marker-duplicate-image-id", "pool-without-image-id", "info-without-image-id",
 		"marker-conflicts-with-history", "marker-conflicts-with-provider", "repair-required"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
@@ -409,6 +424,8 @@ func TestControllerDeleteVolumeRejectsUnverifiedPVIdentity(t *testing.T) {
 				pv.Annotations[annotationDeleteVolumeIdentity] = fmt.Sprintf(`{"version":1,"pvUID":"different-uid","driver":%q,"handle":%q,"imageID":7}`, DefaultDriverName, volume)
 			case "marker-without-image-id":
 				pv.Annotations[annotationDeleteVolumeIdentity] = fmt.Sprintf(`{"version":1,"pvUID":%q,"driver":%q,"handle":%q}`, pv.UID, DefaultDriverName, volume)
+			case "marker-duplicate-image-id":
+				pv.Annotations[annotationDeleteVolumeIdentity] = fmt.Sprintf(`{"version":1,"pvUID":%q,"driver":%q,"handle":%q,"imageID":8,"ImageId":7}`, pv.UID, DefaultDriverName, volume)
 			case "marker-conflicts-with-history", "marker-conflicts-with-provider":
 				pv.Annotations[annotationDeleteVolumeIdentity] = fmt.Sprintf(`{"version":1,"pvUID":%q,"driver":%q,"handle":%q,"imageID":8}`, pv.UID, DefaultDriverName, volume)
 			}
@@ -426,6 +443,7 @@ func TestControllerDeleteVolumeRejectsUnverifiedPVIdentity(t *testing.T) {
 			provider, wire := nodeAttachmentProvider(t)
 			wire.mu.Lock()
 			delete(wire.disks, 41)
+			wire.allowImageDelete = mode == "marker-duplicate-image-id"
 			if mode == "pool-without-image-id" || mode == "info-without-image-id" {
 				wire.zeroImage = true
 				if mode == "pool-without-image-id" {
@@ -476,6 +494,9 @@ func TestControllerDeleteVolumeRejectsUnverifiedPVIdentity(t *testing.T) {
 
 			response, err := reviewControllerClient(t, NewControllerServer(driver, provider, nil)).DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: volume})
 			require.Error(t, err)
+			if mode == "marker-duplicate-image-id" {
+				require.ErrorContains(t, err, "PV deletion identity is unverified")
+			}
 			require.Nil(t, response)
 			current, err := kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
 			require.NoError(t, err)

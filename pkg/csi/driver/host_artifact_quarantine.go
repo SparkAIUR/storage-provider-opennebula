@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -75,7 +76,7 @@ func (m *HostArtifactQuarantineManager) LoadFromConfigMap(ctx context.Context) e
 	now := time.Now().UTC()
 	for key, raw := range cm.Data {
 		var state HostArtifactQuarantineState
-		if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		if err := unmarshalAuthorityJSON(raw, &state); err != nil {
 			klog.Warningf("failed to decode host artifact quarantine state %s: %v", key, err)
 			continue
 		}
@@ -131,7 +132,7 @@ func (m *HostArtifactQuarantineManager) RefreshKey(ctx context.Context, key stri
 		return nil
 	}
 	var state HostArtifactQuarantineState
-	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+	if err := unmarshalAuthorityJSON(raw, &state); err != nil {
 		return err
 	}
 	if strings.TrimSpace(state.Key) == "" {
@@ -172,7 +173,10 @@ func (m *HostArtifactQuarantineManager) RefreshVolume(ctx context.Context, volum
 	now := time.Now().UTC()
 	for key, raw := range cm.Data {
 		var state HostArtifactQuarantineState
-		if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		if err := unmarshalAuthorityJSON(raw, &state); err != nil {
+			if stderrors.Is(err, errDuplicateAuthorityKey) {
+				return err
+			}
 			continue
 		}
 		if strings.TrimSpace(state.Key) == "" {

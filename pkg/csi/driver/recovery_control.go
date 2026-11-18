@@ -465,7 +465,9 @@ func (s *ControllerServer) manualRecoveryAdoptionTarget(ctx context.Context, vol
 			return "", fmt.Errorf("manual recovery adoption for volume %s observed metadata serial %s but operator confirmed %s", volumeID, serial, confirmedSerial)
 		}
 	}
-	if report, ok := s.latestLocalDeviceReport(ctx, volumeID); ok && strings.EqualFold(strings.TrimSpace(report.Node), requestedNode) {
+	if report, ok, err := s.latestLocalDeviceReport(ctx, volumeID); err != nil {
+		return "", err
+	} else if ok && strings.EqualFold(strings.TrimSpace(report.Node), requestedNode) {
 		if reportSerial := strings.TrimSpace(report.DeviceSerial); reportSerial != "" && !strings.EqualFold(reportSerial, confirmedSerial) {
 			return "", fmt.Errorf("manual recovery adoption for volume %s observed node report serial %s but operator confirmed %s", volumeID, reportSerial, confirmedSerial)
 		}

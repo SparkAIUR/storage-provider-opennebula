@@ -256,12 +256,16 @@ func (s *ControllerServer) evaluateVolumeAttachDecision(ctx context.Context, dec
 		return decision.with(VolumeReconcileReject, queueReasonRepairRequired, codes.FailedPrecondition,
 			firstNonEmpty(state.Message, fmt.Sprintf("repair-required state %s is active for volume %s", state.Classification, evidence.VolumeID)))
 	}
-	if quarantine, ok := s.activeVolumeQuarantine(ctx, evidence.VolumeID); ok {
+	if quarantine, ok, err := s.activeVolumeQuarantine(ctx, evidence.VolumeID); err != nil {
+		return decision.with(VolumeReconcilePause, queueReasonVolumeQuarantined, status.Code(err), status.Convert(err).Message())
+	} else if ok {
 		evidence.VolumeQuarantine = &quarantine
 		decision = decision.withEvidence(evidence)
 		return decision.with(VolumeReconcileReject, queueReasonVolumeQuarantined, codes.FailedPrecondition, volumeQuarantineMessage(quarantine))
 	}
-	if s.activeHostArtifactQuarantine(ctx, evidence.VolumeID) {
+	if active, err := s.activeHostArtifactQuarantine(ctx, evidence.VolumeID); err != nil {
+		return decision.with(VolumeReconcilePause, queueReasonRepairRequired, status.Code(err), status.Convert(err).Message())
+	} else if active {
 		evidence.HostArtifactQuarantined = true
 		decision = decision.withEvidence(evidence)
 		return decision.with(VolumeReconcileReject, queueReasonRepairRequired, codes.FailedPrecondition,

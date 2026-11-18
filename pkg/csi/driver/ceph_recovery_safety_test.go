@@ -867,6 +867,63 @@ func TestControllerUnpublishCephRejectsContradictoryQuarantineTimes(t *testing.T
 	}
 }
 
+func TestControllerUnpublishRejectsDuplicateProtectionEvidence(t *testing.T) {
+	now := time.Now().UTC()
+	observed := now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	future := now.Add(time.Hour).Format(time.RFC3339Nano)
+	expired := now.Add(-time.Hour).Format(time.RFC3339Nano)
+	times := fmt.Sprintf(`"firstObservedAt":%q,"lastObservedAt":%q,"expiresAt":%q`, observed, observed, future)
+	for _, tc := range []struct {
+		name, configMap, key, record, message string
+	}{
+		{
+			"duplicate volume expiry", volumeQuarantineStateConfigMapName, cephRestartVolume,
+			fmt.Sprintf(`{"volumeID":%q,"reason":"metadata drift","failureCount":1,%s,"expiresAt":%q}`, cephRestartVolume, times, expired),
+			"volume quarantine is malformed",
+		},
+		{
+			"aliased host expiry", hostArtifactStateConfigMapName, "vm-575",
+			fmt.Sprintf(`{"key":"vm-575","vmID":575,"volumeID":%q,"failureCount":1,%s,"expire\u017fAt":%q}`, cephRestartVolume, times, expired),
+			"host artifact quarantine is malformed",
+		},
+		{
+			"nested repair identity", volumeRepairStateConfigMapName, cephRestartVolume,
+			fmt.Sprintf(`{"version":1,"volumeID":%q,"classification":"wrong_device_identity","lastObservedIdentity":{"observedFromDevice":{"block":{"deviceSerial":"onecsi-7","DeviceSerial":"onecsi-8"}}}}`, cephRestartVolume),
+			"cannot verify current volume repair state",
+		},
+		{
+			"aliased device routing identity", localDeviceStateConfigMapName, localDeviceReportKey("node-a", "other-volume"),
+			fmt.Sprintf(`{"node":"node-a","volumeID":%q,"VolumeId":"other-volume","failureClass":"wrong_device_identity","firstObservedAt":%q,"lastObservedAt":%q,"attempts":1}`, cephRestartVolume, observed, observed),
+			"cannot verify current volume repair state",
+		},
+	} {
+		for _, tcPath := range []struct{ queued, physical bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+			t.Run(fmt.Sprintf("%s/queued=%t/physical=%t", tc.name, tcPath.queued, tcPath.physical), func(t *testing.T) {
+				ctx := context.Background()
+				f := newCephRestartTestFixture(t, tcPath.queued)
+				runtime := f.server.driver.kubeRuntime
+				if tcPath.physical {
+					require.NoError(t, runtime.client.CoreV1().Pods(f.pod.Namespace).Delete(ctx, f.pod.Name, metav1.DeleteOptions{}))
+				}
+				require.NoError(t, runtime.UpsertConfigMapData(ctx, "default", tc.configMap, map[string]string{tc.key: tc.record}))
+				before, err := f.server.readAttachmentHistory(ctx, cephRestartVolume)
+				require.NoError(t, err)
+				response, err := f.unpublish(t)
+				require.ErrorContains(t, err, tc.message)
+				require.Nil(t, response)
+				require.Zero(t, f.provider.inspections.Load())
+				f.requireNoProviderMutation(t)
+				after, err := f.server.readAttachmentHistory(ctx, cephRestartVolume)
+				require.NoError(t, err)
+				require.Equal(t, before, after)
+				persisted, err := runtime.GetConfigMap(ctx, "default", tc.configMap)
+				require.NoError(t, err)
+				require.Equal(t, tc.record, persisted.Data[tc.key])
+			})
+		}
+	}
+}
+
 func TestControllerUnpublishCephRequiresSerializedQuarantineExpiry(t *testing.T) {
 	for _, host := range []bool{false, true} {
 		for _, expiry := range []string{"omitted", "null", "zero"} {

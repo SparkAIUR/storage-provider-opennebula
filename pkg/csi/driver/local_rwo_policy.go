@@ -2,7 +2,6 @@ package driver
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -135,7 +134,10 @@ func (s *ControllerServer) localRWOProtectionProjection(ctx context.Context, vol
 		return decision, nil
 	}
 
-	inferredRequiredNode, inferredReason, inferredSource, automaticTrigger := s.inferredLocalRWORequiredNode(ctx, volumeID, runtimeCtx, history, ignoreExpiredSticky)
+	inferredRequiredNode, inferredReason, inferredSource, automaticTrigger, err := s.inferredLocalRWORequiredNode(ctx, volumeID, runtimeCtx, history, ignoreExpiredSticky)
+	if err != nil {
+		return decision, err
+	}
 	decision.InferredRequiredNode = inferredRequiredNode
 	decision.InferredReason = inferredReason
 	decision.InferredSource = inferredSource
@@ -272,7 +274,7 @@ func localRWOHistoryRuntimeContextDegraded(runtimeCtx *VolumeRuntimeContext) boo
 	return false
 }
 
-func (s *ControllerServer) inferredLocalRWORequiredNode(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext, history VolumeHistoryRecord, ignoreExpiredSticky bool) (string, string, string, string) {
+func (s *ControllerServer) inferredLocalRWORequiredNode(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext, history VolumeHistoryRecord, ignoreExpiredSticky bool) (string, string, string, string, error) {
 	requiredNode := ""
 	reason := ""
 	source := ""
@@ -287,7 +289,9 @@ func (s *ControllerServer) inferredLocalRWORequiredNode(ctx context.Context, vol
 		}
 	}
 	if requiredNode == "" {
-		if report, ok := s.latestLocalDeviceReport(ctx, volumeID); ok && strings.TrimSpace(report.Node) != "" {
+		if report, ok, err := s.latestLocalDeviceReport(ctx, volumeID); err != nil {
+			return "", "", "", "", err
+		} else if ok && strings.TrimSpace(report.Node) != "" {
 			requiredNode = strings.TrimSpace(report.Node)
 			reason = protectionReasonLocalDevice
 			source = protectionSourceLocalDeviceRecovery
@@ -306,7 +310,7 @@ func (s *ControllerServer) inferredLocalRWORequiredNode(ctx context.Context, vol
 		source = protectionSourceHistoricalOwnership
 	}
 	if requiredNode == "" {
-		return "", "", "", ""
+		return "", "", "", "", nil
 	}
 	if s.driver.featureGates.LocalRWOAutoProtection && reason == protectionReasonHistory && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
 		if trigger, ok, err := s.driver.kubeRuntime.AutomaticMaintenanceTrigger(ctx, requiredNode); err == nil && ok {
@@ -317,7 +321,7 @@ func (s *ControllerServer) inferredLocalRWORequiredNode(ctx context.Context, vol
 			automaticTrigger = protectionTriggerControllerInferredSameNode
 		}
 	}
-	return requiredNode, reason, source, automaticTrigger
+	return requiredNode, reason, source, automaticTrigger, nil
 }
 
 func localRWOProtectionMessage(volumeID, requestedNode, requiredNode string, decision LocalRWOProtectionDecision) string {
@@ -373,18 +377,21 @@ func (s *ControllerServer) activeStickyAttachment(volumeID string) (StickyAttach
 	return s.driver.stickyAttachments.Get(volumeID)
 }
 
-func (s *ControllerServer) latestLocalDeviceReport(ctx context.Context, volumeID string) (LocalDeviceMissingReport, bool) {
+func (s *ControllerServer) latestLocalDeviceReport(ctx context.Context, volumeID string) (LocalDeviceMissingReport, bool, error) {
 	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
-		return LocalDeviceMissingReport{}, false
+		return LocalDeviceMissingReport{}, false, nil
 	}
 	cm, err := s.driver.kubeRuntime.GetConfigMap(ctx, namespaceFromServiceAccount(), localDeviceStateConfigMapName)
 	if err != nil || len(cm.Data) == 0 {
-		return LocalDeviceMissingReport{}, false
+		return LocalDeviceMissingReport{}, false, nil
 	}
 	var latest LocalDeviceMissingReport
 	for _, raw := range cm.Data {
 		var report LocalDeviceMissingReport
-		if err := json.Unmarshal([]byte(raw), &report); err != nil {
+		if err := unmarshalAuthorityJSON(raw, &report); err != nil {
+			if errors.Is(err, errDuplicateAuthorityKey) {
+				return LocalDeviceMissingReport{}, false, attachmentEvidenceUnavailable("node device report is malformed", err)
+			}
 			continue
 		}
 		if strings.TrimSpace(report.VolumeID) != strings.TrimSpace(volumeID) {
@@ -395,9 +402,9 @@ func (s *ControllerServer) latestLocalDeviceReport(ctx context.Context, volumeID
 		}
 	}
 	if strings.TrimSpace(latest.VolumeID) == "" {
-		return LocalDeviceMissingReport{}, false
+		return LocalDeviceMissingReport{}, false, nil
 	}
-	return latest, true
+	return latest, true, nil
 }
 
 func (s *ControllerServer) rejectIfActiveRepairState(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext) error {
@@ -910,29 +917,36 @@ func (s *ControllerServer) recordActiveRepairStateEvent(ctx context.Context, run
 	s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonVolumeRepairRequired, firstNonEmpty(state.Message, fmt.Sprintf("repair-required state %s is active", state.Classification)))
 }
 
-func (s *ControllerServer) activeVolumeQuarantine(ctx context.Context, volumeID string) (VolumeQuarantineState, bool) {
+func (s *ControllerServer) activeVolumeQuarantine(ctx context.Context, volumeID string) (VolumeQuarantineState, bool, error) {
 	if s == nil || s.driver == nil || s.driver.volumeQuarantine == nil {
-		return VolumeQuarantineState{}, false
+		return VolumeQuarantineState{}, false, nil
 	}
 	if err := s.driver.volumeQuarantine.RefreshEntry(ctx, volumeID); err != nil {
+		if errors.Is(err, errDuplicateAuthorityKey) {
+			return VolumeQuarantineState{}, false, attachmentEvidenceUnavailable("volume quarantine is malformed", err)
+		}
 		klog.V(3).InfoS("Failed to refresh volume quarantine state", "volumeID", volumeID, "err", err)
 	}
-	return s.driver.volumeQuarantine.GetActive(volumeID, time.Now().UTC())
+	state, active := s.driver.volumeQuarantine.GetActive(volumeID, time.Now().UTC())
+	return state, active, nil
 }
 
-func (s *ControllerServer) activeHostArtifactQuarantine(ctx context.Context, volumeID string) bool {
+func (s *ControllerServer) activeHostArtifactQuarantine(ctx context.Context, volumeID string) (bool, error) {
 	if s == nil || s.driver == nil || s.driver.hostArtifactQuarantine == nil {
-		return false
+		return false, nil
 	}
 	if err := s.driver.hostArtifactQuarantine.RefreshVolume(ctx, volumeID); err != nil {
+		if errors.Is(err, errDuplicateAuthorityKey) {
+			return false, attachmentEvidenceUnavailable("host artifact quarantine is malformed", err)
+		}
 		klog.V(3).InfoS("Failed to refresh host artifact quarantine state", "volumeID", volumeID, "err", err)
 	}
 	for _, state := range s.driver.hostArtifactQuarantine.Snapshot() {
 		if strings.TrimSpace(state.VolumeID) == strings.TrimSpace(volumeID) && (state.ExpiresAt.IsZero() || state.ExpiresAt.After(time.Now().UTC())) {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 func (s *ControllerServer) recordCrossNodeOverrideUsed(ctx context.Context, runtimeCtx *VolumeRuntimeContext, message string) {

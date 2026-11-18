@@ -155,17 +155,22 @@ func (p *PersistentDiskVolumeProvider) verifyObservedAttachmentBackend(ctx conte
 	if image.DatastoreID == nil || *image.DatastoreID < 0 {
 		return &datastoreConfigError{message: fmt.Sprintf("image %d has no valid datastore identity", image.ID)}
 	}
-	datastoreBackend, err := p.attachmentImageBackend(ctx, *image.DatastoreID)
+	datastore, err := p.attachmentDatastore(ctx, *image.DatastoreID)
 	if err != nil {
 		return err
 	}
 	if expected == "" {
-		expected = datastoreBackend
+		expected = datastore.Backend
 	}
-	if datastoreBackend != expected {
-		return fmt.Errorf("image %d datastore backend %q differs from %q", image.ID, datastoreBackend, expected)
+	if datastore.Backend != expected {
+		return fmt.Errorf("image %d datastore backend %q differs from %q", image.ID, datastore.Backend, expected)
 	}
 	transfer, _ := disk.Get("TM_MAD")
+	transfer = strings.ToLower(strings.TrimSpace(transfer))
+	if datastore.TMMad != "" && datastore.TMMad != transfer &&
+		(datastore.TMMad == "shared" || datastore.TMMad == "qcow2" || transfer == "shared" || transfer == "qcow2") {
+		return fmt.Errorf("image %d disk transfer driver %q differs from datastore transfer driver %q", image.ID, transfer, datastore.TMMad)
+	}
 	if attachmentTransferMatchesBackend(transfer, expected) {
 		return nil
 	}
@@ -176,12 +181,8 @@ func attachmentTransferMatchesBackend(transfer, backend string) bool {
 	switch strings.ToLower(strings.TrimSpace(transfer)) {
 	case "ceph":
 		return backend == "ceph"
-	case "ssh", "shared":
-		return backend == "local" || backend == "nfs"
-	case "fs_lvm", "fs_lvm_ssh", "local":
+	case "ssh", "shared", "qcow2", "fs_lvm", "fs_lvm_ssh", "local":
 		return backend == "local"
-	case "nfs":
-		return backend == "nfs"
 	default:
 		return false
 	}

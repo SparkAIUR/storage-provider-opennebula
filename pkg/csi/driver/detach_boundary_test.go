@@ -61,6 +61,50 @@ func TestProviderLegacyDetachAfterVerifiedExpansion(t *testing.T) {
 	require.NotContains(t, state.mutations, "resize:41:256")
 }
 
+func TestControllerUnpublishFilesystemDatastoreTransfer(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, tc := range []struct {
+			datastore, disk string
+			allowed         bool
+		}{
+			{"shared", "shared", true},
+			{"qcow2", "qcow2", true},
+			{"qcow2", "shared", false},
+		} {
+			t.Run(fmt.Sprintf("queued=%t/%s/%s", queued, tc.datastore, tc.disk), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "local"})
+				node := newReadyNode("node-old", true)
+				driver := newStickyTestDriver(t, pv, pvc, node)
+				driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+				provider, wire := nodeAttachmentProvider(t)
+				wire.mu.Lock()
+				wire.imageTransfer, wire.diskTransfer = tc.datastore, tc.disk
+				wire.mu.Unlock()
+				server := NewControllerServer(driver, provider, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+				}
+				reply, err := reviewControllerClient(t, server).ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				if tc.allowed {
+					require.NoError(t, err)
+					require.NotNil(t, reply)
+					require.Equal(t, []string{"detach:41"}, wire.mutations)
+				} else {
+					require.Error(t, err)
+					require.Nil(t, reply)
+					require.Empty(t, wire.mutations)
+					require.Contains(t, wire.disks, 41)
+				}
+			})
+		}
+	}
+}
+
 func TestControllerLegacyDetachBoundaries(t *testing.T) {
 	for _, action := range []string{"unpublish", "transfer", "expiry"} {
 		t.Run(action, func(t *testing.T) {
@@ -105,7 +149,8 @@ func TestControllerLegacyDetachBoundaries(t *testing.T) {
 			record, exists := driver.volumeHistory.Get("volume-test")
 			require.True(t, exists)
 			require.True(t, record.LastSafeDetachTime.IsZero())
-			_, quarantined := controller.activeVolumeQuarantine(ctx, "volume-test")
+			_, quarantined, err := controller.activeVolumeQuarantine(ctx, "volume-test")
+			require.NoError(t, err)
 			require.False(t, quarantined)
 			state.mu.Lock()
 			defer state.mu.Unlock()
@@ -133,7 +178,8 @@ func TestStickyExpiryDoesNotQuarantineDetachAuthorityDenial(t *testing.T) {
 	controller := NewControllerServer(driver, provider, nil)
 	controller.expireStickyDetach(ctx, state)
 
-	_, quarantined := controller.activeVolumeQuarantine(ctx, "volume-test")
+	_, quarantined, err := controller.activeVolumeQuarantine(ctx, "volume-test")
+	require.NoError(t, err)
 	require.False(t, quarantined)
 	_, held := driver.stickyAttachments.Get("volume-test")
 	require.True(t, held)

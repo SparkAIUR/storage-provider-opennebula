@@ -387,6 +387,9 @@ func decodeCephRetentionProtection(raw string, target any) error {
 	if strings.TrimSpace(raw) == "null" {
 		return fmt.Errorf("protection record must be an object")
 	}
+	if err := requireUniqueAuthorityKeys(raw); err != nil {
+		return err
+	}
 	decoder := json.NewDecoder(strings.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
@@ -420,7 +423,7 @@ func verifiedAttachmentBackend(annotation, attribute string) (string, error) {
 	switch backend {
 	case "":
 		return "", errAttachmentBackendUndeclared
-	case "ceph", "cephfs", "local", "nfs":
+	case "ceph", "cephfs", "local":
 		return backend, nil
 	default:
 		return "", fmt.Errorf("persistent volume backend is unknown")

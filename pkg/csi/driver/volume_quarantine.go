@@ -61,7 +61,7 @@ func (m *VolumeQuarantineManager) LoadFromConfigMap(ctx context.Context) error {
 	now := time.Now().UTC()
 	for key, raw := range cm.Data {
 		var state VolumeQuarantineState
-		if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		if err := unmarshalAuthorityJSON(raw, &state); err != nil {
 			klog.Warningf("failed to decode volume quarantine state %s: %v", key, err)
 			continue
 		}
@@ -117,7 +117,7 @@ func (m *VolumeQuarantineManager) RefreshEntry(ctx context.Context, volumeID str
 		return nil
 	}
 	var state VolumeQuarantineState
-	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+	if err := unmarshalAuthorityJSON(raw, &state); err != nil {
 		return err
 	}
 	if strings.TrimSpace(state.VolumeID) == "" {
