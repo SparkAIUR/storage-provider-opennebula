@@ -194,12 +194,22 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			continue
 		}
 		backend, backendErr := persistentVolumeBackend(pv)
-		if unresolvedVolume[volumeHandle] || backendErr != nil || strings.EqualFold(backend, "cephfs") || opennebula.IsSharedFilesystemVolumeID(volumeHandle) {
+		undeclared := errors.Is(backendErr, errAttachmentBackendUndeclared)
+		if unresolvedVolume[volumeHandle] || (backendErr != nil && !undeclared) || opennebula.IsSharedFilesystemVolumeID(volumeHandle) {
+			continue
+		}
+		if undeclared {
+			backend, _ = verifiedAttachmentBackend("", observed[0].Backend)
+		}
+		if backend == "" || backend == "cephfs" {
 			continue
 		}
 		if slices.ContainsFunc(observed, func(attachment opennebula.ObservedAttachment) bool {
 			providerBackend, err := verifiedAttachmentBackend("", attachment.Backend)
-			return err == nil && providerBackend != backend
+			if err != nil {
+				return undeclared
+			}
+			return providerBackend != backend
 		}) {
 			continue
 		}
@@ -446,7 +456,7 @@ func (r *AttachmentReconciler) skipDiskAttachmentReconcile(ctx context.Context, 
 	}
 	if pv != nil {
 		backend, err := persistentVolumeBackend(pv)
-		return err != nil || strings.EqualFold(backend, "cephfs")
+		return (err != nil && !errors.Is(err, errAttachmentBackendUndeclared)) || backend == "cephfs"
 	}
 	return false
 }
@@ -651,6 +661,15 @@ func (r *AttachmentReconciler) deleteStaleVolumeAttachment(ctx context.Context, 
 	}
 	if history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != imageID {
 		return fmt.Errorf("stale attachment image differs from history")
+	}
+	if _, err := persistentVolumeBackend(pv); errors.Is(err, errAttachmentBackendUndeclared) {
+		datastore, lookupErr := r.server.inspectVolumeDatastore(ctx, volume, imageID)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if history.Backend != "" && !strings.EqualFold(history.Backend, datastore.Backend) {
+			return fmt.Errorf("stale attachment backend differs from history")
+		}
 	}
 	if err := validateAttachmentImageAssertions(va.Status.AttachmentMetadata, imageID); err != nil {
 		return err

@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"reflect"
@@ -408,6 +409,8 @@ func cephHistoryHasObservedAuthority(history VolumeHistoryRecord) bool {
 		(history.EvidenceSource == "" || history.EvidenceSource == volumeHistoryEvidenceSourceObserved)
 }
 
+var errAttachmentBackendUndeclared = errors.New("persistent volume backend is undeclared")
+
 func verifiedAttachmentBackend(annotation, attribute string) (string, error) {
 	annotation = strings.ToLower(strings.TrimSpace(annotation))
 	attribute = strings.ToLower(strings.TrimSpace(attribute))
@@ -416,6 +419,8 @@ func verifiedAttachmentBackend(annotation, attribute string) (string, error) {
 	}
 	backend := firstNonEmpty(annotation, attribute)
 	switch backend {
+	case "":
+		return "", errAttachmentBackendUndeclared
 	case "ceph", "cephfs", "local", "nfs":
 		return backend, nil
 	default:

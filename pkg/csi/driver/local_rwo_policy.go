@@ -497,15 +497,14 @@ func (state *VolumeHistoryRecord) observeSuccessfulAttachment(observation succes
 	state.LastSuccessfulDeviceSerial = firstNonEmpty(observation.serial, state.LastSuccessfulDeviceSerial)
 }
 
-func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target string, sourceContext map[string]string, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision, metadata *opennebula.VolumeAttachmentMetadata, freshAttach bool) {
+func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target string, sourceContext map[string]string, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision) {
 	if s == nil || s.driver == nil || s.driver.volumeHistory == nil || strings.TrimSpace(volumeID) == "" {
 		return
 	}
-	if metadata == nil {
-		if inspector, ok := s.volumeProvider.(opennebula.VolumeAttachmentInspector); ok {
-			if inspected, err := inspector.InspectVolumeAttachment(ctx, volumeID, requestedNode); err == nil {
-				metadata = inspected
-			}
+	var metadata *opennebula.VolumeAttachmentMetadata
+	if inspector, ok := s.volumeProvider.(opennebula.VolumeAttachmentInspector); ok {
+		if inspected, err := inspector.InspectVolumeAttachment(ctx, volumeID, requestedNode); err == nil {
+			metadata = inspected
 		}
 	}
 	nodeUID := ""
@@ -516,20 +515,17 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 	}
 	observation := successfulAttachmentObservation{
 		nodeName: strings.TrimSpace(requestedNode), nodeUID: nodeUID, target: strings.TrimSpace(target),
-		imageID: imageID, vmID: vmID, diskID: -1, serial: strings.TrimSpace(sourceContext[publishContextDeviceSerial]),
+		imageID: imageID, vmID: vmID, serial: strings.TrimSpace(sourceContext[publishContextDeviceSerial]),
 	}
 	if metadata != nil && metadata.ImageID == imageID && metadata.AttachedToRequestedNode &&
 		metadata.RequestedNodeID == vmID && strings.TrimSpace(metadata.RequestedNode) == observation.nodeName {
 		for _, disk := range metadata.DiskRecords {
 			if disk.NodeID == vmID && strings.TrimSpace(disk.Target) == observation.target {
-				observation.diskID = disk.DiskID
+				observation.diskID = max(0, disk.DiskID)
 				observation.serial = firstNonEmpty(strings.TrimSpace(disk.Serial), observation.serial)
 				break
 			}
 		}
-	}
-	if freshAttach && observation.diskID < 0 {
-		observation.diskID = 0
 	}
 	now := time.Now().UTC()
 	_, err := s.driver.volumeHistory.Upsert(ctx, volumeID, func(state *VolumeHistoryRecord) {

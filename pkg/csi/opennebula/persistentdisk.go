@@ -2059,20 +2059,37 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 	return attachments, vmNames, nil
 }
 
+func (p *PersistentDiskVolumeProvider) InspectVolumeDatastore(ctx context.Context, volume string, imageID int) (Datastore, error) {
+	image, err := p.ctrl.Image(imageID).InfoContext(ctx, true)
+	if err != nil {
+		return Datastore{}, err
+	}
+	if imageID <= 0 || image.ID != imageID || image.Name != volume || image.DatastoreID == nil || *image.DatastoreID < 0 {
+		return Datastore{}, fmt.Errorf("image or datastore identity is unverified")
+	}
+	return p.attachmentDatastore(ctx, *image.DatastoreID)
+}
+
 func (p *PersistentDiskVolumeProvider) attachmentImageBackend(ctx context.Context, datastoreID int) (string, error) {
+	datastore, err := p.attachmentDatastore(ctx, datastoreID)
+	return datastore.Backend, err
+}
+
+func (p *PersistentDiskVolumeProvider) attachmentDatastore(ctx context.Context, datastoreID int) (Datastore, error) {
 	pool, err := p.ctrl.Datastores().InfoContext(ctx)
 	if err != nil {
-		return "", fmt.Errorf("cannot inspect attachment datastore %d: %w", datastoreID, err)
+		return Datastore{}, fmt.Errorf("cannot inspect attachment datastore %d: %w", datastoreID, err)
 	}
 	datastore, err := findDatastoreByID(pool.Datastores, datastoreID)
 	if err != nil {
-		return "", err
+		return Datastore{}, err
 	}
-	switch backend := datastoreFromSchema(datastore).Backend; backend {
+	observed := datastoreFromSchema(datastore)
+	switch observed.Backend {
 	case "ceph", "cephfs", "local", "nfs":
-		return backend, nil
+		return observed, nil
 	default:
-		return "", &datastoreConfigError{message: fmt.Sprintf("datastore %d has unsupported attachment backend %q", datastoreID, backend)}
+		return Datastore{}, &datastoreConfigError{message: fmt.Sprintf("datastore %d has unsupported attachment backend %q", datastoreID, observed.Backend)}
 	}
 }
 

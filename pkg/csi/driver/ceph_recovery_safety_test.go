@@ -487,7 +487,7 @@ func TestControllerUnpublishCephLateDemandCannotAcknowledge(t *testing.T) {
 
 func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"null", "unrelated-null", "ambiguous-null", "invalid-key-null", "identity-only", "missing-count", "missing-last-observation", "reversed-observation", "unrelated-reversed-observation", "unrelated-invalid-schema", "wrong-report-key", "unknown-confirmation", "unknown-failure", "host-key", "host-owner"} {
+		for _, mode := range []string{"null", "unrelated-null", "unrelated-valid", "ambiguous-null", "invalid-key-null", "identity-only", "missing-count", "missing-last-observation", "reversed-observation", "unrelated-reversed-observation", "unrelated-invalid-schema", "wrong-report-key", "miskeyed-relevant-report", "unknown-confirmation", "unknown-failure", "host-key", "host-owner"} {
 			t.Run(fmt.Sprintf("%v/%s", queued, mode), func(t *testing.T) {
 				f := newCephRestartTestFixture(t, queued)
 				key := localDeviceReportKey(f.node.Name, cephRestartVolume)
@@ -507,7 +507,7 @@ func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T
 				case "unrelated-invalid-schema":
 					key = localDeviceReportKey(f.node.Name, "other-volume")
 					raw = fmt.Sprintf(`{"node":%q,"volumeID":"other-volume","firstObservedAt":17}`, f.node.Name)
-				case "missing-count", "missing-last-observation", "reversed-observation", "unrelated-reversed-observation", "wrong-report-key", "unknown-confirmation", "unknown-failure":
+				case "missing-count", "missing-last-observation", "reversed-observation", "unrelated-reversed-observation", "unrelated-valid", "wrong-report-key", "miskeyed-relevant-report", "unknown-confirmation", "unknown-failure":
 					now := time.Now().UTC()
 					report := LocalDeviceMissingReport{Node: f.node.Name, VolumeID: cephRestartVolume, FailureClass: localDeviceFailureClassMissingDevice,
 						FirstObservedAt: now, LastObservedAt: now, Attempts: 1}
@@ -518,12 +518,18 @@ func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T
 						report.LastObservedAt = time.Time{}
 					case "reversed-observation":
 						report.FirstObservedAt = now.Add(time.Minute)
-					case "unrelated-reversed-observation":
-						report.FirstObservedAt = now.Add(time.Minute)
+					case "unrelated-reversed-observation", "unrelated-valid":
+						if mode == "unrelated-reversed-observation" {
+							report.FirstObservedAt = now.Add(time.Minute)
+						}
 						report.VolumeID = "other-volume"
+						report.FailureClass = localDeviceFailureClassWrongIdentity
 						key = localDeviceReportKey(report.Node, report.VolumeID)
 					case "wrong-report-key":
 						report.VolumeID = "another-volume"
+					case "miskeyed-relevant-report":
+						key = localDeviceReportKey(report.Node, "other-volume")
+						report.FailureClass = localDeviceFailureClassWrongIdentity
 					case "unknown-confirmation":
 						report.ConfirmationState = "future"
 					case "unknown-failure":

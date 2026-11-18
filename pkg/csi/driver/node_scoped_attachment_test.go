@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kruntime "k8s.io/apimachinery/pkg/runtime"
@@ -1783,11 +1784,20 @@ func TestCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t *testing.T) {
 
 type moveHistoryProvider struct {
 	*opennebula.PersistentDiskVolumeProvider
-	wire         *nodeAttachmentProtocol
-	destination  string
-	vmID         int
-	failCensus   atomic.Bool
-	failedCensus atomic.Int32
+	wire          *nodeAttachmentProtocol
+	destination   string
+	vmID          int
+	failCensus    atomic.Bool
+	timeoutAttach atomic.Bool
+	failedCensus  atomic.Int32
+}
+
+func (p *moveHistoryProvider) AttachVolume(ctx context.Context, volume, node string, readOnly bool, parameters map[string]string) error {
+	err := p.PersistentDiskVolumeProvider.AttachVolume(ctx, volume, node, readOnly, parameters)
+	if err == nil && p.timeoutAttach.Swap(false) {
+		return context.DeadlineExceeded
+	}
+	return err
 }
 
 func (p *moveHistoryProvider) InspectVolumeAttachment(ctx context.Context, volume, node string) (*opennebula.VolumeAttachmentMetadata, error) {
@@ -2151,8 +2161,8 @@ func TestControllerUnpublishCephROXWithRemoteReaders(t *testing.T) {
 }
 
 func TestCephSameVMFreshAttachReplacesUnobservedDiskSlot(t *testing.T) {
-	for _, queued := range []bool{false, true} {
-		t.Run(fmt.Sprintf("queued=%t", queued), func(t *testing.T) {
+	for _, tc := range []struct{ queued, retry bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+		t.Run(fmt.Sprintf("queued=%t/retry=%t", tc.queued, tc.retry), func(t *testing.T) {
 			ctx := context.Background()
 			const volume = "volume-test"
 			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
@@ -2174,7 +2184,7 @@ func TestCephSameVMFreshAttachReplacesUnobservedDiskSlot(t *testing.T) {
 			wire.mu.Unlock()
 			probe := &moveHistoryProvider{PersistentDiskVolumeProvider: provider, wire: wire, destination: node.Name, vmID: 41}
 			server := NewControllerServer(driver, probe, nil)
-			if queued {
+			if tc.queued {
 				driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
 				driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
 			}
@@ -2196,6 +2206,15 @@ func TestCephSameVMFreshAttachReplacesUnobservedDiskSlot(t *testing.T) {
 			pod.UID = "same-vm-replacement"
 			_, err = kube.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 			require.NoError(t, err)
+			if tc.retry {
+				probe.timeoutAttach.Store(true)
+				reply, err := client.ControllerPublishVolume(ctx, publish)
+				require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+				require.Nil(t, reply)
+				history, err := server.readAttachmentHistory(ctx, volume)
+				require.NoError(t, err)
+				require.Equal(t, before.LastSuccessfulPublishTime, history.LastSuccessfulPublishTime)
+			}
 			probe.failCensus.Store(true)
 			reply, err := client.ControllerPublishVolume(ctx, publish)
 			require.NoError(t, err)
@@ -2271,6 +2290,119 @@ func TestControllerPublishRecordsCancellationOutcome(t *testing.T) {
 				wire.mu.Lock()
 				defer wire.mu.Unlock()
 				require.Empty(t, wire.mutations)
+			})
+		}
+	}
+}
+
+func TestCreateVolumeRetryReturnsObservedBackend(t *testing.T) {
+	ctx := context.Background()
+	driver := newStickyTestDriver(t)
+	driver.PluginConfig.OverrideVal(config.AllowedDatastoreTypesVar, "ceph")
+	provider, wire := nodeAttachmentProvider(t)
+	wire.mu.Lock()
+	wire.ceph, wire.version, wire.ready = true, "7.4.0", true
+	wire.disks = map[int]int{}
+	wire.marker = 128 * 1024 * 1024
+	wire.mu.Unlock()
+	client := reviewControllerClient(t, NewControllerServer(driver, provider, nil))
+	reply, err := client.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name: "volume-test", CapacityRange: &csi.CapacityRange{RequiredBytes: 128 * 1024 * 1024},
+		VolumeCapabilities: []*csi.VolumeCapability{newPublishReq("volume-test", "node-old").VolumeCapability},
+		Parameters:         map[string]string{storageClassParamDatastoreIDs: "100", paramPVCUID: "test-claim-uid"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "volume-test", reply.Volume.VolumeId)
+	require.EqualValues(t, 128*1024*1024, reply.Volume.CapacityBytes)
+	require.Equal(t, "ceph", reply.Volume.VolumeContext[annotationBackend])
+	require.Equal(t, "100", reply.Volume.VolumeContext[annotationDatastoreID])
+	require.Equal(t, "images", reply.Volume.VolumeContext[annotationDatastoreName])
+	require.Equal(t, "test-claim-uid", reply.Volume.VolumeContext[volumeContextUUID])
+	wire.mu.Lock()
+	defer wire.mu.Unlock()
+	require.Empty(t, wire.mutations)
+}
+
+func TestLegacyDiskCleanupVerifiesUndeclaredBackend(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, tc := range []struct {
+			action, evidence string
+		}{
+			{"foreground", "verified"}, {"orphan", "verified"}, {"stale", "verified"},
+			{"foreground", "unavailable"}, {"foreground", "contradictory"},
+			{"orphan", "unavailable"}, {"stale", "unavailable"},
+		} {
+			t.Run(fmt.Sprintf("queued=%t/%s/%s", queued, tc.action, tc.evidence), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+				pv.ResourceVersion = "1"
+				pv.Status.Phase = corev1.VolumeBound
+				delete(pv.Annotations, annotationBackend)
+				if tc.evidence == "contradictory" {
+					pv.Annotations[annotationBackend] = "ceph"
+					pv.Spec.CSI.VolumeAttributes = map[string]string{annotationBackend: "local"}
+				}
+				node := newReadyNode("node-old", true)
+				objects := []kruntime.Object{pv, pvc, node}
+				const attachmentName = "stale-undeclared-attachment"
+				if tc.action == "stale" {
+					objects = append(objects, &storagev1.VolumeAttachment{
+						ObjectMeta: metav1.ObjectMeta{Name: attachmentName, UID: "stale-undeclared-uid", ResourceVersion: "1"},
+						Spec:       storagev1.VolumeAttachmentSpec{Attacher: DefaultDriverName, NodeName: node.Name, Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name}},
+						Status:     storagev1.VolumeAttachmentStatus{Attached: true, AttachmentMetadata: map[string]string{publishContextOpenNebulaImageID: "7"}},
+					})
+				}
+				driver := newStickyTestDriver(t, objects...)
+				provider, wire := nodeAttachmentProvider(t)
+				wire.mu.Lock()
+				wire.ceph, wire.version = true, "7.4.0"
+				if tc.action == "stale" {
+					delete(wire.disks, 41)
+				}
+				if tc.evidence == "unavailable" {
+					wire.failMethod = "one.datastorepool.info"
+				}
+				wire.mu.Unlock()
+				server := NewControllerServer(driver, provider, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+				}
+
+				if tc.action == "foreground" {
+					client := reviewControllerClient(t, server)
+					reply, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+					if tc.evidence == "verified" {
+						require.NoError(t, err)
+						require.NotNil(t, reply)
+					} else {
+						require.Equal(t, codes.Unavailable, status.Code(err))
+						require.Nil(t, reply)
+					}
+				} else {
+					r := NewAttachmentReconciler(server)
+					r.orphanGrace, r.staleVAGrace = time.Nanosecond, time.Nanosecond
+					require.NoError(t, r.ReconcileOnce(ctx))
+					require.NoError(t, r.ReconcileOnce(ctx))
+				}
+
+				if tc.action == "stale" {
+					_, err := driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(ctx, attachmentName, metav1.GetOptions{})
+					if tc.evidence == "verified" {
+						require.True(t, apierrors.IsNotFound(err))
+					} else {
+						require.NoError(t, err)
+					}
+				}
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				if tc.evidence == "verified" && tc.action != "stale" {
+					require.Equal(t, []string{"detach:41"}, wire.mutations)
+					require.Empty(t, wire.disks)
+				} else {
+					require.Empty(t, wire.mutations)
+				}
 			})
 		}
 	}

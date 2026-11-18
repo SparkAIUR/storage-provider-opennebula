@@ -431,24 +431,27 @@ func (m *VolumeRepairStateManager) Get(volumeID string) (VolumeRepairState, bool
 
 func decodeLocalDeviceReport(key, raw, volumeID string) (LocalDeviceMissingReport, error) {
 	var report LocalDeviceMissingReport
-	if volumeID != "" && !strings.HasSuffix(key, "."+sanitizeLocalDeviceReportKey(volumeID)) {
+	var identity struct {
+		Node     string `json:"node"`
+		VolumeID string `json:"volumeID"`
+	}
+	err := json.Unmarshal([]byte(raw), &identity)
+	identityIncomplete := strings.TrimSpace(identity.Node) == "" || strings.TrimSpace(identity.VolumeID) == ""
+	keyTargetsVolume := volumeID != "" && strings.HasSuffix(key, "."+sanitizeLocalDeviceReportKey(volumeID))
+	if volumeID != "" && identity.VolumeID != volumeID && (err != nil || identityIncomplete) && !keyTargetsVolume {
 		node, handle, split := strings.Cut(key, ".")
 		if split && handle != "" && len(validation.IsDNS1123Subdomain(node)) == 0 && len(validation.IsConfigMapKey(key)) == 0 {
 			return report, nil
 		}
 	}
-	var identity struct {
-		Node     string `json:"node"`
-		VolumeID string `json:"volumeID"`
-	}
-	if err := json.Unmarshal([]byte(raw), &identity); err != nil {
+	if err != nil {
 		return report, err
 	}
-	if strings.TrimSpace(identity.Node) == "" || strings.TrimSpace(identity.VolumeID) == "" || key != localDeviceReportKey(identity.Node, identity.VolumeID) {
+	if identityIncomplete || key != localDeviceReportKey(identity.Node, identity.VolumeID) {
 		return report, fmt.Errorf("node device report identity is invalid")
 	}
 	if volumeID != "" && identity.VolumeID != volumeID {
-		if key == localDeviceReportKey(identity.Node, volumeID) {
+		if keyTargetsVolume {
 			return report, fmt.Errorf("node device report key is ambiguous")
 		}
 		return report, nil

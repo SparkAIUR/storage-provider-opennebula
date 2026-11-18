@@ -20,6 +20,7 @@ type physicalDetachIdentity struct {
 	pvUID, nodeUID        types.UID
 	imageID, vmID, diskID int
 	background, ceph      bool
+	backendInferred       bool
 	cephSingleWriter      bool
 	backend               string
 	attachments           map[string]detachAttachmentAuthority
@@ -81,7 +82,21 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	runtimeCtx.PVAnnotations = pv.Annotations
 	runtimeCtx.Backend = strings.TrimSpace(pv.Annotations[annotationBackend])
 	backend, err := persistentVolumeBackend(pv)
-	if err != nil {
+	if errors.Is(err, errAttachmentBackendUndeclared) {
+		switch {
+		case identity.attachments == nil:
+			datastore, lookupErr := s.inspectVolumeDatastore(ctx, volume, identity.imageID)
+			if lookupErr != nil {
+				return lookupErr
+			}
+			backend = datastore.Backend
+			identity.backendInferred = true
+		case identity.backendInferred:
+			backend = identity.backend
+		default:
+			return attachmentEvidenceUnavailable("detach backend declaration disappeared", nil)
+		}
+	} else if err != nil {
 		return attachmentEvidenceUnavailable("cannot verify detach backend", err)
 	}
 	if identity.ceph && !isCephBackend(backend) {
@@ -128,7 +143,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if err != nil {
 		return attachmentEvidenceUnavailable("detach history is unreadable", err)
 	}
-	if history.Backend != "" && (isCephBackend(history.Backend) || isCephBackend(backend)) && !strings.EqualFold(history.Backend, backend) {
+	if history.Backend != "" && (identity.backendInferred || isCephBackend(history.Backend) || isCephBackend(backend)) && !strings.EqualFold(history.Backend, backend) {
 		return status.Error(codes.Unavailable, "detach backend contradicts observed history")
 	}
 	if history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != identity.imageID {
@@ -221,6 +236,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		return err
 	}
 	identity.attachments = attachments
+	identity.backend = backend
 	return nil
 }
 
@@ -252,6 +268,23 @@ func (s *ControllerServer) recheckAttachmentAuthority(ctx context.Context, volum
 		return status.FromContextError(err).Err()
 	}
 	return nil
+}
+
+func (s *ControllerServer) inspectVolumeDatastore(ctx context.Context, volume string, imageID int) (opennebula.Datastore, error) {
+	inspector, ok := s.volumeProvider.(opennebula.VolumeDatastoreInspector)
+	if !ok {
+		return opennebula.Datastore{}, attachmentEvidenceUnavailable("provider cannot verify the volume datastore", nil)
+	}
+	datastore, err := inspector.InspectVolumeDatastore(ctx, volume, imageID)
+	if err != nil {
+		return opennebula.Datastore{}, attachmentEvidenceUnavailable("volume datastore is unverified", err)
+	}
+	backend, err := verifiedAttachmentBackend("", datastore.Backend)
+	if err != nil || backend == "cephfs" {
+		return opennebula.Datastore{}, attachmentEvidenceUnavailable("volume datastore backend is unverified for a disk image", err)
+	}
+	datastore.Backend = backend
+	return datastore, nil
 }
 
 func (s *ControllerServer) verifyProviderAttachmentBackend(ctx context.Context, volume string, imageID, vmID int, backend string) error {
@@ -331,12 +364,6 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 				return false, attachmentEvidenceUnavailable("cannot verify detach PV UID", err)
 			}
 			identity.pvUID = pv.UID
-			if identity.backend == "" {
-				identity.backend, err = persistentVolumeBackend(pv)
-				if err != nil {
-					return false, attachmentEvidenceUnavailable("cannot verify detach backend", err)
-				}
-			}
 		}
 		current, err := runtime.NodeIdentity(ctx, node)
 		if err != nil || !current.Exists || current.UID == "" || (identity.nodeUID != "" && identity.nodeUID != types.UID(current.UID)) {
@@ -376,7 +403,7 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 	if err != nil {
 		return false, err
 	}
-	if identity.ceph || identity.background {
+	if identity.ceph || isCephBackend(identity.backend) || identity.background {
 		if _, err := s.volumeProvider.GetVolumeInNode(ctx, identity.imageID, identity.vmID); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
 			return false, attachmentEvidenceUnavailable("detach readback did not establish absence", err)
 		}

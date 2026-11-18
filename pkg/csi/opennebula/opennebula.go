@@ -134,6 +134,10 @@ type AttachmentBackendVerifier interface {
 	VerifyAttachmentBackend(ctx context.Context, volume string, imageID, vmID int, expected string) error
 }
 
+type VolumeDatastoreInspector interface {
+	InspectVolumeDatastore(ctx context.Context, volume string, imageID int) (Datastore, error)
+}
+
 type VolumeAttachmentInspector interface {
 	InspectVolumeAttachment(ctx context.Context, volume string, node string) (*VolumeAttachmentMetadata, error)
 }
