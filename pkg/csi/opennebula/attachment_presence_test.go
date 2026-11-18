@@ -10,7 +10,7 @@ import (
 )
 
 func TestAttachRetryRequiresConsistentAbsence(t *testing.T) {
-	for _, scenario := range []string{"absent", "attached", "nil-metadata", "wrong-image", "wrong-vm", "missing-target", "another-vm", "image-usage", "image-vm-ids", "lookup-error"} {
+	for _, scenario := range []string{"absent", "attached", "ready-with-owner", "nil-metadata", "wrong-image", "wrong-vm", "missing-target", "another-vm", "image-usage", "image-vm-ids", "lookup-error"} {
 		t.Run(scenario, func(t *testing.T) {
 			metadata := &VolumeAttachmentMetadata{VolumeHandle: "volume", ImageID: 7, RequestedNodeID: 11, ImageStateRaw: int(img.Ready)}
 			var lookupErr error
@@ -33,7 +33,12 @@ func TestAttachRetryRequiresConsistentAbsence(t *testing.T) {
 				metadata.ImageRunningVMs = 1
 			case "image-vm-ids":
 				metadata.ImageVMIDs = []int{12}
-			case "attached":
+			case "attached", "ready-with-owner":
+				if scenario == "attached" {
+					metadata.ImageStateRaw = int(img.UsedPers)
+				}
+				metadata.ImageRunningVMs = 1
+				metadata.ImageVMIDs = []int{11}
 				metadata.AttachedToRequestedNode = true
 				metadata.DiskRecords = []VolumeDiskRecord{{NodeID: 11, Target: "sdd"}}
 			case "lookup-error":

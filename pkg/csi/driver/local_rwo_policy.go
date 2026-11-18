@@ -571,6 +571,9 @@ func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volume
 			(metadata.VolumeHandle != "" && metadata.VolumeHandle != volumeID) {
 			return observation, attachmentEvidenceUnavailable("publish attachment identity changed", nil)
 		}
+		if err := metadata.VerifyOwnership(); err != nil {
+			return observation, attachmentEvidenceUnavailable("publish attachment ownership is unverified", err)
+		}
 		if adoptedSerial != "" && len(metadata.ConflictingOwnerVMIDs()) != 0 {
 			return observation, attachmentEvidenceUnavailable("publish adoption has conflicting attachment owners", nil)
 		}

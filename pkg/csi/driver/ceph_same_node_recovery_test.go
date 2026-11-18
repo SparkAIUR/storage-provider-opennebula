@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	img "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/image"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -115,7 +116,7 @@ func newCephRestartTestFixture(t *testing.T, queued bool) *cephRestartTestFixtur
 	base.On("GetVolumeInNode", mock.Anything, 3137, 575).Return("vdb", nil)
 	base.On("InspectVolumeLookup", mock.Anything, cephRestartVolume, "node-a").Return(&opennebula.VolumeLookupResult{
 		Status: opennebula.VolumeLookupPresent, VolumeHandle: cephRestartVolume, ImageID: 3137, SizeBytes: 1024 * 1024 * 1024, RequestedNode: "node-a", RequestedNodeID: 575,
-		AttachmentMetadata: &opennebula.VolumeAttachmentMetadata{VolumeHandle: cephRestartVolume, ImageID: 3137, ImageName: cephRestartVolume, ImageState: "USED_PERS", ImageRunningVMs: 1, ImageVMIDs: []int{575}, RequestedNode: "node-a", RequestedNodeID: 575, AttachedToRequestedNode: true, DiskRecords: []opennebula.VolumeDiskRecord{{NodeName: "node-a", NodeID: 575, DiskID: 1, Target: "vdb", Serial: "onecsi-3137"}}},
+		AttachmentMetadata: &opennebula.VolumeAttachmentMetadata{VolumeHandle: cephRestartVolume, ImageID: 3137, ImageName: cephRestartVolume, ImageState: "USED_PERS", ImageStateRaw: int(img.UsedPers), ImageRunningVMs: 1, ImageVMIDs: []int{575}, RequestedNode: "node-a", RequestedNodeID: 575, AttachedToRequestedNode: true, DiskRecords: []opennebula.VolumeDiskRecord{{NodeName: "node-a", NodeID: 575, DiskID: 1, Target: "vdb", Serial: "onecsi-3137"}}},
 	}, nil)
 	provider := &cephRetentionTestProvider{MockOpenNebulaVolumeProviderTestify: base, observe: func(context.Context) (*opennebula.SameNodeRetentionEvidence, error) {
 		return validCephRetentionTestEvidence(), nil
@@ -611,7 +612,7 @@ func TestCephLegacyStaticUnpublishRequiresBackendEvidence(t *testing.T) {
 func cephRestartOwnerMetadata() *opennebula.VolumeAttachmentMetadata {
 	return &opennebula.VolumeAttachmentMetadata{
 		VolumeHandle: cephRestartVolume, ImageID: 3137, ImageName: cephRestartVolume, RequestedNode: "node-a", RequestedNodeID: 575,
-		ImageRunningVMs: 1, ImageVMIDs: []int{575}, AttachedToRequestedNode: true,
+		ImageStateRaw: int(img.UsedPers), ImageRunningVMs: 1, ImageVMIDs: []int{575}, AttachedToRequestedNode: true,
 		DiskRecords: []opennebula.VolumeDiskRecord{{NodeID: 575, DiskID: 1, Target: "vdb"}},
 	}
 }

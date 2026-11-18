@@ -1074,20 +1074,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		attachCtx := s.authorizeHostArtifactAttach(s.publishMutationContext(queueCtx, req, nodeID, volumeID, publishNode, true), req)
 		var attempt *replacementAttachAttempt
 		var dispatch *opennebula.ReplacementAttachDispatch
-		if replacement && history.LastSuccessfulOpenNebulaVMID != nodeID {
-			binding := replacementAttachAttempt{Driver: s.driver.name, VolumeID: req.VolumeId, Node: req.NodeId,
-				ReplacementUID: publishNode.UID, ImageID: volumeID, VMID: nodeID}
-			binding, err = s.verifyDistinctVMReplacement(queueCtx, req, history, binding)
-			if err != nil {
-				return err
-			}
-			attachCtx = opennebula.WithAttachAuthorization(attachCtx, func(ctx context.Context, target *opennebula.HostArtifactAttachmentTarget) error {
-				if _, err := s.verifyDistinctVMReplacement(ctx, req, history, binding); err != nil {
-					return err
-				}
-				return s.checkHostArtifactAttachTarget(ctx, req, target, nil)
-			})
-		} else if replacement {
+		if replacement {
 			attempt, err = s.beginReplacementAttach(queueCtx, req, history, volumeID, nodeID, publishNode)
 			if err != nil {
 				return err

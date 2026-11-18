@@ -642,7 +642,7 @@ func (p *PersistentDiskVolumeProvider) ExpandVolume(ctx context.Context, volume 
 	if size <= 0 {
 		return 0, fmt.Errorf("requested capacity must be positive")
 	}
-	id, current, err := p.volumeExists(ctx, volume, p.readExpansionImageInfo)
+	id, current, err := p.volumeExists(ctx, volume, p.readOrdinaryImageInfo)
 	if err != nil {
 		return 0, err
 	}
@@ -1777,7 +1777,7 @@ type imageAuthorityField struct {
 	Children []imageAuthorityField `xml:",any"`
 }
 
-func validateImageAuthorityXML(data []byte, expansion bool, required ...string) error {
+func validateImageAuthorityXML(data []byte, required ...string) error {
 	var image struct {
 		XMLName   xml.Name              `xml:"IMAGE"`
 		Fields    []imageAuthorityField `xml:",any"`
@@ -1794,9 +1794,6 @@ func validateImageAuthorityXML(data []byte, expansion bool, required ...string) 
 		switch key {
 		case "ID", "NAME", "PERSISTENT", "SIZE":
 		case "STATE", "RUNNING_VMS", "CLONING_OPS", "DATASTORE_ID", "VMS", "SOURCE", "SNAPSHOTS":
-			if expansion {
-				continue
-			}
 		default:
 			continue
 		}
@@ -1837,7 +1834,7 @@ func validateImageAuthorityXML(data []byte, expansion bool, required ...string) 
 	for _, template := range image.Templates {
 		for _, field := range template.Fields {
 			key := field.XMLName.Local
-			if key != requestedSizeTag && (expansion || key != "FORCE_DELETE") {
+			if key != requestedSizeTag && key != "FORCE_DELETE" {
 				continue
 			}
 			if seen[key] {
@@ -1850,11 +1847,11 @@ func validateImageAuthorityXML(data []byte, expansion bool, required ...string) 
 }
 
 func (p *PersistentDiskVolumeProvider) readImageInfo(ctx context.Context, imageID int) (*img.Image, error) {
-	return p.readScopedImageInfo(ctx, imageID, false)
+	return p.readScopedImageInfo(ctx, imageID)
 }
 
 func (p *PersistentDiskVolumeProvider) readAttachmentImageInfo(ctx context.Context, imageID int) (*img.Image, error) {
-	info, err := p.readScopedImageInfo(ctx, imageID, false, "STATE", "RUNNING_VMS", "VMS", "CLONING_OPS")
+	info, err := p.readScopedImageInfo(ctx, imageID, "STATE", "RUNNING_VMS", "VMS", "CLONING_OPS")
 	if err != nil {
 		return nil, err
 	}
@@ -1871,20 +1868,23 @@ func (p *PersistentDiskVolumeProvider) readAttachmentImageInfo(ctx context.Conte
 		}
 		owners[id] = true
 	}
+	if err := verifyImageOwnershipState(img.State(info.StateRaw), info.RunningVMs); err != nil {
+		return nil, err
+	}
 	return info, nil
 }
 
-func (p *PersistentDiskVolumeProvider) readExpansionImageInfo(ctx context.Context, imageID int) (*img.Image, error) {
-	return p.readScopedImageInfo(ctx, imageID, true)
+func (p *PersistentDiskVolumeProvider) readOrdinaryImageInfo(ctx context.Context, imageID int) (*img.Image, error) {
+	return p.ctrl.Image(imageID).InfoContext(ctx, true)
 }
 
-func (p *PersistentDiskVolumeProvider) readScopedImageInfo(ctx context.Context, imageID int, expansion bool, required ...string) (*img.Image, error) {
+func (p *PersistentDiskVolumeProvider) readScopedImageInfo(ctx context.Context, imageID int, required ...string) (*img.Image, error) {
 	response, err := p.ctrl.Client.ImageInfo(ctx, imageID, true)
 	if err != nil {
 		return nil, err
 	}
 	data := []byte(response.Body())
-	if err := validateImageAuthorityXML(data, expansion, required...); err != nil {
+	if err := validateImageAuthorityXML(data, required...); err != nil {
 		if len(required) != 0 && !errors.Is(err, ErrConflictingAttachmentEvidence) {
 			return nil, fmt.Errorf("%w: malformed image authority XML: %v", ErrConflictingAttachmentEvidence, err)
 		}
@@ -2057,7 +2057,7 @@ func (p *PersistentDiskVolumeProvider) volumeDeleted(volumeID int) (bool, error)
 	return p.volumeDeletedContext(context.Background(), volumeID)
 }
 func (p *PersistentDiskVolumeProvider) volumeDeletedContext(ctx context.Context, volumeID int) (bool, error) {
-	info, err := p.readScopedImageInfo(ctx, volumeID, false, "STATE")
+	info, err := p.readScopedImageInfo(ctx, volumeID, "STATE")
 	if err != nil {
 		if openNebulaLookupNotFound(err) {
 			return true, nil
@@ -2324,37 +2324,40 @@ func attachmentPresence(metadata *VolumeAttachmentMetadata, volume string, image
 	if metadata == nil || metadata.VolumeHandle != volume || metadata.ImageID != imageID || metadata.RequestedNodeID != nodeID || nodeID <= 0 {
 		return false, fmt.Errorf("attachment identity could not be verified")
 	}
+	if err := metadata.VerifyOwnership(); err != nil {
+		return false, err
+	}
+	return metadata.AttachedToRequestedNode, nil
+}
+
+func (metadata *VolumeAttachmentMetadata) VerifyOwnership() error {
+	owners := make(map[int]bool, len(metadata.DiskRecords))
 	for _, disk := range metadata.DiskRecords {
-		if disk.NodeID == nodeID {
-			if !metadata.AttachedToRequestedNode || strings.TrimSpace(disk.Target) == "" {
-				return false, fmt.Errorf("requested-node attachment lacks a verified target")
-			}
-			return true, nil
+		if disk.NodeID <= 0 || strings.TrimSpace(disk.Target) == "" || owners[disk.NodeID] {
+			return fmt.Errorf("%w: VM disk ownership is invalid or ambiguous", ErrConflictingAttachmentEvidence)
 		}
-	}
-	if metadata.AttachedToRequestedNode {
-		return false, fmt.Errorf("requested-node attachment observations contradict one another")
-	}
-	owners := make(map[int]bool)
-	for _, record := range metadata.DiskRecords {
-		if record.NodeID <= 0 || strings.TrimSpace(record.Target) == "" {
-			return false, fmt.Errorf("attachment ownership could not be verified")
-		}
-		owners[record.NodeID] = true
-	}
-	for _, id := range metadata.ImageVMIDs {
-		if id == nodeID || !owners[id] {
-			return false, fmt.Errorf("image usage contradicts observed VM attachments")
-		}
+		owners[disk.NodeID] = true
 	}
 	if metadata.ImageRunningVMs != len(owners) || len(metadata.ImageVMIDs) != len(owners) {
-		return false, fmt.Errorf("image usage differs from observed VM attachments")
+		return fmt.Errorf("%w: image usage differs from observed VM attachments", ErrConflictingAttachmentEvidence)
 	}
-	state := img.State(metadata.ImageStateRaw)
-	if len(owners) == 0 && !idleImageState(state) || len(owners) != 0 && !usedImageState(state) {
-		return false, fmt.Errorf("image state does not establish attachment absence")
+	if owners[metadata.RequestedNodeID] != metadata.AttachedToRequestedNode {
+		return fmt.Errorf("%w: requested-node attachment observations contradict one another", ErrConflictingAttachmentEvidence)
 	}
-	return false, nil
+	for _, id := range metadata.ImageVMIDs {
+		if !owners[id] {
+			return fmt.Errorf("%w: image usage contradicts observed VM attachments", ErrConflictingAttachmentEvidence)
+		}
+		delete(owners, id)
+	}
+	return verifyImageOwnershipState(img.State(metadata.ImageStateRaw), metadata.ImageRunningVMs)
+}
+
+func verifyImageOwnershipState(state img.State, owners int) error {
+	if owners == 0 && !idleImageState(state) || owners > 0 && !usedImageState(state) {
+		return fmt.Errorf("%w: image state disagrees with attachment ownership", ErrConflictingAttachmentEvidence)
+	}
+	return nil
 }
 
 func (p *PersistentDiskVolumeProvider) GetVolumeInNode(ctx context.Context, volumeID int, nodeID int) (string, error) {
@@ -2498,6 +2501,13 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeDisk(ctx context.Context, im
 	if err != nil {
 		return VolumeDiskRecord{}, err
 	}
+	image, err := p.readAttachmentImageInfo(ctx, imageID)
+	if err != nil {
+		return VolumeDiskRecord{}, err
+	}
+	if image.ID != imageID || len(image.VMs.ID) != 1 || image.VMs.ID[0] != vmID {
+		return VolumeDiskRecord{}, fmt.Errorf("%w: image ownership contradicts the selected VM disk", ErrConflictingAttachmentEvidence)
+	}
 	return attachmentDiskRecord(info, info.Template.GetDisks(), *disk)
 }
 
@@ -2539,7 +2549,12 @@ func verifiedDiskTarget(disks []shared.Disk, selected shared.Disk) (string, erro
 	target, _ := selected.Get(shared.TargetDisk)
 	name := strings.TrimPrefix(target, "/dev/")
 	if name == "" || name == "." || name == ".." || strings.IndexFunc(name, func(r rune) bool {
-		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.')
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-', r == '.':
+			return false
+		default:
+			return true
+		}
 	}) >= 0 {
 		return "", fmt.Errorf("%w: selected VM disk target is invalid", ErrConflictingAttachmentEvidence)
 	}
@@ -2664,8 +2679,8 @@ func (p *PersistentDiskVolumeProvider) inspectVolumeAttachment(ctx context.Conte
 	if incompleteDiskEvidence != nil {
 		return nil, incompleteDiskEvidence
 	}
-	if len(metadata.DiskRecords) == 0 && imageInfo.RunningVMs == 0 && !idleImageState(img.State(imageInfo.StateRaw)) {
-		return nil, fmt.Errorf("%w: image state does not establish attachment absence", ErrConflictingAttachmentEvidence)
+	if err := metadata.VerifyOwnership(); err != nil {
+		return nil, err
 	}
 	if !requestedNodeSeen {
 		return nil, fmt.Errorf("requested VM was absent from the attachment inspection")

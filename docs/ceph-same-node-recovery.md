@@ -33,7 +33,10 @@ The provider and Kubernetes observations are bounded checks. Controller locks se
 A Publish to a replacement Kubernetes Node with the same name is a separate
 Ceph operation. On OpenNebula 7.4.0, the controller may record one pending
 attach attempt in the existing volume history after verifying the binding,
-demand, prior release, and settled provider absence. The attach template
+demand, prior release, and settled provider absence. The replacement Node
+may use the original VM or a different verified VM. For a different VM,
+the controller independently verifies the original VM identity and release
+before dispatch and again before completing Publish. The attach template
 carries an opaque `CSI_ATTACH_ATTEMPT` value and keeps the existing device
 serial. A restarted controller can complete Publish when the sole selected
 disk carries that exact value and the original admission still matches.

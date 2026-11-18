@@ -45,7 +45,7 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 	if metadata == nil || metadata.ImageID <= 0 || metadata.ImageName != volume || metadata.RequestedNode != node || metadata.RequestedNodeID <= 0 || !metadata.AttachedToRequestedNode {
 		return deny("attachment identity is incomplete")
 	}
-	if metadata.ImageRunningVMs != 1 || len(metadata.ImageVMIDs) != 1 || metadata.ImageVMIDs[0] != metadata.RequestedNodeID || len(metadata.ConflictingOwnerVMIDs()) != 0 {
+	if metadata.ImageStateRaw != int(img.UsedPers) || metadata.ImageRunningVMs != 1 || len(metadata.ImageVMIDs) != 1 || metadata.ImageVMIDs[0] != metadata.RequestedNodeID || len(metadata.ConflictingOwnerVMIDs()) != 0 {
 		return deny("image does not have exactly the requested owner")
 	}
 	if len(metadata.DiskRecords) != 1 {

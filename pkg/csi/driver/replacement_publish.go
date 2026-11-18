@@ -32,6 +32,8 @@ type replacementAttachAttempt struct {
 	HistoryGeneration string `json:"historyGeneration"`
 	ImageID           int    `json:"imageID"`
 	VMID              int    `json:"vmID"`
+	OriginalVMID      int    `json:"originalVMID,omitempty"`
+	OriginalVMName    string `json:"originalVMName,omitempty"`
 }
 
 func replacementHistoryGeneration(history VolumeHistoryRecord) string {
@@ -54,13 +56,20 @@ func replacementHistoryGeneration(history VolumeHistoryRecord) string {
 }
 
 func (attempt replacementAttachAttempt) matchesHistory(history VolumeHistoryRecord) bool {
+	originalVM := attempt.VMID
+	if attempt.OriginalVMID != 0 || attempt.OriginalVMName != "" {
+		if attempt.OriginalVMID <= 0 || attempt.OriginalVMID == attempt.VMID || attempt.OriginalVMName == "" {
+			return false
+		}
+		originalVM = attempt.OriginalVMID
+	}
 	token, err := hex.DecodeString(attempt.ID)
 	return err == nil && len(token) == 32 && attempt.Version == 1 && attempt.PVUID != "" && attempt.PVCUID != "" &&
 		attempt.Driver != "" && attempt.VolumeID == history.VolumeID && attempt.Node != "" &&
 		attempt.Node == history.LastSuccessfulNodeName && attempt.OriginalNodeUID != "" && attempt.ReplacementUID != "" &&
 		attempt.OriginalNodeUID != attempt.ReplacementUID && attempt.OriginalNodeUID == history.LastSuccessfulNodeUID &&
 		attempt.ImageID > 0 && attempt.ImageID == history.LastSuccessfulImageID &&
-		attempt.VMID > 0 && attempt.VMID == history.LastSuccessfulOpenNebulaVMID &&
+		attempt.VMID > 0 && originalVM == history.LastSuccessfulOpenNebulaVMID &&
 		attempt.HistoryGeneration == replacementHistoryGeneration(history) && cephHistoryHasObservedAuthority(history)
 }
 
@@ -198,6 +207,11 @@ func (s *ControllerServer) verifyReplacementAttempt(ctx context.Context, req *cs
 	if err != nil || (disk != nil) != attached {
 		return nil, attachmentEvidenceUnavailable("replacement Ceph attach outcome is unverified", err)
 	}
+	if attempt.OriginalVMID != 0 {
+		if _, err := inspector.InspectReplacementRelease(ctx, attempt.ImageID, attempt.OriginalVMID, attempt.OriginalVMName); err != nil {
+			return nil, attachmentEvidenceUnavailable("original Ceph attachment release is unverified", err)
+		}
+	}
 	history, err := s.readAttachmentHistory(ctx, req.VolumeId)
 	if err != nil || history.PendingReplacementAttach == nil || *history.PendingReplacementAttach != attempt || !attempt.matchesHistory(history) {
 		return nil, attachmentEvidenceUnavailable("replacement Ceph attach history changed", err)
@@ -208,23 +222,6 @@ func (s *ControllerServer) verifyReplacementAttempt(ctx context.Context, req *cs
 	}
 	_, err = s.verifyReplacementBinding(ctx, req, history, attempt, diskID)
 	return disk, err
-}
-
-func (s *ControllerServer) verifyDistinctVMReplacement(ctx context.Context, req *csi.ControllerPublishVolumeRequest, history VolumeHistoryRecord, binding replacementAttachAttempt) (replacementAttachAttempt, error) {
-	inspector, ok := s.volumeProvider.(opennebula.ReplacementAttachInspector)
-	if !ok || !cephHistoryHasObservedAuthority(history) || history.LastSuccessfulImageID != binding.ImageID ||
-		history.LastSuccessfulOpenNebulaVMID <= 0 || binding.VMID == history.LastSuccessfulOpenNebulaVMID {
-		return binding, attachmentEvidenceUnavailable("original Ceph attachment identity is unverified", nil)
-	}
-	if err := inspector.VerifyReplacementRelease(ctx, binding.VolumeID, binding.Node, binding.ImageID, history.LastSuccessfulOpenNebulaVMID, binding.VMID); err != nil {
-		return binding, attachmentEvidenceUnavailable("original Ceph attachment release is unverified", err)
-	}
-	current, err := s.readAttachmentHistory(ctx, binding.VolumeID)
-	if err != nil || current.PendingReplacementAttach != nil || !cephHistoryHasObservedAuthority(current) ||
-		replacementHistoryGeneration(current) != replacementHistoryGeneration(history) {
-		return binding, attachmentEvidenceUnavailable("original Ceph attachment history changed", err)
-	}
-	return s.verifyReplacementBinding(ctx, req, history, binding, -1)
 }
 
 func (s *ControllerServer) retireIdleReplacementAttach(ctx context.Context, attempt replacementAttachAttempt) {
@@ -259,6 +256,13 @@ func (s *ControllerServer) beginReplacementAttach(ctx context.Context, req *csi.
 	if err != nil || disk != nil {
 		return nil, attachmentEvidenceUnavailable("replacement Ceph attach requires settled provider absence", err)
 	}
+	if vmID != history.LastSuccessfulOpenNebulaVMID {
+		attempt.OriginalVMID = history.LastSuccessfulOpenNebulaVMID
+		attempt.OriginalVMName, err = inspector.InspectReplacementRelease(ctx, imageID, attempt.OriginalVMID, "")
+		if err != nil {
+			return nil, attachmentEvidenceUnavailable("original Ceph attachment release is unverified", err)
+		}
+	}
 	attempt, err = s.verifyReplacementBinding(ctx, req, history, attempt, -1)
 	if err != nil {
 		return nil, err
@@ -271,6 +275,7 @@ func (s *ControllerServer) beginReplacementAttach(ctx context.Context, req *csi.
 		return nil
 	})
 	if err != nil {
+		s.retireIdleReplacementAttach(ctx, attempt)
 		return nil, attachmentEvidenceUnavailable("replacement Ceph attach admission could not be persisted", err)
 	}
 	observed, err := s.readAttachmentHistory(ctx, req.VolumeId)

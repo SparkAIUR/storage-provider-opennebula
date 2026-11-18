@@ -2,6 +2,7 @@ package opennebula
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	img "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/image"
@@ -28,7 +29,7 @@ func (d *ReplacementAttachDispatch) DefinitelyIdle() bool {
 }
 
 type ReplacementAttachInspector interface {
-	VerifyReplacementRelease(context.Context, string, string, int, int, int) error
+	InspectReplacementRelease(context.Context, int, int, string) (string, error)
 	InspectReplacementAttach(context.Context, string, string, int, int, string) (*VolumeDiskRecord, error)
 }
 
@@ -37,22 +38,10 @@ func (p *PersistentDiskVolumeProvider) InspectReplacementAttach(ctx context.Cont
 	if err != nil || version != "7.4.0" {
 		return nil, fmt.Errorf("%w: replacement Ceph attach requires OpenNebula 7.4.0", ErrConflictingAttachmentEvidence)
 	}
-	return p.inspectReplacementAttachment(ctx, volume, node, imageID, vmID, 0, attempt)
-}
-
-func (p *PersistentDiskVolumeProvider) VerifyReplacementRelease(ctx context.Context, volume, node string, imageID, oldVMID, newVMID int) error {
-	if oldVMID <= 0 || oldVMID == newVMID {
-		return fmt.Errorf("%w: original VM identity is unverified", ErrConflictingAttachmentEvidence)
-	}
-	_, err := p.inspectReplacementAttachment(ctx, volume, node, imageID, newVMID, oldVMID, "")
-	return err
-}
-
-func (p *PersistentDiskVolumeProvider) inspectReplacementAttachment(ctx context.Context, volume, node string, imageID, vmID, oldVMID int, attempt string) (*VolumeDiskRecord, error) {
 	deny := func() (*VolumeDiskRecord, error) {
 		return nil, fmt.Errorf("%w: replacement Ceph attachment is unverified", ErrConflictingAttachmentEvidence)
 	}
-	metadata, err := p.inspectVolumeAttachment(ctx, volume, node, oldVMID)
+	metadata, err := p.InspectVolumeAttachment(ctx, volume, node)
 	if err != nil {
 		return nil, err
 	}
@@ -141,4 +130,41 @@ func (p *PersistentDiskVolumeProvider) inspectReplacementAttachment(ctx context.
 		return deny()
 	}
 	return &observed, ctx.Err()
+}
+
+func (p *PersistentDiskVolumeProvider) InspectReplacementRelease(ctx context.Context, imageID, vmID int, vmName string) (string, error) {
+	deny := func() (string, error) {
+		return "", fmt.Errorf("%w: original Ceph VM release is unverified", ErrConflictingAttachmentEvidence)
+	}
+	if imageID <= 0 || vmID <= 0 {
+		return deny()
+	}
+	vms, err := p.readAttachmentVMs(ctx, imageID, vmID)
+	if err != nil {
+		return "", err
+	}
+	for _, original := range vms {
+		if original.ID != vmID {
+			continue
+		}
+		if vmName != "" && original.Name != vmName {
+			return deny()
+		}
+		if _, _, err := volumeDiskFromVM(&original, imageID, vmID, true); !errors.Is(err, ErrAttachmentNotFound) {
+			return deny()
+		}
+		info, err := p.readVMInfo(ctx, vmID, vmDisks|vmState)
+		if err != nil || info.Name != original.Name {
+			return deny()
+		}
+		state, lcm, err := info.State()
+		if err != nil || (state != vm.Active || lcm != vm.Running) && (state != vm.Poweroff || lcm != vm.LcmInit) {
+			return deny()
+		}
+		if _, _, err := volumeDiskFromVM(info, imageID, vmID, true); !errors.Is(err, ErrAttachmentNotFound) {
+			return deny()
+		}
+		return info.Name, ctx.Err()
+	}
+	return deny()
 }
