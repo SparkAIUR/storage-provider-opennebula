@@ -16,7 +16,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
@@ -102,7 +101,7 @@ func (attempt replacementAttachAttempt) matchesHistory(history VolumeHistoryReco
 		attempt.detached() && completion.VAName != "" && completion.VAUID != "" && diskErr == nil && diskID >= 0 &&
 			completion.Target != "" && completion.Serial == fmt.Sprintf("onecsi-%d", attempt.ImageID)
 	validVA := attempt.VAName != "" && attempt.VAUID != "" &&
-		(!attempt.detached() || (completion.VAName == attempt.VAName && completion.VAUID == attempt.VAUID))
+		(completion.VAUID != attempt.VAUID || completion.VAName == attempt.VAName)
 	token, err := hex.DecodeString(attempt.ID)
 	return err == nil && len(token) == 32 && validPhase && validVA && attempt.PVUID != "" && attempt.PVCUID != "" &&
 		attempt.Driver != "" && attempt.VolumeID == history.VolumeID && attempt.Node != "" &&
@@ -123,12 +122,12 @@ func (s *ControllerServer) retireCompletedReplacement(ctx context.Context, histo
 		return false, attachmentEvidenceUnavailable("completed replacement VolumeAttachment identity is unavailable", nil)
 	}
 	completion := attempt.DetachCompletion
-	va, err := runtime.client.StorageV1().VolumeAttachments().Get(ctx, completion.VAName, metav1.GetOptions{})
-	if err != nil && !apierrors.IsNotFound(err) {
-		return false, attachmentEvidenceUnavailable("completed replacement VolumeAttachment identity is unverified", err)
+	gone, err := s.replacementVAGone(ctx, completion.VAName, completion.VAUID)
+	if err != nil || !gone {
+		return false, err
 	}
-	if err == nil && (va.UID == "" || string(va.UID) == completion.VAUID) {
-		return false, nil
+	if err := s.checkReplacementVAOrigin(ctx, *attempt, completion.VAName, completion.VAUID); err != nil {
+		return false, err
 	}
 	if err := s.retireVerifiedReplacement(ctx, *attempt); err != nil {
 		return false, err
@@ -481,7 +480,7 @@ func (s *ControllerServer) completeReplacementAttach(ctx context.Context, req *c
 		return observation, attachmentEvidenceUnavailable("replacement Ceph attach scope changed", nil)
 	}
 	if attempt.dispatchPossible() && attempt.VAName != "" && attempt.VAUID != "" {
-		gone, err := s.replacementOriginalVAGone(ctx, attempt)
+		gone, err := s.replacementVAGone(ctx, attempt.VAName, attempt.VAUID)
 		if err != nil {
 			return observation, err
 		}

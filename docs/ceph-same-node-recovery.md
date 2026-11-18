@@ -56,14 +56,20 @@ abandonment and a conditional update that rules out concurrent arming.
 
 If the marked attach takes effect and its reply is lost, a new waiting Pod
 on the admitted replacement Node can coexist with logical deletion of the
-exact pinned VolumeAttachment. The controller rechecks the binding, demand
+exact pinned VolumeAttachment. After that attachment UID is gone, the same
+recovery can acknowledge the sole verified successor if it enters deletion.
+The controller rechecks the binding, demand
 and protections and observes the sole marked disk twice, including its serial,
 slot and completed capacity. This acknowledgement leaves the disk, pending
 attempt and successful history intact. Once the pinned attachment UID is gone,
 Publish can complete against an eligible owned successor on that Node after
-rechecking the same disk and current authority. Only verified Publish advances
-the successful attachment history. Neither step issues another provider
-mutation.
+rechecking the same disk and current authority. If controller expansion has
+finished and the device matches the PV capacity, Publish can also proceed
+while kubelet is still waiting to resize the filesystem. Logical deletion
+continues to require completed capacity on the claim and device. Only verified
+Publish advances the successful attachment history. These recovery steps
+leave provider state unchanged.
+[Kubernetes filesystem expansion](https://v1-35.docs.kubernetes.io/docs/concepts/storage/persistent-volumes/#resizing-a-volume-containing-a-file-system)
 
 If demand disappears after dispatch, Unpublish or the reconciler can detach
 only the exact marked disk after verifying current release. An owned Released
@@ -73,8 +79,9 @@ Idle snapshots alone do not prove that a possibly sent attach cannot still take 
 Unpublish and DeleteVolume stay blocked while that attempt is unresolved.
 
 After a verified physical detach for a deleting VolumeAttachment, the controller
-keeps completion in the same record. A retry for the exact still-deleting
-VolumeAttachment rechecks identity, release, protection and provider absence
+keeps completion in the same record, scoped to the actual deleting
+VolumeAttachment UID. This can be the verified successor after the original
+attachment has retired. A retry for the exact still-deleting VolumeAttachment rechecks identity, release, protection and provider absence
 before acknowledging it. A positively identified, unstarted Pod on the replacement
 Node can wait during this acknowledgement. Kubelet can set Pod `StartTime`
 and default container waiting states before it waits for volumes to attach and

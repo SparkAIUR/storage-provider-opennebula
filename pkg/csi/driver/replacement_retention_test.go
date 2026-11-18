@@ -3,6 +3,8 @@ package driver
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,14 +12,18 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 	for _, queued := range []bool{false, true} {
 		for _, distinctVM := range []bool{false, true} {
-			for _, mode := range []string{"retained", "released-reused", "released-reused-no-va", "released-rebound", "released-unbound", "released-old-pod"} {
+			for _, mode := range []string{"retained", "successor-deleted", "successor-expanded", "released-reused", "released-reused-no-va", "released-rebound", "released-unbound", "released-old-pod"} {
 				t.Run(fmt.Sprintf("queued=%t/distinctVM=%t/%s", queued, distinctVM, mode), func(t *testing.T) {
 					ctx := context.Background()
 					const volume = "volume-test"
@@ -56,7 +62,7 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 					require.Equal(t, string(original.UID), before.LastSuccessfulNodeUID)
 					setReplacementHistoryVersion(t, driver)
 
-					kube := driver.kubeRuntime.client
+					kube := driver.kubeRuntime.client.(*fake.Clientset)
 					core := kube.CoreV1()
 					nodes := core.Nodes()
 					require.NoError(t, nodes.Delete(ctx, original.Name, metav1.DeleteOptions{}))
@@ -117,7 +123,7 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 					client = reviewControllerClient(t, server)
 					unpublish := &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name}
 
-					if mode != "retained" {
+					if strings.HasPrefix(mode, "released-") {
 						now := metav1.Now()
 						va.DeletionTimestamp = &now
 						va.Status.Attached = true
@@ -235,8 +241,153 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 					_, err = client.ControllerPublishVolume(ctx, publish)
 					require.Error(t, err, "the original pinned VA has not retired")
 					require.NoError(t, vas.Delete(ctx, va.Name, metav1.DeleteOptions{}))
+					if !distinctVM {
+						require.NoError(t, vas.Delete(ctx, successor.Name, metav1.DeleteOptions{}))
+						successor.Name = va.Name
+						_, err = vas.Create(ctx, successor, metav1.CreateOptions{})
+						require.NoError(t, err)
+					}
 					_, err = client.ControllerUnpublishVolume(ctx, unpublish)
 					require.Error(t, err, "a delayed Unpublish cannot acknowledge the successor")
+					if mode == "successor-deleted" {
+						now := metav1.Now()
+						successor.DeletionTimestamp = &now
+						_, err = vas.Update(ctx, successor, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+						require.NoError(t, err)
+						current, err := server.readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.Equal(t, lost, current)
+						assertWire(false)
+
+						require.NoError(t, pods.Delete(ctx, waiting.Name, metav1.DeleteOptions{}))
+						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+						require.Error(t, err, "the node has yet to release its volume use")
+						node.Status.VolumesInUse = nil
+						_, err = nodes.UpdateStatus(ctx, node, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						wire.mu.Lock()
+						delete(wire.disks, target)
+						wire.mu.Unlock()
+						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+						require.Error(t, err, "absence alone cannot resolve an armed attach")
+						assertWire(false)
+						wire.mu.Lock()
+						wire.disks[target] = 128
+						wire.mu.Unlock()
+
+						vaResource := storagev1.SchemeGroupVersion.WithResource("volumeattachments")
+						var changedDuringDetach atomic.Bool
+						kube.PrependReactor("get", "volumeattachments", func(action ktesting.Action) (bool, kruntime.Object, error) {
+							if action.(ktesting.GetAction).GetName() == va.Name && changedDuringDetach.CompareAndSwap(false, true) {
+								changed := successor.DeepCopy()
+								changed.UID = "changed-during-detach"
+								require.NoError(t, kube.Tracker().Update(vaResource, changed, ""))
+							}
+							return false, nil, nil
+						})
+						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+						require.Error(t, err, "a changed successor UID invalidates the current detach authorization")
+						require.True(t, changedDuringDetach.Load())
+						assertWire(false)
+						_, err = vas.Update(ctx, successor, metav1.UpdateOptions{})
+						require.NoError(t, err)
+
+						if distinctVM {
+							reconciler := NewAttachmentReconciler(server)
+							reconciler.orphanGrace = 0
+							require.NoError(t, reconciler.ReconcileOnce(ctx))
+							require.NoError(t, reconciler.ReconcileOnce(ctx))
+						} else {
+							_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+							require.NoError(t, err)
+						}
+						assertWire(true)
+						current, err = server.readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.NotNil(t, current.PendingReplacementAttach)
+						require.Equal(t, lost.PendingReplacementAttach.VAUID, current.PendingReplacementAttach.VAUID)
+						require.Equal(t, successor.Name, current.PendingReplacementAttach.DetachCompletion.VAName)
+						require.Equal(t, string(successor.UID), current.PendingReplacementAttach.DetachCompletion.VAUID)
+						require.Equal(t, before.LastSuccessfulNodeUID, current.LastSuccessfulNodeUID)
+						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+						require.NoError(t, err)
+
+						require.NoError(t, vas.Delete(ctx, successor.Name, metav1.DeleteOptions{}))
+						changed := successor.DeepCopy()
+						changed.UID = "late-unrelated-uid"
+						_, err = vas.Create(ctx, changed, metav1.CreateOptions{})
+						require.NoError(t, err)
+						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+						require.Error(t, err, "a different deleting VA cannot replay the detach receipt")
+
+						reconciler := NewAttachmentReconciler(server)
+						require.NoError(t, reconciler.ReconcileOnce(ctx))
+						current, err = server.readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.Nil(t, current.PendingReplacementAttach)
+						require.Equal(t, before.LastSuccessfulNodeUID, current.LastSuccessfulNodeUID)
+						assertWire(true)
+						return
+					}
+					if mode == "successor-expanded" {
+						wire.mu.Lock()
+						wire.imageSizeMiB, wire.disks[target], wire.marker = 256, 256, 256*1024*1024
+						wire.mu.Unlock()
+						expanded := corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("256Mi")}
+						pvc.Spec.Resources.Requests = expanded.DeepCopy()
+						claims := core.PersistentVolumeClaims(pvc.Namespace)
+						_, err = claims.Update(ctx, pvc, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						pvc.Status.Conditions = []corev1.PersistentVolumeClaimCondition{{
+							Type: corev1.PersistentVolumeClaimFileSystemResizePending, Status: corev1.ConditionTrue,
+						}}
+						pvc.Status.AllocatedResources = expanded.DeepCopy()
+						pvc.Status.AllocatedResourceStatuses = map[corev1.ResourceName]corev1.ClaimResourceStatus{
+							corev1.ResourceStorage: corev1.PersistentVolumeClaimNodeResizePending,
+						}
+						_, err = claims.UpdateStatus(ctx, pvc, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						_, err = client.ControllerPublishVolume(ctx, publish)
+						require.Error(t, err, "the provider capacity must match the PV")
+						pv.Spec.Capacity = expanded
+						_, err = core.PersistentVolumes().Update(ctx, pv, metav1.UpdateOptions{})
+						require.NoError(t, err)
+
+						wire.mu.Lock()
+						wire.pending = true
+						wire.mu.Unlock()
+						_, err = client.ControllerPublishVolume(ctx, publish)
+						require.Error(t, err, "the provider has a resize in flight")
+						wire.mu.Lock()
+						wire.pending = false
+						wire.mu.Unlock()
+
+						pvc.Status.AllocatedResourceStatuses[corev1.ResourceStorage] = corev1.PersistentVolumeClaimControllerResizeInProgress
+						_, err = claims.UpdateStatus(ctx, pvc, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						_, err = client.ControllerPublishVolume(ctx, publish)
+						require.Error(t, err, "controller resize pending is ineligible")
+						pvc.Status.AllocatedResourceStatuses[corev1.ResourceStorage] = corev1.PersistentVolumeClaimNodeResizePending
+						pvc.Status.Conditions[0].Status = corev1.ConditionUnknown
+						_, err = claims.UpdateStatus(ctx, pvc, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						_, err = client.ControllerPublishVolume(ctx, publish)
+						require.Error(t, err, "an unknown filesystem resize condition is ineligible")
+						pvc.Status.Conditions[0].Status = corev1.ConditionTrue
+						_, err = claims.UpdateStatus(ctx, pvc, metav1.UpdateOptions{})
+						require.NoError(t, err)
+
+						block := newPublishReq(volume, original.Name)
+						block.VolumeCapability.AccessType = &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}}
+						_, err = client.ControllerPublishVolume(ctx, block)
+						require.Error(t, err, "a raw block request cannot use filesystem resize evidence")
+						current, err := server.readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.Equal(t, lost, current)
+						assertWire(false)
+					}
 					reply, err := client.ControllerPublishVolume(ctx, publish)
 					require.NoError(t, err)
 					require.Equal(t, "vdb", reply.GetPublishContext()["volumeName"])

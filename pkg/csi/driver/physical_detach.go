@@ -171,6 +171,8 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		runtimeCtx.PVCAnnotations = pvc.Annotations
 	}
 
+	var replacementVAName string
+	var replacementVA detachAttachmentAuthority
 	if replacementDetach {
 		phaseEligible := attempt.dispatchPossible()
 		if readback {
@@ -193,21 +195,20 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 				return err
 			}
 		}
-		va, pinned := attachments[attempt.VAName]
-		if len(attachments) != 0 || attempt.detached() {
-			if !pinned || string(va.uid) != attempt.VAUID {
-				return attachmentEvidenceUnavailable("replacement detach attachment identity changed", nil)
-			}
-		} else {
-			current, err := runtime.client.StorageV1().VolumeAttachments().Get(ctx, attempt.VAName, metav1.GetOptions{})
-			if !apierrors.IsNotFound(err) && (err != nil || current.UID == "" || string(current.UID) == attempt.VAUID) {
-				return attachmentEvidenceUnavailable("pinned replacement VolumeAttachment absence is unverified", err)
-			}
+		for name, va := range attachments {
+			replacementVAName, replacementVA = name, va
+		}
+		if attempt.prepared() && replacementVAName != "" &&
+			(replacementVAName != attempt.VAName || string(replacementVA.uid) != attempt.VAUID) {
+			return attachmentEvidenceUnavailable("prepared replacement detach attachment identity changed", nil)
 		}
 		if attempt.detached() {
 			completion := attempt.DetachCompletion
-			if target, present := va.metadata["volumeName"]; present && strings.TrimPrefix(strings.TrimSpace(target), "/dev/") != completion.Target {
-				return attachmentEvidenceUnavailable("completed replacement detach target changed", nil)
+			if replacementVAName != completion.VAName || string(replacementVA.uid) != completion.VAUID {
+				return attachmentEvidenceUnavailable("completed replacement detach attachment identity changed", nil)
+			}
+			if err := validateMarkedReplacementMetadata(replacementVA, pv, completion.Target, completion.Serial); err != nil {
+				return err
 			}
 			identity.diskID, _ = strconv.Atoi(completion.DiskID)
 		}
@@ -216,10 +217,8 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			return err
 		}
 		if disk != nil {
-			for _, va := range attachments {
-				if target, present := va.metadata["volumeName"]; present && strings.TrimPrefix(strings.TrimSpace(target), "/dev/") != disk.Target {
-					return attachmentEvidenceUnavailable("replacement detach VolumeAttachment target changed", nil)
-				}
+			if err := validateMarkedReplacementMetadata(replacementVA, pv, disk.Target, disk.Serial); err != nil {
+				return err
 			}
 			if (identity.diskID >= 0 && identity.diskID != disk.DiskID) ||
 				(identity.replacement != nil && identity.replacementDisk != *disk) {
@@ -346,8 +345,17 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if !waiting && nodeReportsVolumeInUse(node, s.driver.name, volume) {
 		return status.Error(codes.Unavailable, "detach node still reports the volume in use")
 	}
-	if replacementDetach && replacement {
-		if err := runtime.verifyReleasedClaimNameReuse(ctx, pv, pvc); err != nil {
+	if replacementDetach {
+		if replacement {
+			if err := runtime.verifyReleasedClaimNameReuse(ctx, pv, pvc); err != nil {
+				return err
+			}
+		}
+		if replacementVAName != "" && string(replacementVA.uid) != attempt.VAUID &&
+			(node.CreationTimestamp.IsZero() || !replacementVA.created.After(node.CreationTimestamp.Time)) {
+			return attachmentEvidenceUnavailable("deleting successor VolumeAttachment does not belong to the replacement node", nil)
+		}
+		if err := s.checkReplacementVAOrigin(ctx, *attempt, replacementVAName, string(replacementVA.uid)); err != nil {
 			return err
 		}
 	}

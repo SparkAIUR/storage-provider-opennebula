@@ -84,6 +84,7 @@ type nodeAttachmentProtocol struct {
 	missingOriginalVM   bool
 	replacementDisk     bool
 	imageDatastoreID    int
+	imageSizeMiB        int
 	extraImages         string
 	imageInfoByID       map[int]string
 	prependImageID      bool
@@ -259,7 +260,11 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 			if datastoreID == 0 {
 				datastoreID = 100
 			}
-			return fmt.Sprintf(`<IMAGE><ID>%d</ID><NAME>%s</NAME><STATE>%d</STATE><SIZE>128</SIZE><DATASTORE_ID>%d</DATASTORE_ID><SOURCE>/fixture/disk</SOURCE><PERSISTENT>1</PERSISTENT><FORMAT>raw</FORMAT><RUNNING_VMS>%d</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS>%s</VMS><TEMPLATE><PERSISTENT_TYPE>SHAREABLE</PERSISTENT_TYPE>%s</TEMPLATE></IMAGE>`, imageID, firstNonEmpty(state.imageName, "volume-test"), imageState, datastoreID, count, ids, tag)
+			size := state.imageSizeMiB
+			if size == 0 {
+				size = 128
+			}
+			return fmt.Sprintf(`<IMAGE><ID>%d</ID><NAME>%s</NAME><STATE>%d</STATE><SIZE>%d</SIZE><DATASTORE_ID>%d</DATASTORE_ID><SOURCE>/fixture/disk</SOURCE><PERSISTENT>1</PERSISTENT><FORMAT>raw</FORMAT><RUNNING_VMS>%d</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS>%s</VMS><TEMPLATE><PERSISTENT_TYPE>SHAREABLE</PERSISTENT_TYPE>%s</TEMPLATE></IMAGE>`, imageID, firstNonEmpty(state.imageName, "volume-test"), imageState, size, datastoreID, count, ids, tag)
 		}
 		ok, body, code := 1, "", 0
 		if call.Method == state.failMethod {
@@ -4825,6 +4830,9 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						if invalidPins || wrongVA {
 							require.NoError(t, vas.Delete(ctx, publishVA.Name, metav1.DeleteOptions{}))
 							replayVA.UID = "different-deleting-va"
+							if wrongVA {
+								replayVA.CreationTimestamp = metav1.NewTime(replacement.CreationTimestamp.Add(-time.Second))
+							}
 							_, err := vas.Create(ctx, replayVA, metav1.CreateOptions{})
 							require.NoError(t, err)
 						} else {
