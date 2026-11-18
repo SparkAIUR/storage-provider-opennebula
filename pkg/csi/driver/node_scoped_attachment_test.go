@@ -4904,7 +4904,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						wire.alterDirectImage = func(body string) string {
 							if _, attached := wire.disks[vmID]; !attached && lagReplies < 9 {
 								lagReplies++
-								return fixtureDetachImageOwner(body, vmID)
+								return strings.Replace(body, "<STATE>1</STATE>", "<STATE>8</STATE>", 1)
 							}
 							return body
 						}
@@ -5375,8 +5375,20 @@ func (p lateQuarantineAttachProvider) AttachVolume(ctx context.Context, volume, 
 }
 
 func TestControllerAttachHonorsLateVolumeWideHostQuarantine(t *testing.T) {
-	for _, quarantined := range []string{"volume-test", "unrelated-volume"} {
-		t.Run(quarantined, func(t *testing.T) {
+	for _, tc := range []struct {
+		name, volume string
+		failures     int
+		before       bool
+		malformed    bool
+	}{
+		{name: "late-observation", volume: "volume-test", failures: 1},
+		{name: "late-hold", volume: "volume-test", failures: 2},
+		{name: "late-missing-expiry", volume: "volume-test", malformed: true},
+		{name: "early-observation", volume: "volume-test", failures: 1, before: true},
+		{name: "early-hold", volume: "volume-test", failures: 2, before: true},
+		{name: "unrelated-hold", volume: "unrelated-volume", failures: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
@@ -5386,24 +5398,47 @@ func TestControllerAttachHonorsLateVolumeWideHostQuarantine(t *testing.T) {
 			wire.marker = 128 * 1024 * 1024
 			wire.mu.Unlock()
 
+			record := func() {
+				manager := driver.hostArtifactQuarantine
+				state := hostArtifactStateFromConflict(tc.volume, &opennebula.HostArtifactConflictError{
+					Target: opennebula.HostArtifactAttachmentTarget{VMID: 42, DiskID: 2}, RawMessage: "private fixture detail",
+				})
+				if tc.malformed {
+					const record = `{"key":"vm-42.disk-2","volumeID":"volume-test","vmID":42,"diskID":2,"failureCount":1,"firstObservedAt":"2026-01-01T00:00:00Z","lastObservedAt":"2026-01-01T00:00:00Z"}`
+					require.NoError(t, driver.kubeRuntime.UpsertConfigMapData(ctx, "default", hostArtifactStateConfigMapName, map[string]string{state.Key: record}))
+					return
+				}
+				for failure := 1; failure <= tc.failures; failure++ {
+					persisted, active, err := manager.MarkFailure(ctx, state, 2, time.Hour)
+					require.NoError(t, err)
+					require.Equal(t, failure, persisted.FailureCount)
+					require.Equal(t, failure == 2, active)
+					require.Equal(t, failure == 1, persisted.ExpiresAt.IsZero())
+				}
+			}
+			if tc.before {
+				record()
+			}
 			var called atomic.Bool
 			probe := lateQuarantineAttachProvider{PersistentDiskVolumeProvider: provider, beforeAttach: func() {
 				called.Store(true)
-				manager := driver.hostArtifactQuarantine
-				state := hostArtifactStateFromConflict(quarantined, &opennebula.HostArtifactConflictError{
-					Target: opennebula.HostArtifactAttachmentTarget{VMID: 42, DiskID: 2}, RawMessage: "private fixture detail",
-				})
-				_, active, err := manager.MarkFailure(ctx, state, 1, time.Hour)
-				require.NoError(t, err)
-				require.True(t, active)
+				if !tc.before {
+					record()
+				}
 			}}
 			reply, err := reviewControllerClient(t, NewControllerServer(driver, probe, nil)).
 				ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-old"))
-			require.True(t, called.Load(), "ordinary admission must reach the provider before the quarantine exists")
+			wantCode := codes.OK
+			if tc.malformed {
+				wantCode = codes.Unavailable
+			} else if tc.volume == "volume-test" && tc.failures == 2 {
+				wantCode = codes.FailedPrecondition
+			}
+			require.Equal(t, !(tc.before && wantCode != codes.OK), called.Load())
 			wire.mu.Lock()
 			defer wire.mu.Unlock()
-			if quarantined == "volume-test" {
-				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+			if wantCode != codes.OK {
+				require.Equal(t, wantCode, status.Code(err))
 				require.Nil(t, reply)
 				require.Zero(t, wire.attachAttempts)
 				require.Empty(t, wire.mutations)
@@ -5891,6 +5926,9 @@ func TestProviderDetachWaitsForAcceptedOwnershipConvergence(t *testing.T) {
 	}{
 		{mode: "initial-accepted", postDetachRead: "converges"},
 		{mode: "retry-accepted", refuseFirst: true, postDetachRead: "converges"},
+		{mode: "state-only-convergence", postDetachRead: "state-only"},
+		{mode: "state-only-context-expiry", postDetachRead: "state-only-expiry"},
+		{mode: "state-only-bad-count", postDetachRead: "state-only-bad-count"},
 		{mode: "persistent-lag", postDetachRead: "lag"},
 		{mode: "retry-persistent-lag", refuseFirst: true, postDetachRead: "lag"},
 		{mode: "contradictory-owner", postDetachRead: "other-owner"},
@@ -5898,7 +5936,11 @@ func TestProviderDetachWaitsForAcceptedOwnershipConvergence(t *testing.T) {
 		{mode: "lost-detach-response", postDetachRead: "lost-reply"},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			contextTimeout := 4 * time.Second
+			if tc.postDetachRead == "state-only-expiry" {
+				contextTimeout = 500 * time.Millisecond
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), contextTimeout)
 			defer cancel()
 			provider, wire := nodeAttachmentProvider(t)
 			readsAfterDetach := 0
@@ -5917,6 +5959,15 @@ func TestProviderDetachWaitsForAcceptedOwnershipConvergence(t *testing.T) {
 						return body
 					}
 					return fixtureDetachImageOwner(body, 41)
+				case "state-only", "state-only-expiry", "state-only-bad-count":
+					if tc.postDetachRead == "state-only" && readsAfterDetach > 9 {
+						return body
+					}
+					body = strings.Replace(body, "<STATE>1</STATE>", "<STATE>8</STATE>", 1)
+					if tc.postDetachRead == "state-only-bad-count" {
+						body = strings.Replace(body, "<RUNNING_VMS>0</RUNNING_VMS>", "<RUNNING_VMS>1</RUNNING_VMS>", 1)
+					}
+					return body
 				case "lag":
 					return fixtureDetachImageOwner(body, 41)
 				case "other-owner":
@@ -5940,10 +5991,14 @@ func TestProviderDetachWaitsForAcceptedOwnershipConvergence(t *testing.T) {
 			}
 			var timeout *opennebula.HotplugTimeoutError
 			switch tc.postDetachRead {
-			case "converges":
+			case "converges", "state-only":
 				require.NoError(t, err)
 				require.True(t, accepted)
 				require.Greater(t, readsAfterDetach, 9)
+			case "state-only-expiry":
+				require.ErrorIs(t, err, context.DeadlineExceeded)
+				require.Greater(t, readsAfterDetach, 1)
+				require.False(t, accepted)
 			case "lag":
 				require.ErrorAs(t, err, &timeout)
 				require.ErrorIs(t, timeout, opennebula.ErrConflictingAttachmentEvidence)

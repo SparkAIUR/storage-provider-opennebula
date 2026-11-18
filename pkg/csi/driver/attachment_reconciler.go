@@ -258,7 +258,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 				history, err := r.server.readAttachmentHistory(ctx, volumeHandle)
 				attempt := history.PendingReplacementAttach
 				if err != nil || attempt == nil || !attempt.dispatchPossible() || !attempt.matchesHistory(history) ||
-					va.Name != attempt.VAName || string(va.UID) != attempt.VAUID {
+					va.Name != attempt.VAName || va.UID == "" {
 					continue
 				}
 			}

@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -55,14 +56,18 @@ func (s *ControllerServer) detachVolumeAttachments(ctx context.Context, pvName, 
 	attachments := make(map[string]detachAttachmentAuthority)
 	for _, va := range vas.Items {
 		if matchesVolumeAttachment(pvName, &va) && (nodeName == "" || strings.TrimSpace(va.Spec.NodeName) == nodeName) {
-			attachments[va.Name] = detachAttachmentAuthority{
-				uid: va.UID, created: va.CreationTimestamp.Time, attacher: va.Spec.Attacher, node: va.Spec.NodeName,
-				deleting: !va.DeletionTimestamp.IsZero(), attached: va.Status.Attached,
-				metadata: cloneStringMap(va.Status.AttachmentMetadata),
-			}
+			attachments[va.Name] = detachAttachmentSnapshot(&va)
 		}
 	}
 	return attachments, nil
+}
+
+func detachAttachmentSnapshot(va *storagev1.VolumeAttachment) detachAttachmentAuthority {
+	return detachAttachmentAuthority{
+		uid: va.UID, created: va.CreationTimestamp.Time, attacher: va.Spec.Attacher, node: va.Spec.NodeName,
+		deleting: !va.DeletionTimestamp.IsZero(), attached: va.Status.Attached,
+		metadata: cloneStringMap(va.Status.AttachmentMetadata),
+	}
 }
 
 func (s *ControllerServer) recheckDetachVolumeAttachments(ctx context.Context, pvName, nodeName string, expected map[string]detachAttachmentAuthority) error {
@@ -266,11 +271,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if err != nil {
 		return attachmentEvidenceUnavailable("current volume release is unverified", err)
 	}
-	remoteSourceVerified := receipt
-	if remoteScope && !receipt {
-		remoteSourceVerified = localVAName == "" || (localVAName == attempt.VAName && string(localVA.uid) == attempt.VAUID)
-	}
-	remoteReplacement := remoteScope && remoteSourceVerified &&
+	remoteReplacement := remoteScope &&
 		pv.Status.Phase == corev1.VolumeBound && pv.DeletionTimestamp == nil && pvc != nil && !replacement &&
 		pvc.Status.Phase == corev1.ClaimBound && pvc.DeletionTimestamp == nil &&
 		desired.Desired && !desired.MultipleNodes && desired.DemandSource == volumeDemandSourceActivePod &&
@@ -386,7 +387,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			(node.CreationTimestamp.IsZero() || !localVA.created.After(node.CreationTimestamp.Time)) {
 			return attachmentEvidenceUnavailable("deleting successor VolumeAttachment does not belong to the replacement node", nil)
 		}
-		if err := s.checkReplacementVAOrigin(ctx, *attempt, localVAName, string(localVA.uid)); err != nil {
+		if err := s.checkReplacementVAOrigin(ctx, *attempt, pv.Name, localVAName, localVA); err != nil {
 			return err
 		}
 	}
@@ -715,7 +716,11 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 			return s.verifySoleDetachOwner(ctx, volume, node, imageID, vmID, diskID)
 		}
 	}
-	accepted, err := provider.DetachVolumeWithAuthority(opennebula.WithExpectedImageID(ctx, identity.imageID), volume, node, identity.vmID, identity.backend, verifyOwner, authorize)
+	providerCtx := opennebula.WithExpectedImageID(ctx, identity.imageID)
+	if attempt := identity.replacement; attempt != nil {
+		providerCtx = opennebula.WithReplacementDetachReadback(providerCtx, attempt.OriginalVMID, attempt.OriginalVMName)
+	}
+	accepted, err := provider.DetachVolumeWithAuthority(providerCtx, volume, node, identity.vmID, identity.backend, verifyOwner, authorize)
 	if parentErr := ctx.Err(); parentErr != nil {
 		return false, parentErr
 	}

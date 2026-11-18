@@ -25,7 +25,7 @@ const remoteFixtureVAName = "csi-ac85754d1970193a7b964d41879b5a4ea619375d488aa78
 func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 	for _, queued := range []bool{false, true} {
 		for _, distinctVM := range []bool{false, true} {
-			for _, mode := range []string{"retained", "successor-deleted", "successor-expanded", "remote-reschedule", "remote-reschedule-finalized", "released-reused", "released-reused-no-va", "released-rebound", "released-unbound", "released-old-pod"} {
+			for _, mode := range []string{"retained", "successor-deleted", "successor-remote-before-detach", "successor-expanded", "remote-reschedule", "remote-reschedule-finalized", "released-reused", "released-reused-no-va", "released-rebound", "released-unbound", "released-old-pod"} {
 				t.Run(fmt.Sprintf("queued=%t/distinctVM=%t/%s", queued, distinctVM, mode), func(t *testing.T) {
 					ctx := context.Background()
 					const volume = "volume-test"
@@ -264,10 +264,19 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 						if finalized {
 							wrong := va.DeepCopy()
 							wrong.UID = "unverified-source-uid"
+							var originalStillPresent atomic.Bool
+							originalStillPresent.Store(true)
+							kube.PrependReactor("get", "volumeattachments", func(action ktesting.Action) (bool, kruntime.Object, error) {
+								if action.(ktesting.GetAction).GetName() == va.Name && originalStillPresent.Load() {
+									return true, va.DeepCopy(), nil
+								}
+								return false, nil, nil
+							})
 							_, err = vas.Update(ctx, wrong, metav1.UpdateOptions{})
 							require.NoError(t, err)
 							reconcile()
 							assertWire(false)
+							originalStillPresent.Store(false)
 							_, err = vas.Update(ctx, va, metav1.UpdateOptions{})
 							require.NoError(t, err)
 							extra := remoteVA.DeepCopy()
@@ -428,10 +437,12 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 					require.NoError(t, err)
 					_, err = client.ControllerUnpublishVolume(ctx, unpublish)
 					require.Error(t, err, "a delayed Unpublish cannot acknowledge the successor")
-					if mode == "successor-deleted" {
+					if mode == "successor-deleted" || mode == "successor-remote-before-detach" {
+						remoteBeforeDetach := mode == "successor-remote-before-detach"
 						now := metav1.Now()
 						successor.DeletionTimestamp = &now
 						successor.Finalizers = []string{"external-attacher/" + DefaultDriverName}
+						successor.Status.Attached = remoteBeforeDetach && distinctVM
 						_, err = vas.Update(ctx, successor, metav1.UpdateOptions{})
 						require.NoError(t, err)
 						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
@@ -474,11 +485,55 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 						_, err = vas.Update(ctx, successor, metav1.UpdateOptions{})
 						require.NoError(t, err)
 
-						if distinctVM {
-							reconciler := NewAttachmentReconciler(server)
-							reconciler.orphanGrace = 0
+						remote := newReadyNode("remote-node", true)
+						remote.UID = "remote-node-uid"
+						remote.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Minute))
+						remoteVA := replacementPublishVA(pv, remote)
+						remoteVA.Name, remoteVA.UID = remoteFixtureVAName, "remote-destination-uid"
+						scheduleRemote := func() {
+							t.Helper()
+							_, err := nodes.Create(ctx, remote, metav1.CreateOptions{})
+							require.NoError(t, err)
+							demand := activePodForPVC("remote-consumer", pvc.Name, remote.Name)
+							demand.UID, demand.Status.Phase = "remote-consumer-uid", corev1.PodPending
+							_, err = pods.Create(ctx, demand, metav1.CreateOptions{})
+							require.NoError(t, err)
+						}
+						reconciler := NewAttachmentReconciler(server)
+						reconciler.orphanGrace = 0
+						reconcile := func() {
+							t.Helper()
 							require.NoError(t, reconciler.ReconcileOnce(ctx))
 							require.NoError(t, reconciler.ReconcileOnce(ctx))
+						}
+						if remoteBeforeDetach {
+							scheduleRemote()
+							invalid := remoteVA.DeepCopy()
+							invalid.Status.Attached = true
+							_, err = vas.Create(ctx, invalid, metav1.CreateOptions{})
+							require.NoError(t, err)
+							reconcile()
+							assertWire(false)
+							_, err = vas.Update(ctx, remoteVA, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+							require.Error(t, err, "foreground Unpublish cannot detach for remote demand")
+							assertWire(false)
+
+							var unverifiedOrigin atomic.Bool
+							unverifiedOrigin.Store(true)
+							kube.PrependReactor("get", "volumeattachments", func(action ktesting.Action) (bool, kruntime.Object, error) {
+								if action.(ktesting.GetAction).GetName() == va.Name && unverifiedOrigin.Load() {
+									return true, nil, fmt.Errorf("fixture cannot verify the original VA retired")
+								}
+								return false, nil, nil
+							})
+							reconcile()
+							assertWire(false)
+							unverifiedOrigin.Store(false)
+						}
+						if remoteBeforeDetach || distinctVM {
+							reconcile()
 						} else {
 							_, err = client.ControllerUnpublishVolume(ctx, unpublish)
 							require.NoError(t, err)
@@ -494,20 +549,14 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
 						require.NoError(t, err)
 
-						remote := newReadyNode("remote-node", true)
-						remote.UID = "remote-node-uid"
-						remote.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Minute))
-						_, err = nodes.Create(ctx, remote, metav1.CreateOptions{})
-						require.NoError(t, err)
-						demand := activePodForPVC("remote-after-detach", pvc.Name, remote.Name)
-						demand.UID, demand.Status.Phase = "remote-after-detach-uid", corev1.PodPending
-						_, err = pods.Create(ctx, demand, metav1.CreateOptions{})
-						require.NoError(t, err)
-						remoteVA := replacementPublishVA(pv, remote)
-						remoteVA.Name, remoteVA.UID = remoteFixtureVAName, "remote-destination-uid"
+						if !remoteBeforeDetach {
+							scheduleRemote()
+							_, err = vas.Create(ctx, remoteVA, metav1.CreateOptions{})
+							require.NoError(t, err)
+						}
 						invalid := remoteVA.DeepCopy()
 						invalid.Status.Attached = true
-						_, err = vas.Create(ctx, invalid, metav1.CreateOptions{})
+						_, err = vas.Update(ctx, invalid, metav1.UpdateOptions{})
 						require.NoError(t, err)
 						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
 						require.Error(t, err, "receipt replay requires a safe destination attachment")
@@ -547,7 +596,6 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
 						require.Error(t, err, "a different deleting VA cannot replay the detach receipt")
 
-						reconciler := NewAttachmentReconciler(server)
 						require.NoError(t, reconciler.ReconcileOnce(ctx))
 						current, err = server.readAttachmentHistory(ctx, volume)
 						require.NoError(t, err)

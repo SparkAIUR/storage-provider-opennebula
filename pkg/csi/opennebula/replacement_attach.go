@@ -13,6 +13,11 @@ import (
 const attachAttemptField = "CSI_ATTACH_ATTEMPT"
 
 type replacementAttachKey struct{}
+type replacementDetachReadbackKey struct{}
+
+func WithReplacementDetachReadback(ctx context.Context, originalVMID int, originalVMName string) context.Context {
+	return context.WithValue(ctx, replacementDetachReadbackKey{}, attachmentVMIdentity{id: originalVMID, name: originalVMName})
+}
 
 type ReplacementAttachDispatch struct {
 	attempt        string

@@ -205,14 +205,23 @@ func hostArtifactVolumeEntries(persisted map[string]string, volumeID string, now
 		if err := unmarshalAuthorityJSON(raw, &state); err != nil {
 			return nil, err
 		}
-		if strings.TrimSpace(state.Key) == "" {
-			state.Key = key
-		}
 		if strings.TrimSpace(state.VolumeID) != volumeID {
 			continue
 		}
-		if !state.ExpiresAt.IsZero() && !state.ExpiresAt.After(now) {
+		if state.ExpiresAt.IsZero() {
+			if err := decodeAttachmentQuarantine(raw, &state); err != nil {
+				return nil, err
+			}
+			target := opennebula.HostArtifactAttachmentTarget{VMID: state.VMID, NodeName: state.NodeName, DiskID: state.DiskID}
+			if state.Key != key || key != firstNonEmpty(target.Key(), volumeID) ||
+				!validQuarantineObservation(state.FailureCount, state.FirstObservedAt, state.LastObservedAt, state.ExpiresAt) {
+				return nil, fmt.Errorf("host artifact quarantine observation is invalid")
+			}
+		} else if !state.ExpiresAt.After(now) {
 			continue
+		}
+		if strings.TrimSpace(state.Key) == "" {
+			state.Key = key
 		}
 		updated[state.Key] = state
 	}
@@ -231,12 +240,14 @@ func (m *HostArtifactQuarantineManager) activeForAttach(volumeID string, target 
 			return HostArtifactQuarantineState{}, false, err
 		}
 		for _, state := range current {
-			return state, true, nil
+			if state.ExpiresAt.After(now) {
+				return state, true, nil
+			}
 		}
 	} else {
 		for _, state := range m.Snapshot() {
 			if strings.TrimSpace(state.VolumeID) == strings.TrimSpace(volumeID) &&
-				(state.ExpiresAt.IsZero() || state.ExpiresAt.After(now)) {
+				state.ExpiresAt.After(now) {
 				return state, true, nil
 			}
 		}

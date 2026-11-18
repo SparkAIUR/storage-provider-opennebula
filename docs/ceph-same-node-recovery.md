@@ -75,9 +75,10 @@ leave provider state unchanged.
 If demand disappears after dispatch, Unpublish or the reconciler can detach
 only the exact marked disk after verifying current release. For a single
 verified remote destination, the reconciler can release the disk when the source
-attachment has retired or the exact pinned source attachment is deleting. In the
-latter case, Unpublish verifies the detach receipt so the external-attacher can
-remove its finalizer. The destination attachment follows its own Publish lifecycle.
+attachment has retired, the exact pinned source attachment is deleting, or a
+verified same-name successor is deleting after retirement of the pinned UID.
+For a deleting attachment, Unpublish verifies its detach receipt so the
+external-attacher can remove its finalizer. The destination attachment follows its own Publish lifecycle.
 An owned Released
 PV can use its original claim reference after the claim is gone, including when
 a different claim UID has reused the name and is verifiably bound to another PV.
@@ -111,6 +112,8 @@ A change can block acknowledgement even after the history write commits.
 Independent readback can confirm a committed receipt whose write reply was lost.
 After an accepted detach, the controller waits within the hotplug deadline
 for the detached VM's stale image ownership to clear before recording release.
+This also covers a stale USED or USED_PERS image state after both ownership
+indicators have cleared, while the VM and disk census still agree on release.
 If the provider detach reply is lost without verified proof or the controller
 restarts before recording completion, a later caller holds the unresolved
 attempt even when both VMs appear idle.

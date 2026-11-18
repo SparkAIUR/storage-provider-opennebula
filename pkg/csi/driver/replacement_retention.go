@@ -37,18 +37,26 @@ func (s *ControllerServer) replacementVAGone(ctx context.Context, name string, u
 	return !slices.Contains(uids, string(va.UID)), ctx.Err()
 }
 
-func (s *ControllerServer) checkReplacementVAOrigin(ctx context.Context, attempt replacementAttachAttempt, name, uid string) error {
-	if name != "" && name != attempt.VAName {
+func (s *ControllerServer) checkReplacementVAOrigin(ctx context.Context, attempt replacementAttachAttempt, pvName, name string, observed detachAttachmentAuthority) error {
+	if name == "" {
+		gone, err := s.replacementVAGone(ctx, attempt.VAName, attempt.VAUID)
+		if err != nil || !gone {
+			return attachmentEvidenceUnavailable("pinned replacement VolumeAttachment retirement is unverified", err)
+		}
+		return nil
+	}
+	if name != attempt.VAName {
 		return attachmentEvidenceUnavailable("replacement VolumeAttachment name differs from the pinned name", nil)
 	}
-	if name == attempt.VAName && uid == attempt.VAUID {
+	if string(observed.uid) == attempt.VAUID {
 		return ctx.Err()
 	}
-	gone, err := s.replacementVAGone(ctx, attempt.VAName, attempt.VAUID)
-	if err != nil || !gone {
-		return attachmentEvidenceUnavailable("pinned replacement VolumeAttachment retirement is unverified", err)
+	current, err := s.driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(ctx, name, metav1.GetOptions{})
+	if err != nil || current == nil || current.Name != name || !matchesVolumeAttachment(pvName, current) ||
+		!reflect.DeepEqual(observed, detachAttachmentSnapshot(current)) {
+		return attachmentEvidenceUnavailable("successor VolumeAttachment or original retirement is unverified", err)
 	}
-	return nil
+	return ctx.Err()
 }
 
 func validateMarkedReplacementMetadata(va detachAttachmentAuthority, pv *corev1.PersistentVolume, target, serial string) error {
@@ -130,7 +138,7 @@ func (s *ControllerServer) observeMarkedReplacement(ctx context.Context, attempt
 		} else if string(va.uid) == attempt.VAUID || va.deleting || va.attached {
 			return attachmentEvidenceUnavailable("marked replacement completion requires an eligible successor VolumeAttachment", nil)
 		}
-		if err := s.checkReplacementVAOrigin(ctx, attempt, name, string(va.uid)); err != nil {
+		if err := s.checkReplacementVAOrigin(ctx, attempt, pv.Name, name, va); err != nil {
 			return err
 		}
 		size, requested, ok := completedRetentionCapacity(pv, pvc)

@@ -1095,8 +1095,9 @@ func (s *ControllerServer) activeHostArtifactQuarantine(ctx context.Context, vol
 	if err := s.driver.hostArtifactQuarantine.RefreshVolume(ctx, volumeID); err != nil {
 		return false, attachmentEvidenceUnavailable("host artifact quarantine is unverified", err)
 	}
+	now := time.Now().UTC()
 	for _, state := range s.driver.hostArtifactQuarantine.Snapshot() {
-		if strings.TrimSpace(state.VolumeID) == strings.TrimSpace(volumeID) && (state.ExpiresAt.IsZero() || state.ExpiresAt.After(time.Now().UTC())) {
+		if strings.TrimSpace(state.VolumeID) == strings.TrimSpace(volumeID) && state.ExpiresAt.After(now) {
 			return true, nil
 		}
 	}

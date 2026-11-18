@@ -244,7 +244,7 @@ func (p *PersistentDiskVolumeProvider) checkVolumeDeletion(ctx context.Context, 
 	if len(info.Snapshots.Snapshots) > 0 {
 		return fmt.Errorf("image %d has dependent snapshots; source deletion is blocked", volumeID)
 	}
-	metadata, err := p.inspectVolumeAttachment(ctx, volume, "", vmID)
+	metadata, err := p.inspectVolumeAttachment(ctx, volume, "", vmID, false)
 	if err != nil {
 		return err
 	}
@@ -335,7 +335,7 @@ func (p *PersistentDiskVolumeProvider) VerifyVolumeAbsentFromVM(ctx context.Cont
 	if imageID <= 0 || vmID <= 0 {
 		return fmt.Errorf("pinned image and VM identities are required")
 	}
-	metadata, err := p.inspectVolumeAttachment(WithExpectedImageID(ctx, imageID), volume, "", vmID)
+	metadata, err := p.inspectVolumeAttachment(WithExpectedImageID(ctx, imageID), volume, "", vmID, false)
 	if err != nil {
 		return err
 	}
@@ -1888,10 +1888,7 @@ func (p *PersistentDiskVolumeProvider) readAttachmentImageInfo(ctx context.Conte
 		}
 		owners[id] = true
 	}
-	if err := verifyImageOwnershipState(img.State(info.StateRaw), info.RunningVMs); err != nil {
-		return nil, err
-	}
-	return info, nil
+	return info, verifyImageOwnershipState(img.State(info.StateRaw), info.RunningVMs)
 }
 
 func (p *PersistentDiskVolumeProvider) readOrdinaryImageInfo(ctx context.Context, imageID int) (*img.Image, error) {
@@ -2472,11 +2469,22 @@ func (p *PersistentDiskVolumeProvider) getVolumeInNode(ctx context.Context, volu
 	if info.ID != volumeID || strings.TrimSpace(info.Name) == "" {
 		return "", fmt.Errorf("image identity is unverified while checking attachment absence")
 	}
-	metadata, err := p.inspectVolumeAttachment(ctx, info.Name, vmInfo.Name, 0)
+	metadata, err := p.inspectVolumeAttachment(ctx, info.Name, vmInfo.Name, 0, acceptedDetach)
 	if err != nil {
-		if acceptedDetach && errors.Is(err, errAttachmentOwnershipLag) &&
-			!detachOwnershipLagMatches(metadata, volumeID, nodeID, vmInfo.Name) {
-			return "", fmt.Errorf("%w: detach ownership differs from the admitted VM", ErrConflictingAttachmentEvidence)
+		if acceptedDetach && errors.Is(err, errAttachmentOwnershipLag) {
+			if !detachOwnershipLagMatches(metadata, volumeID, nodeID, vmInfo.Name) {
+				return "", fmt.Errorf("%w: detach ownership differs from the admitted VM", ErrConflictingAttachmentEvidence)
+			}
+			if original, replacement := ctx.Value(replacementDetachReadbackKey{}).(attachmentVMIdentity); replacement {
+				if len(metadata.DiskRecords) != 0 {
+					return "", fmt.Errorf("%w: replacement detach has additional disk owners", ErrConflictingAttachmentEvidence)
+				}
+				if original.id != 0 {
+					if _, releaseErr := p.InspectReplacementRelease(ctx, volumeID, original.id, original.name); releaseErr != nil {
+						return "", releaseErr
+					}
+				}
+			}
 		}
 		return "", err
 	}
@@ -2658,15 +2666,23 @@ func attachmentDiskRecord(info *vm.VM, disks []shared.Disk, disk shared.Disk) (V
 }
 
 func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Context, volume string, node string) (*VolumeAttachmentMetadata, error) {
-	metadata, err := p.inspectVolumeAttachment(ctx, volume, node, 0)
+	metadata, err := p.inspectVolumeAttachment(ctx, volume, node, 0, false)
 	if err != nil {
 		return nil, err
 	}
 	return metadata, nil
 }
 
-func (p *PersistentDiskVolumeProvider) inspectVolumeAttachment(ctx context.Context, volume, node string, expectedAbsentVMID int) (*VolumeAttachmentMetadata, error) {
-	volumeID, _, err := p.volumeExists(ctx, volume, p.readAttachmentImageInfo)
+func (p *PersistentDiskVolumeProvider) inspectVolumeAttachment(ctx context.Context, volume, node string, expectedAbsentVMID int, acceptedDetach bool) (*VolumeAttachmentMetadata, error) {
+	readImage := func(ctx context.Context, id int) (*img.Image, error) {
+		info, err := p.readAttachmentImageInfo(ctx, id)
+		if acceptedDetach && errors.Is(err, errAttachmentOwnershipLag) &&
+			info != nil && info.RunningVMs == 0 && usedImageState(img.State(info.StateRaw)) {
+			return info, nil
+		}
+		return info, err
+	}
+	volumeID, _, err := p.volumeExists(ctx, volume, readImage)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check if volume exists while inspecting attachment metadata: %w", err)
 	}
@@ -2682,7 +2698,7 @@ func (p *PersistentDiskVolumeProvider) inspectVolumeAttachment(ctx context.Conte
 		}
 	}
 
-	imageInfo, err := p.readAttachmentImageInfo(ctx, volumeID)
+	imageInfo, err := readImage(ctx, volumeID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to inspect image %d attachment metadata: %w", volumeID, err)
 	}
