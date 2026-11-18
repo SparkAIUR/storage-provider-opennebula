@@ -1085,11 +1085,12 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 				return err
 			}
 			attachCtx, dispatch = opennebula.WithReplacementAttachAttempt(attachCtx, attempt.ID)
-			attachCtx = opennebula.WithAttachAuthorization(attachCtx, func(ctx context.Context, target *opennebula.HostArtifactAttachmentTarget) error {
-				if _, err := s.verifyReplacementAttempt(ctx, req, *attempt, false); err != nil {
+			attachCtx = opennebula.WithPublishMutationAuthorization(attachCtx, req.VolumeId, req.NodeId, nodeID, volumeID, func(ctx context.Context) error {
+				if err := s.checkPublishedAttachmentNode(ctx, req.VolumeId, req.NodeId, publishNode, true); err != nil {
 					return err
 				}
-				return s.checkHostArtifactAttachTarget(ctx, req, target, nil)
+				_, err := s.verifyReplacementAttempt(ctx, req, *attempt, false)
+				return err
 			})
 		}
 		err = s.volumeProvider.AttachVolume(attachCtx, req.VolumeId, req.NodeId, immutableVolume, params)
@@ -2236,18 +2237,21 @@ func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *cs
 		return false, nil, nil
 	}
 	decision := s.evaluateVolumeReconcile(ctx, req.NodeId, "detach", req.VolumeId)
-	if decision.Action == VolumeReconcileProceed && errors.Is(decision.Evidence.AttachedErr, opennebula.ErrAttachmentNotFound) {
+	if errors.Is(decision.Evidence.AttachedErr, opennebula.ErrAttachmentNotFound) &&
+		(decision.Action == VolumeReconcileProceed || decision.Reason == "attachment_absence_unverified") {
 		if decision.Evidence.OpenNebulaImageID != imageID || decision.Evidence.OpenNebulaNodeID != vmID {
 			return true, nil, attachmentEvidenceUnavailable("replacement detach provider identity changed", nil)
 		}
 		handled, err := s.finishVerifiedReplacementAbsence(ctx, req.VolumeId, req.NodeId, physicalDetachIdentity{imageID: imageID, vmID: vmID, diskID: -1})
-		if !handled {
-			return true, nil, attachmentEvidenceUnavailable("replacement detach attempt changed", nil)
-		}
 		if err != nil {
 			return true, nil, err
 		}
-		return true, &csi.ControllerUnpublishVolumeResponse{}, nil
+		if handled {
+			return true, &csi.ControllerUnpublishVolumeResponse{}, nil
+		}
+		if decision.Action == VolumeReconcileProceed {
+			return true, nil, attachmentEvidenceUnavailable("replacement detach attempt changed", nil)
+		}
 	}
 	switch decision.Action {
 	case VolumeReconcileComplete:

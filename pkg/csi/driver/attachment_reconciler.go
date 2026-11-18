@@ -766,24 +766,26 @@ func (r *AttachmentReconciler) deleteStaleVolumeAttachment(ctx context.Context, 
 	if err != nil || !identity.Exists || identity.UID == "" {
 		return fmt.Errorf("stale attachment Kubernetes node identity is unknown: %v", err)
 	}
-	if history.LastSuccessfulNodeName == va.Spec.NodeName && history.LastSuccessfulNodeUID != "" && history.LastSuccessfulNodeUID != identity.UID {
-		return fmt.Errorf("stale attachment node differs from history")
-	}
 	nodeID, err := r.server.volumeProvider.NodeExists(ctx, va.Spec.NodeName)
 	if err != nil || nodeID <= 0 {
 		return fmt.Errorf("stale attachment node identity is unknown: %v", err)
 	}
-	if history.LastSuccessfulNodeName == va.Spec.NodeName && history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != nodeID {
-		return fmt.Errorf("stale attachment VM differs from history")
+	handled, err := r.server.checkReplacedNodeStaleAttachment(ctx, volume, va.Spec.NodeName, imageID, nodeID, history, va)
+	if err != nil {
+		return err
 	}
-	if _, err := r.server.volumeProvider.GetVolumeInNode(ctx, imageID, nodeID); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
-		return fmt.Errorf("stale attachment absence is unverified: %v", err)
+	if !handled {
+		if _, err := r.server.volumeProvider.GetVolumeInNode(ctx, imageID, nodeID); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
+			return fmt.Errorf("stale attachment absence is unverified: %v", err)
+		}
 	}
 	if err := checkIdentity(); err != nil {
 		return err
 	}
-	if err := r.server.verifyDetachAbsenceTarget(ctx, volume, va.Spec.NodeName, imageID, nodeID, types.UID(identity.UID)); err != nil {
-		return err
+	if !handled {
+		if err := r.server.verifyDetachAbsenceTarget(ctx, volume, va.Spec.NodeName, imageID, nodeID, types.UID(identity.UID)); err != nil {
+			return err
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err

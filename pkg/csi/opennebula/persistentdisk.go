@@ -2125,16 +2125,38 @@ func (p *PersistentDiskVolumeProvider) waitForAttachState(ctx context.Context, t
 	lastReady := false
 	retryPending := retryAttach != nil
 
-	for {
+	timedOut := func() error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		return &HotplugTimeoutError{
+			Operation:            "attach",
+			Volume:               volume,
+			Node:                 node,
+			Timeout:              timeout,
+			LastObservedAttached: lastAttached,
+			LastObservedReady:    lastReady,
+			Cause: fmt.Errorf(
+				"timed out after %s waiting for attach of volume %s on node %s (attached=%t ready=%t)",
+				timeout,
+				volume,
+				node,
+				lastAttached,
+				lastReady,
+			),
+		}
+	}
+
+	for {
+		if deadlineCtx.Err() != nil {
+			return timedOut()
+		}
 		attached, ready, err := observe(deadlineCtx)
+		if deadlineCtx.Err() != nil {
+			return timedOut()
+		}
 		if err != nil {
-			if parentErr := ctx.Err(); parentErr != nil {
-				return parentErr
-			}
-			if deadlineCtx.Err() == nil && (retryPending || !errors.Is(err, errAttachmentOwnershipLag)) {
+			if retryPending || !errors.Is(err, errAttachmentOwnershipLag) {
 				return fmt.Errorf("failed while waiting for attach of volume %s on node %s: %w", volume, node, err)
 			}
 			attached, ready = false, false
@@ -2148,36 +2170,21 @@ func (p *PersistentDiskVolumeProvider) waitForAttachState(ctx context.Context, t
 
 		if retryPending && ready && !attached && deadlineCtx.Err() == nil {
 			retryErr := retryAttach(deadlineCtx)
-			if err := ctx.Err(); err != nil {
-				return err
+			if deadlineCtx.Err() != nil {
+				return timedOut()
 			}
-			if retryErr != nil && deadlineCtx.Err() == nil {
+			if retryErr != nil {
 				if !isHotplugStateError(retryErr) || status.Code(retryErr) == codes.Unavailable || status.Code(retryErr) == codes.FailedPrecondition {
 					return fmt.Errorf("failed to retry attach of volume %s on node %s: %w", volume, node, retryErr)
 				}
-			} else if retryErr == nil {
+			} else {
 				retryPending = false
 			}
 		}
 
 		select {
 		case <-deadlineCtx.Done():
-			return &HotplugTimeoutError{
-				Operation:            "attach",
-				Volume:               volume,
-				Node:                 node,
-				Timeout:              timeout,
-				LastObservedAttached: lastAttached,
-				LastObservedReady:    lastReady,
-				Cause: fmt.Errorf(
-					"timed out after %s waiting for attach of volume %s on node %s (attached=%t ready=%t)",
-					timeout,
-					volume,
-					node,
-					lastAttached,
-					lastReady,
-				),
-			}
+			return timedOut()
 		case <-ticker.C:
 		}
 	}

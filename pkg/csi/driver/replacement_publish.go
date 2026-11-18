@@ -42,6 +42,8 @@ type replacementAttachAttempt struct {
 	ID                string                      `json:"id"`
 	PVUID             string                      `json:"pvUID"`
 	PVCUID            string                      `json:"pvcUID"`
+	VAName            string                      `json:"vaName,omitempty"`
+	VAUID             string                      `json:"vaUID,omitempty"`
 	Driver            string                      `json:"driver"`
 	VolumeID          string                      `json:"volumeID"`
 	Node              string                      `json:"node"`
@@ -99,8 +101,11 @@ func (attempt replacementAttachAttempt) matchesHistory(history VolumeHistoryReco
 	validPhase := (attempt.prepared() || attempt.dispatchPossible()) && completion == (replacementDetachCompletion{}) ||
 		attempt.detached() && completion.VAName != "" && completion.VAUID != "" && diskErr == nil && diskID >= 0 &&
 			completion.Target != "" && completion.Serial == fmt.Sprintf("onecsi-%d", attempt.ImageID)
+	pinnedVA := attempt.VAName != "" && attempt.VAUID != ""
+	validVA := (attempt.VAName == "" && attempt.VAUID == "") ||
+		pinnedVA && (!attempt.detached() || (completion.VAName == attempt.VAName && completion.VAUID == attempt.VAUID))
 	token, err := hex.DecodeString(attempt.ID)
-	return err == nil && len(token) == 32 && validPhase && attempt.PVUID != "" && attempt.PVCUID != "" &&
+	return err == nil && len(token) == 32 && validPhase && validVA && attempt.PVUID != "" && attempt.PVCUID != "" &&
 		attempt.Driver != "" && attempt.VolumeID == history.VolumeID && attempt.Node != "" &&
 		attempt.Node == history.LastSuccessfulNodeName && attempt.OriginalNodeUID != "" && attempt.ReplacementUID != "" &&
 		attempt.OriginalNodeUID != attempt.ReplacementUID && attempt.OriginalNodeUID == history.LastSuccessfulNodeUID &&
@@ -178,7 +183,8 @@ func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, req *cs
 		!slices.Equal(pv.Spec.AccessModes, pvc.Spec.AccessModes) || pvc.Namespace != history.PVCNamespace || pvc.Name != history.PVCName {
 		return unavailable()
 	}
-	if attempt.PVUID != "" && (attempt.PVUID != string(pv.UID) || attempt.PVCUID != string(pvc.UID)) {
+	pinned := attempt.PVUID != ""
+	if pinned && (attempt.PVUID != string(pv.UID) || attempt.PVCUID != string(pvc.UID)) {
 		return unavailable()
 	}
 	attempt.PVUID, attempt.PVCUID = string(pv.UID), string(pvc.UID)
@@ -193,48 +199,17 @@ func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, req *cs
 		}) {
 		return unavailable()
 	}
-	volume := corev1.UniqueVolumeName(fmt.Sprintf("kubernetes.io/csi/%s^%s", attempt.Driver, attempt.VolumeID))
-	if slices.Contains(node.Status.VolumesInUse, volume) {
-		return unavailable()
-	}
 	attachments, err := s.detachVolumeAttachments(ctx, pv.Name, "")
-	if err != nil || len(attachments) > 1 {
+	if err != nil || len(attachments) != 1 {
 		return unavailable()
 	}
-	for _, attachment := range attachments {
-		if attachment.attacher != attempt.Driver || attachment.node != attempt.Node || attachment.uid == "" || attachment.deleting || attachment.attached {
+	for name, attachment := range attachments {
+		if name == "" || attachment.attacher != attempt.Driver || attachment.node != attempt.Node || attachment.uid == "" ||
+			attachment.deleting || attachment.attached || !attachment.created.After(node.CreationTimestamp.Time) || validateAttachmentImageAssertions(attachment.metadata, attempt.ImageID) != nil ||
+			(pinned && (attempt.VAName != name || attempt.VAUID != string(attachment.uid))) {
 			return unavailable()
 		}
-	}
-	pods, err := client.Pods(pvc.Namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return unavailable()
-	}
-	consumers := 0
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		references, err := podReferencesClaim(pod, pvc.Name, pvc)
-		if err != nil {
-			return unavailable()
-		}
-		if !references || terminalPodMayBeReleased(pod) {
-			continue
-		}
-		if pod.DeletionTimestamp != nil || pod.UID == "" || pod.Spec.NodeName != req.NodeId {
-			return unavailable()
-		}
-		if start := pod.Status.StartTime; start != nil {
-			if !start.After(node.CreationTimestamp.Time) {
-				return unavailable()
-			}
-		} else if pod.Status.Phase != corev1.PodPending || len(pod.Status.ContainerStatuses) != 0 ||
-			len(pod.Status.InitContainerStatuses) != 0 || len(pod.Status.EphemeralContainerStatuses) != 0 {
-			return unavailable()
-		}
-		consumers++
-	}
-	if consumers == 0 || (pv.Spec.AccessModes[0] == corev1.ReadWriteOncePod && consumers != 1) {
-		return unavailable()
+		attempt.VAName, attempt.VAUID = name, string(attachment.uid)
 	}
 	runtimeCtx := &VolumeRuntimeContext{PVName: pv.Name, PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVCUID: pvc.UID,
 		verifiedClaimBinding: true, PVAnnotations: pv.Annotations, PVCAnnotations: pvc.Annotations, Backend: backend, AccessModes: pv.Spec.AccessModes}
@@ -250,18 +225,53 @@ func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, req *cs
 	if err := s.recheckAttachmentAuthority(ctx, req.VolumeId, runtimeCtx, target, pv, pvc, false); err != nil {
 		return attempt, err
 	}
-	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
-		return attempt, err
-	}
 	current, err := client.Nodes().Get(ctx, req.NodeId, metav1.GetOptions{})
 	if err != nil || current.UID != node.UID || !current.CreationTimestamp.Equal(&node.CreationTimestamp) ||
-		current.DeletionTimestamp != nil || slices.Contains(current.Status.VolumesInUse, volume) ||
+		current.DeletionTimestamp != nil ||
 		!slices.ContainsFunc(current.Status.Conditions, func(c corev1.NodeCondition) bool {
 			return c.Type == corev1.NodeReady && c.Status == corev1.ConditionTrue
 		}) {
 		return unavailable()
 	}
+	if waiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, current); err != nil || !waiting {
+		return unavailable()
+	}
+	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
+		return attempt, err
+	}
 	return attempt, ctx.Err()
+}
+
+func (s *ControllerServer) replacementWaitingConsumers(ctx context.Context, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, node *corev1.Node) (bool, error) {
+	pods, err := s.driver.kubeRuntime.client.CoreV1().Pods(pv.Spec.ClaimRef.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, attachmentEvidenceUnavailable("replacement consumer state is unreadable", err)
+	}
+	consumers := 0
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		references, err := podReferencesClaim(pod, pv.Spec.ClaimRef.Name, pvc)
+		if err != nil {
+			return false, attachmentEvidenceUnavailable("replacement consumer claim is unverified", err)
+		}
+		if !references || terminalPodMayBeReleased(pod) {
+			continue
+		}
+		if pod.DeletionTimestamp != nil || pod.UID == "" || pod.Spec.NodeName != node.Name ||
+			node.CreationTimestamp.IsZero() || !pod.CreationTimestamp.After(node.CreationTimestamp.Time) ||
+			pod.Status.Phase != corev1.PodPending || pod.Status.StartTime != nil || pod.Status.PodIP != "" || len(pod.Status.PodIPs) != 0 ||
+			len(pod.Status.ContainerStatuses) != 0 || len(pod.Status.InitContainerStatuses) != 0 || len(pod.Status.EphemeralContainerStatuses) != 0 ||
+			slices.ContainsFunc(pod.Status.Conditions, func(c corev1.PodCondition) bool {
+				return c.Status == corev1.ConditionTrue && (c.Type == corev1.PodReadyToStartContainers || c.Type == corev1.PodReady || c.Type == corev1.ContainersReady)
+			}) {
+			return false, attachmentEvidenceUnavailable("replacement consumer may already be using the volume", nil)
+		}
+		consumers++
+	}
+	if consumers > 1 && pv.Spec.AccessModes[0] == corev1.ReadWriteOncePod {
+		return false, attachmentEvidenceUnavailable("replacement volume has multiple consumers", nil)
+	}
+	return consumers > 0, ctx.Err()
 }
 
 func (s *ControllerServer) verifyReplacementAttempt(ctx context.Context, req *csi.ControllerPublishVolumeRequest, attempt replacementAttachAttempt, attached bool) (*opennebula.VolumeDiskRecord, error) {

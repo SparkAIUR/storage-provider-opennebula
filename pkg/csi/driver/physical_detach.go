@@ -37,6 +37,7 @@ type physicalDetachIdentity struct {
 
 type detachAttachmentAuthority struct {
 	uid            types.UID
+	created        time.Time
 	attacher, node string
 	deleting       bool
 	attached       bool
@@ -52,7 +53,7 @@ func (s *ControllerServer) detachVolumeAttachments(ctx context.Context, pvName, 
 	for _, va := range vas.Items {
 		if matchesVolumeAttachment(pvName, &va) && (nodeName == "" || strings.TrimSpace(va.Spec.NodeName) == nodeName) {
 			attachments[va.Name] = detachAttachmentAuthority{
-				uid: va.UID, attacher: va.Spec.Attacher, node: va.Spec.NodeName,
+				uid: va.UID, created: va.CreationTimestamp.Time, attacher: va.Spec.Attacher, node: va.Spec.NodeName,
 				deleting: !va.DeletionTimestamp.IsZero(), attached: va.Status.Attached,
 				metadata: cloneStringMap(va.Status.AttachmentMetadata),
 			}
@@ -198,6 +199,12 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			}
 			identity.diskID, _ = strconv.Atoi(completion.DiskID)
 		}
+		if attempt.VAUID != "" && len(attachments) > 0 {
+			va, ok := attachments[attempt.VAName]
+			if !ok || string(va.uid) != attempt.VAUID {
+				return attachmentEvidenceUnavailable("replacement detach attachment identity changed", nil)
+			}
+		}
 		disk, err := s.inspectReplacementDisk(ctx, *attempt, !readback)
 		if err != nil {
 			return err
@@ -255,8 +262,9 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, replacement); err != nil {
 		return err
 	}
+	receipt := readback && replacementDetach && attempt.detached()
 	terminalOnNode := false
-	if claim := pv.Spec.ClaimRef; claim != nil {
+	if claim := pv.Spec.ClaimRef; claim != nil && !receipt {
 		pods, err := runtime.client.CoreV1().Pods(claim.Namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return attachmentEvidenceUnavailable("cannot verify Pod release", err)
@@ -285,7 +293,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			}
 		}
 	}
-	if desired.desiresNode(nodeName) || (replacementDetach && (desired.Desired || desired.MultipleNodes)) {
+	if !receipt && (desired.desiresNode(nodeName) || (replacementDetach && (desired.Desired || desired.MultipleNodes))) {
 		return attachmentEvidenceUnavailable("current volume release is unverified", nil)
 	}
 	if identity.replacementRetired {
@@ -314,11 +322,23 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if !ready && (identity.background || isCephBackend(backend) || terminalOnNode) {
 		return status.Error(codes.Unavailable, "detach node release observation is unavailable")
 	}
-	uniqueName := corev1.UniqueVolumeName(fmt.Sprintf("kubernetes.io/csi/%s^%s", s.driver.name, volume))
-	for _, inUse := range node.Status.VolumesInUse {
-		if inUse == uniqueName {
-			return status.Error(codes.Unavailable, "detach node still reports the volume in use")
+	waiting := false
+	if receipt || identity.replacementRetired {
+		if err := s.checkReplacementMaintenance(ctx); err != nil {
+			return err
 		}
+	}
+	if receipt {
+		waiting, err = s.replacementWaitingConsumers(ctx, pv, pvc, node)
+		if err != nil {
+			return err
+		}
+		if waiting && (pvc == nil || pv.Status.Phase != corev1.VolumeBound || pvc.DeletionTimestamp != nil) {
+			return attachmentEvidenceUnavailable("replacement detach binding is unverified", nil)
+		}
+	}
+	if !waiting && nodeReportsVolumeInUse(node, s.driver.name, volume) {
+		return status.Error(codes.Unavailable, "detach node still reports the volume in use")
 	}
 	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, attachmentNode, attachments); err != nil {
 		return err
@@ -524,7 +544,7 @@ func (s *ControllerServer) finishVerifiedReplacementAbsence(ctx context.Context,
 	}
 	attempt := history.PendingReplacementAttach
 	if attempt == nil {
-		return false, nil
+		return s.checkReplacedNodeStaleAttachment(ctx, volume, node, identity.imageID, identity.vmID, history, nil)
 	}
 	if attempt.Node != node || (!attempt.prepared() && !attempt.detached()) || !attempt.matchesHistory(history) {
 		return true, attachmentEvidenceUnavailable("replacement attachment release is unresolved", nil)
@@ -568,7 +588,15 @@ func (s *ControllerServer) completeVerifiedReplacementDetach(ctx context.Context
 			return err
 		}
 		if verified.replacementRetired {
-			return s.retireReplacementAttach(ctx, attempt)
+			writeErr := s.retireReplacementAttach(ctx, attempt)
+			if writeErr == nil || apierrors.IsConflict(writeErr) {
+				return writeErr
+			}
+			current, err := s.readAttachmentHistory(ctx, volume)
+			if err != nil || current.PendingReplacementAttach != nil || !attempt.matchesHistory(current) {
+				return attachmentEvidenceUnavailable("replacement detach retirement is unverified", errors.Join(writeErr, err))
+			}
+			return nil
 		}
 		_, writeErr := s.driver.volumeHistory.updateHistory(ctx, volume, true, func(current *VolumeHistoryRecord) error {
 			if current.PendingReplacementAttach == nil || *current.PendingReplacementAttach != attempt || !attempt.matchesHistory(*current) {

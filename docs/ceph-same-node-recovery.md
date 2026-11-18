@@ -47,7 +47,8 @@ disk carries that exact value and the original admission still matches.
 A prepared attempt can resume after a restart. Each caller proposes a new
 attempt ID in the conditional update that advances it to dispatch-possible.
 Only the acknowledged winner can send the attach, after reading back the exact
-record and rechecking current authority. If that update's reply is lost, the
+record and rechecking current authority. Replacement Publish requires the same
+owned, unattached VolumeAttachment through dispatch and completion. If that update's reply is lost, the
 same caller can retire its exact ID after independent readback because it knows
 it has sent no attach. This retirement can finish after the request is canceled
 or demand ends. A prepared attempt can also retire after verified
@@ -62,7 +63,10 @@ Unpublish and DeleteVolume stay blocked while that attempt is unresolved.
 After a verified physical detach for a deleting VolumeAttachment, the controller
 keeps completion in the same record. A retry for the exact still-deleting
 VolumeAttachment rechecks identity, release, protection and provider absence
-before acknowledging it. Publish, DeleteVolume and the reconciler can retire the
+before acknowledging it. A positively identified, unstarted Pod on the replacement
+Node can wait during this acknowledgement. Its kubelet `volumesInUse` entry
+can reflect demand. Physical detach still requires release of Pod demand and
+mount use. Publish, DeleteVolume and the reconciler can retire the
 completion after verifying that the original VolumeAttachment UID is gone,
 even when its PV has disappeared or been replaced. Cleanup without a
 VolumeAttachment retires the record after verified detach. Retirement preserves
@@ -73,9 +77,16 @@ write after rechecking the original attempt and provider absence. The receipt
 keeps the identities admitted for the detach. Before acknowledging Unpublish,
 the controller checks the current binding, attachment, release and protection.
 A change can block acknowledgement even after the history write commits.
-Independent readback can confirm a committed receipt whose write reply was lost. If the provider detach reply is lost without
-verified proof or the controller restarts before recording completion, a later
-caller holds the unresolved attempt even when both VMs appear idle.
+Independent readback can confirm a committed receipt whose write reply was lost.
+If the provider detach reply is lost without verified proof or the controller
+restarts before recording completion, a later caller holds the unresolved
+attempt even when both VMs appear idle.
+
+An attached VolumeAttachment that predates a verified same-name Node
+replacement can converge after the controller proves release on both the pinned
+original VM and the current VM. Unpublish can acknowledge the exact deleting
+attachment. The reconciler can request deletion of the exact stale attachment
+after its grace period. Neither path changes provider state.
 
 ## Validation and rollout
 
