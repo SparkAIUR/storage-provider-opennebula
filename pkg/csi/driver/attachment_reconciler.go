@@ -216,9 +216,9 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 		}
 		users := make(map[string]bool)
 		unknownConsumer := false
-		if claim := pv.Spec.ClaimRef; claim != nil && !replacement {
+		if claim := pv.Spec.ClaimRef; claim != nil {
 			for _, pod := range podsByClaim[claim.Namespace+"/"+claim.Name] {
-				referencesPVC, err := podReferencesClaim(pod, claim.Name, pvc)
+				referencesPVC, err := podMayUseAttachmentClaim(pod, claim, pvc, replacement)
 				if err != nil {
 					unknownConsumer = true
 					break

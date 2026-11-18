@@ -435,7 +435,7 @@ func (r *KubeRuntime) attachmentClaim(ctx context.Context, pv *corev1.Persistent
 		return nil, false, err
 	}
 	if pvc.UID != "" && pvc.UID != claim.UID && pv.Status.Phase == corev1.VolumeReleased && pvc.Spec.VolumeName != pv.Name {
-		return nil, true, nil
+		return pvc, true, nil
 	}
 	if pvc.UID != claim.UID || pvc.Spec.VolumeName != pv.Name {
 		return nil, false, fmt.Errorf("PV claim identity is unverified")

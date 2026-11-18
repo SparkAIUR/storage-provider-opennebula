@@ -118,7 +118,7 @@ func TestControllerPublishPreservesUnknownStickyAttachment(t *testing.T) {
 				}
 				provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("", recheckErr).Once()
 				if absent {
-					provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("vdb", nil).Once()
+					provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("vdb", nil).Twice()
 				}
 				client := reviewControllerClient(t, controller)
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

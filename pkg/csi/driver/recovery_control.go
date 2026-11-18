@@ -412,14 +412,8 @@ func (s *ControllerServer) recordRecoveryModeExpiryWarning(ctx context.Context, 
 	_ = s.driver.volumeRecoveryControl.MarkExpiryWarningEmitted(ctx, state.VolumeID)
 }
 
-func (s *ControllerServer) publishContextForRecoveryAdoption(ctx context.Context, volumeID string, sourceContext map[string]string, control VolumeRecoveryControlState, deviceDiscoveryTimeout time.Duration) map[string]string {
-	publishContext := s.publishContextForVolume(ctx, volumeID, strings.TrimSpace(control.ConfirmedVolumeName), deviceDiscoveryTimeout, sourceContext)
-	if strings.TrimSpace(control.ConfirmedVolumeName) != "" {
-		publishContext["volumeName"] = strings.TrimSpace(control.ConfirmedVolumeName)
-	}
-	if strings.TrimSpace(control.ConfirmedDeviceSerial) != "" {
-		publishContext[publishContextDeviceSerial] = strings.TrimSpace(control.ConfirmedDeviceSerial)
-	}
+func (s *ControllerServer) publishContextForRecoveryAdoption(ctx context.Context, volumeID string, observation successfulAttachmentObservation, sourceContext map[string]string, control VolumeRecoveryControlState, deviceDiscoveryTimeout time.Duration) map[string]string {
+	publishContext := s.publishContextForVolume(ctx, volumeID, observation, deviceDiscoveryTimeout, sourceContext)
 	if strings.TrimSpace(control.Mode) != "" {
 		publishContext[publishContextRecoveryMode] = strings.TrimSpace(control.Mode)
 	}

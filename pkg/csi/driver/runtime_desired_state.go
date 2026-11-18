@@ -77,6 +77,16 @@ func podReferencesClaim(pod *corev1.Pod, claimName string, pvc *corev1.Persisten
 	return false, nil
 }
 
+func podMayUseAttachmentClaim(pod *corev1.Pod, claim *corev1.ObjectReference, pvc *corev1.PersistentVolumeClaim, replacement bool) (bool, error) {
+	if replacement {
+		if !pvc.CreationTimestamp.IsZero() && pod.CreationTimestamp.After(pvc.CreationTimestamp.Time) {
+			return false, nil
+		}
+		pvc = nil
+	}
+	return podReferencesClaim(pod, claim.Name, pvc)
+}
+
 func (r *KubeRuntime) NodeIdentity(ctx context.Context, nodeName string) (KubernetesNodeIdentity, error) {
 	if r == nil || !r.enabled {
 		return KubernetesNodeIdentity{}, fmt.Errorf("kubernetes runtime is not enabled")

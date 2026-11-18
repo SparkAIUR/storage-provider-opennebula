@@ -1427,6 +1427,7 @@ func TestCephReleasedPVRetainsAuthorityAcrossClaimRecreation(t *testing.T) {
 			pv, replacement := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
 			pv.Status.Phase = corev1.VolumeReleased
 			replacement.UID = "replacement-claim"
+			replacement.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
 			replacement.Spec.VolumeName = ""
 			replacement.Status.Phase = corev1.ClaimPending
 			replacement.Annotations[annotationRecoveryMode] = recoveryModeManual
@@ -1437,7 +1438,9 @@ func TestCephReleasedPVRetainsAuthorityAcrossClaimRecreation(t *testing.T) {
 			if mode == "old-node-in-use" {
 				node.Status.VolumesInUse = []corev1.UniqueVolumeName{"kubernetes.io/csi/" + DefaultDriverName + "^volume-test"}
 			}
-			driver := newStickyTestDriver(t, pv, replacement, node, activePodForPVC("replacement-pod", replacement.Name, node.Name))
+			pod := activePodForPVC("replacement-pod", replacement.Name, node.Name)
+			pod.CreationTimestamp = metav1.NewTime(replacement.CreationTimestamp.Add(time.Minute))
+			driver := newStickyTestDriver(t, pv, replacement, node, pod)
 			_, err := driver.volumeHistory.Upsert(ctx, "volume-test", func(record *VolumeHistoryRecord) {
 				record.Backend = "ceph"
 				record.LastSuccessfulPublishTime = time.Now().UTC().Add(-time.Hour)
@@ -1483,6 +1486,133 @@ func TestCephReleasedPVRetainsAuthorityAcrossClaimRecreation(t *testing.T) {
 				require.Contains(t, state.disks, 41)
 			}
 		})
+	}
+}
+
+func TestReleasedClaimDetachChecksOriginalConsumers(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, background := range []bool{false, true} {
+			for _, mode := range []string{"original-terminating", "claim-absent", "unknown-age", "replacement-only"} {
+				t.Run(fmt.Sprintf("queued=%t/background=%t/%s", queued, background, mode), func(t *testing.T) {
+					ctx := context.Background()
+					const volume = "volume-test"
+					pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+					pv.Status.Phase = corev1.VolumeReleased
+					pvc.UID, pvc.Spec.VolumeName = "replacement-claim", "replacement-pv"
+					pvc.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
+					node := newReadyNode("node-old", true)
+					pod := activePodForPVC("consumer", pvc.Name, node.Name)
+					pod.CreationTimestamp = metav1.NewTime(pvc.CreationTimestamp.Add(-time.Minute))
+					terminating := metav1.Now()
+					pod.DeletionTimestamp = &terminating
+					if mode == "replacement-only" {
+						pod.CreationTimestamp = metav1.NewTime(pvc.CreationTimestamp.Add(time.Minute))
+					} else if mode == "unknown-age" {
+						pod.CreationTimestamp = metav1.Time{}
+					}
+					objects := []kruntime.Object{pv, node, pod}
+					if mode != "claim-absent" {
+						objects = append(objects, pvc)
+					}
+					driver := newStickyTestDriver(t, objects...)
+					provider, wire := nodeAttachmentProvider(t)
+					wire.mu.Lock()
+					wire.ceph = true
+					wire.mu.Unlock()
+					server := NewControllerServer(driver, provider, nil)
+					if queued {
+						driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+						driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+					}
+					if background {
+						r := NewAttachmentReconciler(server)
+						r.orphanGrace = time.Nanosecond
+						require.NoError(t, r.ReconcileOnce(ctx))
+						require.NoError(t, r.ReconcileOnce(ctx))
+					} else {
+						reply, err := reviewControllerClient(t, server).ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+						if mode == "replacement-only" {
+							require.NoError(t, err)
+							require.NotNil(t, reply)
+						} else {
+							require.ErrorContains(t, err, "a current Pod still references the volume")
+							require.Nil(t, reply)
+						}
+					}
+					wire.mu.Lock()
+					defer wire.mu.Unlock()
+					if mode == "replacement-only" {
+						require.Equal(t, []string{"detach:41"}, wire.mutations)
+					} else {
+						require.Zero(t, wire.detachAttempts)
+						require.Contains(t, wire.disks, 41)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestControllerPublishPrecheckUsesVerifiedVM(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, replaceVM := range []bool{false, true} {
+			t.Run(fmt.Sprintf("queued=%t/replaced=%t", queued, replaceVM), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+				node := newReadyNode("node-old", true)
+				driver := newStickyTestDriver(t, pv, pvc, node)
+				var protocol *nodeAttachmentProtocol
+				directReads := 0
+				provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+					if method != "one.vm.info" {
+						return
+					}
+					protocol.mu.Lock()
+					defer protocol.mu.Unlock()
+					directReads++
+					if replaceVM && directReads == 1 {
+						protocol.vmNames = map[int]string{41: "retired-vm", 42: node.Name}
+						protocol.disks[42] = 128
+					} else if !replaceVM && directReads == 2 {
+						protocol.disks[41] = 128
+					}
+				})
+				protocol = wire
+				wire.mu.Lock()
+				wire.ceph, wire.marker, wire.diskTarget = true, 0, "vdc"
+				delete(wire.disks, 41)
+				wire.mu.Unlock()
+				server := NewControllerServer(driver, provider, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, nil)
+				}
+				reply, err := reviewControllerClient(t, server).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
+				history, historyErr := server.readAttachmentHistory(ctx, volume)
+				require.NoError(t, historyErr)
+				if replaceVM {
+					require.Equal(t, codes.Unavailable, status.Code(err))
+					require.ErrorContains(t, err, "publish attachment identity changed during precheck")
+					require.Nil(t, reply)
+					require.True(t, history.LastSuccessfulPublishTime.IsZero())
+					require.Zero(t, history.LastSuccessfulOpenNebulaVMID)
+				} else {
+					require.NoError(t, err)
+					require.Equal(t, "vdc", reply.GetPublishContext()["volumeName"])
+					require.Equal(t, "7", reply.GetPublishContext()[publishContextOpenNebulaImageID])
+					require.Equal(t, "onecsi-7", reply.GetPublishContext()[publishContextDeviceSerial])
+					require.False(t, history.LastSuccessfulPublishTime.IsZero())
+					require.Equal(t, 41, history.LastSuccessfulOpenNebulaVMID)
+					require.Equal(t, "vdc", history.LastSuccessfulTarget)
+					require.Equal(t, "onecsi-7", history.LastSuccessfulDeviceSerial)
+				}
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				require.GreaterOrEqual(t, directReads, 2)
+				require.Empty(t, wire.mutations)
+			})
+		}
 	}
 }
 

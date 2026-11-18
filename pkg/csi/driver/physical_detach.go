@@ -128,7 +128,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		return attachmentEvidenceUnavailable("detach claim identity is unverified", err)
 	}
 	runtimeCtx.PVCAnnotations = nil
-	if pvc == nil {
+	if pvc == nil || replacement {
 		runtimeCtx.PVCNamespace = ""
 		runtimeCtx.PVCName = ""
 		runtimeCtx.PVCUID = ""
@@ -179,14 +179,14 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		return err
 	}
 	terminalOnNode := false
-	if claim := pv.Spec.ClaimRef; claim != nil && !replacement {
+	if claim := pv.Spec.ClaimRef; claim != nil {
 		pods, err := runtime.client.CoreV1().Pods(claim.Namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return attachmentEvidenceUnavailable("cannot verify Pod release", err)
 		}
 		remoteNode := ""
 		for _, pod := range pods.Items {
-			referencesPVC, err := podReferencesClaim(&pod, claim.Name, pvc)
+			referencesPVC, err := podMayUseAttachmentClaim(&pod, claim, pvc, replacement)
 			if err != nil {
 				return attachmentEvidenceUnavailable("cannot verify Pod claim ownership", err)
 			}
@@ -259,7 +259,7 @@ func (s *ControllerServer) recheckAttachmentAuthority(ctx context.Context, volum
 	}
 	currentPVC, currentReplacement, err := s.driver.kubeRuntime.attachmentClaim(ctx, currentPV)
 	if err != nil || replacement != currentReplacement || (pvc == nil) != (currentPVC == nil) ||
-		(pvc != nil && (currentPVC.UID != pvc.UID || !reflect.DeepEqual(currentPVC.Spec, pvc.Spec) ||
+		(pvc != nil && (currentPVC.UID != pvc.UID || !currentPVC.CreationTimestamp.Equal(&pvc.CreationTimestamp) || !reflect.DeepEqual(currentPVC.Spec, pvc.Spec) ||
 			!reflect.DeepEqual(currentPVC.Status, pvc.Status) || !reflect.DeepEqual(currentPVC.Annotations, pvc.Annotations) ||
 			!reflect.DeepEqual(metav1.GetControllerOfNoCopy(currentPVC), metav1.GetControllerOfNoCopy(pvc)) ||
 			!reflect.DeepEqual(currentPVC.DeletionTimestamp, pvc.DeletionTimestamp))) {

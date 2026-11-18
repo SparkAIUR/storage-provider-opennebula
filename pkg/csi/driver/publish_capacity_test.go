@@ -182,6 +182,8 @@ func TestStickyCapacityFailurePreservesReuseState(t *testing.T) {
 	require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{VolumeID: "volume-test", NodeID: "node-test", Backend: "local", StartedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute), GraceSeconds: 60}))
 	provider := &MockOpenNebulaVolumeProviderTestify{}
 	provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("vdb", nil)
+	provider.On("VolumeExists", mock.Anything, "volume-test").Return(7, 128*1024*1024, nil)
+	provider.On("NodeExists", mock.Anything, "node-test").Return(11, nil)
 	provider.On("RestoreVolumeCapacity", mock.Anything, "volume-test", 11, 7).Return(fmt.Errorf("resize unavailable")).Once()
 	provider.On("RestoreVolumeCapacity", mock.Anything, "volume-test", 11, 7).Return(nil).Once()
 	controller := NewControllerServer(driver, provider, &MockSharedFilesystemProviderTestify{})
@@ -195,7 +197,7 @@ func TestStickyCapacityFailurePreservesReuseState(t *testing.T) {
 	handled, response, err = controller.reuseStickyAttachment(context.Background(), req, 7, 11)
 	require.True(t, handled)
 	require.NoError(t, err)
-	require.Equal(t, "vdb", response.PublishContext["volumeName"])
+	require.Equal(t, "vdb", response.target)
 	_, exists = driver.stickyAttachments.Get(req.VolumeId)
 	require.False(t, exists)
 	provider.AssertExpectations(t)
