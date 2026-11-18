@@ -775,6 +775,14 @@ func (s *ControllerServer) classifyRepairRequiredLookup(ctx context.Context, vol
 }
 
 func (s *ControllerServer) lookupVolumeForPublish(ctx context.Context, volumeID, requestedNode string) (*opennebula.VolumeLookupResult, VolumeHistoryRecord, *VolumeRuntimeContext, error) {
+	result, history, runtimeCtx, err := s.lookupVolumeForAttachment(ctx, volumeID, requestedNode)
+	if err == nil && result.ImageID == 0 {
+		return result, history, runtimeCtx, status.Error(codes.Unavailable, "volume identity is unknown")
+	}
+	return result, history, runtimeCtx, err
+}
+
+func (s *ControllerServer) lookupVolumeForAttachment(ctx context.Context, volumeID, requestedNode string) (*opennebula.VolumeLookupResult, VolumeHistoryRecord, *VolumeRuntimeContext, error) {
 	history := s.currentVolumeHistory(volumeID)
 	var runtimeCtx *VolumeRuntimeContext
 	if s != nil && s.driver != nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {

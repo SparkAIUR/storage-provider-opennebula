@@ -1138,6 +1138,83 @@ func TestControllerUnpublishCephQuarantineMatchesActualTarget(t *testing.T) {
 	}
 }
 
+func TestHostArtifactQuarantineFollowsVolumeAcrossVMs(t *testing.T) {
+	for _, op := range []string{"publish", "retention", "detach"} {
+		for _, malformed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/malformed=%t", op, malformed), func(t *testing.T) {
+				ctx := context.Background()
+				wantCode := codes.FailedPrecondition
+				if malformed {
+					wantCode = codes.Unavailable
+				}
+				volume, node := cephRestartVolume, "node-a"
+				var server *ControllerServer
+				var checkProvider func()
+				if op == "publish" {
+					volume, node = "volume-test", "node-new"
+					pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+					driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true), newReadyNode(node, true))
+					provider, wire := nodeAttachmentProvider(t)
+					wire.mu.Lock()
+					wire.disks[42] = wire.disks[41]
+					delete(wire.disks, 41)
+					wire.mu.Unlock()
+					server = NewControllerServer(driver, provider, nil)
+					checkProvider = func() {
+						wire.mu.Lock()
+						defer wire.mu.Unlock()
+						require.Empty(t, wire.mutations)
+						require.Equal(t, map[int]int{42: 256}, wire.disks)
+					}
+				} else {
+					f := newCephRestartTestFixture(t, op == "retention")
+					server = f.server
+					if op == "detach" {
+						require.NoError(t, server.driver.kubeRuntime.client.CoreV1().Pods(f.pod.Namespace).Delete(ctx, f.pod.Name, metav1.DeleteOptions{}))
+					}
+					checkProvider = func() {
+						f.requireNoProviderMutation(t)
+						require.Zero(t, f.provider.inspections.Load())
+					}
+				}
+				now := time.Now().UTC()
+				const key = "vm-41"
+				record := HostArtifactQuarantineState{Key: key, VMID: 41, VolumeID: " " + volume + " ", FailureCount: 1, FirstObservedAt: now, LastObservedAt: now, ExpiresAt: now.Add(time.Hour)}
+				data, err := json.Marshal(record)
+				require.NoError(t, err)
+				raw := string(data)
+				if malformed {
+					raw = strings.TrimSuffix(raw, "}") + `,"FailureCount":0}`
+				}
+				runtime := server.driver.kubeRuntime
+				require.NoError(t, runtime.UpsertConfigMapData(ctx, "default", hostArtifactStateConfigMapName, map[string]string{key: raw}))
+				client := reviewControllerClient(t, server)
+				if op == "publish" {
+					reply, err := client.ControllerPublishVolume(ctx, newPublishReq(volume, node))
+					require.Equal(t, wantCode, status.Code(err), "%v", err)
+					require.ErrorContains(t, err, "host artifact quarantine")
+					require.Nil(t, reply)
+				} else {
+					reply, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node})
+					require.Equal(t, wantCode, status.Code(err), "%v", err)
+					require.ErrorContains(t, err, "host artifact quarantine")
+					require.Nil(t, reply)
+				}
+				checkProvider()
+				history, err := server.readAttachmentHistory(ctx, volume)
+				require.NoError(t, err)
+				require.True(t, history.LastSafeDetachTime.IsZero())
+				if op == "publish" {
+					require.True(t, history.LastSuccessfulPublishTime.IsZero())
+				}
+				cm, err := runtime.GetConfigMap(ctx, "default", hostArtifactStateConfigMapName)
+				require.NoError(t, err)
+				require.Equal(t, map[string]string{key: raw}, cm.Data)
+			})
+		}
+	}
+}
+
 func TestControllerUnpublishHidesStoredRepairDetails(t *testing.T) {
 	for _, mode := range []string{"auto", "inline-detach", "queued-detach"} {
 		t.Run(mode, func(t *testing.T) {

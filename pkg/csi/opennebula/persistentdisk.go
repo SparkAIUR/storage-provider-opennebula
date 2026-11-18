@@ -1181,6 +1181,10 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 		if ownershipErr != nil {
 			return deny(ownershipErr)
 		}
+		liveID, err := p.lookupImageID(ctx, volume)
+		if err != nil || liveID != volumeID {
+			return deny(detachEvidenceError(ctx, "detach image identity changed or is unverified", err))
+		}
 		if authorize != nil {
 			if err := authorize(ctx, volumeID, nodeID, diskID); err != nil {
 				return deny(err)

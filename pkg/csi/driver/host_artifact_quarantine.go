@@ -220,8 +220,10 @@ func hostArtifactRecordRoutesElsewhere(key, raw, volumeID string, target openneb
 		return false, err
 	}
 	recordTarget := opennebula.HostArtifactAttachmentTarget{VMID: route.VMID, NodeName: route.NodeName, DiskID: route.DiskID}
-	expectedKey := firstNonEmpty(recordTarget.Key(), route.VolumeID)
-	if strings.TrimSpace(route.VolumeID) == "" || route.VolumeID == volumeID || key == volumeID ||
+	recordVolume := strings.TrimSpace(route.VolumeID)
+	volumeID = strings.TrimSpace(volumeID)
+	expectedKey := firstNonEmpty(recordTarget.Key(), recordVolume)
+	if recordVolume == "" || recordVolume == volumeID || key == volumeID ||
 		key != expectedKey || (route.Key != "" && route.Key != key) ||
 		(route.ImageID > 0 && route.ImageID == target.ImageID) {
 		return false, nil

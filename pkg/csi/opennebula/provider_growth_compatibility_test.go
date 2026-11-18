@@ -172,7 +172,7 @@ func TestProviderGrowthCompatibilityUsesSelectedDiskForAdmission(t *testing.T) {
 			}
 			config.extraDisk = ""
 			if method == "one.vm.info" && vmReads == 2 {
-				config.extraDisk = `<DISK><IMAGE_ID>invalid</IMAGE_ID><DISK_ID>3</DISK_ID></DISK>`
+				config.extraDisk = `<DISK><TYPE>SWAP</TYPE><SIZE>1024</SIZE><DISK_ID>3</DISK_ID><TARGET>vdc</TARGET></DISK>`
 			}
 		}
 	})

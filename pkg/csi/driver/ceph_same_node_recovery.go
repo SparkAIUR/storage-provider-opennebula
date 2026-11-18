@@ -346,15 +346,17 @@ func (s *ControllerServer) attachmentProtectionChecks(ctx context.Context, volum
 				return attachmentEvidenceUnavailable("host artifact quarantine is malformed", decodeErr)
 			}
 			recordTarget := opennebula.HostArtifactAttachmentTarget{VMID: state.VMID, NodeName: state.NodeName, DiskID: state.DiskID}
-			expectedKey := firstNonEmpty(recordTarget.Key(), state.VolumeID)
-			if state.Key != key || state.Key != expectedKey || strings.TrimSpace(state.VolumeID) == "" ||
+			recordVolume := strings.TrimSpace(state.VolumeID)
+			matchesVolume := recordVolume == strings.TrimSpace(volumeID)
+			expectedKey := firstNonEmpty(recordTarget.Key(), recordVolume)
+			if state.Key != key || state.Key != expectedKey || recordVolume == "" ||
 				!validQuarantineObservation(state.FailureCount, state.FirstObservedAt, state.LastObservedAt, state.ExpiresAt) {
 				return attachmentEvidenceUnavailable("host artifact quarantine identity or expiry is unknown", nil)
 			}
-			if state.ImageID > 0 && target.ImageID > 0 && (state.VolumeID == volumeID) != (state.ImageID == target.ImageID) {
+			if state.ImageID > 0 && target.ImageID > 0 && matchesVolume != (state.ImageID == target.ImageID) {
 				return attachmentEvidenceUnavailable("host artifact quarantine contradicts volume ownership", nil)
 			}
-			if state.ExpiresAt.After(time.Now().UTC()) && (state.VolumeID == volumeID || slices.Contains(targetKeys, key)) {
+			if state.ExpiresAt.After(time.Now().UTC()) && (matchesVolume || slices.Contains(targetKeys, key)) {
 				return status.Error(codes.FailedPrecondition, "attachment change is blocked by host artifact quarantine")
 			}
 		}

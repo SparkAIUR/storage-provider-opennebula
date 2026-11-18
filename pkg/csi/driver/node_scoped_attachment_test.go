@@ -119,7 +119,7 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 					marker = "<RESIZE>YES</RESIZE><SIZE_PREV>128</SIZE_PREV>"
 				}
 				slot := firstNonEmpty(state.diskSlot, "2")
-				disk = fmt.Sprintf(`<DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><SAVE>YES</SAVE><SHAREABLE>YES</SHAREABLE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>ssh</TM_MAD><TM_MAD_SYSTEM>ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>%s</DISK_ID><TARGET>%s</TARGET><SIZE>%d</SIZE><SERIAL>onecsi-7</SERIAL>%s</DISK>`, slot, firstNonEmpty(state.diskTarget, "vdb"), size, marker)
+				disk = fmt.Sprintf(`<DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><SAVE>YES</SAVE><SHAREABLE>YES</SHAREABLE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>ssh</TM_MAD><TM_MAD_SYSTEM>ssh</TM_MAD_SYSTEM><IMAGE_ID>%d</IMAGE_ID><DISK_ID>%s</DISK_ID><TARGET>%s</TARGET><SIZE>%d</SIZE><SERIAL>onecsi-%d</SERIAL>%s</DISK>`, imageID, slot, firstNonEmpty(state.diskTarget, "vdb"), size, imageID, marker)
 				if state.ceph {
 					disk = strings.NewReplacer("<LN_TARGET>SYSTEM</LN_TARGET>", "<LN_TARGET>NONE</LN_TARGET>", "<TM_MAD>ssh</TM_MAD>", "<TM_MAD>ceph</TM_MAD>", "<TM_MAD_SYSTEM>ssh</TM_MAD_SYSTEM>", "<TM_MAD_SYSTEM>ceph</TM_MAD_SYSTEM>").Replace(disk)
 				}
@@ -1152,6 +1152,100 @@ func TestLiveImageZeroProvesOrdinaryAttachmentAbsence(t *testing.T) {
 				wire.mu.Lock()
 				defer wire.mu.Unlock()
 				require.Empty(t, wire.mutations)
+			})
+		}
+	}
+}
+
+func TestControllerPublishRejectsLiveImageZero(t *testing.T) {
+	for _, inspected := range []bool{false, true} {
+		t.Run(fmt.Sprintf("inspector=%t", inspected), func(t *testing.T) {
+			ctx := context.Background()
+			const volume = "volume-test"
+			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			node := newReadyNode("node-old", true)
+			driver := newStickyTestDriver(t, pv, pvc, node)
+			provider, wire := nodeAttachmentProvider(t)
+			wire.mu.Lock()
+			wire.zeroImage = true
+			wire.mu.Unlock()
+			var volumeProvider opennebula.OpenNebulaVolumeProvider = provider
+			if !inspected {
+				volumeProvider = struct {
+					opennebula.OpenNebulaVolumeProvider
+				}{provider}
+			}
+			server := NewControllerServer(driver, volumeProvider, nil)
+			reply, err := reviewControllerClient(t, server).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
+			require.Equal(t, codes.Unavailable, status.Code(err))
+			require.ErrorContains(t, err, "volume identity is unknown")
+			require.Nil(t, reply)
+			decision := server.evaluateVolumeReconcile(ctx, node.Name, "attach", volume)
+			require.Equal(t, VolumeReconcilePause, decision.Action)
+			history, err := server.readAttachmentHistory(ctx, volume)
+			require.NoError(t, err)
+			require.True(t, history.LastSuccessfulPublishTime.IsZero())
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			require.Empty(t, wire.mutations)
+		})
+	}
+}
+
+func TestControllerUnpublishRejectsLateAmbiguousImageName(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, retry := range []bool{false, true} {
+			t.Run(fmt.Sprintf("queued=%t/retry=%t", queued, retry), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+				node := newReadyNode("node-old", true)
+				driver := newStickyTestDriver(t, pv, pvc, node)
+				driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+				var protocol *nodeAttachmentProtocol
+				provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+					if retry && method == "one.image.info" {
+						protocol.mu.Lock()
+						if protocol.detachAttempts == 1 {
+							protocol.duplicateImage = true
+						}
+						protocol.mu.Unlock()
+					}
+				})
+				protocol = wire
+				wire.mu.Lock()
+				wire.rejectFirstDetach = retry
+				wire.mu.Unlock()
+				probe := &detachCensusProbe{PersistentDiskVolumeProvider: provider}
+				if !retry {
+					probe.beforeDetach = func() {
+						wire.mu.Lock()
+						wire.duplicateImage = true
+						wire.mu.Unlock()
+					}
+				}
+				server := NewControllerServer(driver, probe, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+				}
+				reply, err := reviewControllerClient(t, server).ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+				require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+				require.ErrorContains(t, err, "detach image identity changed or is unverified")
+				require.Nil(t, reply)
+				history, err := server.readAttachmentHistory(ctx, volume)
+				require.NoError(t, err)
+				require.True(t, history.LastSafeDetachTime.IsZero())
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				require.True(t, wire.duplicateImage)
+				require.Empty(t, wire.mutations)
+				require.Contains(t, wire.disks, 41)
+				if retry {
+					require.Equal(t, 1, wire.detachAttempts)
+				} else {
+					require.Zero(t, wire.detachAttempts)
+				}
 			})
 		}
 	}

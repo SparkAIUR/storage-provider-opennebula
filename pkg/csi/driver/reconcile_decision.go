@@ -126,7 +126,11 @@ func (s *ControllerServer) evaluateVolumeReconcile(ctx context.Context, node, op
 		return decision
 	}
 
-	lookup, history, runtimeCtx, lookupErr := s.lookupVolumeForPublish(ctx, evidence.VolumeID, evidence.NodeID)
+	lookupVolume := s.lookupVolumeForPublish
+	if evidence.Operation == VolumeReconcileDetach {
+		lookupVolume = s.lookupVolumeForAttachment
+	}
+	lookup, history, runtimeCtx, lookupErr := lookupVolume(ctx, evidence.VolumeID, evidence.NodeID)
 	evidence.Lookup = lookup
 	evidence.LookupErr = lookupErr
 	evidence.History = history
