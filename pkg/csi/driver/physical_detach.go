@@ -313,22 +313,11 @@ func (s *ControllerServer) verifyDetachAbsenceTarget(ctx context.Context, volume
 		if history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != imageID {
 			return attachmentEvidenceUnavailable("detach absence image differs from history", nil)
 		}
-		if history.LastSuccessfulNodeName == node {
-			if history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != vmID {
-				return attachmentEvidenceUnavailable("detach absence VM differs from history", nil)
-			}
-			if history.LastSuccessfulNodeUID != "" {
-				if nodeUID != "" && string(nodeUID) != history.LastSuccessfulNodeUID {
-					return attachmentEvidenceUnavailable("detach absence node differs from history", nil)
-				}
-				nodeUID = types.UID(history.LastSuccessfulNodeUID)
-			}
+		if history.LastSuccessfulNodeName == node && history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != vmID {
+			return attachmentEvidenceUnavailable("detach absence VM differs from history", nil)
 		}
-		if nodeUID != "" {
-			current, err := runtime.NodeIdentity(ctx, node)
-			if err != nil || !current.Exists || current.Deleting || current.UID != string(nodeUID) {
-				return attachmentEvidenceUnavailable("detach absence node identity changed", err)
-			}
+		if err := s.verifyDetachAbsenceNode(ctx, node, history, nodeUID); err != nil {
+			return err
 		}
 	}
 	currentVM, err := s.volumeProvider.NodeExists(ctx, node)
@@ -338,6 +327,22 @@ func (s *ControllerServer) verifyDetachAbsenceTarget(ctx context.Context, volume
 	currentImage, _, err := s.volumeProvider.VolumeExists(ctx, volume)
 	if err != nil || imageID <= 0 || currentImage != imageID {
 		return attachmentEvidenceUnavailable("detach absence image identity is unverified", err)
+	}
+	return status.FromContextError(ctx.Err()).Err()
+}
+
+func (s *ControllerServer) verifyDetachAbsenceNode(ctx context.Context, node string, history VolumeHistoryRecord, nodeUID types.UID) error {
+	if history.LastSuccessfulNodeName == node && history.LastSuccessfulNodeUID != "" {
+		if nodeUID != "" && string(nodeUID) != history.LastSuccessfulNodeUID {
+			return attachmentEvidenceUnavailable("detach absence node differs from history", nil)
+		}
+		nodeUID = types.UID(history.LastSuccessfulNodeUID)
+	}
+	if runtime := s.driver.kubeRuntime; runtime != nil && runtime.enabled && nodeUID != "" {
+		current, err := runtime.NodeIdentity(ctx, node)
+		if err != nil || !current.Exists || current.Deleting || current.UID != string(nodeUID) {
+			return attachmentEvidenceUnavailable("detach absence node identity changed", err)
+		}
 	}
 	return status.FromContextError(ctx.Err()).Err()
 }

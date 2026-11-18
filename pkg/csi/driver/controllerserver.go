@@ -1378,15 +1378,18 @@ func (s *ControllerServer) confirmMissingUnpublish(ctx context.Context, volume, 
 	if runtime := s.driver.kubeRuntime; runtime != nil && runtime.enabled {
 		current, err := s.readAttachmentHistory(ctx, volume)
 		if err != nil || current.LastSuccessfulImageID != history.LastSuccessfulImageID ||
-			current.LastSuccessfulOpenNebulaVMID != history.LastSuccessfulOpenNebulaVMID {
+			current.LastSuccessfulOpenNebulaVMID != history.LastSuccessfulOpenNebulaVMID ||
+			current.LastSuccessfulNodeName != history.LastSuccessfulNodeName ||
+			current.LastSuccessfulNodeUID != history.LastSuccessfulNodeUID {
 			return attachmentEvidenceUnavailable("missing volume history is unverified", err)
 		}
+		history = current
 	}
 	if history.LastSuccessfulImageID <= 0 {
 		if err := s.verifyUnpinnedVolumeAbsence(ctx, volume); err != nil {
 			return attachmentEvidenceUnavailable("missing volume ownership is unverified", err)
 		}
-		return status.FromContextError(ctx.Err()).Err()
+		return s.verifyDetachAbsenceNode(ctx, node, history, "")
 	}
 	verifier, ok := s.volumeProvider.(opennebula.VolumeAbsenceVerifier)
 	if !ok {
@@ -1408,7 +1411,7 @@ func (s *ControllerServer) confirmMissingUnpublish(ctx context.Context, volume, 
 	if err := verifier.VerifyVolumeAbsent(ctx, volume, history.LastSuccessfulImageID, vmIDs...); err != nil {
 		return attachmentEvidenceUnavailable("missing volume ownership is unverified", err)
 	}
-	return status.FromContextError(ctx.Err()).Err()
+	return s.verifyDetachAbsenceNode(ctx, node, history, "")
 }
 
 func (s *ControllerServer) verifyUnpinnedVolumeAbsence(ctx context.Context, volume string) error {

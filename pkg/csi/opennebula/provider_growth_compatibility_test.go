@@ -223,6 +223,33 @@ func TestProviderGrowthAndRestorationIgnoreUnrelatedBlankImageReference(t *testi
 	}
 }
 
+func TestProviderGrowthAndRestorationAcceptDuplicateCompletedDiskRows(t *testing.T) {
+	for _, restore := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restore=%t", restore), func(t *testing.T) {
+			p, st := growthCompatibilityFixture(t, "7.4.1", restore, func(c *growthFixtureConfig) {
+				c.pendingReads = 0
+				c.beforeObservation = func(method string) {
+					if method == "one.vm.diskresize" {
+						c.extraDisk = `<DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><SIZE>256</SIZE></DISK>`
+					}
+				}
+			})
+			ctx := context.Background()
+			if restore {
+				require.NoError(t, p.RestoreVolumeCapacity(ctx, "volume-test", 11, 7))
+			} else {
+				size, err := p.ExpandVolume(ctx, "volume-test", 268_435_456, false)
+				require.NoError(t, err)
+				require.EqualValues(t, 268_435_456, size)
+			}
+			require.EqualValues(t, 1, st.resizeCalls.Load())
+			require.EqualValues(t, 1, st.metadataWrites.Load())
+			require.EqualValues(t, 268_435_456, st.marker.Load())
+			require.Zero(t, st.otherMutations.Load())
+		})
+	}
+}
+
 func TestProviderRestorationRejectsNonblankMalformedImageReference(t *testing.T) {
 	p, st := growthCompatibilityFixture(t, "7.4.1", true, func(c *growthFixtureConfig) {
 		c.extraDisk = `<DISK><IMAGE_ID>invalid</IMAGE_ID><DISK_ID>3</DISK_ID></DISK>`

@@ -38,7 +38,6 @@ func (p *PersistentDiskVolumeProvider) completedDiskSize(ctx context.Context, vm
 }
 
 func completedDiskSizeFromVM(info *vm.VM, diskID, imageID int) (int64, error) {
-	var selected *shared.Disk
 	for _, disk := range info.Template.GetDisks() {
 		iid, err := disk.GetI(shared.ImageID)
 		if err != nil || iid != imageID {
@@ -48,15 +47,9 @@ func completedDiskSizeFromVM(info *vm.VM, diskID, imageID int) (int64, error) {
 		if e != nil || did != diskID {
 			continue
 		}
-		if selected != nil {
-			return 0, fmt.Errorf("duplicate resize disk identity")
-		}
-		selected = &disk
+		return completedSelectedDiskSize(info, disk)
 	}
-	if selected == nil {
-		return 0, fmt.Errorf("resize identity changed: image %d vm %d disk %d", imageID, info.ID, diskID)
-	}
-	return completedSelectedDiskSize(info, *selected)
+	return 0, fmt.Errorf("resize identity changed: image %d vm %d disk %d", imageID, info.ID, diskID)
 }
 
 func completedSelectedDiskSize(info *vm.VM, disk shared.Disk) (int64, error) {

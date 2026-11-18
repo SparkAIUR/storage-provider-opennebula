@@ -165,10 +165,10 @@ func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name st
 
 func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume string) error {
 	expectedID, _ := ctx.Value(expectedImageIdentity{}).(int)
+	vmID, _ := ctx.Value(expectedDeletionVMIdentity{}).(int)
 	volumeID, err := p.lookupImageID(ctx, volume)
 	if errors.Is(err, ErrVolumeNotFound) {
 		if expectedID > 0 {
-			vmID, _ := ctx.Value(expectedDeletionVMIdentity{}).(int)
 			return p.VerifyVolumeAbsent(ctx, volume, expectedID, vmID)
 		}
 		return ErrVolumeNotFound
@@ -200,7 +200,7 @@ func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume 
 	if len(info.Snapshots.Snapshots) > 0 {
 		return fmt.Errorf("image %d has dependent snapshots; source deletion is blocked", volumeID)
 	}
-	metadata, err := p.InspectVolumeAttachment(ctx, volume, "")
+	metadata, err := p.inspectVolumeAttachment(ctx, volume, "", vmID)
 	if err != nil {
 		return err
 	}
@@ -249,18 +249,8 @@ func (p *PersistentDiskVolumeProvider) VerifyVolumeAbsent(ctx context.Context, v
 		}
 	}
 	for _, vmID := range vmIDs {
-		if vmID <= 0 {
-			continue
-		}
-		info, err := p.ctrl.VM(vmID).InfoContext(ctx, true)
-		if IsAuthoritativeVolumeAbsence(err) && !slices.ContainsFunc(pool.VMs, func(info vm.VM) bool { return info.ID == vmID }) {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("cannot verify pinned VM disk absence: %w", err)
-		}
-		if _, _, err := volumeDiskFromVM(info, imageID, vmID, true); !errors.Is(err, ErrAttachmentNotFound) {
-			return fmt.Errorf("pinned VM disk absence is unverified: %v", err)
+		if err := p.verifyPinnedVMDiskAbsent(ctx, imageID, vmID, pool.VMs); err != nil {
+			return err
 		}
 	}
 	if _, err := p.lookupImageID(ctx, volume); !errors.Is(err, ErrVolumeNotFound) {
@@ -270,6 +260,26 @@ func (p *PersistentDiskVolumeProvider) VerifyVolumeAbsent(ctx context.Context, v
 		return fmt.Errorf("volume handle now resolves to a live image")
 	}
 	return ctx.Err()
+}
+
+func (p *PersistentDiskVolumeProvider) verifyPinnedVMDiskAbsent(ctx context.Context, imageID, vmID int, census []vm.VM) error {
+	if vmID <= 0 {
+		return nil
+	}
+	info, err := p.ctrl.VM(vmID).InfoContext(ctx, true)
+	if IsAuthoritativeVolumeAbsence(err) && !slices.ContainsFunc(census, func(info vm.VM) bool { return info.ID == vmID }) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("cannot verify pinned VM disk absence: %w", err)
+	}
+	if _, _, err := volumeDiskFromVM(info, imageID, vmID, true); !errors.Is(err, ErrAttachmentNotFound) {
+		if err != nil {
+			return fmt.Errorf("pinned VM disk absence is unverified: %w", err)
+		}
+		return fmt.Errorf("pinned VM still has the image disk")
+	}
+	return nil
 }
 
 func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name string, sourceVolume string, selection DatastoreSelectionConfig) (*VolumeCreateResult, error) {
@@ -1994,6 +2004,10 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeLookup(ctx context.Context, 
 }
 
 func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Context, volume string, node string) (*VolumeAttachmentMetadata, error) {
+	return p.inspectVolumeAttachment(ctx, volume, node, 0)
+}
+
+func (p *PersistentDiskVolumeProvider) inspectVolumeAttachment(ctx context.Context, volume, node string, expectedAbsentVMID int) (*VolumeAttachmentMetadata, error) {
 	volumeID, _, err := p.VolumeExists(ctx, volume)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check if volume exists while inspecting attachment metadata: %w", err)
@@ -2080,6 +2094,9 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Conte
 	if !requestedNodeSeen {
 		return nil, fmt.Errorf("requested VM was absent from the attachment inspection")
 	}
+	if err := p.verifyPinnedVMDiskAbsent(ctx, volumeID, expectedAbsentVMID, vmPool.VMs); err != nil {
+		return nil, err
+	}
 	return metadata, nil
 }
 
@@ -2117,7 +2134,6 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 			})
 		}
 	}
-	attachments = slices.DeleteFunc(attachments, func(a ObservedAttachment) bool { return conflictedImages[a.ImageID] })
 	imageCache := map[int]struct {
 		name    string
 		backend string
@@ -2125,6 +2141,9 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 	for i := range attachments {
 		attachment := &attachments[i]
 		imageID := attachment.ImageID
+		if conflictedImages[imageID] {
+			continue
+		}
 		imageMeta, ok := imageCache[imageID]
 		if !ok {
 			imageInfo, imageErr := p.ctrl.Image(imageID).InfoContext(ctx, true)
@@ -2132,7 +2151,9 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 				return nil, nil, fmt.Errorf("failed to inspect image %d while listing attachments: %w", imageID, imageErr)
 			}
 			if imageInfo.ID != imageID || strings.TrimSpace(imageInfo.Name) == "" {
-				return nil, nil, fmt.Errorf("image identity is unverified while listing attachments")
+				conflictedImages[imageID] = true
+				klog.V(2).InfoS("Skipping attachment with unverified image identity", "imageID", imageID)
+				continue
 			}
 			imageMeta.name = imageInfo.Name
 			if imageInfo.DatastoreID != nil {
@@ -2147,6 +2168,7 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 		attachment.VolumeHandle = imageMeta.name
 		attachment.Backend = imageMeta.backend
 	}
+	attachments = slices.DeleteFunc(attachments, func(a ObservedAttachment) bool { return conflictedImages[a.ImageID] })
 	return attachments, vmNames, nil
 }
 

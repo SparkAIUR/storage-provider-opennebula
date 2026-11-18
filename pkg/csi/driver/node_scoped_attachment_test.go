@@ -53,11 +53,14 @@ type nodeAttachmentProtocol struct {
 	imageName         string
 	duplicateImage    bool
 	missingImage      bool
+	allowImageDelete  bool
 	hideImageName     bool
 	omitOriginalVM    bool
 	missingOriginalVM bool
 	replacementDisk   bool
 	imageDatastoreID  int
+	extraImages       string
+	imageInfoByID     map[int]string
 	imageTransfer     string
 	diskTarget        string
 	ownerCount        int
@@ -156,7 +159,7 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				if state.duplicateImage {
 					body += fmt.Sprintf("<IMAGE><ID>8</ID><NAME>%s</NAME></IMAGE>", firstNonEmpty(state.imageName, "volume-test"))
 				}
-				body += "</IMAGE_POOL>"
+				body += state.extraImages + "</IMAGE_POOL>"
 			case "one.image.info":
 				body = imageXML()
 				switch {
@@ -164,6 +167,8 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 					body = strings.Replace(body, "<ID>7</ID>", "<ID>8</ID>", 1)
 				case state.missingImage:
 					ok, body, code = 0, "image not found", 0x400
+				case state.imageInfoByID[number(1)] != "":
+					body = state.imageInfoByID[number(1)]
 				}
 			case "one.vmpool.info":
 				body = "<VM_POOL>"
@@ -220,6 +225,12 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				state.disks[id] = size
 				state.mutations = append(state.mutations, fmt.Sprintf("resize:%d:%d", id, size))
 				body = strconv.Itoa(id)
+			case "one.image.delete":
+				require.True(t, state.allowImageDelete, "unexpected provider image deletion")
+				require.Equal(t, 7, number(1))
+				state.missingImage = true
+				state.mutations = append(state.mutations, "image-delete:7")
+				body = "7"
 			case "one.image.update":
 				require.Equal(t, 1, number(3))
 				key, raw, found := strings.Cut(strings.TrimSpace(call.Params[2].Value.String), "=")
@@ -930,13 +941,13 @@ func TestProviderDetachRetryRespectsHotplugDeadline(t *testing.T) {
 
 func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"same-node", "replacement-uid", "replacement-vm", "vm-changed-before-dispatch", "duplicate-image", "replacement-image", "late-duplicate-image", "missing-image", "hidden-handle", "missing-image-retained-disk", "missing-image-unknown-ownership", "missing-image-malformed-disk", "owner-omitted", "owner-omitted-released", "owner-omitted-gone", "owner-omitted-unreadable"} {
+		for _, mode := range []string{"same-node", "replacement-uid", "replacement-vm", "vm-changed-before-dispatch", "duplicate-image", "replacement-image", "late-duplicate-image", "missing-image", "missing-image-replacement-uid", "hidden-handle", "missing-image-retained-disk", "missing-image-unknown-ownership", "missing-image-malformed-disk", "owner-omitted", "owner-omitted-released", "owner-omitted-gone", "owner-omitted-unreadable"} {
 			t.Run(fmt.Sprintf("queued=%v/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
 				node := newReadyNode("node-old", true)
 				historicalUID := node.UID
-				if mode == "replacement-uid" {
+				if mode == "replacement-uid" || mode == "missing-image-replacement-uid" {
 					node.UID = "replacement-uid"
 				}
 				driver := newStickyTestDriver(t, pv, pvc, node, newReadyNode("node-new", true))
@@ -971,10 +982,11 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 					state.vmNames = map[int]string{41: "retired-vm", 42: "node-old"}
 				case "same-node", "replacement-uid", "late-duplicate-image":
 					delete(state.disks, 41)
-				case "duplicate-image", "replacement-image", "missing-image":
+				case "duplicate-image", "replacement-image", "missing-image", "missing-image-replacement-uid":
 					delete(state.disks, 41)
 					state.missingImage = mode != "duplicate-image"
-					state.duplicateImage, state.replacementDisk = mode != "missing-image", mode != "missing-image"
+					state.duplicateImage = mode == "duplicate-image" || mode == "replacement-image"
+					state.replacementDisk = state.duplicateImage
 				case "missing-image-retained-disk", "missing-image-unknown-ownership", "missing-image-malformed-disk":
 					state.missingImage = true
 					if mode == "missing-image-unknown-ownership" {
@@ -1892,24 +1904,55 @@ func TestStickyTransferRetriesAgainstConcurrentAbsentUnpublish(t *testing.T) {
 }
 
 func TestCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t *testing.T) {
+	for _, mode := range []string{"serial", "wrong-image-id", "blank-image-name"} {
+		t.Run(mode, func(t *testing.T) {
+			testCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t, mode)
+		})
+	}
+}
+
+func testCephOrphanCleanupIgnoresUnrelatedCSIImageConflict(t *testing.T, mode string) {
+	t.Helper()
 	ctx := context.Background()
 	pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
-	driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true), newReadyNode("node-new", true))
+	otherPV, otherPVC := newLocalPVAndPVC("other-volume", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+	otherVA := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "other-va", UID: "other-va-uid"},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: DefaultDriverName, NodeName: "node-new",
+			Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &otherPV.Name},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: true},
+	}
+	driver := newStickyTestDriver(t, pv, pvc, otherPV, otherPVC, otherVA, newReadyNode("node-old", true), newReadyNode("node-new", true))
 	provider, wire := nodeAttachmentProvider(t)
 	wire.mu.Lock()
 	wire.ceph = true
 	wire.disks[41] = 128
 	wire.marker = 128 * 1024 * 1024
 	wire.extraDiskByVM = map[int]string{42: `<DISK><IMAGE_ID>8</IMAGE_ID><DISK_ID>2</DISK_ID><SERIAL>onecsi-9</SERIAL><TARGET>vdc</TARGET></DISK>`}
+	wire.extraImages = `<IMAGE><ID>8</ID><NAME>other-volume</NAME></IMAGE>`
+	switch mode {
+	case "wrong-image-id":
+		wire.imageInfoByID = map[int]string{8: `<IMAGE><ID>9</ID><NAME>other-volume</NAME></IMAGE>`}
+	case "blank-image-name":
+		wire.imageInfoByID = map[int]string{8: `<IMAGE><ID>8</ID><NAME></NAME></IMAGE>`}
+	}
+	if mode != "serial" {
+		wire.extraDiskByVM[42] = strings.Replace(wire.extraDiskByVM[42], "onecsi-9", "onecsi-8", 1)
+	}
 	wire.mu.Unlock()
 
 	_, err := provider.GetVolumeInNode(ctx, 7, 42)
 	require.ErrorIs(t, err, opennebula.ErrAttachmentNotFound)
 	reconciler := NewAttachmentReconciler(NewControllerServer(driver, provider, nil))
 	reconciler.orphanGrace = time.Nanosecond
+	reconciler.staleVAGrace = time.Nanosecond
 	require.NoError(t, reconciler.ReconcileOnce(ctx))
 	require.Len(t, reconciler.orphanSeen, 1)
 	require.NoError(t, reconciler.ReconcileOnce(ctx))
+	_, err = driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(ctx, otherVA.Name, metav1.GetOptions{})
+	require.NoError(t, err)
 	wire.mu.Lock()
 	defer wire.mu.Unlock()
 	require.Equal(t, []string{"detach:41"}, wire.mutations)

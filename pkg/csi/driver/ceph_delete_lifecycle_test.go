@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/require"
@@ -33,7 +34,11 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 	for _, queued := range []bool{false, true} {
 		t.Run(fmt.Sprint(queued), func(t *testing.T) {
 			f := newCephRestartTestFixture(t, queued)
-			_, err := f.unpublish(t)
+			_, err := f.server.driver.volumeHistory.Upsert(context.Background(), cephRestartVolume, func(record *VolumeHistoryRecord) {
+				record.LastSuccessfulOpenNebulaVMID = 575
+			})
+			require.NoError(t, err)
+			_, err = f.unpublish(t)
 			require.NoError(t, err)
 			f.requireNoProviderMutation(t)
 			var mode, imageReads, deletes, otherMutations atomic.Int32
@@ -41,6 +46,13 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 			endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var call struct {
 					Method string `xml:"methodName"`
+					Params []struct {
+						Value struct {
+							Int int `xml:"int"`
+							I4  int `xml:"i4"`
+							I8  int `xml:"i8"`
+						} `xml:"value"`
+					} `xml:"params>param"`
 				}
 				require.NoError(t, xml.NewDecoder(r.Body).Decode(&call))
 				state := 1
@@ -82,6 +94,18 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 					if mode.Load() >= 4 {
 						body = "<VM_POOL/>"
 					}
+				case "one.vm.info":
+					require.GreaterOrEqual(t, len(call.Params), 2)
+					id := call.Params[1].Value
+					require.Equal(t, 575, id.Int+id.I4+id.I8)
+					switch mode.Load() {
+					case 8:
+						body = `<VM><ID>575</ID><NAME>node-a</NAME><TEMPLATE><DISK><IMAGE_ID>3137</IMAGE_ID><DISK_ID>1</DISK_ID><TARGET>vdb</TARGET><SERIAL>onecsi-3137</SERIAL></DISK></TEMPLATE></VM>`
+					case 9:
+						ok, code, body = false, 0x200, "pinned VM unavailable"
+					default:
+						body = `<VM><ID>575</ID><NAME>node-a</NAME><TEMPLATE/></VM>`
+					}
 				case "one.image.delete":
 					deletes.Add(1)
 					deleted.Store(true)
@@ -105,7 +129,7 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 			require.NoError(t, err)
 			f.server.volumeProvider = &cephDeletionProtocolProvider{cephRetentionTestProvider: f.provider, deleteProvider: provider}
 			client := reviewControllerClient(t, f.server)
-			for _, i := range []int32{0, 1, 2, 3, 5, 6, 7} {
+			for _, i := range []int32{0, 1, 2, 3, 5, 6, 7, 8, 9} {
 				mode.Store(i)
 				imageReads.Store(0)
 				response, err := client.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: cephRestartVolume})
@@ -185,6 +209,60 @@ func TestControllerDeleteCephVerifiesMissingImageOwnership(t *testing.T) {
 			require.Zero(t, wire.detachAttempts)
 		})
 	}
+}
+
+func TestUnpinnedDeleteRetryAfterLostReplyRemainsBlocked(t *testing.T) {
+	ctx := context.Background()
+	const volume = "volume-test"
+	driver := newStickyTestDriver(t)
+	driver.PluginConfig.OverrideVal(config.AllowedDatastoreTypesVar, "ceph")
+	provider, wire := nodeAttachmentProvider(t)
+	wire.mu.Lock()
+	wire.ceph, wire.ready, wire.allowImageDelete = true, true, true
+	delete(wire.disks, 41)
+	wire.marker = 128 * 1024 * 1024
+	wire.mu.Unlock()
+	client := reviewControllerClient(t, NewControllerServer(driver, provider, nil))
+	pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	provisioned, err := client.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name:               volume,
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: 128 * 1024 * 1024},
+		VolumeCapabilities: []*csi.VolumeCapability{newPublishReq(volume, "node-old").VolumeCapability},
+		Parameters:         map[string]string{storageClassParamDatastoreIDs: "100", paramPVCUID: string(pvc.UID)},
+	})
+	require.NoError(t, err)
+	require.Equal(t, volume, provisioned.Volume.VolumeId)
+	require.NotContains(t, provisioned.Volume.VolumeContext, publishContextOpenNebulaImageID)
+	require.Equal(t, string(pvc.UID), provisioned.Volume.VolumeContext[volumeContextUUID])
+
+	pv.Finalizers = []string{"external-provisioner.volume.kubernetes.io/finalizer"}
+	pv.Spec.CSI.VolumeHandle = provisioned.Volume.VolumeId
+	pv.Spec.CSI.VolumeAttributes = provisioned.Volume.VolumeContext
+	kube := driver.kubeRuntime.client
+	_, err = kube.CoreV1().PersistentVolumes().Create(ctx, pv, metav1.CreateOptions{})
+	require.NoError(t, err)
+	_, err = kube.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(ctx, pvc, metav1.CreateOptions{})
+	require.NoError(t, err)
+	request := &csi.DeleteVolumeRequest{VolumeId: provisioned.Volume.VolumeId}
+	_, err = client.DeleteVolume(ctx, request)
+	require.NoError(t, err)
+
+	restarted := newStickyTestDriver(t)
+	restarted.kubeRuntime.client = kube
+	server := NewControllerServer(restarted, provider, nil)
+	response, err := reviewControllerClient(t, server).DeleteVolume(ctx, request)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Nil(t, response)
+	current, err := kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, pv.Finalizers, current.Finalizers)
+	history, err := server.readAttachmentHistory(ctx, volume)
+	require.NoError(t, err)
+	require.Zero(t, history)
+	wire.mu.Lock()
+	defer wire.mu.Unlock()
+	require.True(t, wire.missingImage)
+	require.Equal(t, []string{"image-delete:7"}, wire.mutations)
 }
 
 func TestMissingImageRejectsMalformedOrUnpinnedOwnedHistory(t *testing.T) {
