@@ -166,23 +166,23 @@ func (p *PersistentDiskVolumeProvider) verifyObservedAttachmentBackend(ctx conte
 		return fmt.Errorf("image %d datastore backend %q differs from %q", image.ID, datastoreBackend, expected)
 	}
 	transfer, _ := disk.Get("TM_MAD")
-	switch strings.ToLower(strings.TrimSpace(transfer)) {
-	case "ceph":
-		if expected == "ceph" {
-			return nil
-		}
-	case "ssh", "shared":
-		if expected == "local" || expected == "nfs" {
-			return nil
-		}
-	case "fs_lvm", "fs_lvm_ssh", "local":
-		if expected == "local" {
-			return nil
-		}
-	case "nfs":
-		if expected == "nfs" {
-			return nil
-		}
+	if attachmentTransferMatchesBackend(transfer, expected) {
+		return nil
 	}
 	return fmt.Errorf("image %d disk transfer driver %q does not establish backend %q", image.ID, transfer, expected)
+}
+
+func attachmentTransferMatchesBackend(transfer, backend string) bool {
+	switch strings.ToLower(strings.TrimSpace(transfer)) {
+	case "ceph":
+		return backend == "ceph"
+	case "ssh", "shared":
+		return backend == "local" || backend == "nfs"
+	case "fs_lvm", "fs_lvm_ssh", "local":
+		return backend == "local"
+	case "nfs":
+		return backend == "nfs"
+	default:
+		return false
+	}
 }

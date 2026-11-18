@@ -94,6 +94,15 @@ func TestAttachmentReconcilerDetachesOrphanAttachment(t *testing.T) {
 	require.Equal(t, pvc.UID, events.Items[0].InvolvedObject.UID)
 }
 
+type staleAttachmentTestProvider struct {
+	*MockOpenNebulaVolumeProviderTestify
+}
+
+func (p staleAttachmentTestProvider) InspectVolumeDatastore(ctx context.Context, volume string, imageID int) (opennebula.Datastore, error) {
+	args := p.Called(ctx, volume, imageID)
+	return args.Get(0).(opennebula.Datastore), args.Error(1)
+}
+
 func TestAttachmentReconcilerDeletesStaleVolumeAttachment(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-1", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 	va := &storagev1.VolumeAttachment{
@@ -114,11 +123,12 @@ func TestAttachmentReconcilerDeletesStaleVolumeAttachment(t *testing.T) {
 	driver := newAttachmentTestDriver(pv, pvc, va, node)
 	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
 	mockProvider.On("VolumeExists", mock.Anything, "vol-1").Return(1, 1024, nil)
+	mockProvider.On("InspectVolumeDatastore", mock.Anything, "vol-1", 1).Return(opennebula.Datastore{Backend: "local"}, nil).Once()
 	mockProvider.On("NodeExists", mock.Anything, "node-a").Return(101, nil)
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 101).Return("", opennebula.ErrAttachmentNotFound)
 	mockProvider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil, nil).Once()
 
-	server := NewControllerServer(driver, mockProvider, &MockSharedFilesystemProviderTestify{})
+	server := NewControllerServer(driver, staleAttachmentTestProvider{mockProvider}, &MockSharedFilesystemProviderTestify{})
 	reconciler := NewAttachmentReconciler(server)
 	reconciler.staleVASeen["va-owned"] = time.Now().Add(-2 * reconciler.staleVAGrace)
 

@@ -1389,8 +1389,8 @@ func (p *PersistentDiskVolumeProvider) VolumeExists(ctx context.Context, volume 
 	if err != nil {
 		return -1, -1, err
 	}
-	if info.Name != volume {
-		return -1, -1, fmt.Errorf("pinned image %d name differs from volume handle", id)
+	if info.ID != id || info.Name != volume {
+		return -1, -1, fmt.Errorf("image information differs from the expected ID or handle")
 	}
 	size, err := effectiveImageSize(info)
 	if err != nil {
@@ -2098,8 +2098,11 @@ func (p *PersistentDiskVolumeProvider) attachmentDatastore(ctx context.Context, 
 			return Datastore{}, &datastoreConfigError{message: fmt.Sprintf("datastore %d has conflicting image datastore categories", datastoreID)}
 		}
 	}
-	switch observed.Backend {
-	case "ceph", "cephfs", "local", "nfs":
+	switch backend := normalizeAllowedDatastoreType(observed.DSMad); observed.DSMad {
+	case "ceph", "fs", "local", "fs_lvm", "fs_lvm_ssh", "nfs", "nas":
+		if observed.Backend != backend || (observed.TMMad != "" && !attachmentTransferMatchesBackend(observed.TMMad, backend)) {
+			return Datastore{}, &datastoreConfigError{message: fmt.Sprintf("datastore %d drivers disagree with backend %q", datastoreID, observed.Backend)}
+		}
 		return observed, nil
 	default:
 		return Datastore{}, &datastoreConfigError{message: fmt.Sprintf("datastore %d has unsupported attachment backend %q", datastoreID, observed.Backend)}

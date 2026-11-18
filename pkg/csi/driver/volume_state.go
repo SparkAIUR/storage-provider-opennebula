@@ -429,6 +429,11 @@ func (m *VolumeRepairStateManager) Get(volumeID string) (VolumeRepairState, bool
 	return state, ok
 }
 
+func localDeviceReportKeyNode(key, volumeID string) (string, bool) {
+	node, matches := strings.CutSuffix(key, "."+sanitizeLocalDeviceReportKey(volumeID))
+	return node, matches && len(validation.IsDNS1123Subdomain(node)) == 0
+}
+
 func decodeLocalDeviceReport(key, raw, volumeID string) (LocalDeviceMissingReport, error) {
 	var report LocalDeviceMissingReport
 	var identity struct {
@@ -520,6 +525,18 @@ func (m *VolumeRepairStateManager) GetCurrent(ctx context.Context, volumeID stri
 		report, err := decodeLocalDeviceReport(key, raw, volumeID)
 		if err != nil {
 			return VolumeRepairState{}, false, err
+		}
+		if report.VolumeID == "" {
+			if node, matches := localDeviceReportKeyNode(key, volumeID); matches {
+				identity, err := m.runtime.NodeIdentity(ctx, node)
+				if err != nil {
+					return VolumeRepairState{}, false, err
+				}
+				if identity.Exists {
+					return VolumeRepairState{}, false, fmt.Errorf("node device report key is ambiguous")
+				}
+			}
+			continue
 		}
 		if report.VolumeID != volumeID || (report.ConfirmationState != localDeviceConfirmationStateRepairRequired && localDeviceFailureClass(report) != localDeviceFailureClassWrongIdentity) {
 			continue

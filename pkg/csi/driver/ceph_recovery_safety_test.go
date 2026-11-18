@@ -190,7 +190,7 @@ func TestControllerUnpublishCephDelayedRPCWithoutActiveDemand(t *testing.T) {
 
 func TestCephRestartCleanupReleaseGuards(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"released", "claim-removed", "terminal-released", "terminal-in-use", "terminal-terminating", "terminating", "node-in-use", "repair", "incomplete-device-report", "volume-quarantine", "host-quarantine", "observe", "desired-unknown", "provider-unknown", "late-pod", "late-observe-at-rpc", "pv-replaced-after-grace", "node-replaced", "already-absent", "readback-unknown", "readback-attached"} {
+		for _, mode := range []string{"released", "claim-removed", "terminal-released", "terminal-in-use", "terminal-terminating", "terminating", "ephemeral-terminating", "ephemeral-unverified", "node-in-use", "repair", "incomplete-device-report", "volume-quarantine", "host-quarantine", "observe", "desired-unknown", "provider-unknown", "late-pod", "late-observe-at-rpc", "pv-replaced-after-grace", "node-replaced", "already-absent", "readback-unknown", "readback-attached"} {
 			t.Run(fmt.Sprintf("%v/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				f := newCephRestartTestFixture(t, queued)
@@ -198,7 +198,8 @@ func TestCephRestartCleanupReleaseGuards(t *testing.T) {
 				require.NoError(t, err)
 				persisted, err := f.server.driver.kubeRuntime.client.CoreV1().ConfigMaps("default").List(ctx, metav1.ListOptions{})
 				require.NoError(t, err)
-				objects := []kruntime.Object{f.pv.DeepCopy(), f.pvc.DeepCopy(), f.node.DeepCopy()}
+				pvc := f.pvc.DeepCopy()
+				objects := []kruntime.Object{f.pv.DeepCopy(), pvc, f.node.DeepCopy()}
 				for i := range persisted.Items {
 					objects = append(objects, persisted.Items[i].DeepCopy())
 				}
@@ -210,6 +211,22 @@ func TestCephRestartCleanupReleaseGuards(t *testing.T) {
 					if mode == "terminating" || mode == "terminal-terminating" {
 						at := metav1.NewTime(time.Now().Add(-time.Hour))
 						pod.DeletionTimestamp = &at
+					}
+					objects = append(objects, pod)
+				}
+				if strings.HasPrefix(mode, "ephemeral-") {
+					pod := f.pod.DeepCopy()
+					pod.Name = "pvc"
+					pod.Spec.Volumes = []corev1.Volume{{
+						Name: cephRestartVolume,
+						VolumeSource: corev1.VolumeSource{Ephemeral: &corev1.EphemeralVolumeSource{
+							VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{},
+						}},
+					}}
+					deleting := metav1.NewTime(time.Now().Add(-time.Hour))
+					pod.DeletionTimestamp = &deleting
+					if mode == "ephemeral-terminating" {
+						pvc.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(pod, corev1.SchemeGroupVersion.WithKind("Pod"))}
 					}
 					objects = append(objects, pod)
 				}
@@ -328,6 +345,14 @@ func TestCephRestartCleanupReleaseGuards(t *testing.T) {
 	}
 }
 
+type staleCleanupTestProvider struct {
+	*cleanupReadbackProvider
+}
+
+func (p staleCleanupTestProvider) InspectVolumeDatastore(ctx context.Context, volume string, imageID int) (opennebula.Datastore, error) {
+	return (staleAttachmentTestProvider{p.MockOpenNebulaVolumeProviderTestify}).InspectVolumeDatastore(ctx, volume, imageID)
+}
+
 func TestAttachmentReconcilerStaleIdentityAndAbsence(t *testing.T) {
 	for _, mode := range []string{"absent", "foreign-driver", "foreign-attacher", "replacement-before-read", "replacement-before-list", "replacement-at-delete", "replaced-pv", "unknown", "reattached", "replacement-vm", "va-image", "va-serial"} {
 		t.Run(mode, func(t *testing.T) {
@@ -358,6 +383,7 @@ func TestAttachmentReconcilerStaleIdentityAndAbsence(t *testing.T) {
 			base := new(MockOpenNebulaVolumeProviderTestify)
 			base.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil, nil)
 			base.On("VolumeExists", mock.Anything, cephRestartVolume).Return(3137, 1024, nil)
+			base.On("InspectVolumeDatastore", mock.Anything, cephRestartVolume, 3137).Return(opennebula.Datastore{Backend: "ceph"}, nil).Maybe()
 			base.On("NodeExists", mock.Anything, "node-a").Return(vmID, nil)
 			physical := &cleanupReadbackProvider{MockOpenNebulaVolumeProviderTestify: base}
 			if mode == "unknown" {
@@ -398,7 +424,7 @@ func TestAttachmentReconcilerStaleIdentityAndAbsence(t *testing.T) {
 				}
 				return false, nil, nil
 			})
-			r := NewAttachmentReconciler(NewControllerServer(f.server.driver, physical, nil))
+			r := NewAttachmentReconciler(NewControllerServer(f.server.driver, staleCleanupTestProvider{physical}, nil))
 			r.staleVASeen[string(f.va.UID)] = time.Now().Add(-2 * r.staleVAGrace)
 			require.NoError(t, r.ReconcileOnce(ctx))
 			va, err := client.StorageV1().VolumeAttachments().Get(ctx, f.va.Name, metav1.GetOptions{})
@@ -440,9 +466,10 @@ func TestAttachmentReconcilerDoesNotCombineForeignHandleOwnership(t *testing.T) 
 	base := new(MockOpenNebulaVolumeProviderTestify)
 	base.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil, nil)
 	base.On("VolumeExists", mock.Anything, cephRestartVolume).Return(3137, 1024, nil)
+	base.On("InspectVolumeDatastore", mock.Anything, cephRestartVolume, 3137).Return(opennebula.Datastore{Backend: "ceph"}, nil).Once()
 	base.On("NodeExists", mock.Anything, "node-a").Return(575, nil)
 	physical := &cleanupReadbackProvider{MockOpenNebulaVolumeProviderTestify: base}
-	r := NewAttachmentReconciler(NewControllerServer(f.server.driver, physical, nil))
+	r := NewAttachmentReconciler(NewControllerServer(f.server.driver, staleCleanupTestProvider{physical}, nil))
 	r.staleVASeen[string(f.va.UID)] = time.Now().Add(-2 * r.staleVAGrace)
 	r.staleVASeen[string(foreignVA.UID)] = time.Now().Add(-2 * r.staleVAGrace)
 	require.NoError(t, r.ReconcileOnce(ctx))
@@ -452,6 +479,7 @@ func TestAttachmentReconcilerDoesNotCombineForeignHandleOwnership(t *testing.T) 
 	require.NoError(t, err)
 	require.Equal(t, foreignVA.UID, observed.UID)
 	base.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+	base.AssertExpectations(t)
 }
 
 func TestControllerUnpublishCephLateDemandCannotAcknowledge(t *testing.T) {
@@ -487,7 +515,7 @@ func TestControllerUnpublishCephLateDemandCannotAcknowledge(t *testing.T) {
 
 func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"null", "unrelated-null", "unrelated-valid", "unrelated-dotted", "ambiguous-null", "invalid-key-null", "identity-only", "missing-count", "missing-last-observation", "reversed-observation", "unrelated-reversed-observation", "unrelated-invalid-schema", "wrong-report-key", "miskeyed-relevant-report", "unknown-confirmation", "unknown-failure", "host-key", "host-owner"} {
+		for _, mode := range []string{"null", "unrelated-null", "unrelated-valid", "unrelated-dotted", "colliding-dotted", "ambiguous-null", "invalid-key-null", "identity-only", "missing-count", "missing-last-observation", "reversed-observation", "unrelated-reversed-observation", "unrelated-invalid-schema", "wrong-report-key", "miskeyed-relevant-report", "unknown-confirmation", "unknown-failure", "host-key", "host-owner"} {
 			t.Run(fmt.Sprintf("%v/%s", queued, mode), func(t *testing.T) {
 				f := newCephRestartTestFixture(t, queued)
 				key := localDeviceReportKey(f.node.Name, cephRestartVolume)
@@ -507,7 +535,7 @@ func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T
 				case "unrelated-invalid-schema":
 					key = localDeviceReportKey(f.node.Name, "other-volume")
 					raw = fmt.Sprintf(`{"node":%q,"volumeID":"other-volume","firstObservedAt":17}`, f.node.Name)
-				case "missing-count", "missing-last-observation", "reversed-observation", "unrelated-reversed-observation", "unrelated-valid", "unrelated-dotted", "wrong-report-key", "miskeyed-relevant-report", "unknown-confirmation", "unknown-failure":
+				case "missing-count", "missing-last-observation", "reversed-observation", "unrelated-reversed-observation", "unrelated-valid", "unrelated-dotted", "colliding-dotted", "wrong-report-key", "miskeyed-relevant-report", "unknown-confirmation", "unknown-failure":
 					now := time.Now().UTC()
 					report := LocalDeviceMissingReport{Node: f.node.Name, VolumeID: cephRestartVolume, FailureClass: localDeviceFailureClassMissingDevice,
 						FirstObservedAt: now, LastObservedAt: now, Attempts: 1}
@@ -527,10 +555,15 @@ func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T
 						key = localDeviceReportKey(report.Node, report.VolumeID)
 					case "wrong-report-key":
 						report.VolumeID = "another-volume"
-					case "unrelated-dotted":
+					case "unrelated-dotted", "colliding-dotted":
 						report.VolumeID = "archive." + cephRestartVolume
 						report.FailureClass = localDeviceFailureClassWrongIdentity
 						key = localDeviceReportKey(report.Node, report.VolumeID)
+						if mode == "colliding-dotted" {
+							candidate := newReadyNode(f.node.Name+".archive", true)
+							_, err := f.server.driver.kubeRuntime.client.CoreV1().Nodes().Create(context.Background(), candidate, metav1.CreateOptions{})
+							require.NoError(t, err)
+						}
 					case "miskeyed-relevant-report":
 						key = localDeviceReportKey(report.Node, "other-volume")
 						report.FailureClass = localDeviceFailureClassWrongIdentity

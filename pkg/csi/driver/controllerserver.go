@@ -433,7 +433,7 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 				s.driver.metrics.RecordOperation("create_volume", backend, "unavailable", time.Since(started))
 				return nil, err
 			}
-			setVolumeContextPlacement(response.Volume, datastore.Backend, datastore.ID, datastore.Name, string(selection.Policy))
+			setVolumeContextPlacement(response.Volume, datastore.Backend, datastore.ID, datastore.Name, "")
 			s.driver.metrics.RecordOperation("create_volume", backend, "success", time.Since(started))
 			klog.V(3).InfoS("Volume already exists with the same size",
 				"method", "CreateVolume", "volumeID", volumeID, "requiredSize", requiredBytes)
@@ -1152,19 +1152,23 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 
-	var identityErr error
-	ctx, identityErr = s.pinKnownVolumeIdentity(ctx, req.VolumeId)
-	if identityErr != nil {
-		return nil, attachmentEvidenceUnavailable("volume identity is unavailable", identityErr)
+	if s.driver.volumeHistory != nil {
+		if err := s.driver.volumeHistory.RefreshEntry(ctx, req.VolumeId); err != nil {
+			return nil, attachmentEvidenceUnavailable("volume identity is unavailable", err)
+		}
 	}
 	volumeID, _, err := s.volumeProvider.VolumeExists(ctx, req.VolumeId)
-	if err != nil && !errors.Is(err, opennebula.ErrVolumeNotFound) && !opennebula.IsAuthoritativeVolumeAbsence(err) {
+	if err != nil && !errors.Is(err, opennebula.ErrVolumeNotFound) {
 		return nil, attachmentEvidenceUnavailable("volume lookup is unknown", err)
 	}
-	if volumeID == -1 {
+	if errors.Is(err, opennebula.ErrVolumeNotFound) {
 		klog.V(1).InfoS("Volume not found, skipping volume unpublish",
 			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId)
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
+	history := s.currentVolumeHistory(req.VolumeId)
+	if volumeID <= 0 || (history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != volumeID) {
+		return nil, attachmentEvidenceUnavailable("live volume identity differs from the expected image", nil)
 	}
 
 	nodeID, err := s.volumeProvider.NodeExists(ctx, req.NodeId)
@@ -1853,9 +1857,12 @@ func (s *ControllerServer) publishContextForVolume(ctx context.Context, volumeID
 	publishContext := map[string]string{
 		"volumeName": target,
 	}
-	for _, key := range []string{paramPVCName, paramPVCNamespace, paramPVName} {
-		if value := strings.TrimSpace(sourceContext[key]); value != "" {
-			publishContext[key] = value
+	kubeEnabled := s.driver != nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled
+	if !kubeEnabled {
+		for _, key := range []string{paramPVCName, paramPVCNamespace, paramPVName} {
+			if value := strings.TrimSpace(sourceContext[key]); value != "" {
+				publishContext[key] = value
+			}
 		}
 	}
 
@@ -1864,15 +1871,11 @@ func (s *ControllerServer) publishContextForVolume(ctx context.Context, volumeID
 		publishContext[publishContextOpenNebulaImageID] = strconv.Itoa(opennebulaImageID)
 		publishContext[publishContextDeviceSerial] = fmt.Sprintf("onecsi-%d", opennebulaImageID)
 	}
-	if s.driver != nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
+	if kubeEnabled {
 		if runtimeCtx, runtimeErr := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeID); runtimeErr == nil {
-			if publishContext[paramPVCNamespace] == "" && runtimeCtx.PVCNamespace != "" {
+			if runtimeCtx.verifiedClaimBinding {
 				publishContext[paramPVCNamespace] = runtimeCtx.PVCNamespace
-			}
-			if publishContext[paramPVCName] == "" && runtimeCtx.PVCName != "" {
 				publishContext[paramPVCName] = runtimeCtx.PVCName
-			}
-			if publishContext[paramPVName] == "" && runtimeCtx.PVName != "" {
 				publishContext[paramPVName] = runtimeCtx.PVName
 			}
 			if backend, err := runtimeCtx.verifiedAttachmentBackend(); err == nil {

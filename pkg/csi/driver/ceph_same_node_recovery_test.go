@@ -181,6 +181,43 @@ func TestControllerUnpublishCephDeletingAttachmentSameNode(t *testing.T) {
 	}
 }
 
+func TestControllerUnpublishCephGenericEphemeralDemand(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, owned := range []bool{false, true} {
+			t.Run(fmt.Sprintf("queued=%t/owned=%t", queued, owned), func(t *testing.T) {
+				ctx := context.Background()
+				f := newCephRestartTestFixture(t, queued)
+				client := f.server.driver.kubeRuntime.client
+				require.NoError(t, client.CoreV1().Pods(f.pod.Namespace).Delete(ctx, f.pod.Name, metav1.DeleteOptions{}))
+				f.pod.Name = "pvc"
+				f.pod.Spec.Volumes = []corev1.Volume{{
+					Name: cephRestartVolume,
+					VolumeSource: corev1.VolumeSource{Ephemeral: &corev1.EphemeralVolumeSource{
+						VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{},
+					}},
+				}}
+				_, err := client.CoreV1().Pods(f.pod.Namespace).Create(ctx, f.pod, metav1.CreateOptions{})
+				require.NoError(t, err)
+				if owned {
+					f.pvc.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(f.pod, corev1.SchemeGroupVersion.WithKind("Pod"))}
+					f.syncObjects(t)
+				}
+				reply, err := f.unpublish(t)
+				if owned {
+					require.NoError(t, err)
+					require.NotNil(t, reply)
+					require.EqualValues(t, 2, f.provider.inspections.Load())
+				} else {
+					require.Equal(t, codes.Unavailable, status.Code(err))
+					require.Nil(t, reply)
+					require.Zero(t, f.provider.inspections.Load())
+				}
+				f.requireNoProviderMutation(t)
+			})
+		}
+	}
+}
+
 func TestControllerUnpublishCephRejectsDeletingNodeInEitherSnapshot(t *testing.T) {
 	for _, queued := range []bool{false, true} {
 		for _, late := range []bool{false, true} {
@@ -827,8 +864,6 @@ func TestControllerUnpublishCephCurrentBindingRetainsPinnedSameImage(t *testing.
 			va.Name, va.UID = "rebound-attachment", "rebound-va-uid"
 			va.DeletionTimestamp = nil
 			va.Spec.Source.PersistentVolumeName = &pv.Name
-			va.Status.AttachmentMetadata[paramPVName] = pv.Name
-			va.Status.AttachmentMetadata[paramPVCName] = pvc.Name
 			attachedStatus := va.Status
 			va.Status = storagev1.VolumeAttachmentStatus{}
 			va, err = client.StorageV1().VolumeAttachments().Create(ctx, va, metav1.CreateOptions{})

@@ -52,7 +52,10 @@ type nodeAttachmentProtocol struct {
 	ceph              bool
 	imageName         string
 	duplicateImage    bool
+	missingImage      bool
+	replacementDisk   bool
 	imageDatastoreID  int
+	imageTransfer     string
 	diskTarget        string
 	ownerCount        int
 	ready             bool
@@ -106,6 +109,9 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 					disk = strings.NewReplacer("<LN_TARGET>SYSTEM</LN_TARGET>", "<LN_TARGET>NONE</LN_TARGET>", "<TM_MAD>ssh</TM_MAD>", "<TM_MAD>ceph</TM_MAD>", "<TM_MAD_SYSTEM>ssh</TM_MAD_SYSTEM>", "<TM_MAD_SYSTEM>ceph</TM_MAD_SYSTEM>").Replace(disk)
 				}
 			}
+			if id == 41 && state.replacementDisk {
+				disk += "<DISK><IMAGE_ID>8</IMAGE_ID><DISK_ID>3</DISK_ID><TARGET>vdc</TARGET><SERIAL>onecsi-8</SERIAL></DISK>"
+			}
 			return fmt.Sprintf(`<VM><ID>%d</ID><NAME>%s</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE>%s</TEMPLATE><HISTORY_RECORDS><HISTORY><SEQ>0</SEQ><DS_ID>200</DS_ID></HISTORY></HISTORY_RECORDS></VM>`, id, name, state.extraDiskBefore+disk+state.extraDiskByVM[id])
 		}
 		imageXML := func() string {
@@ -140,13 +146,22 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 		} else {
 			switch call.Method {
 			case "one.imagepool.info":
-				body = "<IMAGE_POOL>" + imageXML()
+				body = "<IMAGE_POOL>"
+				if !state.missingImage {
+					body += imageXML()
+				}
 				if state.duplicateImage {
 					body += fmt.Sprintf("<IMAGE><ID>8</ID><NAME>%s</NAME></IMAGE>", firstNonEmpty(state.imageName, "volume-test"))
 				}
 				body += "</IMAGE_POOL>"
 			case "one.image.info":
 				body = imageXML()
+				switch {
+				case number(1) == 8 && state.duplicateImage:
+					body = strings.Replace(body, "<ID>7</ID>", "<ID>8</ID>", 1)
+				case state.missingImage:
+					ok, body, code = 0, "image not found", 0x400
+				}
 			case "one.vmpool.info":
 				body = "<VM_POOL>" + vmXML(41, false) + vmXML(42, false)
 				if _, present := state.disks[43]; present {
@@ -161,6 +176,9 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 					const rbdTemplate = `<TEMPLATE><DISK_TYPE>RBD</DISK_TYPE><COMPATIBLE_SYS_DS>200</COMPATIBLE_SYS_DS><POOL_NAME>fixture</POOL_NAME><CEPH_HOST>mon.example.invalid</CEPH_HOST><CEPH_USER>csi</CEPH_USER><CEPH_SECRET>fixture</CEPH_SECRET><BRIDGE_LIST>bridge.example.invalid</BRIDGE_LIST></TEMPLATE>`
 					body = strings.NewReplacer("<DS_MAD>fs</DS_MAD>", "<DS_MAD>ceph</DS_MAD>", "<TM_MAD>ssh</TM_MAD>", "<TM_MAD>ceph</TM_MAD>",
 						"</DATASTORE>", rbdTemplate+"</DATASTORE>").Replace(body)
+				}
+				if state.imageTransfer != "" {
+					body = strings.Replace(body, "<TM_MAD>ceph</TM_MAD>", "<TM_MAD>"+state.imageTransfer+"</TM_MAD>", 1)
 				}
 			case "one.vm.attach":
 				id := number(1)
@@ -423,6 +441,64 @@ func TestControllerDetachRechecksReleaseAtProviderAttempt(t *testing.T) {
 				require.Equal(t, []string{"detach:41"}, state.mutations)
 			}
 		})
+	}
+}
+
+func TestControllerUnpublishGenericEphemeralRelease(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, mode := range []string{"terminating-owned", "terminating-unverified", "released"} {
+			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+				node := newReadyNode("node-old", true)
+				pod := activePodForPVC("consumer", pvc.Name, node.Name)
+				pod.UID = "pod-uid"
+				pod.Spec.Volumes[0].VolumeSource = corev1.VolumeSource{Ephemeral: &corev1.EphemeralVolumeSource{
+					VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{},
+				}}
+				deleting := metav1.Now()
+				pod.DeletionTimestamp = &deleting
+				pvc.Name = "consumer-data"
+				pv.Spec.ClaimRef.Name = pvc.Name
+				if mode != "terminating-unverified" {
+					pvc.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(pod, corev1.SchemeGroupVersion.WithKind("Pod"))}
+				}
+				va := &storagev1.VolumeAttachment{
+					ObjectMeta: metav1.ObjectMeta{Name: "deleting-va", UID: "va-uid", DeletionTimestamp: &deleting},
+					Spec: storagev1.VolumeAttachmentSpec{
+						Attacher: DefaultDriverName, NodeName: node.Name,
+						Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name},
+					},
+					Status: storagev1.VolumeAttachmentStatus{Attached: true},
+				}
+				objects := []kruntime.Object{pv, pvc, va, node}
+				if mode != "released" {
+					objects = append(objects, pod)
+				}
+				driver := newStickyTestDriver(t, objects...)
+				driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+				provider, wire := nodeAttachmentProvider(t)
+				server := NewControllerServer(driver, provider, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+				}
+				reply, err := reviewControllerClient(t, server).ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				if mode == "released" {
+					require.NoError(t, err)
+					require.NotNil(t, reply)
+					require.Equal(t, []string{"detach:41"}, wire.mutations)
+					return
+				}
+				require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+				require.Nil(t, reply)
+				require.Zero(t, wire.detachAttempts)
+				require.Empty(t, wire.mutations)
+			})
+		}
 	}
 }
 
@@ -844,7 +920,7 @@ func TestProviderDetachRetryRespectsHotplugDeadline(t *testing.T) {
 
 func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"same-node", "replacement-uid", "replacement-vm", "vm-changed-before-dispatch"} {
+		for _, mode := range []string{"same-node", "replacement-uid", "replacement-vm", "vm-changed-before-dispatch", "duplicate-image", "replacement-image", "late-duplicate-image", "missing-image"} {
 			t.Run(fmt.Sprintf("queued=%v/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
@@ -871,6 +947,11 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 						defer protocol.mu.Unlock()
 						protocol.vmNames = map[int]string{41: "retired-vm", 42: "node-old"}
 					}
+					if mode == "late-duplicate-image" && method == "one.imagepool.info" && imageReads.Add(1) == 2 {
+						protocol.mu.Lock()
+						defer protocol.mu.Unlock()
+						protocol.duplicateImage, protocol.replacementDisk = true, true
+					}
 				})
 				protocol = state
 				state.mu.Lock()
@@ -878,8 +959,12 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 				switch mode {
 				case "replacement-vm":
 					state.vmNames = map[int]string{41: "retired-vm", 42: "node-old"}
-				case "same-node", "replacement-uid":
+				case "same-node", "replacement-uid", "late-duplicate-image":
 					delete(state.disks, 41)
+				case "duplicate-image", "replacement-image", "missing-image":
+					delete(state.disks, 41)
+					state.missingImage = mode != "duplicate-image"
+					state.duplicateImage, state.replacementDisk = mode != "missing-image", mode != "missing-image"
 				}
 				state.mu.Unlock()
 				controller := NewControllerServer(driver, provider, nil)
@@ -890,12 +975,17 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 				client := reviewControllerClient(t, controller)
 				response, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: "node-old"})
 				history, _ := driver.volumeHistory.Get("volume-test")
-				if mode == "same-node" {
+				switch mode {
+				case "same-node":
 					require.NoError(t, err)
 					require.NotNil(t, response)
 					require.False(t, history.LastSafeDetachTime.IsZero())
-				} else {
-					require.Equal(t, codes.Unavailable, status.Code(err))
+				case "missing-image":
+					require.NoError(t, err)
+					require.NotNil(t, response)
+					require.True(t, history.LastSafeDetachTime.IsZero())
+				default:
+					require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
 					require.Nil(t, response)
 					require.True(t, history.LastSafeDetachTime.IsZero())
 				}
@@ -904,6 +994,9 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 				require.Empty(t, state.mutations)
 				if strings.Contains(mode, "vm") {
 					require.Contains(t, state.disks, 41)
+				}
+				if mode == "duplicate-image" || mode == "replacement-image" || mode == "late-duplicate-image" {
+					require.True(t, state.replacementDisk)
 				}
 			})
 		}
@@ -1959,7 +2052,10 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 			client := reviewControllerClient(t, server)
 			require.Empty(t, driver.volumeHistory.Snapshot())
 			publish := newPublishReq(volume, node.Name)
-			publish.VolumeContext = map[string]string{"example.test/static-attribute": "unrelated"}
+			publish.VolumeContext = map[string]string{
+				"example.test/static-attribute": "unrelated",
+				paramPVName:                     pv.Name, paramPVCName: pvc.Name, paramPVCNamespace: pvc.Namespace,
+			}
 			publish.VolumeCapability.GetMount().FsType = "ext4"
 			published, err := client.ControllerPublishVolume(ctx, publish)
 			require.NoError(t, err)
@@ -2013,6 +2109,9 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 			pvc.Spec.VolumeName = pv.Name
 			delete(pv.Annotations, annotationBackend)
 			pv.Spec.CSI.VolumeAttributes = map[string]string{annotationBackend: "Ceph"}
+			for key, value := range publish.VolumeContext {
+				pv.Spec.CSI.VolumeAttributes[key] = value
+			}
 			_, err = kube.CoreV1().PersistentVolumes().Create(ctx, pv, metav1.CreateOptions{})
 			require.NoError(t, err)
 			_, err = kube.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(ctx, pvc, metav1.CreateOptions{})
@@ -2023,13 +2122,19 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 			pod.Status.Phase = corev1.PodPending
 			_, err = kube.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 			require.NoError(t, err)
-			metadata := cloneStringMap(published.PublishContext)
-			metadata[paramPVName], metadata[paramPVCName] = pv.Name, pvc.Name
+			publish.VolumeContext = pv.Spec.CSI.VolumeAttributes
+			rebound, err := client.ControllerPublishVolume(ctx, publish)
+			require.NoError(t, err)
+			require.Equal(t, pv.Name, rebound.PublishContext[paramPVName])
+			require.Equal(t, pvc.Name, rebound.PublishContext[paramPVCName])
+			require.Equal(t, pvc.Namespace, rebound.PublishContext[paramPVCNamespace])
+			history, err = server.readAttachmentHistory(ctx, volume)
+			require.NoError(t, err)
 			deleting := metav1.Now()
 			va := &storagev1.VolumeAttachment{
 				ObjectMeta: metav1.ObjectMeta{Name: "rebound-static-va", UID: "rebound-static-va-uid", DeletionTimestamp: &deleting, Finalizers: []string{"external-attacher/" + DefaultDriverName}},
 				Spec:       storagev1.VolumeAttachmentSpec{Attacher: DefaultDriverName, NodeName: node.Name, Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name}},
-				Status:     storagev1.VolumeAttachmentStatus{Attached: true, AttachmentMetadata: metadata},
+				Status:     storagev1.VolumeAttachmentStatus{Attached: true, AttachmentMetadata: rebound.PublishContext},
 			}
 			_, err = kube.StorageV1().VolumeAttachments().Create(ctx, va, metav1.CreateOptions{})
 			require.NoError(t, err)
@@ -2355,6 +2460,7 @@ func TestCreateVolumeRetryReturnsObservedBackend(t *testing.T) {
 	require.Equal(t, "ceph", reply.Volume.VolumeContext[annotationBackend])
 	require.Equal(t, "100", reply.Volume.VolumeContext[annotationDatastoreID])
 	require.Equal(t, "images", reply.Volume.VolumeContext[annotationDatastoreName])
+	require.NotContains(t, reply.Volume.VolumeContext, annotationSelectionPolicy)
 	require.Empty(t, reply.Volume.AccessibleTopology)
 	require.Equal(t, "test-claim-uid", reply.Volume.VolumeContext[volumeContextUUID])
 	wire.mu.Lock()
@@ -2371,7 +2477,8 @@ func TestLegacyDiskCleanupVerifiesUndeclaredBackend(t *testing.T) {
 			{"foreground", "unavailable"}, {"foreground", "contradictory"},
 			{"orphan", "unavailable"}, {"stale", "unavailable"},
 			{"foreground", "system-datastore"}, {"foreground", "declared-system"}, {"orphan", "system-datastore"}, {"stale", "system-datastore"},
-			{"stale", "duplicate-image"},
+			{"stale", "duplicate-image"}, {"stale", "declared-system"}, {"stale", "declared-unavailable"},
+			{"stale", "declared-conflicting-drivers"}, {"stale", "declared-verified"},
 		} {
 			t.Run(fmt.Sprintf("queued=%t/%s/%s", queued, tc.action, tc.evidence), func(t *testing.T) {
 				ctx := context.Background()
@@ -2384,7 +2491,7 @@ func TestLegacyDiskCleanupVerifiesUndeclaredBackend(t *testing.T) {
 					pv.Annotations[annotationBackend] = "ceph"
 					pv.Spec.CSI.VolumeAttributes = map[string]string{annotationBackend: "local"}
 				}
-				if tc.evidence == "declared-system" {
+				if strings.HasPrefix(tc.evidence, "declared-") {
 					pv.Annotations[annotationBackend] = "ceph"
 				}
 				node := newReadyNode("node-old", true)
@@ -2416,12 +2523,14 @@ func TestLegacyDiskCleanupVerifiesUndeclaredBackend(t *testing.T) {
 					delete(wire.disks, 41)
 				}
 				switch tc.evidence {
-				case "unavailable":
+				case "unavailable", "declared-unavailable":
 					wire.failMethod = "one.datastorepool.info"
 				case "system-datastore", "declared-system":
 					wire.imageDatastoreID = 200
 				case "duplicate-image":
 					wire.duplicateImage = true
+				case "declared-conflicting-drivers":
+					wire.imageTransfer = "ssh"
 				}
 				wire.mu.Unlock()
 				server := NewControllerServer(driver, provider, nil)
@@ -2453,7 +2562,7 @@ func TestLegacyDiskCleanupVerifiesUndeclaredBackend(t *testing.T) {
 
 				if tc.action == "stale" {
 					_, err := driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(ctx, attachmentName, metav1.GetOptions{})
-					if tc.evidence == "verified" {
+					if tc.evidence == "verified" || tc.evidence == "declared-verified" {
 						require.True(t, apierrors.IsNotFound(err))
 					} else {
 						require.NoError(t, err)

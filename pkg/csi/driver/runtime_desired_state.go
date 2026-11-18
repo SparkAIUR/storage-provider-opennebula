@@ -50,6 +50,33 @@ const (
 	volumeDemandSourceVolumeParked                 = "volume_parked"
 )
 
+func podVolumeClaimName(pod *corev1.Pod, volume corev1.Volume) string {
+	switch {
+	case volume.PersistentVolumeClaim != nil:
+		return strings.TrimSpace(volume.PersistentVolumeClaim.ClaimName)
+	case volume.Ephemeral != nil:
+		return pod.Name + "-" + volume.Name
+	default:
+		return ""
+	}
+}
+
+func podReferencesClaim(pod *corev1.Pod, claimName string, pvc *corev1.PersistentVolumeClaim) (bool, error) {
+	if claimName == "" {
+		return false, nil
+	}
+	for _, volume := range pod.Spec.Volumes {
+		if podVolumeClaimName(pod, volume) != claimName {
+			continue
+		}
+		if volume.Ephemeral != nil && (pvc == nil || pvc.Namespace != pod.Namespace || pod.UID == "" || !metav1.IsControlledBy(pvc, pod)) {
+			return false, fmt.Errorf("ephemeral PVC ownership is unverified for Pod %s/%s", pod.Namespace, pod.Name)
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
 func (r *KubeRuntime) NodeIdentity(ctx context.Context, nodeName string) (KubernetesNodeIdentity, error) {
 	if r == nil || !r.enabled {
 		return KubernetesNodeIdentity{}, fmt.Errorf("kubernetes runtime is not enabled")
@@ -142,15 +169,9 @@ func (r *KubeRuntime) desiredNodeForVolume(ctx context.Context, volumeHandle str
 		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
-		referencesPVC := false
-		for _, volume := range pod.Spec.Volumes {
-			if volume.PersistentVolumeClaim == nil {
-				continue
-			}
-			if strings.TrimSpace(volume.PersistentVolumeClaim.ClaimName) == runtimeCtx.PVCName {
-				referencesPVC = true
-				break
-			}
+		referencesPVC, err := podReferencesClaim(pod, pvc.Name, pvc)
+		if err != nil {
+			return state, err
 		}
 		if !referencesPVC {
 			continue

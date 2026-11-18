@@ -134,21 +134,17 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 	}
 	r.cleanupStaleDriverState(ctx, presentHandles, existingNodes)
 
-	activePVCUsers := make(map[string]map[string]bool)
+	podsByClaim := make(map[string][]*corev1.Pod)
 	for idx := range podList.Items {
 		pod := &podList.Items[idx]
 		if terminalPodMayBeReleased(pod) {
 			continue
 		}
 		for _, volume := range pod.Spec.Volumes {
-			if volume.PersistentVolumeClaim == nil {
-				continue
+			if name := podVolumeClaimName(pod, volume); name != "" {
+				key := pod.Namespace + "/" + name
+				podsByClaim[key] = append(podsByClaim[key], pod)
 			}
-			key := pod.Namespace + "/" + volume.PersistentVolumeClaim.ClaimName
-			if activePVCUsers[key] == nil {
-				activePVCUsers[key] = make(map[string]bool)
-			}
-			activePVCUsers[key][pod.Spec.NodeName] = true
 		}
 	}
 
@@ -214,13 +210,26 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			continue
 		}
 
-		_, replacement, err := r.server.driver.kubeRuntime.attachmentClaim(ctx, pv)
+		pvc, replacement, err := r.server.driver.kubeRuntime.attachmentClaim(ctx, pv)
 		if err != nil {
 			continue
 		}
-		var users map[string]bool
+		users := make(map[string]bool)
+		unknownConsumer := false
 		if claim := pv.Spec.ClaimRef; claim != nil && !replacement {
-			users = activePVCUsers[claim.Namespace+"/"+claim.Name]
+			for _, pod := range podsByClaim[claim.Namespace+"/"+claim.Name] {
+				referencesPVC, err := podReferencesClaim(pod, claim.Name, pvc)
+				if err != nil {
+					unknownConsumer = true
+					break
+				}
+				if referencesPVC {
+					users[pod.Spec.NodeName] = true
+				}
+			}
+		}
+		if unknownConsumer {
+			continue
 		}
 		vas := vaByVolume[volumeHandle]
 		singleWriter := hasSingleWriterAccessMode(pv.Spec.AccessModes)
@@ -427,7 +436,18 @@ func (r *AttachmentReconciler) cleanupLocalDeviceReports(ctx context.Context, pv
 		if err != nil {
 			continue
 		}
-		if pvByHandle[strings.TrimSpace(report.VolumeID)] == nil || nodeMissing(existingNodes, report.Node) {
+		if pvByHandle[strings.TrimSpace(report.VolumeID)] != nil && !nodeMissing(existingNodes, report.Node) {
+			continue
+		}
+		ambiguous := false
+		for handle := range pvByHandle {
+			node, matches := localDeviceReportKeyNode(key, handle)
+			if matches && !nodeMissing(existingNodes, node) {
+				ambiguous = true
+				break
+			}
+		}
+		if !ambiguous {
 			_ = r.server.driver.kubeRuntime.deleteConfigMapKeyIfCurrent(ctx, cm, key, raw)
 		}
 	}
@@ -659,14 +679,16 @@ func (r *AttachmentReconciler) deleteStaleVolumeAttachment(ctx context.Context, 
 	if history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != imageID {
 		return fmt.Errorf("stale attachment image differs from history")
 	}
-	if _, err := persistentVolumeBackend(pv); errors.Is(err, errAttachmentBackendUndeclared) {
-		datastore, lookupErr := r.server.inspectVolumeDatastore(ctx, volume, imageID)
-		if lookupErr != nil {
-			return lookupErr
-		}
-		if history.Backend != "" && !strings.EqualFold(history.Backend, datastore.Backend) {
-			return fmt.Errorf("stale attachment backend differs from history")
-		}
+	backend, err := persistentVolumeBackend(pv)
+	if err != nil && !errors.Is(err, errAttachmentBackendUndeclared) {
+		return err
+	}
+	datastore, err := r.server.inspectVolumeDatastore(ctx, volume, imageID)
+	if err != nil {
+		return err
+	}
+	if backend != "" && backend != datastore.Backend || history.Backend != "" && !strings.EqualFold(history.Backend, datastore.Backend) {
+		return fmt.Errorf("stale attachment backend differs from current or historical declarations")
 	}
 	if err := validateAttachmentImageAssertions(va.Status.AttachmentMetadata, imageID); err != nil {
 		return err

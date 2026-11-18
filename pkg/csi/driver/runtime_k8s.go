@@ -88,18 +88,19 @@ type PlacementReport struct {
 }
 
 type VolumeRuntimeContext struct {
-	PVName           string
-	PVCNamespace     string
-	PVCName          string
-	PVCUID           types.UID
-	PVAnnotations    map[string]string
-	PVCAnnotations   map[string]string
-	AccessModes      []corev1.PersistentVolumeAccessMode
-	Backend          string
-	backendAttribute string
-	DatastoreID      int
-	RestartMode      string
-	DetachGraceHint  int
+	PVName               string
+	PVCNamespace         string
+	PVCName              string
+	PVCUID               types.UID
+	verifiedClaimBinding bool
+	PVAnnotations        map[string]string
+	PVCAnnotations       map[string]string
+	AccessModes          []corev1.PersistentVolumeAccessMode
+	Backend              string
+	backendAttribute     string
+	DatastoreID          int
+	RestartMode          string
+	DetachGraceHint      int
 }
 
 type KubeRuntime struct {
@@ -499,6 +500,7 @@ func (r *KubeRuntime) ResolveVolumeRuntimeContext(ctx context.Context, volumeHan
 				runtimeCtx.PVCName = ""
 			} else if pvcErr == nil {
 				runtimeCtx.PVCUID = pv.Spec.ClaimRef.UID
+				runtimeCtx.verifiedClaimBinding = runtimeCtx.PVCUID != "" && pvc.Spec.VolumeName == pv.Name
 				runtimeCtx.PVCAnnotations = cloneStringMap(pvc.Annotations)
 				if runtimeCtx.RestartMode == "" {
 					runtimeCtx.RestartMode = strings.TrimSpace(runtimeCtx.PVCAnnotations[annotationRestartOpt])

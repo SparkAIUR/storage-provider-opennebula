@@ -186,24 +186,25 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		}
 		remoteNode := ""
 		for _, pod := range pods.Items {
-			for _, v := range pod.Spec.Volumes {
-				if v.PersistentVolumeClaim == nil || v.PersistentVolumeClaim.ClaimName != claim.Name {
-					continue
+			referencesPVC, err := podReferencesClaim(&pod, claim.Name, pvc)
+			if err != nil {
+				return attachmentEvidenceUnavailable("cannot verify Pod claim ownership", err)
+			}
+			if !referencesPVC {
+				continue
+			}
+			if terminalPodMayBeReleased(&pod) {
+				terminalOnNode = terminalOnNode || pod.Spec.NodeName == nodeName
+				continue
+			}
+			if pod.Spec.NodeName == "" || pod.Spec.NodeName == nodeName {
+				return attachmentEvidenceUnavailable("a current Pod still references the volume on the detach node", nil)
+			}
+			if identity.background {
+				if !identity.cephSingleWriter || !cephHistoryHasObservedAuthority(history) || (remoteNode != "" && remoteNode != pod.Spec.NodeName) {
+					return attachmentEvidenceUnavailable("background detach is blocked by remote Pod demand", nil)
 				}
-				if terminalPodMayBeReleased(&pod) {
-					terminalOnNode = terminalOnNode || pod.Spec.NodeName == nodeName
-					break
-				}
-				if pod.Spec.NodeName == "" || pod.Spec.NodeName == nodeName {
-					return attachmentEvidenceUnavailable("a current Pod still references the volume on the detach node", nil)
-				}
-				if identity.background {
-					if !identity.cephSingleWriter || !cephHistoryHasObservedAuthority(history) || (remoteNode != "" && remoteNode != pod.Spec.NodeName) {
-						return attachmentEvidenceUnavailable("background detach is blocked by remote Pod demand", nil)
-					}
-					remoteNode = pod.Spec.NodeName
-				}
-				break
+				remoteNode = pod.Spec.NodeName
 			}
 		}
 	}
@@ -260,6 +261,7 @@ func (s *ControllerServer) recheckAttachmentAuthority(ctx context.Context, volum
 	if err != nil || replacement != currentReplacement || (pvc == nil) != (currentPVC == nil) ||
 		(pvc != nil && (currentPVC.UID != pvc.UID || !reflect.DeepEqual(currentPVC.Spec, pvc.Spec) ||
 			!reflect.DeepEqual(currentPVC.Status, pvc.Status) || !reflect.DeepEqual(currentPVC.Annotations, pvc.Annotations) ||
+			!reflect.DeepEqual(metav1.GetControllerOfNoCopy(currentPVC), metav1.GetControllerOfNoCopy(pvc)) ||
 			!reflect.DeepEqual(currentPVC.DeletionTimestamp, pvc.DeletionTimestamp))) {
 		return status.Error(codes.Unavailable, "volume claim or recovery controls changed during attachment checks")
 	}
@@ -333,6 +335,10 @@ func (s *ControllerServer) verifyDetachAbsenceTarget(ctx context.Context, volume
 	if err != nil || vmID <= 0 || currentVM != vmID {
 		return attachmentEvidenceUnavailable("detach absence VM identity changed", err)
 	}
+	currentImage, _, err := s.volumeProvider.VolumeExists(ctx, volume)
+	if err != nil || imageID <= 0 || currentImage != imageID {
+		return attachmentEvidenceUnavailable("detach absence image identity is unverified", err)
+	}
 	return status.FromContextError(ctx.Err()).Err()
 }
 
@@ -395,8 +401,7 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 			return s.verifySoleDetachOwner(ctx, volume, node, imageID, vmID, diskID)
 		}
 	}
-	ctx = opennebula.WithExpectedImageID(ctx, identity.imageID)
-	accepted, err := provider.DetachVolumeWithAuthority(ctx, volume, node, identity.vmID, identity.backend, verifyOwner, authorize)
+	accepted, err := provider.DetachVolumeWithAuthority(opennebula.WithExpectedImageID(ctx, identity.imageID), volume, node, identity.vmID, identity.backend, verifyOwner, authorize)
 	if parentErr := ctx.Err(); parentErr != nil {
 		return false, parentErr
 	}

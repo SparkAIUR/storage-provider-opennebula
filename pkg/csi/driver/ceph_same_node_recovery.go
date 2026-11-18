@@ -142,15 +142,8 @@ func validateCephRetentionDisk(req *csi.ControllerUnpublishVolumeRequest, imageI
 	if err := validateAttachmentImageAssertions(authority.AttachmentMetadata, disk.ImageID); err != nil {
 		return cephRetentionUnavailable("VolumeAttachment device identity contradicts the pinned image", err)
 	}
-	for key, expected := range map[string]string{
-		publishContextDeviceSerial: disk.DeviceSerial,
-		paramPVName:                authority.PVName,
-		paramPVCName:               authority.PVCName,
-		paramPVCNamespace:          authority.PVCNamespace,
-	} {
-		if observed, present := authority.AttachmentMetadata[key]; present && strings.TrimSpace(observed) != expected {
-			return cephRetentionUnavailable("VolumeAttachment metadata contradicts the current device or claim identity", nil)
-		}
+	if observed, present := authority.AttachmentMetadata[publishContextDeviceSerial]; present && strings.TrimSpace(observed) != disk.DeviceSerial {
+		return cephRetentionUnavailable("VolumeAttachment serial contradicts the current device", nil)
 	}
 	if target, present := authority.AttachmentMetadata["volumeName"]; present && strings.TrimPrefix(strings.TrimSpace(target), "/dev/") != disk.Target {
 		return cephRetentionUnavailable("VolumeAttachment target contradicts the current device", nil)
@@ -158,6 +151,18 @@ func validateCephRetentionDisk(req *csi.ControllerUnpublishVolumeRequest, imageI
 	history := authority.History
 	if !cephHistoryHasObservedAuthority(history) {
 		return cephRetentionUnavailable("history has no observed success authority", nil)
+	}
+	matchesBinding := func(pv, pvc, namespace string) bool {
+		for key, expected := range map[string]string{paramPVName: pv, paramPVCName: pvc, paramPVCNamespace: namespace} {
+			if observed, present := authority.AttachmentMetadata[key]; present && (expected == "" || strings.TrimSpace(observed) != expected) {
+				return false
+			}
+		}
+		return true
+	}
+	if !matchesBinding(authority.PVName, authority.PVCName, authority.PVCNamespace) &&
+		!matchesBinding(history.PVName, history.PVCName, history.PVCNamespace) {
+		return cephRetentionUnavailable("VolumeAttachment metadata contradicts current and historical binding names", nil)
 	}
 	if history.LastSuccessfulImageID != disk.ImageID || history.LastSuccessfulNodeName != req.NodeId || history.LastSuccessfulNodeUID != string(authority.NodeUID) {
 		return cephRetentionUnavailable("observed volume history does not match image and node identity", nil)
@@ -261,16 +266,17 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
-		for _, volume := range pod.Spec.Volumes {
-			if volume.PersistentVolumeClaim == nil || volume.PersistentVolumeClaim.ClaimName != pvc.Name {
-				continue
-			}
-			if pod.UID == "" || pod.Spec.NodeName != req.NodeId {
-				return nil, cephRetentionUnavailable("current Pod demand is ambiguous or cross-node", nil)
-			}
-			authority.ConsumerUIDs = append(authority.ConsumerUIDs, string(pod.UID))
-			break
+		referencesPVC, err := podReferencesClaim(&pod, pvc.Name, pvc)
+		if err != nil {
+			return nil, cephRetentionUnavailable("current Pod claim is unverified", err)
 		}
+		if !referencesPVC {
+			continue
+		}
+		if pod.UID == "" || pod.Spec.NodeName != req.NodeId {
+			return nil, cephRetentionUnavailable("current Pod demand is ambiguous or cross-node", nil)
+		}
+		authority.ConsumerUIDs = append(authority.ConsumerUIDs, string(pod.UID))
 	}
 	if len(authority.ConsumerUIDs) == 0 {
 		return nil, cephRetentionUnavailable("current same-node Pod demand disappeared", nil)
