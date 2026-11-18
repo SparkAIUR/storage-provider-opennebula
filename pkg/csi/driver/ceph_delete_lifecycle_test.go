@@ -166,7 +166,7 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 }
 
 func TestControllerDeleteCephVerifiesMissingImageOwnership(t *testing.T) {
-	for _, mode := range []string{"retained-disk", "backed-disk-without-id", "backed-disk-conflicting-serial", "backed-disk-blank-id-conflicting-serial", "serial-reference", "unknown-ownership", "replacement-image", "hidden-handle", "confirmed-absent", "unrelated-observed-conflict", "owner-omitted", "owner-omitted-released", "owner-omitted-gone"} {
+	for _, mode := range []string{"retained-disk", "backed-disk-without-id", "backed-disk-conflicting-serial", "backed-disk-blank-id-conflicting-serial", "serial-reference", "unknown-ownership", "replacement-image", "hidden-handle", "confirmed-absent", "missing-vm-template", "contradictory-vm-name", "unrelated-observed-conflict", "owner-omitted", "owner-omitted-released", "owner-omitted-gone"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			const volume = "volume-test"
@@ -207,6 +207,17 @@ func TestControllerDeleteCephVerifiesMissingImageOwnership(t *testing.T) {
 				wire.missingImage = false
 			case "confirmed-absent":
 				delete(wire.disks, 41)
+			case "missing-vm-template":
+				omitTemplate := func(body string) string {
+					start, end := strings.Index(body, "<TEMPLATE>"), strings.Index(body, "</TEMPLATE>")
+					return body[:start] + body[end+len("</TEMPLATE>"):]
+				}
+				wire.alterDirectVM, wire.alterOriginalPoolVM = omitTemplate, omitTemplate
+			case "contradictory-vm-name":
+				delete(wire.disks, 41)
+				wire.alterDirectVM = func(body string) string {
+					return strings.Replace(body, "<NAME>node-old</NAME>", "<NAME>node-other</NAME>", 1)
+				}
 			case "unrelated-observed-conflict":
 				delete(wire.disks, 41)
 				wire.extraDiskByVM = map[int]string{42: "<DISK><DISK_ID>2</DISK_ID><IMAGE_ID>8</IMAGE_ID><SERIAL>onecsi-9</SERIAL></DISK>"}

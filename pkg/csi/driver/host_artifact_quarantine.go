@@ -109,45 +109,49 @@ func (m *HostArtifactQuarantineManager) GetActive(key string, now time.Time) (Ho
 	return state, true
 }
 
-func (m *HostArtifactQuarantineManager) RefreshKey(ctx context.Context, key string) error {
-	if m == nil || m.runtime == nil || !m.runtime.enabled || strings.TrimSpace(key) == "" {
-		return nil
-	}
-	key = strings.TrimSpace(key)
-	cm, err := m.runtime.GetConfigMap(ctx, m.namespace, hostArtifactStateConfigMapName)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			m.mu.Lock()
-			delete(m.entries, key)
-			m.mu.Unlock()
-			return nil
+func (m *HostArtifactQuarantineManager) activeForTarget(target opennebula.HostArtifactAttachmentTarget, persisted map[string]string, now time.Time) (HostArtifactQuarantineState, bool, error) {
+	keys := hostArtifactTargetQuarantineKeys(target)
+	if persisted == nil {
+		for _, key := range keys {
+			if state, active := m.GetActive(key, now); active {
+				return state, true, nil
+			}
 		}
-		return err
+		return HostArtifactQuarantineState{}, false, nil
 	}
-	raw := strings.TrimSpace(cm.Data[key])
-	if raw == "" {
-		m.mu.Lock()
-		delete(m.entries, key)
-		m.mu.Unlock()
-		return nil
-	}
-	var state HostArtifactQuarantineState
-	if err := unmarshalAuthorityJSON(raw, &state); err != nil {
-		return err
-	}
-	if strings.TrimSpace(state.Key) == "" {
-		state.Key = key
-	}
-	if !state.ExpiresAt.IsZero() && !state.ExpiresAt.After(time.Now().UTC()) {
-		m.mu.Lock()
-		delete(m.entries, key)
-		m.mu.Unlock()
-		return nil
+
+	var active HostArtifactQuarantineState
+	observed := make(map[string]HostArtifactQuarantineState, len(keys))
+	for _, key := range keys {
+		raw, present := persisted[key]
+		if !present {
+			continue
+		}
+		var state HostArtifactQuarantineState
+		if err := decodeAttachmentQuarantine(raw, &state); err != nil {
+			return HostArtifactQuarantineState{}, false, err
+		}
+		recordTarget := opennebula.HostArtifactAttachmentTarget{VMID: state.VMID, NodeName: state.NodeName, DiskID: state.DiskID}
+		if state.Key != key || state.Key != recordTarget.Key() || strings.TrimSpace(state.VolumeID) == "" ||
+			!validQuarantineObservation(state.FailureCount, state.FirstObservedAt, state.LastObservedAt, state.ExpiresAt) {
+			return HostArtifactQuarantineState{}, false, fmt.Errorf("host artifact quarantine identity or expiry is unknown")
+		}
+		if state.ExpiresAt.IsZero() || state.ExpiresAt.After(now) {
+			observed[key] = state
+		}
+		if active.Key == "" && state.ExpiresAt.After(now) {
+			active = state
+		}
 	}
 	m.mu.Lock()
-	m.entries[key] = state
+	for _, key := range keys {
+		delete(m.entries, key)
+	}
+	for key, state := range observed {
+		m.entries[key] = state
+	}
 	m.mu.Unlock()
-	return nil
+	return active, active.Key != "", nil
 }
 
 func (m *HostArtifactQuarantineManager) RefreshVolume(ctx context.Context, volumeID string) error {

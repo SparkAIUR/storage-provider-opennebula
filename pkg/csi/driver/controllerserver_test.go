@@ -40,6 +40,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -2031,7 +2032,7 @@ func TestControllerPublishVolumeBlocksActiveHostArtifactQuarantine(t *testing.T)
 }
 
 func TestControllerPublishRedactsPersistedSlotQuarantine(t *testing.T) {
-	for _, mode := range []string{"same-volume", "other-volume", "observe-other-volume"} {
+	for _, mode := range []string{"same-volume", "other-volume", "observe-other-volume", "refresh-unavailable", "target-unavailable", "empty-slot"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			const volume = "vol-request"
@@ -2053,13 +2054,29 @@ func TestControllerPublishRedactsPersistedSlotQuarantine(t *testing.T) {
 			}
 			payload, err := json.Marshal(state)
 			require.NoError(t, err)
+			if mode == "empty-slot" {
+				payload = nil
+			}
 			require.NoError(t, driver.kubeRuntime.UpsertConfigMapData(ctx, "default", hostArtifactStateConfigMapName, map[string]string{state.Key: string(payload)}))
+			if mode == "refresh-unavailable" {
+				var reads atomic.Int32
+				driver.kubeRuntime.client.(*fake.Clientset).PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+					if action.(ktesting.GetAction).GetName() == hostArtifactStateConfigMapName && reads.Add(1) > 1 {
+						return true, nil, errors.New("quarantine refresh unavailable")
+					}
+					return false, nil, nil
+				})
+			}
 			require.Empty(t, driver.hostArtifactQuarantine.Snapshot())
 			provider := new(MockOpenNebulaVolumeProviderTestify)
 			provider.On("VolumeExists", mock.Anything, volume).Return(233, volumeSize, nil)
 			provider.On("NodeExists", mock.Anything, "node-161").Return(161, nil)
+			var targetErr error
+			if mode == "target-unavailable" {
+				targetErr = errors.New("provider-private target error")
+			}
 			provider.On("InspectHostArtifactAttachmentTarget", mock.Anything, volume, "node-161", mock.Anything).
-				Return(&opennebula.HostArtifactAttachmentTarget{VMID: 161, DiskID: 2}, nil).Once()
+				Return(&opennebula.HostArtifactAttachmentTarget{VMID: 161, DiskID: 2}, targetErr).Once()
 			if mode == "observe-other-volume" {
 				provider.On("GetVolumeInNode", mock.Anything, 233, 161).Return("vdb", nil)
 			}
@@ -2081,11 +2098,16 @@ func TestControllerPublishRedactsPersistedSlotQuarantine(t *testing.T) {
 				require.ErrorContains(t, err, state.Message)
 				require.ErrorContains(t, err, state.RepairHint)
 				require.Equal(t, []string{status.Convert(err).Message()}, warnings)
-			case "other-volume":
+			case "other-volume", "refresh-unavailable":
 				require.Equal(t, codes.FailedPrecondition, status.Code(err))
 				require.Nil(t, reply)
 				require.Equal(t, generic, status.Convert(err).Message())
 				require.Equal(t, []string{generic}, warnings)
+			case "target-unavailable", "empty-slot":
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.Nil(t, reply)
+				require.NotContains(t, err.Error(), "provider-private")
+				require.Empty(t, warnings)
 			case "observe-other-volume":
 				require.NoError(t, err)
 				require.NotNil(t, reply)

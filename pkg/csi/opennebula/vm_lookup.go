@@ -47,62 +47,75 @@ func (e *VMDuplicateNameError) Error() string {
 type VMNameInventory map[string][]int
 
 func (inventory VMNameInventory) Resolve(nodeName string) (int, error) {
+	id, _, _, err := inventory.resolve(nodeName)
+	return id, err
+}
+
+func (inventory VMNameInventory) resolve(nodeName string) (int, string, string, error) {
+	name, path := nodeName, VMResolutionByName
 	matches := inventory[nodeName]
 	if len(matches) == 0 {
-		for name, ids := range inventory {
-			if strings.EqualFold(name, nodeName) {
+		path = VMResolutionPoolExactMatch
+		for candidate, ids := range inventory {
+			if strings.EqualFold(candidate, nodeName) {
+				name = candidate
 				matches = append(matches, ids...)
 			}
 		}
 	}
-	return uniqueVMMatch(nodeName, matches)
+	id, err := uniqueVMMatch(nodeName, matches)
+	var duplicate *VMDuplicateNameError
+	switch {
+	case errors.As(err, &duplicate):
+		return -1, "", VMResolutionDuplicateMatch, err
+	case err != nil:
+		return -1, "", VMResolutionNotFound, err
+	default:
+		return id, name, path, nil
+	}
 }
 
 func ResolveNodeVMID(ctx context.Context, ctrl *goca.Controller, nodeName string) (int, string, error) {
+	id, _, path, err := resolveNodeVM(ctx, ctrl, nodeName)
+	return id, path, err
+}
+
+func resolveNodeVM(ctx context.Context, ctrl *goca.Controller, nodeName string) (int, string, string, error) {
 	if ctrl == nil {
-		return -1, VMResolutionNotFound, errors.New("opennebula controller is nil")
+		return -1, "", VMResolutionNotFound, errors.New("opennebula controller is nil")
 	}
 	observations, err := readVMAuthorityPool(ctx, ctrl)
 	if err != nil {
-		return -1, VMResolutionNotFound, fmt.Errorf("failed to list OpenNebula VMs: %w", err)
+		return -1, "", VMResolutionNotFound, fmt.Errorf("failed to list OpenNebula VMs: %w", err)
 	}
-	var vms []vmSchema.VM
-	invalid := make(map[int]error)
+	inventory := make(VMNameInventory, len(observations))
+	counts := vmIdentityCounts(observations)
 	for _, observation := range observations {
-		info, err := observation.vm()
+		info, err := observation.vm(0)
 		if err != nil {
 			for _, name := range observation.Names {
 				if strings.EqualFold(name, nodeName) {
-					return -1, VMResolutionNotFound, err
+					return -1, "", VMResolutionNotFound, err
 				}
-			}
-			for _, id := range observation.candidateIDs() {
-				invalid[id] = err
 			}
 			continue
 		}
-		vms = append(vms, info)
+		inventory[info.Name] = append(inventory[info.Name], info.ID)
 	}
-	id, path, err := resolveNodeVMIDWithFallback(
-		nodeName,
-		func(name string) (int, error) {
-			var matches []int
-			for _, candidate := range vms {
-				if candidate.Name == name {
-					matches = append(matches, candidate.ID)
-				}
-			}
-			return uniqueVMMatch(name, matches)
-		},
-		func() ([]vmSchema.VM, error) {
-			return vms, nil
-		},
-	)
-	if err == nil && invalid[id] != nil {
-		return -1, VMResolutionNotFound, invalid[id]
+	id, name, path, err := inventory.resolve(nodeName)
+	if err == nil && counts[id] > 1 {
+		return -1, "", VMResolutionNotFound, fmt.Errorf("%w: VM %d occurs under more than one identity", ErrConflictingAttachmentEvidence, id)
 	}
-	return id, path, err
+	return id, name, path, err
 }
+
+type vmEvidence uint8
+
+const (
+	vmDisks vmEvidence = 1 << iota
+	vmState
+	vmHistory
+)
 
 type vmAuthorityXML struct {
 	XMLName   xml.Name            `xml:"VM"`
@@ -113,16 +126,19 @@ type vmAuthorityXML struct {
 	Templates []vmSchema.Template `xml:"TEMPLATE"`
 }
 
-func (raw vmAuthorityXML) vm() (vmSchema.VM, error) {
+func (raw vmAuthorityXML) vm(required vmEvidence) (vmSchema.VM, error) {
 	var info vmSchema.VM
 	for _, field := range []struct {
-		name   string
-		values []string
-		dest   *int
+		name     string
+		values   []string
+		dest     *int
+		required bool
 	}{
-		{"ID", raw.IDs, &info.ID}, {"STATE", raw.States, &info.StateRaw}, {"LCM_STATE", raw.LCMStates, &info.LCMStateRaw},
+		{"ID", raw.IDs, &info.ID, true},
+		{"STATE", raw.States, &info.StateRaw, required&vmState != 0},
+		{"LCM_STATE", raw.LCMStates, &info.LCMStateRaw, required&vmState != 0},
 	} {
-		if len(field.values) > 1 || (field.name == "ID" && len(field.values) == 0) {
+		if len(field.values) > 1 || (field.required && len(field.values) == 0) {
 			return info, fmt.Errorf("%w: invalid multiplicity of VM %s", ErrConflictingAttachmentEvidence, field.name)
 		}
 		if len(field.values) == 1 {
@@ -133,11 +149,12 @@ func (raw vmAuthorityXML) vm() (vmSchema.VM, error) {
 			*field.dest = value
 		}
 	}
-	if len(raw.Names) > 1 || len(raw.Templates) > 1 {
-		return info, fmt.Errorf("%w: repeated VM NAME or TEMPLATE", ErrConflictingAttachmentEvidence)
+	if len(raw.Names) != 1 || strings.TrimSpace(raw.Names[0]) == "" {
+		return info, fmt.Errorf("%w: invalid VM NAME", ErrConflictingAttachmentEvidence)
 	}
-	if len(raw.Names) == 1 {
-		info.Name = raw.Names[0]
+	info.Name = raw.Names[0]
+	if len(raw.Templates) > 1 || (required&vmDisks != 0 && len(raw.Templates) == 0) {
+		return info, fmt.Errorf("%w: invalid multiplicity of VM TEMPLATE", ErrConflictingAttachmentEvidence)
 	}
 	if len(raw.Templates) == 1 {
 		info.Template = raw.Templates[0]
@@ -154,6 +171,16 @@ func (raw vmAuthorityXML) candidateIDs() []int {
 		}
 	}
 	return ids
+}
+
+func vmIdentityCounts(rows []vmAuthorityXML) map[int]int {
+	counts := make(map[int]int, len(rows))
+	for _, row := range rows {
+		for _, id := range row.candidateIDs() {
+			counts[id]++
+		}
+	}
+	return counts
 }
 
 func (raw vmAuthorityXML) attachmentImages() ([]int, bool) {
@@ -194,8 +221,12 @@ func (p *PersistentDiskVolumeProvider) readAttachmentVMs(ctx context.Context, im
 		return nil, err
 	}
 	var vms []vmSchema.VM
+	counts := vmIdentityCounts(rows)
 	for _, row := range rows {
-		info, err := row.vm()
+		info, err := row.vm(vmDisks)
+		if err == nil && counts[info.ID] > 1 {
+			err = fmt.Errorf("%w: VM %d occurs more than once", ErrConflictingAttachmentEvidence, info.ID)
+		}
 		if err == nil {
 			vms = append(vms, info)
 			continue
@@ -210,7 +241,7 @@ func (p *PersistentDiskVolumeProvider) readAttachmentVMs(ctx context.Context, im
 	return vms, nil
 }
 
-func (p *PersistentDiskVolumeProvider) readVMInfo(ctx context.Context, vmID int) (*vmSchema.VM, error) {
+func (p *PersistentDiskVolumeProvider) readVMInfo(ctx context.Context, vmID int, required vmEvidence) (*vmSchema.VM, error) {
 	response, err := p.ctrl.Client.VMInfo(ctx, vmID, true)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
@@ -218,43 +249,35 @@ func (p *PersistentDiskVolumeProvider) readVMInfo(ctx context.Context, vmID int)
 	if err != nil {
 		return nil, err
 	}
+	data := []byte(response.Body())
 	var raw vmAuthorityXML
-	if err := xml.Unmarshal([]byte(response.Body()), &raw); err != nil {
+	if err := xml.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
-	info, err := raw.vm()
-	if err == nil && info.ID != vmID {
-		err = fmt.Errorf("%w: requested VM %d identity differs from response %d", ErrConflictingAttachmentEvidence, vmID, info.ID)
+	info, err := raw.vm(required)
+	if err != nil {
+		return nil, err
 	}
-	return &info, err
+	if info.ID != vmID {
+		return nil, fmt.Errorf("%w: requested VM %d identity differs from response %d", ErrConflictingAttachmentEvidence, vmID, info.ID)
+	}
+	if required&vmHistory != 0 {
+		var history struct {
+			Records []vmSchema.HistoryRecord `xml:"HISTORY_RECORDS>HISTORY"`
+		}
+		if err := xml.Unmarshal(data, &history); err != nil {
+			return nil, err
+		}
+		info.HistoryRecords = history.Records
+	}
+	return &info, nil
 }
 
-func resolveNodeVMIDWithFallback(nodeName string, byName func(string) (int, error), listVMs func() ([]vmSchema.VM, error)) (int, string, error) {
-	if id, err := byName(nodeName); err == nil {
-		return id, VMResolutionByName, nil
+func verifyVMName(info *vmSchema.VM, expected string) error {
+	if info.Name != expected {
+		return fmt.Errorf("%w: VM %d name differs across observations", ErrConflictingAttachmentEvidence, info.ID)
 	}
-
-	vms, err := listVMs()
-	if err != nil {
-		return -1, VMResolutionNotFound, fmt.Errorf("failed to list OpenNebula VMs: %w", err)
-	}
-
-	matches := make([]int, 0, 1)
-	for _, candidate := range vms {
-		if strings.EqualFold(candidate.Name, nodeName) {
-			matches = append(matches, candidate.ID)
-		}
-	}
-
-	id, err := uniqueVMMatch(nodeName, matches)
-	var duplicate *VMDuplicateNameError
-	if errors.As(err, &duplicate) {
-		return -1, VMResolutionDuplicateMatch, err
-	}
-	if err != nil {
-		return -1, VMResolutionNotFound, err
-	}
-	return id, VMResolutionPoolExactMatch, nil
+	return nil
 }
 
 func uniqueVMMatch(nodeName string, matches []int) (int, error) {

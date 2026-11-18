@@ -15,12 +15,16 @@ var supportedGrowthVersion = regexp.MustCompile(`^7\.4\.(0|[1-9][0-9]*)$`)
 
 // authorizePersistentDiskGrowth is operation-specific. Probe and satisfied-capacity
 // retries retain 7.4.0 support. No result is cached across growth attempts.
-func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context.Context, vmID, diskID, imageID int, restoring bool) error {
+func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context.Context, vmID, diskID, imageID int, vmName string) error {
+	restoring := vmName != ""
 	deny := func(reason string) error {
 		return &datastoreConfigError{message: fmt.Sprintf("persistent disk growth requires verified OpenNebula 7.4.1+ metadata support for non-NONE transfer targets: %s", reason)}
 	}
+	var censusName string
 	if restoring {
-		if err := p.verifyRestorationCensus(ctx, vmID, diskID, imageID); err != nil {
+		var err error
+		censusName, err = p.verifyRestorationCensus(ctx, vmID, diskID, imageID)
+		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
@@ -43,6 +47,12 @@ func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context
 	}
 	var selected *shared.Disk
 	if restoring {
+		if censusName != vmName {
+			return deny("restoration VM name differs from the census")
+		}
+		if err := verifyVMName(info, censusName); err != nil {
+			return deny(err.Error())
+		}
 		slot, disk, err := publishDiskFromVM(info, imageID, vmID)
 		if err != nil || slot != diskID {
 			return deny("restoration attachment or disk slot is unverified")
@@ -116,30 +126,30 @@ func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context
 	return nil
 }
 
-func (p *PersistentDiskVolumeProvider) verifyRestorationCensus(ctx context.Context, vmID, diskID, imageID int) error {
+func (p *PersistentDiskVolumeProvider) verifyRestorationCensus(ctx context.Context, vmID, diskID, imageID int) (string, error) {
 	vms, err := p.readAttachmentVMs(ctx, imageID, vmID)
 	if err != nil {
-		return err
+		return "", err
 	}
-	seen := false
+	name := ""
 	for _, info := range vms {
 		if info.ID != vmID {
 			continue
 		}
-		if seen {
-			return fmt.Errorf("restoration VM identity is ambiguous")
+		if name != "" {
+			return "", fmt.Errorf("restoration VM identity is ambiguous")
 		}
 		slot, _, err := publishDiskFromVM(&info, imageID, vmID)
 		if err != nil {
-			return err
+			return "", err
 		}
 		if slot != diskID {
-			return fmt.Errorf("restoration disk slot differs from the VM census")
+			return "", fmt.Errorf("restoration disk slot differs from the VM census")
 		}
-		seen = true
+		name = info.Name
 	}
-	if !seen {
-		return fmt.Errorf("restoration VM identity is absent from the census")
+	if name == "" {
+		return "", fmt.Errorf("restoration VM identity is absent from the census")
 	}
-	return nil
+	return name, nil
 }

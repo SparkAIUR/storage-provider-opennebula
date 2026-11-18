@@ -1056,7 +1056,8 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		klog.V(3).InfoS("Attaching volume to node",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "sizeBytes", sizeBytes, "hotplugTimeout", hotplugTimeout, "deviceDiscoveryTimeout", deviceDiscoveryTimeout)
 		attachStarted := time.Now()
-		err = s.volumeProvider.AttachVolume(queueCtx, req.VolumeId, req.NodeId, immutableVolume, params)
+		attachCtx := s.publishMutationContext(queueCtx, req, nodeID, volumeID, publishNode, true)
+		err = s.volumeProvider.AttachVolume(attachCtx, req.VolumeId, req.NodeId, immutableVolume, params)
 		if ctxErr := queueCtx.Err(); ctxErr != nil {
 			return ctxErr
 		}
@@ -1066,7 +1067,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			}
 			s.handleHotplugTimeout(queueCtx, req.NodeId, req.VolumeId, params, "attach", "disk", err)
 			switch {
-			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), status.Code(err) == codes.Unavailable:
 				return err
 			case opennebula.IsDatastoreConfigError(err):
 				return status.Error(codes.FailedPrecondition, err.Error())
@@ -1081,7 +1082,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		if err != nil {
 			return status.Errorf(codes.Unavailable, "failed to verify attached volume: %v", err)
 		}
-		if err := s.restoreVolumeCapacity(queueCtx, req.VolumeId, nodeID, volumeID); err != nil {
+		if err := s.restoreVolumeCapacity(attachCtx, req.VolumeId, nodeID, volumeID); err != nil {
 			return err
 		}
 		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(queueCtx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), runtimeCtx); localErr != nil {
@@ -2055,7 +2056,13 @@ func (s *ControllerServer) restoreRetainedVolumeCapacity(ctx context.Context, re
 	if err := s.checkPublishedAttachmentNode(ctx, req.VolumeId, req.NodeId, admittedNode, false); err != nil {
 		return err
 	}
-	return s.restoreVolumeCapacity(ctx, req.VolumeId, vmID, imageID)
+	return s.restoreVolumeCapacity(s.publishMutationContext(ctx, req, vmID, imageID, admittedNode, false), req.VolumeId, vmID, imageID)
+}
+
+func (s *ControllerServer) publishMutationContext(ctx context.Context, req *csi.ControllerPublishVolumeRequest, vmID, imageID int, admittedNode KubernetesNodeIdentity, newAttachment bool) context.Context {
+	return opennebula.WithPublishMutationAuthorization(ctx, req.VolumeId, req.NodeId, vmID, imageID, func(ctx context.Context) error {
+		return s.checkPublishedAttachmentNode(ctx, req.VolumeId, req.NodeId, admittedNode, newAttachment)
+	})
 }
 
 func (s *ControllerServer) restoreVolumeCapacity(ctx context.Context, volume string, nodeID, volumeID int) error {
@@ -2067,7 +2074,7 @@ func (s *ControllerServer) restoreVolumeCapacity(ctx context.Context, volume str
 		return nil
 	}
 	switch {
-	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), status.Code(err) == codes.Unavailable:
 		return err
 	case opennebula.IsDatastoreConfigError(err):
 		return status.Error(codes.FailedPrecondition, err.Error())

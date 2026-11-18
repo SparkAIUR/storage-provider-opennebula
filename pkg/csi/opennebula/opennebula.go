@@ -77,6 +77,7 @@ type VolumeAttachmentMetadata struct {
 	RequestedNodeID         int                `json:"requestedNodeID,omitempty"`
 	AttachedToRequestedNode bool               `json:"attachedToRequestedNode,omitempty"`
 	DiskRecords             []VolumeDiskRecord `json:"diskRecords,omitempty"`
+	requestedVMName         string
 }
 
 type VolumeLookupStatus string

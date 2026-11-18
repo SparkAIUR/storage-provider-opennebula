@@ -38,6 +38,8 @@ type nodeAttachmentProtocol struct {
 	endpoint            string
 	hideDiskInfo        bool
 	rejectFirstDetach   bool
+	rejectFirstAttach   bool
+	attachAttempts      int
 	detachAttempts      int
 	ignoreMarkerWrite   bool
 	mu                  sync.Mutex
@@ -49,6 +51,9 @@ type nodeAttachmentProtocol struct {
 	poolExtraDisk       string
 	directDiskFields    string
 	directVMFields      string
+	alterDirectVM       func(string) string
+	alterOriginalPoolVM func(string) string
+	alterDatastorePool  func(string) string
 	poolVMFields        map[int]string
 	directImageFields   string
 	imageTemplateFields string
@@ -153,7 +158,14 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 					prefix = state.directVMFields
 				}
 			}
-			return fmt.Sprintf(`<VM>%s<ID>%d</ID><NAME>%s</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE>%s</TEMPLATE><HISTORY_RECORDS><HISTORY><SEQ>0</SEQ><DS_ID>200</DS_ID></HISTORY></HISTORY_RECORDS></VM>`, prefix, id, name, state.extraDiskBefore+disk+state.extraDiskByVM[id])
+			result := fmt.Sprintf(`<VM>%s<ID>%d</ID><NAME>%s</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE>%s</TEMPLATE><HISTORY_RECORDS><HISTORY><SEQ>0</SEQ><DS_ID>200</DS_ID></HISTORY></HISTORY_RECORDS></VM>`, prefix, id, name, state.extraDiskBefore+disk+state.extraDiskByVM[id])
+			if id == 41 && direct && state.alterDirectVM != nil {
+				return state.alterDirectVM(result)
+			}
+			if id == 41 && !direct && state.alterOriginalPoolVM != nil {
+				return state.alterOriginalPoolVM(result)
+			}
+			return result
 		}
 		imageXML := func() string {
 			ids := ""
@@ -243,7 +255,15 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 					}
 					body = strings.Replace(body, "<TM_MAD>"+current+"</TM_MAD>", "<TM_MAD>"+state.imageTransfer+"</TM_MAD>", 1)
 				}
+				if state.alterDatastorePool != nil {
+					body = state.alterDatastorePool(body)
+				}
 			case "one.vm.attach":
+				state.attachAttempts++
+				if state.rejectFirstAttach && state.attachAttempts == 1 {
+					ok, body, code = 0, "wrong state HOTPLUG", 0x800
+					break
+				}
 				id := number(1)
 				require.Contains(t, call.Params[2].Value.String, `IMAGE_ID="7"`)
 				state.disks[id] = 128
@@ -1278,7 +1298,11 @@ func TestControllerUnpublishRejectsLateAmbiguousImageName(t *testing.T) {
 
 func TestControllerUnpublishRejectsConflictingFinalVMAndDiskFields(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, tc := range []struct{ name, diskFields, vmFields string }{
+		for _, tc := range []struct {
+			name, diskFields, vmFields string
+			alterVM                    func(string) string
+			alterDatastore             func(string) string
+		}{
 			{name: "resize", diskFields: "<RESIZE>NO</RESIZE><RESIZE>YES</RESIZE>"},
 			{name: "image", diskFields: "<IMAGE_ID>8</IMAGE_ID>"},
 			{name: "slot", diskFields: "<DISK_ID>3</DISK_ID>"},
@@ -1287,6 +1311,15 @@ func TestControllerUnpublishRejectsConflictingFinalVMAndDiskFields(t *testing.T)
 			{name: "vm-name", vmFields: "<NAME>different-vm</NAME>"},
 			{name: "vm-id", vmFields: "<ID>42</ID>"},
 			{name: "vm-template", vmFields: "<TEMPLATE/>"},
+			{name: "missing-state", alterVM: func(body string) string { return strings.Replace(body, "<STATE>3</STATE>", "", 1) }},
+			{name: "missing-lcm", alterVM: func(body string) string { return strings.Replace(body, "<LCM_STATE>3</LCM_STATE>", "", 1) }},
+			{name: "missing-name", alterVM: func(body string) string { return strings.Replace(body, "<NAME>node-old</NAME>", "", 1) }},
+			{name: "changed-name", alterVM: func(body string) string {
+				return strings.Replace(body, "<NAME>node-old</NAME>", "<NAME>node-other</NAME>", 1)
+			}},
+			{name: "datastore-transfer", alterDatastore: func(body string) string {
+				return strings.Replace(body, "<TM_MAD>ssh</TM_MAD>", "<TM_MAD>ceph</TM_MAD><TM_MAD>ssh</TM_MAD>", 1)
+			}},
 		} {
 			t.Run(fmt.Sprintf("queued=%t/%s", queued, tc.name), func(t *testing.T) {
 				ctx := context.Background()
@@ -1302,6 +1335,7 @@ func TestControllerUnpublishRejectsConflictingFinalVMAndDiskFields(t *testing.T)
 					if method == "one.vm.info" && armed.Load() && reads.Add(1) == 2 {
 						protocol.mu.Lock()
 						protocol.directDiskFields, protocol.directVMFields = tc.diskFields, tc.vmFields
+						protocol.alterDirectVM, protocol.alterDatastorePool = tc.alterVM, tc.alterDatastore
 						protocol.mu.Unlock()
 					}
 				})
@@ -2993,6 +3027,10 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 		{false, false, "late-duplicate-id"}, {true, false, "late-duplicate-id"},
 		{false, false, "late-duplicate-resize"}, {true, false, "late-duplicate-resize"},
 		{false, false, "late-duplicate-vm-lcm"}, {true, false, "late-duplicate-vm-lcm"},
+		{false, false, "late-changed-vm-name"}, {true, false, "late-changed-vm-name"},
+		{false, false, "late-missing-vm-name"}, {true, false, "late-missing-vm-name"},
+		{false, false, "repeated-datastore-transfer"}, {true, false, "repeated-datastore-transfer"},
+		{false, false, "repeated-datastore-template-type"}, {true, false, "repeated-datastore-template-type"},
 		{false, false, "late-duplicate-persistent"}, {true, false, "late-duplicate-persistent"},
 		{false, false, "late-duplicate-capacity"}, {true, false, "late-duplicate-capacity"},
 		{false, true, "zero-slot"}, {true, true, "zero-slot"},
@@ -3035,11 +3073,20 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 					}
 					protocol.mu.Unlock()
 				}
-				if (tc.drift == "late-duplicate-resize" || tc.drift == "late-duplicate-vm-lcm") && unpublishActive.Load() && method == "one.vm.info" && directReads.Add(1) == 2 {
+				if (tc.drift == "late-duplicate-resize" || tc.drift == "late-duplicate-vm-lcm" || tc.drift == "late-changed-vm-name" || tc.drift == "late-missing-vm-name") && unpublishActive.Load() && method == "one.vm.info" && directReads.Add(1) == 2 {
 					protocol.mu.Lock()
-					if tc.drift == "late-duplicate-vm-lcm" {
+					switch tc.drift {
+					case "late-duplicate-vm-lcm":
 						protocol.directVMFields = "<LCM_STATE>14</LCM_STATE>"
-					} else {
+					case "late-changed-vm-name":
+						protocol.alterDirectVM = func(body string) string {
+							return strings.Replace(body, "<NAME>node-old</NAME>", "<NAME>node-other</NAME>", 1)
+						}
+					case "late-missing-vm-name":
+						protocol.alterDirectVM = func(body string) string {
+							return strings.Replace(body, "<NAME>node-old</NAME>", "", 1)
+						}
+					default:
 						protocol.directDiskFields = "<RESIZE>NO</RESIZE><RESIZE>YES</RESIZE>"
 					}
 					protocol.mu.Unlock()
@@ -3196,6 +3243,14 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 				wire.duplicateImage = true
 			case "system-datastore":
 				wire.imageDatastoreID = 200
+			case "repeated-datastore-transfer":
+				wire.alterDatastorePool = func(body string) string {
+					return strings.Replace(body, "<TM_MAD>ceph</TM_MAD>", "<TM_MAD>ssh</TM_MAD><TM_MAD>ceph</TM_MAD>", 1)
+				}
+			case "repeated-datastore-template-type":
+				wire.alterDatastorePool = func(body string) string {
+					return strings.Replace(body, "<TEMPLATE>", "<TEMPLATE><TYPE>SYSTEM_DS</TYPE><TYPE>IMAGE_DS</TYPE>", 1)
+				}
 			case "zero-slot-changed":
 				wire.diskSlot = "2"
 			}
@@ -3206,7 +3261,7 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 				require.Equal(t, codes.Unavailable, status.Code(err))
 				require.Nil(t, response)
 				switch tc.drift {
-				case "late-duplicate-resize", "late-duplicate-vm-lcm":
+				case "late-duplicate-resize", "late-duplicate-vm-lcm", "late-changed-vm-name", "late-missing-vm-name":
 					require.ErrorContains(t, err, "provider")
 					require.EqualValues(t, 2, directReads.Load())
 				case "late-duplicate-persistent", "late-duplicate-capacity":
@@ -3512,6 +3567,15 @@ func TestControllerPublishRecordsCancellationOutcome(t *testing.T) {
 }
 
 func TestCreateVolumeRetryReturnsObservedBackend(t *testing.T) {
+	for _, mode := range []string{"valid", "ambiguous-selected-name", "unrelated-ambiguous-transfer"} {
+		t.Run(mode, func(t *testing.T) {
+			testCreateVolumeRetryReturnsObservedBackend(t, mode)
+		})
+	}
+}
+
+func testCreateVolumeRetryReturnsObservedBackend(t *testing.T, mode string) {
+	t.Helper()
 	ctx := context.Background()
 	driver := newStickyTestDriver(t)
 	driver.PluginConfig.OverrideVal(config.AllowedDatastoreTypesVar, "ceph")
@@ -3521,6 +3585,16 @@ func TestCreateVolumeRetryReturnsObservedBackend(t *testing.T) {
 	wire.ceph, wire.version, wire.ready = true, "7.4.0", true
 	wire.disks = map[int]int{}
 	wire.marker = 128 * 1024 * 1024
+	switch mode {
+	case "ambiguous-selected-name":
+		wire.alterDatastorePool = func(body string) string {
+			return strings.Replace(body, "<NAME>images</NAME>", "<NAME>other</NAME><NAME>images</NAME>", 1)
+		}
+	case "unrelated-ambiguous-transfer":
+		wire.alterDatastorePool = func(body string) string {
+			return strings.Replace(body, "</DATASTORE_POOL>", "<DATASTORE><ID>300</ID><NAME>unrelated</NAME><TM_MAD>ssh</TM_MAD><TM_MAD>ceph</TM_MAD></DATASTORE></DATASTORE_POOL>", 1)
+		}
+	}
 	wire.mu.Unlock()
 	client := reviewControllerClient(t, NewControllerServer(driver, provider, nil))
 	reply, err := client.CreateVolume(ctx, &csi.CreateVolumeRequest{
@@ -3528,6 +3602,14 @@ func TestCreateVolumeRetryReturnsObservedBackend(t *testing.T) {
 		VolumeCapabilities: []*csi.VolumeCapability{newPublishReq("volume-test", "node-old").VolumeCapability},
 		Parameters:         map[string]string{storageClassParamDatastoreIDs: "100", paramPVCUID: "test-claim-uid"},
 	})
+	wire.mu.Lock()
+	defer wire.mu.Unlock()
+	require.Empty(t, wire.mutations)
+	if mode == "ambiguous-selected-name" {
+		require.Equal(t, codes.Unavailable, status.Code(err))
+		require.Nil(t, reply)
+		return
+	}
 	require.NoError(t, err)
 	require.Equal(t, "volume-test", reply.Volume.VolumeId)
 	require.EqualValues(t, 128*1024*1024, reply.Volume.CapacityBytes)
@@ -3537,9 +3619,6 @@ func TestCreateVolumeRetryReturnsObservedBackend(t *testing.T) {
 	require.NotContains(t, reply.Volume.VolumeContext, annotationSelectionPolicy)
 	require.Empty(t, reply.Volume.AccessibleTopology)
 	require.Equal(t, "test-claim-uid", reply.Volume.VolumeContext[volumeContextUUID])
-	wire.mu.Lock()
-	defer wire.mu.Unlock()
-	require.Empty(t, wire.mutations)
 }
 
 func TestLegacyDiskCleanupVerifiesUndeclaredBackend(t *testing.T) {
@@ -3652,5 +3731,84 @@ func TestLegacyDiskCleanupVerifiesUndeclaredBackend(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestControllerPublishRechecksNodeAtProviderMutations(t *testing.T) {
+	for _, mutation := range []string{"attach", "retry-attach", "resize", "post-attach-resize", "marker", "image-drift", "vm-drift"} {
+		t.Run(mutation, func(t *testing.T) {
+			ctx := context.Background()
+			const volume = "volume-test"
+			node := newReadyNode("node-old", true)
+			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+			driver := newStickyTestDriver(t, pv, pvc, node)
+			var wire *nodeAttachmentProtocol
+			var replaced atomic.Bool
+			provider, state := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+				wire.mu.Lock()
+				replace := (mutation == "attach" && method == "one.datastorepool.info") ||
+					(mutation == "retry-attach" && method == "one.vm.info" && wire.attachAttempts == 1) ||
+					((mutation == "resize" || mutation == "post-attach-resize") && method == "one.system.version") ||
+					(mutation == "marker" && method == "one.image.info" && len(wire.mutations) == 1)
+				if method == "one.system.version" && (mutation == "image-drift" || mutation == "vm-drift") {
+					if mutation == "image-drift" {
+						wire.duplicateImage = true
+					} else {
+						wire.vmNames = map[int]string{41: "node-other"}
+					}
+					replaced.Store(true)
+				}
+				wire.mu.Unlock()
+				if replace && replaced.CompareAndSwap(false, true) {
+					nodes := driver.kubeRuntime.client.CoreV1().Nodes()
+					require.NoError(t, nodes.Delete(ctx, node.Name, metav1.DeleteOptions{}))
+					replacement := node.DeepCopy()
+					replacement.UID = "replacement"
+					_, err := nodes.Create(ctx, replacement, metav1.CreateOptions{})
+					require.NoError(t, err)
+				}
+			})
+			wire = state
+			wire.mu.Lock()
+			wire.ceph, wire.version = true, "7.4.0"
+			wire.disks[41] = 128
+			if mutation == "attach" || mutation == "retry-attach" || mutation == "post-attach-resize" {
+				delete(wire.disks, 41)
+			}
+			wire.rejectFirstAttach = mutation == "retry-attach"
+			wire.mu.Unlock()
+
+			server := NewControllerServer(driver, provider, nil)
+			before, err := server.readAttachmentHistory(ctx, volume)
+			require.NoError(t, err)
+			reply, err := reviewControllerClient(t, server).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
+			require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+			switch mutation {
+			case "image-drift":
+				require.ErrorContains(t, err, "publish mutation image identity is unverified")
+			case "vm-drift":
+				require.ErrorContains(t, err, "publish mutation VM identity is unverified")
+			default:
+				require.ErrorContains(t, err, "publish Kubernetes Node identity changed")
+			}
+			require.Nil(t, reply)
+			require.True(t, replaced.Load())
+			after, err := server.readAttachmentHistory(ctx, volume)
+			require.NoError(t, err)
+			require.Equal(t, before.LastSuccessfulPublishTime, after.LastSuccessfulPublishTime)
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			switch mutation {
+			case "marker":
+				require.Equal(t, []string{"resize:41:256"}, wire.mutations)
+			case "post-attach-resize":
+				require.Equal(t, []string{"attach:41:false"}, wire.mutations)
+			default:
+				require.Empty(t, wire.mutations)
+			}
+			if mutation == "retry-attach" {
+				require.Equal(t, 1, wire.attachAttempts)
+			}
+		})
 	}
 }

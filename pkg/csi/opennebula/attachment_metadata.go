@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 
 	img "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/image"
@@ -82,14 +83,14 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 	if imageSize <= 0 || effectiveSize != imageSize {
 		return deny("image capacity is unknown or requires restoration")
 	}
-	info, err := p.readVMInfo(ctx, metadata.RequestedNodeID)
+	info, err := p.readVMInfo(ctx, metadata.RequestedNodeID, vmDisks|vmState)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
 	}
 	if err != nil {
 		return deny(fmt.Sprintf("fresh VM inspection failed: %v", err))
 	}
-	if info.ID != metadata.RequestedNodeID {
+	if err := verifyVMName(info, record.NodeName); err != nil {
 		return deny("VM identity changed during inspection")
 	}
 	state, lcm, err := info.State()
@@ -140,8 +141,19 @@ func (p *PersistentDiskVolumeProvider) VerifyAttachmentBackend(ctx context.Conte
 	if imageID < 0 || image.ID != imageID || image.Name != volume {
 		return fmt.Errorf("attachment image identity changed")
 	}
-	info, err := p.readVMInfo(ctx, vmID)
+	info, err := p.readVMInfo(ctx, vmID, vmDisks)
 	if err != nil {
+		return err
+	}
+	vms, err := p.readAttachmentVMs(ctx, imageID, vmID)
+	if err != nil {
+		return err
+	}
+	match := slices.IndexFunc(vms, func(observed vm.VM) bool { return observed.ID == vmID })
+	if match < 0 {
+		return fmt.Errorf("%w: attachment VM %d is absent from the census", ErrConflictingAttachmentEvidence, vmID)
+	}
+	if err := verifyVMName(info, vms[match].Name); err != nil {
 		return err
 	}
 	_, disk, err := volumeDiskFromVM(info, imageID, vmID, true)
