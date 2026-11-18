@@ -24,7 +24,7 @@ import (
 func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 	for _, queued := range []bool{false, true} {
 		for _, distinctVM := range []bool{false, true} {
-			for _, mode := range []string{"retained", "successor-deleted", "successor-expanded", "remote-reschedule", "released-reused", "released-reused-no-va", "released-rebound", "released-unbound", "released-old-pod"} {
+			for _, mode := range []string{"retained", "successor-deleted", "successor-expanded", "remote-reschedule", "remote-reschedule-finalized", "released-reused", "released-reused-no-va", "released-rebound", "released-unbound", "released-old-pod"} {
 				t.Run(fmt.Sprintf("queued=%t/distinctVM=%t/%s", queued, distinctVM, mode), func(t *testing.T) {
 					ctx := context.Background()
 					const volume = "volume-test"
@@ -179,7 +179,8 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 						return
 					}
 
-					if mode == "remote-reschedule" {
+					if strings.HasPrefix(mode, "remote-reschedule") {
+						finalized := mode == "remote-reschedule-finalized"
 						const remoteVM = 43
 						remote := newReadyNode("remote-node", true)
 						remote.UID = "remote-node-uid"
@@ -209,7 +210,16 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 						}
 						reconcile()
 						assertWire(false)
-						require.NoError(t, vas.Delete(ctx, va.Name, metav1.DeleteOptions{}))
+						if finalized {
+							now := metav1.Now()
+							va.DeletionTimestamp = &now
+							va.Finalizers = []string{"external-attacher/" + DefaultDriverName}
+							va.Status.Attached = distinctVM
+							_, err = vas.Update(ctx, va, metav1.UpdateOptions{})
+							require.NoError(t, err)
+						} else {
+							require.NoError(t, vas.Delete(ctx, va.Name, metav1.DeleteOptions{}))
+						}
 						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
 						require.Error(t, err, "foreground Unpublish cannot use the remote demand exception")
 						assertWire(false)
@@ -242,6 +252,23 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 							_, err = vas.Create(ctx, remoteVA, metav1.CreateOptions{})
 							require.NoError(t, err)
 						}
+						if finalized {
+							wrong := va.DeepCopy()
+							wrong.UID = "unverified-source-uid"
+							_, err = vas.Update(ctx, wrong, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							reconcile()
+							assertWire(false)
+							_, err = vas.Update(ctx, va, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							extra := remoteVA.DeepCopy()
+							extra.Name, extra.UID = "unexpected-destination", "unexpected-destination-uid"
+							_, err = vas.Create(ctx, extra, metav1.CreateOptions{})
+							require.NoError(t, err)
+							reconcile()
+							assertWire(false)
+							require.NoError(t, vas.Delete(ctx, extra.Name, metav1.DeleteOptions{}))
+						}
 						wire.mu.Lock()
 						nonce := wire.attachAttempt
 						wire.attachAttempt = ""
@@ -252,10 +279,46 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 						wire.attachAttempt = nonce
 						wire.mu.Unlock()
 
+						if finalized && distinctVM {
+							var changed atomic.Bool
+							kube.PrependReactor("get", "nodes", func(action ktesting.Action) (bool, kruntime.Object, error) {
+								if action.(ktesting.GetAction).GetName() == remote.Name && changed.CompareAndSwap(false, true) {
+									current := remoteVA.DeepCopy()
+									current.UID = "changed-destination-uid"
+									resource := storagev1.SchemeGroupVersion.WithResource("volumeattachments")
+									require.NoError(t, kube.Tracker().Update(resource, current, ""))
+								}
+								return false, nil, nil
+							})
+							require.NoError(t, reconciler.ReconcileOnce(ctx))
+							require.True(t, changed.Load())
+							assertWire(false)
+							_, err = vas.Update(ctx, remoteVA, metav1.UpdateOptions{})
+							require.NoError(t, err)
+						}
 						reconcile()
 						assertWire(true)
 						current, err := server.readAttachmentHistory(ctx, volume)
 						require.NoError(t, err)
+						if finalized {
+							require.NotNil(t, current.PendingReplacementAttach)
+							require.Equal(t, string(va.UID), current.PendingReplacementAttach.DetachCompletion.VAUID)
+							source, err := vas.Get(ctx, va.Name, metav1.GetOptions{})
+							require.NoError(t, err)
+							require.Equal(t, va.Finalizers, source.Finalizers)
+							_, err = client.ControllerPublishVolume(ctx, newPublishReq(volume, remote.Name))
+							require.Error(t, err, "destination Publish cannot use the source receipt")
+							_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+							require.NoError(t, err)
+							assertWire(true)
+							source.Finalizers = nil
+							_, err = vas.Update(ctx, source, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							require.NoError(t, vas.Delete(ctx, source.Name, metav1.DeleteOptions{}))
+							reconcile()
+							current, err = server.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+						}
 						require.Nil(t, current.PendingReplacementAttach)
 						require.Equal(t, before.LastSuccessfulNodeUID, current.LastSuccessfulNodeUID)
 						if distinctVM {

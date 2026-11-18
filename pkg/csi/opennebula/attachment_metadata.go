@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"slices"
 	"strings"
 
 	img "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/image"
@@ -40,7 +39,7 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 		return nil, ctxErr
 	}
 	if err != nil {
-		return deny(fmt.Sprintf("attachment inspection failed: %v", err))
+		return nil, fmt.Errorf("cannot verify same-node Ceph retention for volume %s on node %s: attachment inspection failed: %w", volume, node, err)
 	}
 	if metadata == nil || metadata.ImageID <= 0 || metadata.ImageName != volume || metadata.RequestedNode != node || metadata.RequestedNodeID <= 0 || !metadata.AttachedToRequestedNode {
 		return deny("attachment identity is incomplete")
@@ -145,15 +144,7 @@ func (p *PersistentDiskVolumeProvider) VerifyAttachmentBackend(ctx context.Conte
 	if err != nil {
 		return err
 	}
-	vms, err := p.readAttachmentVMs(ctx, imageID, vmID)
-	if err != nil {
-		return err
-	}
-	match := slices.IndexFunc(vms, func(observed vm.VM) bool { return observed.ID == vmID })
-	if match < 0 {
-		return fmt.Errorf("%w: attachment VM %d is absent from the census", ErrConflictingAttachmentEvidence, vmID)
-	}
-	if err := verifyVMName(info, vms[match].Name); err != nil {
+	if _, err := p.readAttachmentVMs(ctx, imageID, attachmentVMIdentity{id: vmID, name: info.Name}); err != nil {
 		return err
 	}
 	_, disk, err := volumeDiskFromVM(info, imageID, vmID, true)

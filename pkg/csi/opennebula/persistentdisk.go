@@ -274,7 +274,7 @@ func (p *PersistentDiskVolumeProvider) VerifyVolumeAbsent(ctx context.Context, v
 		}
 		return fmt.Errorf("pinned image still exists")
 	}
-	vms, err := p.readAttachmentVMs(ctx, imageID, vmIDs...)
+	vms, err := p.readAttachmentVMs(ctx, imageID, attachmentVMIdentity{}, vmIDs...)
 	if err != nil {
 		return fmt.Errorf("cannot verify pinned image ownership: %w", err)
 	}
@@ -793,7 +793,9 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		}
 		err = p.ctrl.VM(nodeID).DiskAttachContext(ctx, diskTemplate)
 		if dispatch != nil {
-			dispatch.definitelyIdle = isDefinitiveHotplugRefusal(err)
+			var refusal *gocaerrors.ResponseError
+			authDenied := errors.As(err, &refusal) && refusal.Code == gocaerrors.OneAuthorizationError && strings.TrimSpace(refusal.Msg) != ""
+			dispatch.definitelyIdle = authDenied || isDefinitiveHotplugRefusal(err)
 		}
 		return err
 	}
@@ -2704,19 +2706,12 @@ func (p *PersistentDiskVolumeProvider) inspectVolumeAttachment(ctx context.Conte
 		requestedVMName: requestedVMName,
 	}
 
-	vms, err := p.readAttachmentVMs(ctx, volumeID, requestedNodeID, expectedAbsentVMID)
+	vms, err := p.readAttachmentVMs(ctx, volumeID, attachmentVMIdentity{id: requestedNodeID, name: requestedVMName, lookupName: node}, expectedAbsentVMID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list virtual machines while inspecting volume %d attachment metadata: %w", volumeID, err)
 	}
-	requestedNodeSeen := strings.TrimSpace(node) == ""
 	var incompleteDiskEvidence error
 	for _, vmInfo := range vms {
-		if vmInfo.ID == requestedNodeID {
-			if err := verifyVMName(&vmInfo, requestedVMName); err != nil {
-				return nil, err
-			}
-			requestedNodeSeen = true
-		}
 		disks := vmInfo.Template.GetDisks()
 		seen := false
 		for _, disk := range disks {
@@ -2747,9 +2742,6 @@ func (p *PersistentDiskVolumeProvider) inspectVolumeAttachment(ctx context.Conte
 
 	if incompleteDiskEvidence != nil {
 		return nil, incompleteDiskEvidence
-	}
-	if !requestedNodeSeen {
-		return nil, fmt.Errorf("requested VM was absent from the attachment inspection")
 	}
 	if err := metadata.VerifyOwnership(); err != nil {
 		return metadata, err

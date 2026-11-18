@@ -73,10 +73,12 @@ leave provider state unchanged.
 [Kubernetes filesystem expansion](https://v1-35.docs.kubernetes.io/docs/concepts/storage/persistent-volumes/#resizing-a-volume-containing-a-file-system)
 
 If demand disappears after dispatch, Unpublish or the reconciler can detach
-only the exact marked disk after verifying current release. After the local
-attachment has retired, the reconciler can also release that disk for a single
-verified remote destination. Any destination attachment remains under its own
-Publish lifecycle. An owned Released
+only the exact marked disk after verifying current release. For a single
+verified remote destination, the reconciler can release the disk when the source
+attachment has retired or the exact pinned source attachment is deleting. In the
+latter case, Unpublish verifies the detach receipt so the external-attacher can
+remove its finalizer. The destination attachment follows its own Publish lifecycle.
+An owned Released
 PV can use its original claim reference after the claim is gone, including when
 a different claim UID has reused the name and is verifiably bound to another PV.
 Idle snapshots alone do not prove that a possibly sent attach cannot still take effect.

@@ -97,7 +97,7 @@ func (p *PersistentDiskVolumeProvider) InspectReplacementAttach(ctx context.Cont
 	if len(marker) != 1 || marker[0].Value != attempt {
 		return deny()
 	}
-	vms, err := p.readAttachmentVMs(ctx, imageID, vmID)
+	vms, err := p.readAttachmentVMs(ctx, imageID, attachmentVMIdentity{id: vmID, name: info.Name, lookupName: node})
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +139,7 @@ func (p *PersistentDiskVolumeProvider) InspectReplacementRelease(ctx context.Con
 	if imageID <= 0 || vmID <= 0 {
 		return deny()
 	}
-	vms, err := p.readAttachmentVMs(ctx, imageID, vmID)
+	vms, err := p.readAttachmentVMs(ctx, imageID, attachmentVMIdentity{}, vmID)
 	if err != nil {
 		return "", err
 	}

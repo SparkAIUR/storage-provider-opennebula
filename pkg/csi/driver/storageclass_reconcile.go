@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"strings"
@@ -36,6 +37,16 @@ type StorageClassReconcileOptions struct {
 	ConfigMapName        string
 	ManualMutationPolicy string
 	AdoptUnannotated     bool
+}
+
+func BindStorageClassReconcileCLI(flags *flag.FlagSet) (*string, *StorageClassReconcileOptions) {
+	mode := flags.String("mode", "driver", "Execution mode: driver, preflight, inventory-controller, inventory-validate, support-bundle, volume-health, local-disk-sessions, local-disk-reprobe, hotplug-diagnose, or storageclass-reconcile")
+	opts := &StorageClassReconcileOptions{}
+	flags.StringVar(&opts.Namespace, "storageclass-reconcile-namespace", "", "Namespace containing the storageclass-reconcile ConfigMap")
+	flags.StringVar(&opts.ConfigMapName, "storageclass-reconcile-configmap", "", "ConfigMap containing desired chart-managed StorageClass fingerprints")
+	flags.StringVar(&opts.ManualMutationPolicy, "storageclass-reconcile-manual-policy", storageClassManualMutationPolicyFail, "Manual StorageClass mutation policy for storageclass-reconcile mode: fail or skip")
+	flags.BoolVar(&opts.AdoptUnannotated, "storageclass-reconcile-adopt-unannotated", true, "Adopt unannotated StorageClasses only when their live spec already matches the desired chart spec")
+	return mode, opts
 }
 
 type StorageClassReconcileDesired struct {

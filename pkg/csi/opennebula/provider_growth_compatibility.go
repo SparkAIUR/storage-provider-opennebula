@@ -71,7 +71,7 @@ func (p *PersistentDiskVolumeProvider) observeGrowthTarget(ctx context.Context, 
 	var censusDisk VolumeDiskRecord
 	if restoring {
 		var err error
-		censusDisk, err = p.verifyRestorationCensus(ctx, vmID, diskID, imageID)
+		censusDisk, err = p.verifyRestorationCensus(ctx, vmID, diskID, imageID, vmName)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return "", nil, ctxErr
@@ -168,7 +168,7 @@ func (p *PersistentDiskVolumeProvider) verifyGrowthImage(ctx context.Context, im
 	return nil
 }
 
-func (p *PersistentDiskVolumeProvider) verifyRestorationCensus(ctx context.Context, vmID, diskID, imageID int) (VolumeDiskRecord, error) {
+func (p *PersistentDiskVolumeProvider) verifyRestorationCensus(ctx context.Context, vmID, diskID, imageID int, vmName string) (VolumeDiskRecord, error) {
 	image, err := p.readAttachmentImageInfo(ctx, imageID)
 	if err != nil {
 		return VolumeDiskRecord{}, err
@@ -176,7 +176,7 @@ func (p *PersistentDiskVolumeProvider) verifyRestorationCensus(ctx context.Conte
 	if image.ID != imageID || image.Persistent == nil || *image.Persistent != 1 {
 		return VolumeDiskRecord{}, fmt.Errorf("restoration image identity or persistence is unverified")
 	}
-	vms, err := p.readAttachmentVMs(ctx, imageID, vmID)
+	vms, err := p.readAttachmentVMs(ctx, imageID, attachmentVMIdentity{id: vmID, name: vmName})
 	if err != nil {
 		return VolumeDiskRecord{}, err
 	}

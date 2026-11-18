@@ -147,7 +147,9 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if identity.attachments != nil && !reflect.DeepEqual(identity.attachments, attachments) {
 		return attachmentEvidenceUnavailable("VolumeAttachment deletion authority changed before detach attempt", nil)
 	}
-	if replacementDetach && (len(attachments) > 1 || (readback && identity.background && identity.replacementDisk.NodeID == 0 && len(attachments) != 0)) {
+	receipt := readback && replacementDetach && attempt.detached()
+	remoteScope := replacementDetach && ((identity.background && attempt.dispatchPossible()) || receipt)
+	if replacementDetach && (len(attachments) > 2 || (!remoteScope && len(attachments) > 1) || (readback && identity.background && identity.replacementDisk.NodeID == 0 && len(attachments) != 0)) {
 		return attachmentEvidenceUnavailable("replacement detach has conflicting VolumeAttachments", nil)
 	}
 	var localVAName, destinationVAName string
@@ -157,14 +159,14 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			return status.Error(codes.Unavailable, err.Error())
 		}
 		if replacementDetach && va.node != nodeName {
-			if identity.background && attempt.dispatchPossible() && va.attacher == s.driver.name &&
+			if remoteScope && destinationVAName == "" && va.attacher == s.driver.name &&
 				va.uid != "" && !va.deleting && !va.attached {
 				destinationVAName, destinationVA = name, va
 				continue
 			}
 			return status.Error(codes.Unavailable, "replacement detach has an unverified destination VolumeAttachment")
 		}
-		if va.attacher != s.driver.name || va.uid == "" || !va.deleting {
+		if va.attacher != s.driver.name || va.uid == "" || !va.deleting || (replacementDetach && localVAName != "") {
 			return status.Error(codes.Unavailable, "current VolumeAttachment does not authorize physical detach")
 		}
 		localVAName, localVA = name, va
@@ -264,11 +266,15 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if err != nil {
 		return attachmentEvidenceUnavailable("current volume release is unverified", err)
 	}
-	remoteReplacement := replacementDetach && identity.background && attempt.dispatchPossible() && localVAName == "" &&
+	remoteReplacement := remoteScope &&
+		((!receipt && localVAName == "") || (localVAName == attempt.VAName && string(localVA.uid) == attempt.VAUID)) &&
 		pv.Status.Phase == corev1.VolumeBound && pv.DeletionTimestamp == nil && pvc != nil && !replacement &&
 		pvc.Status.Phase == corev1.ClaimBound && pvc.DeletionTimestamp == nil &&
 		desired.Desired && !desired.MultipleNodes && desired.DemandSource == volumeDemandSourceActivePod &&
 		desired.NodeName != "" && desired.NodeName != nodeName
+	if remoteScope && desired.Desired && desired.NodeName != nodeName && !remoteReplacement {
+		return attachmentEvidenceUnavailable("replacement detach has no verified source or destination for current remote demand", nil)
+	}
 	if destinationVAName != "" && (!remoteReplacement || destinationVA.node != desired.NodeName ||
 		destinationVAName != fmt.Sprintf("csi-%x", sha256.Sum256([]byte(volume+s.driver.name+desired.NodeName)))) {
 		return attachmentEvidenceUnavailable("replacement detach destination differs from current demand", nil)
@@ -288,10 +294,9 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, replacement); err != nil {
 		return err
 	}
-	receipt := readback && replacementDetach && attempt.detached()
 	terminalOnNode := false
 	remoteConsumerNode := ""
-	if claim := pv.Spec.ClaimRef; claim != nil && (!receipt || replacement) {
+	if claim := pv.Spec.ClaimRef; claim != nil && (!receipt || replacement || remoteReplacement) {
 		pods, err := runtime.client.CoreV1().Pods(claim.Namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return attachmentEvidenceUnavailable("cannot verify Pod release", err)
@@ -313,8 +318,8 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 					pod.DeletionTimestamp != nil || pod.UID == "")) {
 				return attachmentEvidenceUnavailable("a current Pod still references the volume on the detach node", nil)
 			}
-			if identity.background {
-				if !identity.cephSingleWriter || !cephHistoryHasObservedAuthority(history) || (remoteConsumerNode != "" && remoteConsumerNode != pod.Spec.NodeName) {
+			if remoteReplacement || identity.background {
+				if (!remoteReplacement && !identity.cephSingleWriter) || !cephHistoryHasObservedAuthority(history) || (remoteConsumerNode != "" && remoteConsumerNode != pod.Spec.NodeName) {
 					return attachmentEvidenceUnavailable("background detach is blocked by remote Pod demand", nil)
 				}
 				remoteConsumerNode = pod.Spec.NodeName
@@ -356,7 +361,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			return err
 		}
 	}
-	if receipt && !replacement {
+	if receipt && !replacement && !remoteReplacement {
 		waiting, err = s.replacementWaitingConsumers(ctx, pv, pvc, node)
 		if err != nil {
 			return err

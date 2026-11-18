@@ -88,6 +88,10 @@ func resolveNodeVM(ctx context.Context, ctrl *goca.Controller, nodeName string) 
 	if err != nil {
 		return -1, "", VMResolutionNotFound, fmt.Errorf("failed to list OpenNebula VMs: %w", err)
 	}
+	return resolveVMRows(observations, nodeName)
+}
+
+func resolveVMRows(observations []vmAuthorityXML, nodeName string) (int, string, string, error) {
 	inventory := make(VMNameInventory, len(observations))
 	counts := vmIdentityCounts(observations)
 	for _, observation := range observations {
@@ -219,10 +223,29 @@ func readVMPool(ctx context.Context, ctrl *goca.Controller, extended bool) ([]vm
 	return pool.VMs, err
 }
 
-func (p *PersistentDiskVolumeProvider) readAttachmentVMs(ctx context.Context, imageID int, vmIDs ...int) ([]vmSchema.VM, error) {
+type attachmentVMIdentity struct {
+	id         int
+	name       string
+	lookupName string
+}
+
+func (p *PersistentDiskVolumeProvider) readAttachmentVMs(ctx context.Context, imageID int, requested attachmentVMIdentity, vmIDs ...int) ([]vmSchema.VM, error) {
 	rows, err := readVMPool(ctx, p.ctrl, true)
 	if err != nil {
 		return nil, err
+	}
+	if requested.name != "" {
+		lookupName := requested.lookupName
+		if lookupName == "" {
+			lookupName = requested.name
+		}
+		id, name, _, err := resolveVMRows(rows, lookupName)
+		if err != nil {
+			return nil, fmt.Errorf("%w: requested VM identity is unverified in the attachment census: %v", ErrConflictingAttachmentEvidence, err)
+		}
+		if id != requested.id || name != requested.name {
+			return nil, fmt.Errorf("%w: requested VM identity changed in the attachment census", ErrConflictingAttachmentEvidence)
+		}
 	}
 	var vms []vmSchema.VM
 	counts := vmIdentityCounts(rows)
@@ -237,7 +260,7 @@ func (p *PersistentDiskVolumeProvider) readAttachmentVMs(ctx context.Context, im
 		}
 		images, scoped := row.attachmentImages()
 		if !scoped || slices.Contains(images, imageID) || slices.ContainsFunc(row.candidateIDs(), func(id int) bool {
-			return id > 0 && slices.Contains(vmIDs, id)
+			return id > 0 && (id == requested.id || slices.Contains(vmIDs, id))
 		}) {
 			return nil, err
 		}

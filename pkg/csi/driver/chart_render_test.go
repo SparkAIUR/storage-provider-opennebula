@@ -23,6 +23,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/yaml"
 )
 
@@ -147,6 +148,18 @@ const (
 	reconcileTestDriverTag        = "fixture-tag"
 )
 
+func parseStorageClassJobArgs(args []string) (string, StorageClassReconcileOptions, error) {
+	flags := flag.NewFlagSet("storageclass-reconcile", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	klog.InitFlags(flags)
+	mode, opts := BindStorageClassReconcileCLI(flags)
+	err := flags.Parse(args)
+	if err == nil && flags.NArg() != 0 {
+		err = fmt.Errorf("unexpected positional arguments: %v", flags.Args())
+	}
+	return *mode, *opts, err
+}
+
 func TestStorageClassReconcileRenderContract(t *testing.T) {
 	for _, mode := range []string{"default", "disabled", "enabled", "no-classes"} {
 		t.Run(mode, func(t *testing.T) {
@@ -179,13 +192,8 @@ func TestStorageClassReconcileRenderContract(t *testing.T) {
 							job.Spec.Template.Labels["app.kubernetes.io/component"] == "storageclass-reconcile"
 						for _, container := range job.Spec.Template.Spec.Containers {
 							argv := append(append([]string(nil), container.Command...), container.Args...)
-							for i, arg := range argv {
-								flag := strings.TrimLeft(arg, "-")
-								if flag == "mode=storageclass-reconcile" || (flag == "mode" && i+1 < len(argv) && argv[i+1] == "storageclass-reconcile") {
-									reconcile = true
-									break
-								}
-							}
+							runMode, _, _ := parseStorageClassJobArgs(argv)
+							reconcile = reconcile || runMode == "storageclass-reconcile"
 						}
 						if reconcile {
 							jobs = append(jobs, job)
@@ -214,17 +222,12 @@ func TestStorageClassReconcileRenderContract(t *testing.T) {
 			require.Equal(t, reconcileTestDriverRepository+":"+reconcileTestDriverTag, container.Image)
 			require.Empty(t, container.Command, "the Job must use the CSI driver image entrypoint")
 			args := container.Args
-			flags := flag.NewFlagSet("storageclass-reconcile", flag.ContinueOnError)
-			runMode := flags.String("mode", "", "")
-			flags.Int("v", 0, "")
-			opts := StorageClassReconcileOptions{}
-			flags.StringVar(&opts.Namespace, "storageclass-reconcile-namespace", "", "")
-			flags.StringVar(&opts.ConfigMapName, "storageclass-reconcile-configmap", "", "")
-			flags.StringVar(&opts.ManualMutationPolicy, "storageclass-reconcile-manual-policy", "fail", "")
-			flags.BoolVar(&opts.AdoptUnannotated, "storageclass-reconcile-adopt-unannotated", true, "")
-			require.NoError(t, flags.Parse(args))
-			require.Zero(t, flags.NArg())
-			require.Equal(t, "storageclass-reconcile", *runMode)
+			runMode, opts, err := parseStorageClassJobArgs(args)
+			require.NoError(t, err)
+			require.Equal(t, "storageclass-reconcile", runMode)
+			invalid := append(append([]string(nil), args...), "--storageclass-reconcile-configmap-unknown=input")
+			_, _, err = parseStorageClassJobArgs(invalid)
+			require.Error(t, err)
 			require.Equal(t, input.Name, opts.ConfigMapName)
 			require.Equal(t, input.Namespace, opts.Namespace)
 			require.Equal(t, "pre-upgrade", job.Annotations["helm.sh/hook"])

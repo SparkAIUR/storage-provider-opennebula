@@ -245,18 +245,23 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 
 		for _, attachment := range observed {
 			key := volumeHandle + "@" + attachment.NodeName + "@" + string(pv.UID)
-			var matchingVA *storagev1.VolumeAttachment
-			for idx := range vas {
-				if strings.TrimSpace(vas[idx].Spec.NodeName) == strings.TrimSpace(attachment.NodeName) && vas[idx].Status.Attached {
-					matchingVA = &vas[idx]
-					break
-				}
-			}
-			if matchingVA != nil {
-				continue
-			}
 			remoteCephDemand := cephSingleWriter &&
 				!users[""] && !users[attachment.NodeName] && len(users) == 1
+			matchingAttachedVA := slices.IndexFunc(vas, func(va storagev1.VolumeAttachment) bool {
+				return strings.TrimSpace(va.Spec.NodeName) == attachment.NodeName && va.Status.Attached
+			})
+			if matchingAttachedVA >= 0 {
+				va := vas[matchingAttachedVA]
+				if !remoteCephDemand || va.DeletionTimestamp == nil {
+					continue
+				}
+				history, err := r.server.readAttachmentHistory(ctx, volumeHandle)
+				attempt := history.PendingReplacementAttach
+				if err != nil || attempt == nil || !attempt.dispatchPossible() || !attempt.matchesHistory(history) ||
+					va.Name != attempt.VAName || string(va.UID) != attempt.VAUID {
+					continue
+				}
+			}
 			if len(users) > 0 && !remoteCephDemand {
 				continue
 			}

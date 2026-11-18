@@ -40,6 +40,7 @@ type nodeAttachmentProtocol struct {
 	hideDiskInfo        bool
 	rejectFirstDetach   bool
 	rejectFirstAttach   bool
+	attachRefusal       string
 	abortFirstAttach    bool
 	alterDirectImage    func(string) string
 	loseAttachReply     bool
@@ -352,6 +353,19 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				state.attachAttempts++
 				if state.abortFirstAttach && state.attachAttempts == 1 {
 					panic(http.ErrAbortHandler)
+				}
+				if state.attachAttempts == 1 && state.attachRefusal != "" {
+					switch state.attachRefusal {
+					case "authorization-refusal":
+						ok, body, code = 0, "User is not authorized to perform MANAGE on VM 41", 0x200
+					case "authorization-text":
+						ok, body, code = 0, "AUTHORIZATION: User is not authorized to perform MANAGE on VM 41", 0x800
+					case "authorization-malformed":
+						_, err := fmt.Fprint(w, `<methodResponse><params><param><value><array><data><value><boolean>0</boolean></value><value><string>Not authorized</string></value><value><string>512</string></value></data></array></value></param></params></methodResponse>`)
+						require.NoError(t, err)
+						return
+					}
+					break
 				}
 				if state.rejectFirstAttach && state.attachAttempts == 1 {
 					ok, body, code = 0, "wrong state HOTPLUG", 0x800
@@ -4160,7 +4174,7 @@ func fixtureDetachImageOwner(body string, vmID int) string {
 
 func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "safe-detach-updated", "unknown", "final-refusal", "write-conflict", "lost-write-reply", "readback-failed", "readback-unproven", "prepared-outage", "armed-outage", "armed-lost-ack", "armed-lost-ack-canceled", "armed-lost-ack-consumer-gone", "armed-lost-ack-retire-conflict", "armed-lost-ack-one-conflict", "armed-lost-ack-conflict-competing", "competing-arm", "prepared-abandoned", "prepared-abandoned-quarantine", "prepared-abandoned-conflict", "prepared-abandoned-orphan", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
+		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "safe-detach-updated", "unknown", "final-refusal", "authorization-refusal", "authorization-text", "authorization-malformed", "write-conflict", "lost-write-reply", "readback-failed", "readback-unproven", "prepared-outage", "armed-outage", "armed-lost-ack", "armed-lost-ack-canceled", "armed-lost-ack-consumer-gone", "armed-lost-ack-retire-conflict", "armed-lost-ack-one-conflict", "armed-lost-ack-conflict-competing", "competing-arm", "prepared-abandoned", "prepared-abandoned-quarantine", "prepared-abandoned-conflict", "prepared-abandoned-orphan", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
 			"distinct-vm-inflight", "same-vm-abandoned-replay",
 			"no-publish-va", "attached-publish-va", "deleting-publish-va", "foreign-publish-va", "removed-publish-va", "replaced-publish-va",
 			"current-runtime-consumer", "current-terminated-container", "current-restarted-container", "current-sandbox-ready",
@@ -4386,6 +4400,9 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				wire.abortFirstAttach = mode == "unknown" || mode == "distinct-vm-inflight"
 				wire.allowImageDelete = mode == "distinct-vm-inflight"
 				wire.rejectFirstAttach = mode == "final-refusal"
+				if strings.HasPrefix(mode, "authorization-") {
+					wire.attachRefusal = mode
+				}
 				vmID := 41
 				if strings.HasPrefix(mode, "distinct-vm") {
 					vmID = 42
@@ -4671,25 +4688,37 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				stored, err := NewControllerServer(driver, provider, nil).readAttachmentHistory(ctx, volume)
 				require.NoError(t, err)
 				require.Equal(t, string(node.UID), stored.LastSuccessfulNodeUID)
-				if mode == "readback-failed" || mode == "lost-write-reply" || mode == "final-refusal" || mode == "pre-dispatch" {
+				if mode == "readback-failed" || mode == "lost-write-reply" || mode == "final-refusal" || mode == "authorization-refusal" || mode == "pre-dispatch" {
 					require.Nil(t, stored.PendingReplacementAttach)
 					failBeforeDispatch.Store(false)
 					wire.mu.Lock()
 					attempts := wire.attachAttempts
+					refusedToken := wire.attachFields["CSI_ATTACH_ATTEMPT"]
 					require.Empty(t, wire.mutations)
-					wire.loseAttachReply, wire.failMethod = false, ""
+					wire.loseAttachReply, wire.failMethod, wire.attachRefusal = false, "", ""
 					wire.mu.Unlock()
-					if mode == "final-refusal" {
+					if mode == "final-refusal" || mode == "authorization-refusal" {
 						require.Equal(t, 1, attempts)
 					} else {
 						require.Zero(t, attempts)
 					}
-					retried, err := client.ControllerPublishVolume(ctx, publish)
+					retryClient := client
+					if mode == "authorization-refusal" {
+						restarted := newStickyTestDriver(t)
+						restarted.kubeRuntime.client = kube
+						require.NoError(t, restarted.volumeHistory.LoadFromConfigMap(ctx))
+						retryClient = makeClient(restarted)
+					}
+					retried, err := retryClient.ControllerPublishVolume(ctx, publish)
 					require.NoError(t, err)
 					require.Equal(t, "onecsi-7", retried.GetPublishContext()[publishContextDeviceSerial])
 					wire.mu.Lock()
 					defer wire.mu.Unlock()
 					require.Equal(t, attempts+1, wire.attachAttempts)
+					if mode == "authorization-refusal" {
+						require.NotEmpty(t, refusedToken)
+						require.NotEqual(t, refusedToken, wire.attachAttempt)
+					}
 					require.Equal(t, []string{"attach:41:false"}, wire.mutations)
 					if mode == "lost-write-reply" {
 						require.NotEmpty(t, lostWriteToken)
@@ -5302,7 +5331,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				wire.mu.Lock()
 				defer wire.mu.Unlock()
 				require.Equal(t, 1, wire.attachAttempts)
-				if mode == "unknown" {
+				if mode == "unknown" || mode == "authorization-text" || mode == "authorization-malformed" {
 					require.Empty(t, wire.mutations)
 				} else {
 					require.Equal(t, []string{fmt.Sprintf("attach:%d:false", vmID)}, wire.mutations)

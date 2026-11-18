@@ -89,6 +89,21 @@ func TestSameNodeRetentionReadOnlyEvidence(t *testing.T) {
 	require.Zero(t, mutations.Load())
 }
 
+func TestAttachmentCensusRejectsConflictingRequestedNames(t *testing.T) {
+	for _, identity := range []string{"<ID>12</ID>", "<ID>bad</ID>", ""} {
+		t.Run(fmt.Sprintf("second identity %q", identity), func(t *testing.T) {
+			p, mutations := retentionProtocolFixture(t, func(c *retentionProtocolCase) {
+				c.extraVM = "<VM>" + identity + "<NAME>node-test</NAME><TEMPLATE/></VM>"
+			})
+			_, err := p.InspectVolumeAttachment(context.Background(), "volume-test", "node-test")
+			require.ErrorIs(t, err, ErrConflictingAttachmentEvidence)
+			_, err = p.InspectSameNodeRetention(context.Background(), "volume-test", "node-test")
+			require.ErrorIs(t, err, ErrConflictingAttachmentEvidence)
+			require.Zero(t, mutations.Load())
+		})
+	}
+}
+
 func TestSameNodeRetentionRejectsUncertainOrUnsafeEvidence(t *testing.T) {
 	cases := map[string]func(*retentionProtocolCase){
 		"contradictory image datastore backend": func(c *retentionProtocolCase) { c.datastoreBackend = "fs" },
