@@ -188,22 +188,23 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			(pvc != nil && !slices.Equal(pv.Spec.AccessModes, pvc.Spec.AccessModes)) {
 			return attachmentEvidenceUnavailable("replacement detach binding or identity is unverified", nil)
 		}
+		va, pinned := attachments[attempt.VAName]
+		if len(attachments) != 0 || attempt.detached() {
+			if !pinned || string(va.uid) != attempt.VAUID {
+				return attachmentEvidenceUnavailable("replacement detach attachment identity changed", nil)
+			}
+		} else {
+			current, err := runtime.client.StorageV1().VolumeAttachments().Get(ctx, attempt.VAName, metav1.GetOptions{})
+			if !apierrors.IsNotFound(err) && (err != nil || current.UID == "" || string(current.UID) == attempt.VAUID) {
+				return attachmentEvidenceUnavailable("pinned replacement VolumeAttachment absence is unverified", err)
+			}
+		}
 		if attempt.detached() {
 			completion := attempt.DetachCompletion
-			va, ok := attachments[completion.VAName]
-			if !ok || string(va.uid) != completion.VAUID {
-				return attachmentEvidenceUnavailable("completed replacement detach does not match the deleting VolumeAttachment", nil)
-			}
 			if target, present := va.metadata["volumeName"]; present && strings.TrimPrefix(strings.TrimSpace(target), "/dev/") != completion.Target {
 				return attachmentEvidenceUnavailable("completed replacement detach target changed", nil)
 			}
 			identity.diskID, _ = strconv.Atoi(completion.DiskID)
-		}
-		if attempt.VAUID != "" && len(attachments) > 0 {
-			va, ok := attachments[attempt.VAName]
-			if !ok || string(va.uid) != attempt.VAUID {
-				return attachmentEvidenceUnavailable("replacement detach attachment identity changed", nil)
-			}
 		}
 		disk, err := s.inspectReplacementDisk(ctx, *attempt, !readback)
 		if err != nil {

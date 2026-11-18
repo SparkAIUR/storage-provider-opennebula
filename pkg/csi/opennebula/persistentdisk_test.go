@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	gocaerrors "github.com/OpenNebula/one/src/oca/go/src/goca/errors"
 	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/shared"
 	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/vm"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
@@ -437,7 +438,7 @@ func TestWaitForDetachStateRetriesHotplugUntilSuccess(t *testing.T) {
 	}, func(context.Context) error {
 		retryCount++
 		if retryCount == 1 {
-			return fmt.Errorf("wrong state HOTPLUG")
+			return &gocaerrors.ResponseError{Code: gocaerrors.OneActionError, Msg: "wrong state HOTPLUG"}
 		}
 		return nil
 	}, "vol-a", "node-a")

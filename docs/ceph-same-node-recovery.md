@@ -64,9 +64,15 @@ After a verified physical detach for a deleting VolumeAttachment, the controller
 keeps completion in the same record. A retry for the exact still-deleting
 VolumeAttachment rechecks identity, release, protection and provider absence
 before acknowledging it. A positively identified, unstarted Pod on the replacement
-Node can wait during this acknowledgement. Its kubelet `volumesInUse` entry
-can reflect demand. Physical detach still requires release of Pod demand and
-mount use. Publish, DeleteVolume and the reconciler can retire the
+Node can wait during this acknowledgement. Kubelet can set Pod `StartTime`
+and default container waiting states before it waits for volumes to attach and
+mount. Those fields can coexist with `volumesInUse` demand. Physical detach
+still requires release of Pod demand and mount use.
+[Kubernetes 1.35 kubelet sync order](https://github.com/kubernetes/kubernetes/blob/v1.35.0/pkg/kubelet/kubelet.go#L1871-L1962)
+[Kubelet status timestamps](https://github.com/kubernetes/kubernetes/blob/v1.35.0/pkg/kubelet/status/status_manager.go#L761-L768)
+[Default waiting states](https://github.com/kubernetes/kubernetes/blob/v1.35.0/pkg/kubelet/kubelet_pods.go#L2253-L2266)
+
+Publish, DeleteVolume and the reconciler can retire the
 completion after verifying that the original VolumeAttachment UID is gone,
 even when its PV has disappeared or been replaced. Cleanup without a
 VolumeAttachment retires the record after verified detach. Retirement preserves
@@ -78,6 +84,8 @@ keeps the identities admitted for the detach. Before acknowledging Unpublish,
 the controller checks the current binding, attachment, release and protection.
 A change can block acknowledgement even after the history write commits.
 Independent readback can confirm a committed receipt whose write reply was lost.
+After an accepted detach, the controller waits within the hotplug deadline
+for the detached VM's stale image ownership to clear before recording release.
 If the provider detach reply is lost without verified proof or the controller
 restarts before recording completion, a later caller holds the unresolved
 attempt even when both VMs appear idle.

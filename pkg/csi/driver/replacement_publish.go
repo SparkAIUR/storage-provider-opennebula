@@ -101,9 +101,8 @@ func (attempt replacementAttachAttempt) matchesHistory(history VolumeHistoryReco
 	validPhase := (attempt.prepared() || attempt.dispatchPossible()) && completion == (replacementDetachCompletion{}) ||
 		attempt.detached() && completion.VAName != "" && completion.VAUID != "" && diskErr == nil && diskID >= 0 &&
 			completion.Target != "" && completion.Serial == fmt.Sprintf("onecsi-%d", attempt.ImageID)
-	pinnedVA := attempt.VAName != "" && attempt.VAUID != ""
-	validVA := (attempt.VAName == "" && attempt.VAUID == "") ||
-		pinnedVA && (!attempt.detached() || (completion.VAName == attempt.VAName && completion.VAUID == attempt.VAUID))
+	validVA := attempt.VAName != "" && attempt.VAUID != "" &&
+		(!attempt.detached() || (completion.VAName == attempt.VAName && completion.VAUID == attempt.VAUID))
 	token, err := hex.DecodeString(attempt.ID)
 	return err == nil && len(token) == 32 && validPhase && validVA && attempt.PVUID != "" && attempt.PVCUID != "" &&
 		attempt.Driver != "" && attempt.VolumeID == history.VolumeID && attempt.Node != "" &&
@@ -259,11 +258,7 @@ func (s *ControllerServer) replacementWaitingConsumers(ctx context.Context, pv *
 		}
 		if pod.DeletionTimestamp != nil || pod.UID == "" || pod.Spec.NodeName != node.Name ||
 			node.CreationTimestamp.IsZero() || !pod.CreationTimestamp.After(node.CreationTimestamp.Time) ||
-			pod.Status.Phase != corev1.PodPending || pod.Status.StartTime != nil || pod.Status.PodIP != "" || len(pod.Status.PodIPs) != 0 ||
-			len(pod.Status.ContainerStatuses) != 0 || len(pod.Status.InitContainerStatuses) != 0 || len(pod.Status.EphemeralContainerStatuses) != 0 ||
-			slices.ContainsFunc(pod.Status.Conditions, func(c corev1.PodCondition) bool {
-				return c.Status == corev1.ConditionTrue && (c.Type == corev1.PodReadyToStartContainers || c.Type == corev1.PodReady || c.Type == corev1.ContainersReady)
-			}) {
+			!replacementPodPendingBeforeMount(pod) {
 			return false, attachmentEvidenceUnavailable("replacement consumer may already be using the volume", nil)
 		}
 		consumers++
@@ -272,6 +267,43 @@ func (s *ControllerServer) replacementWaitingConsumers(ctx context.Context, pv *
 		return false, attachmentEvidenceUnavailable("replacement volume has multiple consumers", nil)
 	}
 	return consumers > 0, ctx.Err()
+}
+
+func replacementPodPendingBeforeMount(pod *corev1.Pod) bool {
+	if pod.Status.Phase != corev1.PodPending || pod.Status.PodIP != "" || len(pod.Status.PodIPs) != 0 ||
+		slices.ContainsFunc(pod.Status.Conditions, func(c corev1.PodCondition) bool {
+			return c.Status != corev1.ConditionFalse && (c.Type == corev1.PodReadyToStartContainers || c.Type == corev1.PodReady || c.Type == corev1.ContainersReady)
+		}) {
+		return false
+	}
+	if start := pod.Status.StartTime; start != nil &&
+		(start.IsZero() || start.Before(&pod.CreationTimestamp) || start.After(time.Now())) {
+		return false
+	}
+	return premountContainerStatuses(pod.Status.ContainerStatuses, func(name string) bool {
+		return slices.ContainsFunc(pod.Spec.Containers, func(c corev1.Container) bool { return c.Name == name })
+	}) && premountContainerStatuses(pod.Status.InitContainerStatuses, func(name string) bool {
+		return slices.ContainsFunc(pod.Spec.InitContainers, func(c corev1.Container) bool { return c.Name == name })
+	}) && premountContainerStatuses(pod.Status.EphemeralContainerStatuses, func(name string) bool {
+		return slices.ContainsFunc(pod.Spec.EphemeralContainers, func(c corev1.EphemeralContainer) bool { return c.Name == name })
+	})
+}
+
+func premountContainerStatuses(statuses []corev1.ContainerStatus, declared func(string) bool) bool {
+	seen := make(map[string]bool, len(statuses))
+	for _, container := range statuses {
+		waiting := container.State.Waiting
+		if container.Name == "" || seen[container.Name] || !declared(container.Name) ||
+			container.Ready || (container.Started != nil && *container.Started) || container.RestartCount != 0 ||
+			container.ContainerID != "" || container.ImageID != "" ||
+			container.LastTerminationState != (corev1.ContainerState{}) ||
+			container.State.Running != nil || container.State.Terminated != nil ||
+			waiting == nil || waiting.Message != "" || (waiting.Reason != "ContainerCreating" && waiting.Reason != "PodInitializing") {
+			return false
+		}
+		seen[container.Name] = true
+	}
+	return true
 }
 
 func (s *ControllerServer) verifyReplacementAttempt(ctx context.Context, req *csi.ControllerPublishVolumeRequest, attempt replacementAttachAttempt, attached bool) (*opennebula.VolumeDiskRecord, error) {

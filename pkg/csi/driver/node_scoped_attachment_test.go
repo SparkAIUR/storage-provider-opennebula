@@ -4125,19 +4125,41 @@ func setReplacementHistoryVersion(t *testing.T, driver *Driver) {
 	require.NoError(t, err)
 }
 
+func setPremountKubeletFixtureStatus(pod *corev1.Pod, reason string) {
+	start := pod.CreationTimestamp
+	pod.Status.StartTime = &start
+	container := pod.Spec.Containers[0]
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: container.Name, Image: container.Image,
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}},
+	}}
+}
+
+func fixtureDetachImageOwner(body string, vmID int) string {
+	return strings.NewReplacer(
+		"<STATE>1</STATE>", "<STATE>8</STATE>",
+		"<RUNNING_VMS>0</RUNNING_VMS>", "<RUNNING_VMS>1</RUNNING_VMS>",
+		"<VMS></VMS>", fmt.Sprintf("<VMS><ID>%d</ID></VMS>", vmID),
+	).Replace(body)
+}
+
 func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 	for _, queued := range []bool{false, true} {
 		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "safe-detach-updated", "unknown", "final-refusal", "write-conflict", "lost-write-reply", "readback-failed", "readback-unproven", "prepared-outage", "armed-outage", "armed-lost-ack", "armed-lost-ack-canceled", "armed-lost-ack-consumer-gone", "armed-lost-ack-retire-conflict", "armed-lost-ack-one-conflict", "armed-lost-ack-conflict-competing", "competing-arm", "prepared-abandoned", "prepared-abandoned-quarantine", "prepared-abandoned-conflict", "prepared-abandoned-orphan", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
 			"distinct-vm-inflight", "same-vm-abandoned-replay",
 			"no-publish-va", "attached-publish-va", "deleting-publish-va", "foreign-publish-va", "removed-publish-va", "replaced-publish-va",
-			"current-runtime-consumer", "current-terminating-consumer", "unknown-consumer-lifetime",
+			"current-runtime-consumer", "current-terminated-container", "current-restarted-container", "current-sandbox-ready",
+			"unknown-container-status", "old-consumer-start-time", "current-terminating-consumer", "unknown-consumer-lifetime",
 			"same-vm-abandoned-retirement-lost-ack", "distinct-vm-abandoned-retirement-lost-ack", "distinct-vm-abandoned-replay",
 			"same-vm-abandoned-replay-worker-pv-gone", "distinct-vm-abandoned-replay-worker-pv-replaced",
 			"same-vm-abandoned-replay-publish-pv-replaced", "distinct-vm-abandoned-replay-publish-pv-replaced",
 			"same-vm-abandoned-replay-delete-pv-gone", "distinct-vm-abandoned-replay-delete-pv-replaced",
 			"distinct-vm-abandoned-replay-completion-conflict", "distinct-vm-abandoned-replay-completion-conflict-changed-va",
 			"distinct-vm-abandoned-replay-completion-conflict-changed-generation", "distinct-vm-abandoned-replay-completion-conflict-changed-provider",
-			"distinct-vm-abandoned-replay-post-detach-pod", "distinct-vm-abandoned-post-detach-pod",
+			"same-vm-abandoned-replay-post-detach-pod", "distinct-vm-abandoned-replay-post-detach-pod", "distinct-vm-abandoned-post-detach-pod",
+			"same-vm-abandoned-replay-detach-lag", "distinct-vm-abandoned-replay-detach-lag-retry",
+			"distinct-vm-abandoned-replay-missing-va-pins", "distinct-vm-abandoned-replay-missing-va-name", "distinct-vm-abandoned-replay-missing-va-uid",
+			"distinct-vm-abandoned-replay-wrong-va-uid", "distinct-vm-abandoned-hidden-pinned-va",
 			"distinct-vm-abandoned-replay-post-detach-protection", "distinct-vm-abandoned-post-detach-protection", "distinct-vm-abandoned-replay-replaced-va", "distinct-vm-abandoned-replay-protection", "distinct-vm-abandoned-completion-lost-ack", "distinct-vm-abandoned", "distinct-vm-orphan", "distinct-vm-abandoned-released", "distinct-vm-abandoned-rebound", "distinct-vm-orphan-released", "distinct-vm-abandoned-wrong-marker", "distinct-vm-abandoned-consumer",
 			"distinct-vm-abandoned-late-uid", "distinct-vm-abandoned-late-quarantine", "distinct-vm-abandoned-terminating", "distinct-vm-abandoned-readback", "distinct-vm-abandoned-no-disk-orphan", "distinct-vm-abandoned-no-disk-stale-va", "distinct-vm-abandoned-no-disk-original-owner", "distinct-vm-abandoned-detach-reply", "distinct-vm-abandoned-retire-conflict", "phase-less", "distinct-vm-still-owned", "distinct-vm-unreadable-original", "distinct-vm-original-changed", "distinct-vm-marker-mismatch", "distinct-vm-node-changed", "distinct-vm-destination-changed", "other-version"} {
 			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
@@ -4177,6 +4199,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				latePod.UID = "post-detach-consumer"
 				latePod.Status.Phase = corev1.PodPending
 				latePod.CreationTimestamp = metav1.Now()
+				setPremountKubeletFixtureStatus(latePod, "ContainerCreating")
 				latePodArrival := strings.HasSuffix(mode, "-post-detach-pod")
 				lateProtection := strings.HasSuffix(mode, "-post-detach-protection")
 				setObserve := func(active bool) {
@@ -4280,8 +4303,31 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				consumer.Status.Phase = corev1.PodPending
 				consumer.CreationTimestamp = metav1.NewTime(replacement.CreationTimestamp.Add(time.Second))
 				switch mode {
+				case "lost-reply", "distinct-vm", "distinct-vm-lost-reply":
+					consumer.Spec.InitContainers = []corev1.Container{{Name: "init", Image: "busybox"}}
+					setPremountKubeletFixtureStatus(consumer, "PodInitializing")
+					consumer.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+						Name: "init", Image: "busybox", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
+					}}
 				case "current-runtime-consumer":
-					consumer.Status.StartTime = &consumer.CreationTimestamp
+					setPremountKubeletFixtureStatus(consumer, "ContainerCreating")
+					consumer.Status.ContainerStatuses[0].State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: consumer.CreationTimestamp}}
+				case "current-terminated-container":
+					setPremountKubeletFixtureStatus(consumer, "ContainerCreating")
+					consumer.Status.ContainerStatuses[0].State = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{}}
+				case "current-restarted-container":
+					setPremountKubeletFixtureStatus(consumer, "ContainerCreating")
+					consumer.Status.ContainerStatuses[0].RestartCount = 1
+					consumer.Status.ContainerStatuses[0].LastTerminationState.Terminated = &corev1.ContainerStateTerminated{}
+				case "current-sandbox-ready":
+					setPremountKubeletFixtureStatus(consumer, "ContainerCreating")
+					consumer.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReadyToStartContainers, Status: corev1.ConditionTrue}}
+				case "unknown-container-status":
+					setPremountKubeletFixtureStatus(consumer, "ContainerCreating")
+					consumer.Status.ContainerStatuses[0].Name = "undeclared"
+				case "old-consumer-start-time":
+					setPremountKubeletFixtureStatus(consumer, "ContainerCreating")
+					consumer.Status.StartTime = &replacement.CreationTimestamp
 				case "current-terminating-consumer":
 					now := metav1.Now()
 					consumer.DeletionTimestamp = &now
@@ -4594,7 +4640,8 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					}
 					return
 				}
-				if invalidPublishVA || mode == "current-runtime-consumer" || mode == "current-terminating-consumer" || mode == "unknown-consumer-lifetime" ||
+				if invalidPublishVA || strings.HasPrefix(mode, "current-") || mode == "unknown-consumer-lifetime" ||
+					mode == "unknown-container-status" || mode == "old-consumer-start-time" ||
 					mode == "write-conflict" || mode == "external-disk" ||
 					mode == "terminating-old-consumer" || mode == "ambiguous-old-consumer" || mode == "distinct-vm-still-owned" || mode == "distinct-vm-unreadable-original" || mode == "other-version" {
 					if mode == "removed-publish-va" || mode == "replaced-publish-va" {
@@ -4756,15 +4803,56 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						}
 					}
 					var replayVA *storagev1.VolumeAttachment
+					invalidPins := strings.Contains(mode, "-missing-va-")
+					wrongVA := strings.HasSuffix(mode, "-wrong-va-uid")
+					hiddenPinnedVA := strings.HasSuffix(mode, "-hidden-pinned-va")
+					if invalidPins {
+						stored, err = driver.volumeHistory.Upsert(ctx, volume, func(history *VolumeHistoryRecord) {
+							if !strings.HasSuffix(mode, "-uid") {
+								history.PendingReplacementAttach.VAName = ""
+							}
+							if !strings.HasSuffix(mode, "-name") {
+								history.PendingReplacementAttach.VAUID = ""
+							}
+						})
+						require.NoError(t, err)
+					}
 					if replay {
 						replayVA = publishVA.DeepCopy()
 						now := metav1.Now()
 						replayVA.DeletionTimestamp = &now
 						replayVA.Status.Attached = true
-						_, err := vas.Update(ctx, replayVA, metav1.UpdateOptions{})
+						if invalidPins || wrongVA {
+							require.NoError(t, vas.Delete(ctx, publishVA.Name, metav1.DeleteOptions{}))
+							replayVA.UID = "different-deleting-va"
+							_, err := vas.Create(ctx, replayVA, metav1.CreateOptions{})
+							require.NoError(t, err)
+						} else {
+							_, err := vas.Update(ctx, replayVA, metav1.UpdateOptions{})
+							require.NoError(t, err)
+						}
+					} else if hiddenPinnedVA {
+						hidden := publishVA.DeepCopy()
+						otherPV := "different-pv"
+						hidden.Spec.Source.PersistentVolumeName = &otherPV
+						_, err := vas.Update(ctx, hidden, metav1.UpdateOptions{})
 						require.NoError(t, err)
 					} else {
 						require.NoError(t, vas.Delete(ctx, publishVA.Name, metav1.DeleteOptions{}))
+					}
+					ownershipLag := strings.Contains(mode, "-detach-lag")
+					lagReplies := 0
+					if ownershipLag {
+						wire.mu.Lock()
+						wire.rejectFirstDetach = strings.HasSuffix(mode, "-retry")
+						wire.alterDirectImage = func(body string) string {
+							if _, attached := wire.disks[vmID]; !attached && lagReplies < 9 {
+								lagReplies++
+								return fixtureDetachImageOwner(body, vmID)
+							}
+							return body
+						}
+						wire.mu.Unlock()
 					}
 					var lostCompletionReply atomic.Bool
 					lostRetirementAck := strings.HasSuffix(mode, "-retirement-lost-ack")
@@ -4858,6 +4946,17 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					} else {
 						err = unpublish(restarted)
 					}
+					if invalidPins || wrongVA || hiddenPinnedVA {
+						require.Equal(t, codes.Unavailable, status.Code(err))
+						current, err := NewControllerServer(driver, provider, nil).readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.Equal(t, stored, current)
+						wire.mu.Lock()
+						defer wire.mu.Unlock()
+						require.Zero(t, wire.detachAttempts)
+						require.Equal(t, []string{fmt.Sprintf("attach:%d:false", vmID)}, wire.mutations)
+						return
+					}
 					if conflict {
 						require.True(t, conflictInjected.Load())
 						cm, readErr := kube.CoreV1().ConfigMaps(driver.volumeHistory.namespace).Get(ctx, volumeHistoryStateConfigMapName, metav1.GetOptions{})
@@ -4913,11 +5012,11 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							if latePodArrival {
 								currentPod, err := kube.CoreV1().Pods(pvc.Namespace).Get(ctx, latePod.Name, metav1.GetOptions{})
 								require.NoError(t, err)
-								currentPod.Status.StartTime = &currentPod.CreationTimestamp
+								currentPod.Status.ContainerStatuses[0].ContainerID = "containerd://running-writer"
 								_, err = kube.CoreV1().Pods(pvc.Namespace).UpdateStatus(ctx, currentPod, metav1.UpdateOptions{})
 								require.NoError(t, err)
 								require.Error(t, unpublish(retry))
-								currentPod.Status.StartTime = nil
+								currentPod.Status.ContainerStatuses[0].ContainerID = ""
 								_, err = kube.CoreV1().Pods(pvc.Namespace).UpdateStatus(ctx, currentPod, metav1.UpdateOptions{})
 								require.NoError(t, err)
 							} else {
@@ -4942,7 +5041,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						}
 						require.Equal(t, expected, current)
 						wire.mu.Lock()
-						require.Equal(t, []string{"attach:42:false", "detach:42"}, wire.mutations)
+						require.Equal(t, []string{fmt.Sprintf("attach:%d:false", vmID), fmt.Sprintf("detach:%d", vmID)}, wire.mutations)
 						wire.loseAttachReply = false
 						wire.mu.Unlock()
 						if replay && latePodArrival {
@@ -4955,7 +5054,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							require.Equal(t, "onecsi-7", reply.GetPublishContext()[publishContextDeviceSerial])
 							wire.mu.Lock()
 							defer wire.mu.Unlock()
-							require.Equal(t, []string{"attach:42:false", "detach:42", "attach:42:false"}, wire.mutations)
+							require.Equal(t, []string{fmt.Sprintf("attach:%d:false", vmID), fmt.Sprintf("detach:%d", vmID), fmt.Sprintf("attach:%d:false", vmID)}, wire.mutations)
 						}
 						return
 					}
@@ -5107,6 +5206,14 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						defer wire.mu.Unlock()
 						require.Equal(t, 1, wire.attachAttempts)
 						require.Equal(t, []string{fmt.Sprintf("attach:%d:false", vmID), fmt.Sprintf("detach:%d", vmID)}, wire.mutations)
+						if ownershipLag {
+							require.Equal(t, 9, lagReplies)
+							if wire.rejectFirstDetach {
+								require.Equal(t, 2, wire.detachAttempts)
+							} else {
+								require.Equal(t, 1, wire.detachAttempts)
+							}
+						}
 						requireAttachDiskIdentity(t, wire.attachFields, 7, stored.PendingReplacementAttach.ID, false)
 						return
 					}
@@ -5559,6 +5666,7 @@ func TestRecreatedNodeConvergesOldVolumeAttachment(t *testing.T) {
 
 				pod := activePodForPVC("waiting", pvc.Name, node.Name)
 				pod.UID, pod.Status.Phase, pod.CreationTimestamp = "waiting", corev1.PodPending, metav1.Now()
+				setPremountKubeletFixtureStatus(pod, "ContainerCreating")
 				switch mode {
 				case "new-va":
 					va.CreationTimestamp = metav1.Now()
@@ -5628,5 +5736,80 @@ func TestRecreatedNodeConvergesOldVolumeAttachment(t *testing.T) {
 				require.Empty(t, wire.mutations)
 			})
 		}
+	}
+}
+
+func TestProviderDetachWaitsForAcceptedOwnershipConvergence(t *testing.T) {
+	for _, tc := range []struct {
+		mode           string
+		refuseFirst    bool
+		postDetachRead string
+	}{
+		{mode: "initial-accepted", postDetachRead: "converges"},
+		{mode: "retry-accepted", refuseFirst: true, postDetachRead: "converges"},
+		{mode: "persistent-lag", postDetachRead: "lag"},
+		{mode: "retry-persistent-lag", refuseFirst: true, postDetachRead: "lag"},
+		{mode: "contradictory-owner", postDetachRead: "other-owner"},
+		{mode: "malformed-owner-list", postDetachRead: "malformed"},
+		{mode: "lost-detach-response", postDetachRead: "lost-reply"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			provider, wire := nodeAttachmentProvider(t)
+			readsAfterDetach := 0
+			wire.mu.Lock()
+			wire.ceph, wire.version = true, "7.4.0"
+			wire.rejectFirstDetach = tc.refuseFirst
+			wire.loseDetachReply = tc.postDetachRead == "lost-reply"
+			wire.alterDirectImage = func(body string) string {
+				if _, attached := wire.disks[41]; attached {
+					return body
+				}
+				readsAfterDetach++
+				switch tc.postDetachRead {
+				case "converges":
+					if readsAfterDetach > 9 {
+						return body
+					}
+					return fixtureDetachImageOwner(body, 41)
+				case "lag":
+					return fixtureDetachImageOwner(body, 41)
+				case "other-owner":
+					return fixtureDetachImageOwner(body, 42)
+				case "malformed":
+					return strings.Replace(body, "<VMS></VMS>", "<VMS><ID/></VMS>", 1)
+				default:
+					return body
+				}
+			}
+			wire.mu.Unlock()
+
+			accepted, err := provider.DetachVolumeWithAuthority(ctx, "volume-test", "node-old", 41, "ceph", nil, nil)
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			require.Equal(t, []string{"detach:41"}, wire.mutations)
+			if tc.refuseFirst {
+				require.Equal(t, 2, wire.detachAttempts)
+			} else {
+				require.Equal(t, 1, wire.detachAttempts)
+			}
+			var timeout *opennebula.HotplugTimeoutError
+			switch tc.postDetachRead {
+			case "converges":
+				require.NoError(t, err)
+				require.True(t, accepted)
+				require.Greater(t, readsAfterDetach, 9)
+			case "lag":
+				require.ErrorAs(t, err, &timeout)
+				require.ErrorIs(t, timeout, opennebula.ErrConflictingAttachmentEvidence)
+				require.Greater(t, readsAfterDetach, 1)
+				require.False(t, accepted)
+			default:
+				require.Error(t, err)
+				require.False(t, errors.As(err, &timeout))
+				require.False(t, accepted)
+			}
+		})
 	}
 }

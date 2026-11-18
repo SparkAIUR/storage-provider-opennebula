@@ -793,8 +793,7 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		}
 		err = p.ctrl.VM(nodeID).DiskAttachContext(ctx, diskTemplate)
 		if dispatch != nil {
-			var refusal *gocaerrors.ResponseError
-			dispatch.definitelyIdle = errors.As(err, &refusal) && refusal.Code == gocaerrors.OneActionError && isHotplugStateError(refusal)
+			dispatch.definitelyIdle = isDefinitiveHotplugRefusal(err)
 		}
 		return err
 	}
@@ -1221,7 +1220,7 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 	}
 	diskID, sizeBytes, err := p.observeDetachDisk(ctx, volume, volumeID, nodeID, vmName, nil, "")
 	if errors.Is(err, ErrAttachmentNotFound) {
-		_, observedErr := p.getVolumeInNode(ctx, volumeID, nodeID, vmName, true)
+		_, observedErr := p.getVolumeInNode(ctx, volumeID, nodeID, vmName, true, false)
 		if errors.Is(observedErr, ErrAttachmentNotFound) {
 			return false, nil
 		}
@@ -1253,7 +1252,7 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 		}
 		currentDisk, _, err := p.observeDetachDisk(ctx, volume, volumeID, nodeID, vmName, &expectedBackend, target)
 		if errors.Is(err, ErrAttachmentNotFound) {
-			_, observedErr := p.getVolumeInNode(ctx, volumeID, nodeID, vmName, true)
+			_, observedErr := p.getVolumeInNode(ctx, volumeID, nodeID, vmName, true, false)
 			if errors.Is(observedErr, ErrAttachmentNotFound) {
 				return nil
 			}
@@ -1291,7 +1290,7 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 	if authorityErr != nil {
 		return false, authorityErr
 	}
-	if detachErr != nil && !isHotplugStateError(detachErr) {
+	if detachErr != nil && !isDefinitiveHotplugRefusal(detachErr) {
 		return false, fmt.Errorf("failed to detach volume %s from node %s: %w", volume, node, detachErr)
 	}
 
@@ -1300,7 +1299,10 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 		retryDetach = detachDisk
 	}
 	if err := p.waitForDetachState(ctx, hotplugTimeout, p.hotplugPollWait, func(ctx context.Context) (bool, bool, error) {
-		_, infoErr := p.getVolumeInNode(ctx, volumeID, nodeID, vmName, true)
+		_, infoErr := p.getVolumeInNode(ctx, volumeID, nodeID, vmName, true, accepted)
+		if accepted && errors.Is(infoErr, errAttachmentOwnershipLag) {
+			return false, false, infoErr
+		}
 		attached := infoErr == nil
 		if !attached && !errors.Is(infoErr, ErrAttachmentNotFound) {
 			return false, false, deny(detachEvidenceError(ctx, "detach readback is unverified", infoErr))
@@ -1985,6 +1987,11 @@ func isHotplugStateError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "wrong state hotplug")
 }
 
+func isDefinitiveHotplugRefusal(err error) bool {
+	var refusal *gocaerrors.ResponseError
+	return errors.As(err, &refusal) && refusal.Code == gocaerrors.OneActionError && isHotplugStateError(refusal)
+}
+
 func (p *PersistentDiskVolumeProvider) VolumeReadyWithTimeout(ctx context.Context, volumeID int) (bool, error) {
 	err := p.waitForResourceStatusContext(ctx, volumeID, volumeUsedTimeout, p.volumeReadyContext)
 	if err != nil {
@@ -2207,9 +2214,15 @@ func (p *PersistentDiskVolumeProvider) waitForDetachState(ctx context.Context, t
 	lastAttached := true
 	lastReady := false
 	retryPending := retryDetach != nil
+	var ownershipLag error
 	timedOut := func() error {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		cause := fmt.Errorf("timed out after %s waiting for detach of volume %s on node %s (attached=%t ready=%t)",
+			timeout, volume, node, lastAttached, lastReady)
+		if ownershipLag != nil {
+			cause = fmt.Errorf("%w: %w", cause, ownershipLag)
 		}
 		return &HotplugTimeoutError{
 			Operation:            "detach",
@@ -2218,14 +2231,7 @@ func (p *PersistentDiskVolumeProvider) waitForDetachState(ctx context.Context, t
 			Timeout:              timeout,
 			LastObservedAttached: lastAttached,
 			LastObservedReady:    lastReady,
-			Cause: fmt.Errorf(
-				"timed out after %s waiting for detach of volume %s on node %s (attached=%t ready=%t)",
-				timeout,
-				volume,
-				node,
-				lastAttached,
-				lastReady,
-			),
+			Cause:                cause,
 		}
 	}
 
@@ -2238,26 +2244,28 @@ func (p *PersistentDiskVolumeProvider) waitForDetachState(ctx context.Context, t
 			return timedOut()
 		}
 		if err != nil {
-			return fmt.Errorf("failed while waiting for detach of volume %s on node %s: %w", volume, node, err)
-		}
-
-		lastAttached = attached
-		lastReady = ready
-		if !attached {
-			return nil
-		}
-
-		if retryPending && ready && attached {
-			retryErr := retryDetach(deadlineCtx)
-			if deadlineCtx.Err() != nil {
-				return timedOut()
+			if retryPending || !errors.Is(err, errAttachmentOwnershipLag) {
+				return fmt.Errorf("failed while waiting for detach of volume %s on node %s: %w", volume, node, err)
 			}
-			if retryErr != nil {
-				if !isHotplugStateError(retryErr) {
+			ownershipLag = err
+		} else {
+			ownershipLag = nil
+			lastAttached = attached
+			lastReady = ready
+			if !attached {
+				return nil
+			}
+
+			if retryPending && ready {
+				retryErr := retryDetach(deadlineCtx)
+				if deadlineCtx.Err() != nil {
+					return timedOut()
+				}
+				if retryErr == nil {
+					retryPending = false
+				} else if !isDefinitiveHotplugRefusal(retryErr) {
 					return fmt.Errorf("failed to retry detach of volume %s on node %s: %w", volume, node, retryErr)
 				}
-			} else {
-				retryPending = false
 			}
 		}
 
@@ -2397,10 +2405,10 @@ func verifyImageOwnershipState(state img.State, owners int) error {
 }
 
 func (p *PersistentDiskVolumeProvider) GetVolumeInNode(ctx context.Context, volumeID int, nodeID int) (string, error) {
-	return p.getVolumeInNode(ctx, volumeID, nodeID, "", false)
+	return p.getVolumeInNode(ctx, volumeID, nodeID, "", false, false)
 }
 
-func (p *PersistentDiskVolumeProvider) getVolumeInNode(ctx context.Context, volumeID, nodeID int, vmName string, requireCompleteImageReferences bool) (string, error) {
+func (p *PersistentDiskVolumeProvider) getVolumeInNode(ctx context.Context, volumeID, nodeID int, vmName string, requireCompleteImageReferences, acceptedDetach bool) (string, error) {
 	vmInfo, err := p.readVMInfo(ctx, nodeID, vmDisks)
 	if err != nil {
 		return "", fmt.Errorf("failed to get VM info: %w", err)
@@ -2460,8 +2468,12 @@ func (p *PersistentDiskVolumeProvider) getVolumeInNode(ctx context.Context, volu
 	if info.ID != volumeID || strings.TrimSpace(info.Name) == "" {
 		return "", fmt.Errorf("image identity is unverified while checking attachment absence")
 	}
-	metadata, err := p.InspectVolumeAttachment(ctx, info.Name, vmInfo.Name)
+	metadata, err := p.inspectVolumeAttachment(ctx, info.Name, vmInfo.Name, 0)
 	if err != nil {
+		if acceptedDetach && errors.Is(err, errAttachmentOwnershipLag) &&
+			!detachOwnershipLagMatches(metadata, volumeID, nodeID, vmInfo.Name) {
+			return "", fmt.Errorf("%w: detach ownership differs from the admitted VM", ErrConflictingAttachmentEvidence)
+		}
 		return "", err
 	}
 	if metadata.requestedVMName != vmInfo.Name {
@@ -2475,6 +2487,23 @@ func (p *PersistentDiskVolumeProvider) getVolumeInNode(ctx context.Context, volu
 		return "", fmt.Errorf("contradictory VM observations")
 	}
 	return "", fmt.Errorf("%w: image %d node %d", ErrAttachmentNotFound, volumeID, nodeID)
+}
+
+func detachOwnershipLagMatches(metadata *VolumeAttachmentMetadata, imageID, nodeID int, vmName string) bool {
+	if metadata == nil || metadata.ImageID != imageID || metadata.RequestedNodeID != nodeID ||
+		metadata.requestedVMName != vmName || metadata.AttachedToRequestedNode ||
+		metadata.ImageRunningVMs != len(metadata.ImageVMIDs) || !usedImageState(img.State(metadata.ImageStateRaw)) {
+		return false
+	}
+	if len(metadata.ImageVMIDs) == 0 {
+		return len(metadata.DiskRecords) == 0
+	}
+	if len(metadata.ImageVMIDs) != len(metadata.DiskRecords)+1 || !slices.Contains(metadata.ImageVMIDs, nodeID) {
+		return false
+	}
+	return !slices.ContainsFunc(metadata.DiskRecords, func(disk VolumeDiskRecord) bool {
+		return !slices.Contains(metadata.ImageVMIDs, disk.NodeID)
+	})
 }
 
 func (p *PersistentDiskVolumeProvider) InspectVolumeLookup(ctx context.Context, volume string, requestedNode string) (*VolumeLookupResult, error) {
@@ -2625,7 +2654,11 @@ func attachmentDiskRecord(info *vm.VM, disks []shared.Disk, disk shared.Disk) (V
 }
 
 func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Context, volume string, node string) (*VolumeAttachmentMetadata, error) {
-	return p.inspectVolumeAttachment(ctx, volume, node, 0)
+	metadata, err := p.inspectVolumeAttachment(ctx, volume, node, 0)
+	if err != nil {
+		return nil, err
+	}
+	return metadata, nil
 }
 
 func (p *PersistentDiskVolumeProvider) inspectVolumeAttachment(ctx context.Context, volume, node string, expectedAbsentVMID int) (*VolumeAttachmentMetadata, error) {
@@ -2715,11 +2748,11 @@ func (p *PersistentDiskVolumeProvider) inspectVolumeAttachment(ctx context.Conte
 	if incompleteDiskEvidence != nil {
 		return nil, incompleteDiskEvidence
 	}
-	if err := metadata.VerifyOwnership(); err != nil {
-		return nil, err
-	}
 	if !requestedNodeSeen {
 		return nil, fmt.Errorf("requested VM was absent from the attachment inspection")
+	}
+	if err := metadata.VerifyOwnership(); err != nil {
+		return metadata, err
 	}
 	if err := p.verifyPinnedVMDiskAbsent(ctx, volumeID, expectedAbsentVMID, vms); err != nil {
 		return nil, err
