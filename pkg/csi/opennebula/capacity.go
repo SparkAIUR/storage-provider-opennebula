@@ -99,7 +99,8 @@ func completedSelectedDiskSize(info *vm.VM, disk shared.Disk) (int64, error) {
 	return diskSizeBytesFromTemplate(disk)
 }
 
-func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, vmID, diskID, id int, size int64, vmName string) error {
+func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, identity attachmentVMIdentity, diskID, id int, size int64) error {
+	vmID, vmName := identity.id, identity.name
 	restoring := vmName != ""
 	info, err := p.readResizeImage(ctx, id, restoring)
 	if err != nil {
@@ -122,7 +123,7 @@ func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, 
 	}
 	if restoring {
 		err := p.verifyPublishMutation(ctx, vmID, id, vmName, func() error {
-			_, disk, err := p.observeGrowthTarget(ctx, vmID, diskID, id, vmName)
+			_, disk, err := p.observeGrowthTarget(ctx, identity, diskID, id)
 			if err != nil {
 				return err
 			}
@@ -154,6 +155,11 @@ func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, 
 }
 
 func (p *PersistentDiskVolumeProvider) RestoreVolumeCapacity(ctx context.Context, volume string, vmID, imageID int) error {
+	admitted, _ := ctx.Value(publishMutationKey{}).(publishMutationAdmission)
+	return p.restoreVolumeCapacity(ctx, volume, imageID, attachmentVMIdentity{id: vmID, lookupName: admitted.node})
+}
+
+func (p *PersistentDiskVolumeProvider) restoreVolumeCapacity(ctx context.Context, volume string, imageID int, identity attachmentVMIdentity) error {
 	info, err := p.readImageInfo(ctx, imageID)
 	if err != nil {
 		return err
@@ -169,8 +175,24 @@ func (p *PersistentDiskVolumeProvider) RestoreVolumeCapacity(ctx context.Context
 	if err != nil {
 		return err
 	}
+	vmID := identity.id
+	if identity.name == "" && identity.lookupName != "" {
+		resolvedID, name, _, err := resolveNodeVM(ctx, p.ctrl, identity.lookupName)
+		if err != nil {
+			return err
+		}
+		if resolvedID != vmID {
+			return fmt.Errorf("%w: restoration VM identity changed", ErrConflictingAttachmentEvidence)
+		}
+		identity.name = name
+	}
 	vmInfo, err := p.readVMInfo(ctx, vmID, vmDisks|vmState)
 	if err != nil {
+		return err
+	}
+	if identity.name == "" {
+		identity.name = vmInfo.Name
+	} else if err := verifyVMName(vmInfo, identity.name); err != nil {
 		return err
 	}
 	slot, _, err := publishDiskFromVM(vmInfo, imageID, vmID)
@@ -182,7 +204,7 @@ func (p *PersistentDiskVolumeProvider) RestoreVolumeCapacity(ctx context.Context
 		return err
 	}
 	if actual < desired {
-		_, err = p.expandAttachedDisk(ctx, vmID, slot, imageID, desired, vmInfo.Name)
+		_, err = p.expandAttachedDisk(ctx, identity, slot, imageID, desired)
 		return err
 	}
 	return nil

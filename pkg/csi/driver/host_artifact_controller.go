@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -51,7 +52,7 @@ func (s *ControllerServer) rejectIfHostArtifactQuarantineActive(ctx context.Cont
 }
 
 func (s *ControllerServer) checkHostArtifactAttachTarget(ctx context.Context, req *csi.ControllerPublishVolumeRequest, target *opennebula.HostArtifactAttachmentTarget, prior map[string]string) error {
-	if !s.hostArtifactQuarantineEnabled() || target == nil {
+	if !s.hostArtifactQuarantineEnabled() {
 		return nil
 	}
 	var runtimeCtx *VolumeRuntimeContext
@@ -74,10 +75,11 @@ func (s *ControllerServer) checkHostArtifactAttachTarget(ctx context.Context, re
 			persisted = map[string]string{}
 		case err != nil:
 			if prior != nil {
-				_, active, _ := manager.activeForTarget(*target, prior, now)
+				state, active, _ := manager.activeForAttach(req.VolumeId, target, prior, now)
 				if active {
-					s.recordHostArtifactWarning(ctx, req.VolumeId, req.GetVolumeContext(), eventReasonHostArtifactQuarantined, hostArtifactSlotBlocked)
-					return status.Error(codes.FailedPrecondition, hostArtifactSlotBlocked)
+					message := hostArtifactAttachHoldMessage(target, state.Key)
+					s.recordHostArtifactWarning(ctx, req.VolumeId, req.GetVolumeContext(), eventReasonHostArtifactQuarantined, message)
+					return status.Error(codes.FailedPrecondition, message)
 				}
 			}
 			return attachmentEvidenceUnavailable("host artifact quarantine is unverified", err)
@@ -88,19 +90,27 @@ func (s *ControllerServer) checkHostArtifactAttachTarget(ctx context.Context, re
 			}
 		}
 	}
-	state, active, err := manager.activeForTarget(*target, persisted, now)
+	state, active, err := manager.activeForAttach(req.VolumeId, target, persisted, now)
 	if err != nil {
 		return attachmentEvidenceUnavailable("host artifact quarantine is malformed", err)
 	}
 	if !active {
 		return nil
 	}
-	s.recordHostArtifactWarning(ctx, req.VolumeId, req.GetVolumeContext(), eventReasonHostArtifactQuarantined, hostArtifactSlotBlocked)
+	message := hostArtifactAttachHoldMessage(target, state.Key)
+	s.recordHostArtifactWarning(ctx, req.VolumeId, req.GetVolumeContext(), eventReasonHostArtifactQuarantined, message)
 	if recoveryControl.Active() && recoveryControl.SuppressRepairActions {
 		return nil
 	}
 	s.driver.metrics.RecordHostArtifactQuarantine(state.Classification, "active")
-	return status.Error(codes.FailedPrecondition, hostArtifactSlotBlocked)
+	return status.Error(codes.FailedPrecondition, message)
+}
+
+func hostArtifactAttachHoldMessage(target *opennebula.HostArtifactAttachmentTarget, key string) string {
+	if target != nil && slices.Contains(hostArtifactTargetQuarantineKeys(*target), key) {
+		return hostArtifactSlotBlocked
+	}
+	return "host artifact quarantine is active for the requested volume"
 }
 
 const hostArtifactSlotBlocked = "host artifact quarantine is active for the requested attachment slot"

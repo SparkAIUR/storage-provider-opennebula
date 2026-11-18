@@ -266,8 +266,11 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if err != nil {
 		return attachmentEvidenceUnavailable("current volume release is unverified", err)
 	}
-	remoteReplacement := remoteScope &&
-		((!receipt && localVAName == "") || (localVAName == attempt.VAName && string(localVA.uid) == attempt.VAUID)) &&
+	remoteSourceVerified := receipt
+	if remoteScope && !receipt {
+		remoteSourceVerified = localVAName == "" || (localVAName == attempt.VAName && string(localVA.uid) == attempt.VAUID)
+	}
+	remoteReplacement := remoteScope && remoteSourceVerified &&
 		pv.Status.Phase == corev1.VolumeBound && pv.DeletionTimestamp == nil && pvc != nil && !replacement &&
 		pvc.Status.Phase == corev1.ClaimBound && pvc.DeletionTimestamp == nil &&
 		desired.Desired && !desired.MultipleNodes && desired.DemandSource == volumeDemandSourceActivePod &&
@@ -458,7 +461,7 @@ func (s *ControllerServer) inspectVolumeDatastore(ctx context.Context, volume st
 	return datastore, nil
 }
 
-func (s *ControllerServer) verifyProviderAttachmentBackend(ctx context.Context, volume string, imageID, vmID int, backend string) error {
+func (s *ControllerServer) verifyProviderAttachmentBackend(ctx context.Context, volume, node string, imageID, vmID int, backend string) error {
 	if backend == "" {
 		return nil
 	}
@@ -466,7 +469,7 @@ func (s *ControllerServer) verifyProviderAttachmentBackend(ctx context.Context, 
 	if !ok {
 		return attachmentEvidenceUnavailable("provider cannot verify the attachment backend", nil)
 	}
-	if err := provider.VerifyAttachmentBackend(ctx, volume, imageID, vmID, backend); err != nil {
+	if err := provider.VerifyAttachmentBackend(ctx, volume, node, imageID, vmID, backend); err != nil {
 		return attachmentEvidenceUnavailable("provider attachment backend is unverified", err)
 	}
 	return nil

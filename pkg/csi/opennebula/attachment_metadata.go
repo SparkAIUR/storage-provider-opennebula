@@ -132,7 +132,7 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 	return &SameNodeRetentionEvidence{VolumeID: volume, ImageID: metadata.ImageID, NodeID: metadata.RequestedNodeID, DiskID: record.DiskID, Target: record.Target, DeviceSerial: record.Serial, SizeBytes: completedSize}, nil
 }
 
-func (p *PersistentDiskVolumeProvider) VerifyAttachmentBackend(ctx context.Context, volume string, imageID, vmID int, expected string) error {
+func (p *PersistentDiskVolumeProvider) VerifyAttachmentBackend(ctx context.Context, volume, node string, imageID, vmID int, expected string) error {
 	image, err := p.readImageInfo(ctx, imageID)
 	if err != nil {
 		return err
@@ -140,11 +140,21 @@ func (p *PersistentDiskVolumeProvider) VerifyAttachmentBackend(ctx context.Conte
 	if imageID < 0 || image.ID != imageID || image.Name != volume {
 		return fmt.Errorf("attachment image identity changed")
 	}
+	resolvedID, vmName, _, err := resolveNodeVM(ctx, p.ctrl, node)
+	if err != nil {
+		return err
+	}
+	if resolvedID != vmID {
+		return fmt.Errorf("%w: attachment VM identity changed", ErrConflictingAttachmentEvidence)
+	}
 	info, err := p.readVMInfo(ctx, vmID, vmDisks)
 	if err != nil {
 		return err
 	}
-	if _, err := p.readAttachmentVMs(ctx, imageID, attachmentVMIdentity{id: vmID, name: info.Name}); err != nil {
+	if err := verifyVMName(info, vmName); err != nil {
+		return err
+	}
+	if _, err := p.readAttachmentVMs(ctx, imageID, attachmentVMIdentity{id: vmID, name: vmName, lookupName: node}); err != nil {
 		return err
 	}
 	_, disk, err := volumeDiskFromVM(info, imageID, vmID, true)

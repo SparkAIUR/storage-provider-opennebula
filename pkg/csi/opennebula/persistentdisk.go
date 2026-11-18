@@ -659,16 +659,17 @@ func (p *PersistentDiskVolumeProvider) ExpandVolume(ctx context.Context, volume 
 		}
 		return 0, &datastoreConfigError{message: "detached disk growth is unsupported; attach the volume and retry"}
 	}
-	return p.expandAttachedDisk(ctx, vmID, diskID, id, size, "")
+	return p.expandAttachedDisk(ctx, attachmentVMIdentity{id: vmID}, diskID, id, size)
 }
 
-func (p *PersistentDiskVolumeProvider) expandAttachedDisk(ctx context.Context, vmID, diskID, id int, size int64, vmName string) (int64, error) {
+func (p *PersistentDiskVolumeProvider) expandAttachedDisk(ctx context.Context, identity attachmentVMIdentity, diskID, id int, size int64) (int64, error) {
+	vmID, vmName := identity.id, identity.name
 	actual, err := p.completedDiskSize(ctx, vmID, diskID, id, vmName)
 	if err != nil {
 		return 0, err
 	}
 	if actual < size && actual > 0 {
-		if err := p.authorizePersistentDiskGrowth(ctx, vmID, diskID, id, vmName); err != nil {
+		if err := p.authorizePersistentDiskGrowth(ctx, identity, diskID, id); err != nil {
 			return 0, err
 		}
 		mb := size / sizeConversion
@@ -691,7 +692,7 @@ func (p *PersistentDiskVolumeProvider) expandAttachedDisk(ctx context.Context, v
 	if err != nil {
 		return 0, err
 	}
-	if err := p.persistVerifiedSize(ctx, vmID, diskID, id, completed, vmName); err != nil {
+	if err := p.persistVerifiedSize(ctx, identity, diskID, id, completed); err != nil {
 		return 0, err
 	}
 	return completed, nil
@@ -794,8 +795,9 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		err = p.ctrl.VM(nodeID).DiskAttachContext(ctx, diskTemplate)
 		if dispatch != nil {
 			var refusal *gocaerrors.ResponseError
-			authDenied := errors.As(err, &refusal) && refusal.Code == gocaerrors.OneAuthorizationError && strings.TrimSpace(refusal.Msg) != ""
-			dispatch.definitelyIdle = authDenied || isDefinitiveHotplugRefusal(err)
+			authRefused := errors.As(err, &refusal) && strings.TrimSpace(refusal.Msg) != "" &&
+				(refusal.Code == gocaerrors.OneAuthenticationError || refusal.Code == gocaerrors.OneAuthorizationError)
+			dispatch.definitelyIdle = authRefused || isDefinitiveHotplugRefusal(err)
 		}
 		return err
 	}
@@ -868,7 +870,7 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 	if attempt != "" {
 		return nil
 	}
-	return p.RestoreVolumeCapacity(ctx, volume, nodeID, volumeID)
+	return p.restoreVolumeCapacity(ctx, volume, volumeID, attachmentVMIdentity{id: nodeID, name: vmName, lookupName: node})
 }
 
 func (p *PersistentDiskVolumeProvider) InspectHostArtifactAttachmentTarget(ctx context.Context, volume string, node string, params map[string]string) (*HostArtifactAttachmentTarget, error) {

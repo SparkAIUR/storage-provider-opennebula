@@ -1274,7 +1274,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		sameNode := desiredErr == nil && desired
 		maintenance := s.driver.maintenanceMode != nil && s.driver.maintenanceMode.Active()
 		if sameNode || maintenance {
-			providerBackendErr = s.verifyProviderAttachmentBackend(ctx, req.VolumeId, volumeID, nodeID, backend)
+			providerBackendErr = s.verifyProviderAttachmentBackend(ctx, req.VolumeId, req.NodeId, volumeID, nodeID, backend)
 		}
 		if providerBackendErr == nil {
 			if sameNode {
@@ -1360,7 +1360,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 			if currentBackend, err := runtimeCtx.verifiedAttachmentBackend(); err != nil || currentBackend != backend {
 				return attachmentEvidenceUnavailable("detach grace backend is unverified", err)
 			}
-			if err := s.verifyProviderAttachmentBackend(queueCtx, req.VolumeId, volumeID, nodeID, backend); err != nil {
+			if err := s.verifyProviderAttachmentBackend(queueCtx, req.VolumeId, req.NodeId, volumeID, nodeID, backend); err != nil {
 				return err
 			}
 			if err := s.startDetachGrace(queueCtx, runtimeCtx, stickyState); err != nil {
@@ -2280,7 +2280,7 @@ func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *cs
 			if decision.Evidence.OpenNebulaImageID != imageID || decision.Evidence.OpenNebulaNodeID != vmID {
 				return true, nil, attachmentEvidenceUnavailable("provider attachment identity changed during unpublish", nil)
 			}
-			if err := s.verifyProviderAttachmentBackend(ctx, req.VolumeId, imageID, vmID, backend); err != nil {
+			if err := s.verifyProviderAttachmentBackend(ctx, req.VolumeId, req.NodeId, imageID, vmID, backend); err != nil {
 				return true, nil, err
 			}
 			s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)

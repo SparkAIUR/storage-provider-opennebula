@@ -16,12 +16,13 @@ var supportedGrowthVersion = regexp.MustCompile(`^7\.4\.(0|[1-9][0-9]*)$`)
 
 // authorizePersistentDiskGrowth is operation-specific. Probe and satisfied-capacity
 // retries retain 7.4.0 support. No result is cached across growth attempts.
-func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context.Context, vmID, diskID, imageID int, vmName string) error {
+func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context.Context, identity attachmentVMIdentity, diskID, imageID int) error {
+	vmID, vmName := identity.id, identity.name
 	deny := func(reason string) error {
 		return &datastoreConfigError{message: fmt.Sprintf("persistent disk growth requires verified OpenNebula 7.4.1+ metadata support for non-NONE transfer targets: %s", reason)}
 	}
 	observe := func() (string, error) {
-		target, _, err := p.observeGrowthTarget(ctx, vmID, diskID, imageID, vmName)
+		target, _, err := p.observeGrowthTarget(ctx, identity, diskID, imageID)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", ctxErr
 		}
@@ -66,12 +67,13 @@ func (p *PersistentDiskVolumeProvider) authorizePersistentDiskGrowth(ctx context
 	return nil
 }
 
-func (p *PersistentDiskVolumeProvider) observeGrowthTarget(ctx context.Context, vmID, diskID, imageID int, vmName string) (string, *shared.Disk, error) {
+func (p *PersistentDiskVolumeProvider) observeGrowthTarget(ctx context.Context, identity attachmentVMIdentity, diskID, imageID int) (string, *shared.Disk, error) {
+	vmID, vmName := identity.id, identity.name
 	restoring := vmName != ""
 	var censusDisk VolumeDiskRecord
 	if restoring {
 		var err error
-		censusDisk, err = p.verifyRestorationCensus(ctx, vmID, diskID, imageID, vmName)
+		censusDisk, err = p.verifyRestorationCensus(ctx, identity, diskID, imageID)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return "", nil, ctxErr
@@ -168,7 +170,8 @@ func (p *PersistentDiskVolumeProvider) verifyGrowthImage(ctx context.Context, im
 	return nil
 }
 
-func (p *PersistentDiskVolumeProvider) verifyRestorationCensus(ctx context.Context, vmID, diskID, imageID int, vmName string) (VolumeDiskRecord, error) {
+func (p *PersistentDiskVolumeProvider) verifyRestorationCensus(ctx context.Context, identity attachmentVMIdentity, diskID, imageID int) (VolumeDiskRecord, error) {
+	vmID := identity.id
 	image, err := p.readAttachmentImageInfo(ctx, imageID)
 	if err != nil {
 		return VolumeDiskRecord{}, err
@@ -176,7 +179,7 @@ func (p *PersistentDiskVolumeProvider) verifyRestorationCensus(ctx context.Conte
 	if image.ID != imageID || image.Persistent == nil || *image.Persistent != 1 {
 		return VolumeDiskRecord{}, fmt.Errorf("restoration image identity or persistence is unverified")
 	}
-	vms, err := p.readAttachmentVMs(ctx, imageID, attachmentVMIdentity{id: vmID, name: vmName})
+	vms, err := p.readAttachmentVMs(ctx, imageID, identity)
 	if err != nil {
 		return VolumeDiskRecord{}, err
 	}

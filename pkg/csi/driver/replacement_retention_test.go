@@ -2,7 +2,6 @@ package driver
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -20,6 +19,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 )
+
+const remoteFixtureVAName = "csi-ac85754d1970193a7b964d41879b5a4ea619375d488aa789c4f066d11eb33e72"
 
 func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 	for _, queued := range []bool{false, true} {
@@ -199,7 +200,7 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 						wire.vmNames[remoteVM] = remote.Name
 						wire.mu.Unlock()
 						remoteVA := replacementPublishVA(pv, remote)
-						remoteVA.Name = fmt.Sprintf("csi-%x", sha256.Sum256([]byte(volume+DefaultDriverName+remote.Name)))
+						remoteVA.Name = remoteFixtureVAName
 						remoteVA.UID = "remote-va-uid"
 						reconciler := NewAttachmentReconciler(server)
 						reconciler.orphanGrace = 0
@@ -238,6 +239,14 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 						reconcile()
 						assertWire(false)
 						require.NoError(t, vas.Delete(ctx, remoteVA.Name, metav1.DeleteOptions{}))
+
+						noncanonical := remoteVA.DeepCopy()
+						noncanonical.Name = "noncanonical-remote-va"
+						_, err = vas.Create(ctx, noncanonical, metav1.CreateOptions{})
+						require.NoError(t, err)
+						reconcile()
+						assertWire(false)
+						require.NoError(t, vas.Delete(ctx, noncanonical.Name, metav1.DeleteOptions{}))
 
 						blocking := activePodForPVC("releasing-local-consumer", pvc.Name, node.Name)
 						blocking.UID = "releasing-local-uid"
@@ -422,6 +431,7 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 					if mode == "successor-deleted" {
 						now := metav1.Now()
 						successor.DeletionTimestamp = &now
+						successor.Finalizers = []string{"external-attacher/" + DefaultDriverName}
 						_, err = vas.Update(ctx, successor, metav1.UpdateOptions{})
 						require.NoError(t, err)
 						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
@@ -484,6 +494,51 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
 						require.NoError(t, err)
 
+						remote := newReadyNode("remote-node", true)
+						remote.UID = "remote-node-uid"
+						remote.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Minute))
+						_, err = nodes.Create(ctx, remote, metav1.CreateOptions{})
+						require.NoError(t, err)
+						demand := activePodForPVC("remote-after-detach", pvc.Name, remote.Name)
+						demand.UID, demand.Status.Phase = "remote-after-detach-uid", corev1.PodPending
+						_, err = pods.Create(ctx, demand, metav1.CreateOptions{})
+						require.NoError(t, err)
+						remoteVA := replacementPublishVA(pv, remote)
+						remoteVA.Name, remoteVA.UID = remoteFixtureVAName, "remote-destination-uid"
+						invalid := remoteVA.DeepCopy()
+						invalid.Status.Attached = true
+						_, err = vas.Create(ctx, invalid, metav1.CreateOptions{})
+						require.NoError(t, err)
+						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+						require.Error(t, err, "receipt replay requires a safe destination attachment")
+						_, err = vas.Update(ctx, remoteVA, metav1.UpdateOptions{})
+						require.NoError(t, err)
+
+						node.Status.VolumesInUse = []corev1.UniqueVolumeName{corev1.UniqueVolumeName("kubernetes.io/csi/" + DefaultDriverName + "^" + volume)}
+						_, err = nodes.UpdateStatus(ctx, node, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+						require.Error(t, err, "remote receipt replay requires continued local mount release")
+						node.Status.VolumesInUse = nil
+						_, err = nodes.UpdateStatus(ctx, node, metav1.UpdateOptions{})
+						require.NoError(t, err)
+
+						wire.mu.Lock()
+						if wire.vmNames == nil {
+							wire.vmNames = make(map[int]string)
+						}
+						wire.vmNames[43] = remote.Name
+						wire.mu.Unlock()
+						_, err = client.ControllerPublishVolume(ctx, newPublishReq(volume, remote.Name))
+						require.Error(t, err, "destination Publish waits for the source receipt to retire")
+						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+						require.NoError(t, err)
+						assertWire(true)
+						_, err = vas.Get(ctx, successor.Name, metav1.GetOptions{})
+						require.NoError(t, err)
+						successor.Finalizers = nil
+						_, err = vas.Update(ctx, successor, metav1.UpdateOptions{})
+						require.NoError(t, err)
 						require.NoError(t, vas.Delete(ctx, successor.Name, metav1.DeleteOptions{}))
 						changed := successor.DeepCopy()
 						changed.UID = "late-unrelated-uid"
@@ -499,6 +554,17 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 						require.Nil(t, current.PendingReplacementAttach)
 						require.Equal(t, before.LastSuccessfulNodeUID, current.LastSuccessfulNodeUID)
 						assertWire(true)
+						require.NoError(t, vas.Delete(ctx, changed.Name, metav1.DeleteOptions{}))
+						wire.mu.Lock()
+						wire.loseAttachReply = false
+						wire.expectedAttachNonce = nil
+						wire.mu.Unlock()
+						reply, err := client.ControllerPublishVolume(ctx, newPublishReq(volume, remote.Name))
+						require.NoError(t, err)
+						require.Equal(t, "onecsi-7", reply.GetPublishContext()[publishContextDeviceSerial])
+						wire.mu.Lock()
+						defer wire.mu.Unlock()
+						require.Equal(t, []string{fmt.Sprintf("attach:%d:false", target), fmt.Sprintf("detach:%d", target), "attach:43:false"}, wire.mutations)
 						return
 					}
 					if mode == "successor-expanded" {

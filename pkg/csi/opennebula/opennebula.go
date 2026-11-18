@@ -132,7 +132,7 @@ type AuthorizedVolumeDetacher interface {
 }
 
 type AttachmentBackendVerifier interface {
-	VerifyAttachmentBackend(ctx context.Context, volume string, imageID, vmID int, expected string) error
+	VerifyAttachmentBackend(ctx context.Context, volume, node string, imageID, vmID int, expected string) error
 }
 
 type VolumeDatastoreInspector interface {

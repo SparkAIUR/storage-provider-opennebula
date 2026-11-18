@@ -173,30 +173,9 @@ func (m *HostArtifactQuarantineManager) RefreshVolume(ctx context.Context, volum
 		}
 		return err
 	}
-	updated := map[string]HostArtifactQuarantineState{}
-	now := time.Now().UTC()
-	for key, raw := range cm.Data {
-		unrelated, err := hostArtifactRecordRoutesElsewhere(key, raw, volumeID, opennebula.HostArtifactAttachmentTarget{})
-		if err != nil {
-			return err
-		}
-		if unrelated {
-			continue
-		}
-		var state HostArtifactQuarantineState
-		if err := unmarshalAuthorityJSON(raw, &state); err != nil {
-			return err
-		}
-		if strings.TrimSpace(state.Key) == "" {
-			state.Key = key
-		}
-		if strings.TrimSpace(state.VolumeID) != volumeID {
-			continue
-		}
-		if !state.ExpiresAt.IsZero() && !state.ExpiresAt.After(now) {
-			continue
-		}
-		updated[state.Key] = state
+	updated, err := hostArtifactVolumeEntries(cm.Data, volumeID, time.Now().UTC())
+	if err != nil {
+		return err
 	}
 	m.mu.Lock()
 	for key, state := range m.entries {
@@ -209,6 +188,60 @@ func (m *HostArtifactQuarantineManager) RefreshVolume(ctx context.Context, volum
 	}
 	m.mu.Unlock()
 	return nil
+}
+
+func hostArtifactVolumeEntries(persisted map[string]string, volumeID string, now time.Time) (map[string]HostArtifactQuarantineState, error) {
+	volumeID = strings.TrimSpace(volumeID)
+	updated := map[string]HostArtifactQuarantineState{}
+	for key, raw := range persisted {
+		unrelated, err := hostArtifactRecordRoutesElsewhere(key, raw, volumeID, opennebula.HostArtifactAttachmentTarget{})
+		if err != nil {
+			return nil, err
+		}
+		if unrelated {
+			continue
+		}
+		var state HostArtifactQuarantineState
+		if err := unmarshalAuthorityJSON(raw, &state); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(state.Key) == "" {
+			state.Key = key
+		}
+		if strings.TrimSpace(state.VolumeID) != volumeID {
+			continue
+		}
+		if !state.ExpiresAt.IsZero() && !state.ExpiresAt.After(now) {
+			continue
+		}
+		updated[state.Key] = state
+	}
+	return updated, nil
+}
+
+func (m *HostArtifactQuarantineManager) activeForAttach(volumeID string, target *opennebula.HostArtifactAttachmentTarget, persisted map[string]string, now time.Time) (HostArtifactQuarantineState, bool, error) {
+	if target != nil {
+		if state, active, err := m.activeForTarget(*target, persisted, now); err != nil || active {
+			return state, active, err
+		}
+	}
+	if persisted != nil {
+		current, err := hostArtifactVolumeEntries(persisted, volumeID, now)
+		if err != nil {
+			return HostArtifactQuarantineState{}, false, err
+		}
+		for _, state := range current {
+			return state, true, nil
+		}
+	} else {
+		for _, state := range m.Snapshot() {
+			if strings.TrimSpace(state.VolumeID) == strings.TrimSpace(volumeID) &&
+				(state.ExpiresAt.IsZero() || state.ExpiresAt.After(now)) {
+				return state, true, nil
+			}
+		}
+	}
+	return HostArtifactQuarantineState{}, false, nil
 }
 
 func hostArtifactRecordRoutesElsewhere(key, raw, volumeID string, target opennebula.HostArtifactAttachmentTarget) (bool, error) {

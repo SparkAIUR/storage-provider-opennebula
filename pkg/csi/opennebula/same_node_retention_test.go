@@ -310,7 +310,7 @@ func TestVerifyAttachmentBackendRequiresPositiveDatastoreAndDiskFacts(t *testing
 					c.failMethod = "one.datastorepool.info"
 				}
 			})
-			err := p.VerifyAttachmentBackend(context.Background(), "volume-test", 7, 11, tc.expected)
+			err := p.VerifyAttachmentBackend(context.Background(), "volume-test", "node-test", 7, 11, tc.expected)
 			if tc.failure != "" {
 				require.ErrorContains(t, err, tc.failure)
 			} else {

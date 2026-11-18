@@ -61,6 +61,7 @@ type nodeAttachmentProtocol struct {
 	extraDiskBefore     string
 	extraDiskByVM       map[int]string
 	poolExtraDisk       string
+	extendedPoolExtraVM string
 	directDiskFields    string
 	directVMFields      string
 	alterDirectVM       func(string) string
@@ -316,6 +317,9 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				if _, present := state.disks[43]; present || state.vmNames[43] != "" {
 					body += vmXML(43, false)
 				}
+				if call.Method == "one.vmpool.infoextended" {
+					body += state.extendedPoolExtraVM
+				}
 				body += "</VM_POOL>"
 				if call.Method == "one.vmpool.info" {
 					body = shortVMDiskXML.ReplaceAllStringFunc(body, func(disk string) string {
@@ -358,6 +362,10 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 					switch state.attachRefusal {
 					case "authorization-refusal":
 						ok, body, code = 0, "User is not authorized to perform MANAGE on VM 41", 0x200
+					case "authentication-refusal":
+						ok, body, code = 0, "User couldn't be authenticated, aborting call.", 0x100
+					case "authentication-text":
+						ok, body, code = 0, "AUTHENTICATION: User couldn't be authenticated", 0x800
 					case "authorization-text":
 						ok, body, code = 0, "AUTHORIZATION: User is not authorized to perform MANAGE on VM 41", 0x800
 					case "authorization-malformed":
@@ -4174,7 +4182,7 @@ func fixtureDetachImageOwner(body string, vmID int) string {
 
 func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "safe-detach-updated", "unknown", "final-refusal", "authorization-refusal", "authorization-text", "authorization-malformed", "write-conflict", "lost-write-reply", "readback-failed", "readback-unproven", "prepared-outage", "armed-outage", "armed-lost-ack", "armed-lost-ack-canceled", "armed-lost-ack-consumer-gone", "armed-lost-ack-retire-conflict", "armed-lost-ack-one-conflict", "armed-lost-ack-conflict-competing", "competing-arm", "prepared-abandoned", "prepared-abandoned-quarantine", "prepared-abandoned-conflict", "prepared-abandoned-orphan", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
+		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "safe-detach-updated", "unknown", "final-refusal", "authorization-refusal", "authorization-text", "authorization-malformed", "authentication-refusal", "authentication-text", "write-conflict", "lost-write-reply", "readback-failed", "readback-unproven", "prepared-outage", "armed-outage", "armed-lost-ack", "armed-lost-ack-canceled", "armed-lost-ack-consumer-gone", "armed-lost-ack-retire-conflict", "armed-lost-ack-one-conflict", "armed-lost-ack-conflict-competing", "competing-arm", "prepared-abandoned", "prepared-abandoned-quarantine", "prepared-abandoned-conflict", "prepared-abandoned-orphan", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
 			"distinct-vm-inflight", "same-vm-abandoned-replay",
 			"no-publish-va", "attached-publish-va", "deleting-publish-va", "foreign-publish-va", "removed-publish-va", "replaced-publish-va",
 			"current-runtime-consumer", "current-terminated-container", "current-restarted-container", "current-sandbox-ready",
@@ -4400,7 +4408,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				wire.abortFirstAttach = mode == "unknown" || mode == "distinct-vm-inflight"
 				wire.allowImageDelete = mode == "distinct-vm-inflight"
 				wire.rejectFirstAttach = mode == "final-refusal"
-				if strings.HasPrefix(mode, "authorization-") {
+				if strings.HasPrefix(mode, "authorization-") || strings.HasPrefix(mode, "authentication-") {
 					wire.attachRefusal = mode
 				}
 				vmID := 41
@@ -4688,7 +4696,8 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				stored, err := NewControllerServer(driver, provider, nil).readAttachmentHistory(ctx, volume)
 				require.NoError(t, err)
 				require.Equal(t, string(node.UID), stored.LastSuccessfulNodeUID)
-				if mode == "readback-failed" || mode == "lost-write-reply" || mode == "final-refusal" || mode == "authorization-refusal" || mode == "pre-dispatch" {
+				refusedBeforeDispatch := mode == "authorization-refusal" || mode == "authentication-refusal"
+				if mode == "readback-failed" || mode == "lost-write-reply" || mode == "final-refusal" || refusedBeforeDispatch || mode == "pre-dispatch" {
 					require.Nil(t, stored.PendingReplacementAttach)
 					failBeforeDispatch.Store(false)
 					wire.mu.Lock()
@@ -4697,13 +4706,13 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					require.Empty(t, wire.mutations)
 					wire.loseAttachReply, wire.failMethod, wire.attachRefusal = false, "", ""
 					wire.mu.Unlock()
-					if mode == "final-refusal" || mode == "authorization-refusal" {
+					if mode == "final-refusal" || refusedBeforeDispatch {
 						require.Equal(t, 1, attempts)
 					} else {
 						require.Zero(t, attempts)
 					}
 					retryClient := client
-					if mode == "authorization-refusal" {
+					if refusedBeforeDispatch {
 						restarted := newStickyTestDriver(t)
 						restarted.kubeRuntime.client = kube
 						require.NoError(t, restarted.volumeHistory.LoadFromConfigMap(ctx))
@@ -4715,7 +4724,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					wire.mu.Lock()
 					defer wire.mu.Unlock()
 					require.Equal(t, attempts+1, wire.attachAttempts)
-					if mode == "authorization-refusal" {
+					if refusedBeforeDispatch {
 						require.NotEmpty(t, refusedToken)
 						require.NotEqual(t, refusedToken, wire.attachAttempt)
 					}
@@ -5331,7 +5340,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				wire.mu.Lock()
 				defer wire.mu.Unlock()
 				require.Equal(t, 1, wire.attachAttempts)
-				if mode == "unknown" || mode == "authorization-text" || mode == "authorization-malformed" {
+				if mode == "unknown" || mode == "authorization-text" || mode == "authorization-malformed" || mode == "authentication-text" {
 					require.Empty(t, wire.mutations)
 				} else {
 					require.Equal(t, []string{fmt.Sprintf("attach:%d:false", vmID)}, wire.mutations)
@@ -5352,6 +5361,94 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+type lateQuarantineAttachProvider struct {
+	*opennebula.PersistentDiskVolumeProvider
+	beforeAttach func()
+}
+
+func (p lateQuarantineAttachProvider) AttachVolume(ctx context.Context, volume, node string, readOnly bool, params map[string]string) error {
+	p.beforeAttach()
+	return p.PersistentDiskVolumeProvider.AttachVolume(ctx, volume, node, readOnly, params)
+}
+
+func TestControllerAttachHonorsLateVolumeWideHostQuarantine(t *testing.T) {
+	for _, quarantined := range []string{"volume-test", "unrelated-volume"} {
+		t.Run(quarantined, func(t *testing.T) {
+			ctx := context.Background()
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
+			provider, wire := nodeAttachmentProvider(t)
+			wire.mu.Lock()
+			delete(wire.disks, 41)
+			wire.marker = 128 * 1024 * 1024
+			wire.mu.Unlock()
+
+			var called atomic.Bool
+			probe := lateQuarantineAttachProvider{PersistentDiskVolumeProvider: provider, beforeAttach: func() {
+				called.Store(true)
+				manager := driver.hostArtifactQuarantine
+				state := hostArtifactStateFromConflict(quarantined, &opennebula.HostArtifactConflictError{
+					Target: opennebula.HostArtifactAttachmentTarget{VMID: 42, DiskID: 2}, RawMessage: "private fixture detail",
+				})
+				_, active, err := manager.MarkFailure(ctx, state, 1, time.Hour)
+				require.NoError(t, err)
+				require.True(t, active)
+			}}
+			reply, err := reviewControllerClient(t, NewControllerServer(driver, probe, nil)).
+				ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-old"))
+			require.True(t, called.Load(), "ordinary admission must reach the provider before the quarantine exists")
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			if quarantined == "volume-test" {
+				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				require.Nil(t, reply)
+				require.Zero(t, wire.attachAttempts)
+				require.Empty(t, wire.mutations)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, "vdb", reply.GetPublishContext()["volumeName"])
+				require.Equal(t, []string{"attach:41:false"}, wire.mutations)
+			}
+		})
+	}
+}
+
+func TestProviderMutationCensusPreservesKubernetesNodeName(t *testing.T) {
+	for _, lateExact := range []bool{false, true} {
+		t.Run(fmt.Sprintf("late_exact=%t", lateExact), func(t *testing.T) {
+			provider, wire := nodeAttachmentProvider(t)
+			wire.mu.Lock()
+			wire.vmNames = map[int]string{41: "NODE-OLD"}
+			wire.disks[41], wire.marker = 128, 256*1024*1024
+			if lateExact {
+				wire.extendedPoolExtraVM = "<VM><ID>43</ID><NAME>node-old</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE/></VM>"
+			}
+			wire.mu.Unlock()
+
+			ctx := context.Background()
+			err := provider.VerifyAttachmentBackend(ctx, "volume-test", "node-old", 7, 41, "local")
+			if lateExact {
+				require.ErrorIs(t, err, opennebula.ErrConflictingAttachmentEvidence)
+			} else {
+				require.NoError(t, err)
+			}
+			ctx = opennebula.WithPublishMutationAuthorization(ctx, "volume-test", "node-old", 41, 7, func(context.Context) error { return nil })
+			err = provider.RestoreVolumeCapacity(ctx, "volume-test", 41, 7)
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			if lateExact {
+				require.ErrorContains(t, err, "VM identity changed in the attachment census")
+				require.Empty(t, wire.mutations)
+				require.Equal(t, 128, wire.disks[41])
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, []string{"resize:41:256", "marker:268435456"}, wire.mutations)
+				require.Equal(t, 256, wire.disks[41])
+			}
+		})
 	}
 }
 
