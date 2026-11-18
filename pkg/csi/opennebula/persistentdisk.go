@@ -1304,12 +1304,21 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 	}
 	if err := p.waitForDetachState(ctx, hotplugTimeout, p.hotplugPollWait, func(ctx context.Context) (bool, bool, error) {
 		_, infoErr := p.getVolumeInNode(ctx, volumeID, nodeID, vmName, true, accepted)
-		if accepted && errors.Is(infoErr, errAttachmentOwnershipLag) {
-			return false, false, infoErr
-		}
+		ownershipLag := accepted && errors.Is(infoErr, errAttachmentOwnershipLag)
 		attached := infoErr == nil
-		if !attached && !errors.Is(infoErr, ErrAttachmentNotFound) {
+		if !attached && !ownershipLag && !errors.Is(infoErr, ErrAttachmentNotFound) {
 			return false, false, deny(detachEvidenceError(ctx, "detach readback is unverified", infoErr))
+		}
+		if original, replacement := ctx.Value(replacementDetachReadbackKey{}).(attachmentVMIdentity); accepted && !attached && replacement && original.id != 0 {
+			if _, err := p.InspectReplacementRelease(ctx, volumeID, original.id, original.name); err != nil {
+				if errors.Is(err, errReplacementVMSettling) {
+					return false, false, err
+				}
+				return false, false, deny(detachEvidenceError(ctx, "original VM release is unverified", err))
+			}
+		}
+		if ownershipLag {
+			return false, false, infoErr
 		}
 		ready, readyErr := p.nodeReadyContext(ctx, nodeID, vmName)
 		if readyErr != nil {
@@ -2215,15 +2224,15 @@ func (p *PersistentDiskVolumeProvider) waitForDetachState(ctx context.Context, t
 	lastAttached := true
 	lastReady := false
 	retryPending := retryDetach != nil
-	var ownershipLag error
+	var settlementErr error
 	timedOut := func() error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		cause := fmt.Errorf("timed out after %s waiting for detach of volume %s on node %s (attached=%t ready=%t)",
 			timeout, volume, node, lastAttached, lastReady)
-		if ownershipLag != nil {
-			cause = fmt.Errorf("%w: %w", cause, ownershipLag)
+		if settlementErr != nil {
+			cause = fmt.Errorf("%w: %w", cause, settlementErr)
 		}
 		return &HotplugTimeoutError{
 			Operation:            "detach",
@@ -2245,12 +2254,12 @@ func (p *PersistentDiskVolumeProvider) waitForDetachState(ctx context.Context, t
 			return timedOut()
 		}
 		if err != nil {
-			if retryPending || !errors.Is(err, errAttachmentOwnershipLag) {
+			if retryPending || (!errors.Is(err, errAttachmentOwnershipLag) && !errors.Is(err, errReplacementVMSettling)) {
 				return fmt.Errorf("failed while waiting for detach of volume %s on node %s: %w", volume, node, err)
 			}
-			ownershipLag = err
+			settlementErr = err
 		} else {
-			ownershipLag = nil
+			settlementErr = nil
 			lastAttached = attached
 			lastReady = ready
 			if !attached {
@@ -2470,21 +2479,13 @@ func (p *PersistentDiskVolumeProvider) getVolumeInNode(ctx context.Context, volu
 		return "", fmt.Errorf("image identity is unverified while checking attachment absence")
 	}
 	metadata, err := p.inspectVolumeAttachment(ctx, info.Name, vmInfo.Name, 0, acceptedDetach)
+	_, replacement := ctx.Value(replacementDetachReadbackKey{}).(attachmentVMIdentity)
+	if acceptedDetach && replacement && metadata != nil && len(metadata.DiskRecords) != 0 {
+		return "", fmt.Errorf("%w: replacement detach has additional disk owners", ErrConflictingAttachmentEvidence)
+	}
 	if err != nil {
-		if acceptedDetach && errors.Is(err, errAttachmentOwnershipLag) {
-			if !detachOwnershipLagMatches(metadata, volumeID, nodeID, vmInfo.Name) {
-				return "", fmt.Errorf("%w: detach ownership differs from the admitted VM", ErrConflictingAttachmentEvidence)
-			}
-			if original, replacement := ctx.Value(replacementDetachReadbackKey{}).(attachmentVMIdentity); replacement {
-				if len(metadata.DiskRecords) != 0 {
-					return "", fmt.Errorf("%w: replacement detach has additional disk owners", ErrConflictingAttachmentEvidence)
-				}
-				if original.id != 0 {
-					if _, releaseErr := p.inspectReplacementRelease(ctx, volumeID, original.id, original.name, false); releaseErr != nil {
-						return "", releaseErr
-					}
-				}
-			}
+		if acceptedDetach && errors.Is(err, errAttachmentOwnershipLag) && !detachOwnershipLagMatches(metadata, volumeID, nodeID, vmInfo.Name) {
+			return "", fmt.Errorf("%w: detach ownership differs from the admitted VM", ErrConflictingAttachmentEvidence)
 		}
 		return "", err
 	}

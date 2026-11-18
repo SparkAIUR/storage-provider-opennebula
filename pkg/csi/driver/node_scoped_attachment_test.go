@@ -4182,7 +4182,7 @@ func fixtureDetachImageOwner(body string, vmID int) string {
 
 func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "safe-detach-updated", "unknown", "final-refusal", "authorization-refusal", "authorization-text", "authorization-malformed", "authentication-refusal", "authentication-text", "write-conflict", "lost-write-reply", "readback-failed", "readback-unproven", "prepared-outage", "armed-outage", "armed-lost-ack", "armed-lost-ack-canceled", "armed-lost-ack-consumer-gone", "armed-lost-ack-retire-conflict", "armed-lost-ack-one-conflict", "armed-lost-ack-conflict-competing", "competing-arm", "prepared-abandoned", "prepared-abandoned-quarantine", "prepared-abandoned-conflict", "prepared-abandoned-orphan", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
+		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "safe-detach-updated", "unknown", "final-refusal", "authorization-refusal", "authorization-text", "authorization-malformed", "authentication-refusal", "authentication-text", "write-conflict", "lost-write-reply", "readback-failed", "readback-unproven", "prepared-outage", "armed-outage", "armed-lost-ack", "armed-lost-ack-canceled", "armed-lost-ack-consumer-gone", "armed-lost-ack-retire-conflict", "armed-lost-ack-one-conflict", "armed-lost-ack-conflict-competing", "competing-arm", "prepared-abandoned", "prepared-abandoned-quarantine", "prepared-abandoned-conflict", "prepared-abandoned-orphan", "prepared-abandoned-destination", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
 			"distinct-vm-inflight", "same-vm-abandoned-replay",
 			"no-publish-va", "attached-publish-va", "deleting-publish-va", "foreign-publish-va", "removed-publish-va", "replaced-publish-va",
 			"current-runtime-consumer", "current-terminated-container", "current-restarted-container", "current-sandbox-ready",
@@ -4591,12 +4591,58 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					fresh.kubeRuntime.client = kube
 					restarted := makeClient(fresh)
 					if abandonedPreparation {
-						require.NoError(t, vas.Delete(ctx, publishVA.Name, metav1.DeleteOptions{}))
+						if mode != "prepared-abandoned-destination" {
+							require.NoError(t, vas.Delete(ctx, publishVA.Name, metav1.DeleteOptions{}))
+						}
 						released := replacement.DeepCopy()
 						released.Status.VolumesInUse = nil
 						_, err := nodes.UpdateStatus(ctx, released, metav1.UpdateOptions{})
 						require.NoError(t, err)
 						require.NoError(t, kube.CoreV1().Pods(pvc.Namespace).Delete(ctx, consumer.Name, metav1.DeleteOptions{}))
+						if mode == "prepared-abandoned-destination" {
+							now := metav1.Now()
+							finalizers := []string{"external-attacher/" + driver.name}
+							publishVA.DeletionTimestamp, publishVA.Finalizers = &now, finalizers
+							_, err = vas.Update(ctx, publishVA, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							remote := newReadyNode("remote-node", true)
+							remote.UID = "destination-node"
+							remote.CreationTimestamp = metav1.NewTime(now.Add(-time.Minute))
+							_, err = nodes.Create(ctx, remote, metav1.CreateOptions{})
+							require.NoError(t, err)
+							destination := replacementPublishVA(pv, remote)
+							destination.Name, destination.UID = remoteFixtureVAName, "destination-attachment"
+							destination.DeletionTimestamp, destination.Finalizers = &now, finalizers
+							_, err = vas.Create(ctx, destination, metav1.CreateOptions{})
+							require.NoError(t, err)
+							wire.mu.Lock()
+							wire.vmNames = map[int]string{41: node.Name, 43: remote.Name}
+							wire.disks[41] = 128
+							wire.mu.Unlock()
+
+							request := &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: remote.Name}
+							_, err = restarted.ControllerUnpublishVolume(ctx, request)
+							require.Error(t, err, "preparation alone cannot authorize acknowledgement of an owned image")
+							wire.mu.Lock()
+							delete(wire.disks, 41)
+							wire.mu.Unlock()
+
+							_, err = restarted.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+							require.Error(t, err)
+							kube.ClearActions()
+							_, err = restarted.ControllerUnpublishVolume(ctx, request)
+							require.NoError(t, err)
+							for _, action := range kube.Actions() {
+								require.Contains(t, []string{"get", "list"}, action.GetVerb())
+							}
+							current, err := server.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.Equal(t, stored, current)
+							destination.Finalizers = nil
+							_, err = vas.Update(ctx, destination, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							require.NoError(t, vas.Delete(ctx, destination.Name, metav1.DeleteOptions{}))
+						}
 						if mode == "prepared-abandoned-quarantine" {
 							_, active, err := driver.volumeQuarantine.MarkFailure(ctx, VolumeQuarantineState{VolumeID: volume, Reason: "metadata drift"}, 1, time.Hour)
 							require.NoError(t, err)
@@ -4621,7 +4667,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						}
 						current, historyErr := server.readAttachmentHistory(ctx, volume)
 						require.NoError(t, historyErr)
-						if mode == "prepared-abandoned" || mode == "prepared-abandoned-orphan" {
+						if mode == "prepared-abandoned" || mode == "prepared-abandoned-orphan" || mode == "prepared-abandoned-destination" {
 							require.NoError(t, err)
 							require.Nil(t, current.PendingReplacementAttach)
 						} else {
@@ -4899,7 +4945,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						require.NoError(t, vas.Delete(ctx, publishVA.Name, metav1.DeleteOptions{}))
 					}
 					ownershipLag := strings.Contains(mode, "-detach-lag")
-					lagReplies, transitionalOriginalReads := 0, 0
+					lagReplies, transitionalOriginalReads, originalReadsAfterImageLag := 0, 0, 0
 					persistentReboot := strings.HasSuffix(mode, "-persistent-reboot")
 					originalConflict := strings.HasSuffix(mode, "-original-conflict")
 					if ownershipLag {
@@ -4920,8 +4966,11 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 								if originalConflict {
 									return strings.Replace(body, "<NAME>retired-vm</NAME>", "<NAME>unrelated-vm</NAME>", 1)
 								}
-								if persistentReboot || lagReplies < 9 {
+								if persistentReboot || transitionalOriginalReads < 6 {
 									transitionalOriginalReads++
+									if lagReplies == 9 {
+										originalReadsAfterImageLag++
+									}
 									return strings.Replace(body, "<LCM_STATE>3</LCM_STATE>", "<LCM_STATE>2</LCM_STATE>", 1)
 								}
 								return body
@@ -5302,7 +5351,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						if ownershipLag {
 							require.Equal(t, 9, lagReplies)
 							if strings.HasSuffix(mode, "-reboot") {
-								require.Positive(t, transitionalOriginalReads)
+								require.Greater(t, originalReadsAfterImageLag, 1, "original VM must still be booting after image convergence")
 							}
 							if wire.rejectFirstDetach {
 								require.Equal(t, 2, wire.detachAttempts)

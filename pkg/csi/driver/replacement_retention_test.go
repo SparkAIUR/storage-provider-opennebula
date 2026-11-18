@@ -325,16 +325,103 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 							_, err = nodes.Update(ctx, remote, metav1.UpdateOptions{})
 							require.NoError(t, err)
 
-							kube.ClearActions()
-							_, err = client.ControllerUnpublishVolume(ctx, destinationRequest)
-							require.NoError(t, err)
-							for _, action := range kube.Actions() {
-								require.Contains(t, []string{"get", "list"}, action.GetVerb(), "destination acknowledgement must be read-only")
+							acknowledgeDestination := func() {
+								t.Helper()
+								kube.ClearActions()
+								_, err := client.ControllerUnpublishVolume(ctx, destinationRequest)
+								require.NoError(t, err)
+								for _, action := range kube.Actions() {
+									require.Contains(t, []string{"get", "list"}, action.GetVerb(), "destination acknowledgement must be read-only")
+								}
+								assertWire(detached)
+								current, err := server.readAttachmentHistory(ctx, volume)
+								require.NoError(t, err)
+								require.Equal(t, beforeCancellation, current)
 							}
-							assertWire(detached)
-							current, err := server.readAttachmentHistory(ctx, volume)
+							acknowledgeDestination()
+
+							remote.Status.VolumesInUse = []corev1.UniqueVolumeName{"kubernetes.io/csi/" + DefaultDriverName + "^" + volume}
+							_, err = nodes.UpdateStatus(ctx, remote, metav1.UpdateOptions{})
 							require.NoError(t, err)
-							require.Equal(t, beforeCancellation, current)
+							denyDestination()
+							waiting := activePodForPVC("renewed-consumer", pvc.Name, remote.Name)
+							waiting.UID, waiting.Status.Phase = "renewed-consumer-uid", corev1.PodPending
+							waiting.ResourceVersion = "201"
+							waiting.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Second))
+							waiting.Spec.Containers = []corev1.Container{{Name: "app", Image: "test"}}
+							_, err = pods.Create(ctx, waiting, metav1.CreateOptions{})
+							require.NoError(t, err)
+							denyDestination()
+							setPremountKubeletFixtureStatus(waiting, "ContainerCreating")
+							_, err = pods.UpdateStatus(ctx, waiting, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							acknowledgeDestination()
+
+							mounted := waiting.DeepCopy()
+							mounted.Status.ContainerStatuses[0].ContainerID = "containerd://may-be-mounted"
+							_, err = pods.UpdateStatus(ctx, mounted, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							denyDestination()
+							_, err = pods.UpdateStatus(ctx, waiting, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							changedWaiting := func() {
+								changed := waiting.DeepCopy()
+								changed.ResourceVersion = "202"
+								changed.Status.ContainerStatuses[0].State.Waiting.Reason = "PodInitializing"
+								_, err := pods.UpdateStatus(ctx, changed, metav1.UpdateOptions{})
+								require.NoError(t, err)
+							}
+							onDestinationEvidence.Store(&changedWaiting)
+							denyDestination()
+							require.Nil(t, onDestinationEvidence.Load())
+							require.NoError(t, pods.Delete(ctx, waiting.Name, metav1.DeleteOptions{}))
+							remote.Status.VolumesInUse = nil
+							_, err = nodes.UpdateStatus(ctx, remote, metav1.UpdateOptions{})
+							require.NoError(t, err)
+
+							pvcs := core.PersistentVolumeClaims(pvc.Namespace)
+							pvc.DeletionTimestamp = &deleting
+							_, err = pvcs.Update(ctx, pvc, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							acknowledgeDestination()
+							_, err = pods.Create(ctx, waiting, metav1.CreateOptions{})
+							require.NoError(t, err)
+							denyDestination()
+							require.NoError(t, pods.Delete(ctx, waiting.Name, metav1.DeleteOptions{}))
+
+							require.NoError(t, pvcs.Delete(ctx, pvc.Name, metav1.DeleteOptions{}))
+							denyDestination()
+							pv.Status.Phase = corev1.VolumeReleased
+							_, err = core.PersistentVolumes().UpdateStatus(ctx, pv, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							acknowledgeDestination()
+							reused := pvc.DeepCopy()
+							reused.UID, reused.DeletionTimestamp = "reused-destination-claim", nil
+							reused.CreationTimestamp = metav1.Now()
+							other, _ := newLocalPVAndPVC("separate-destination-handle", pv.Spec.AccessModes, nil)
+							other.Status.Phase = corev1.VolumeBound
+							other.Spec.ClaimRef = &corev1.ObjectReference{Namespace: reused.Namespace, Name: reused.Name, UID: pvc.UID}
+							reused.Spec.VolumeName = other.Name
+							_, err = core.PersistentVolumes().Create(ctx, other, metav1.CreateOptions{})
+							require.NoError(t, err)
+							_, err = pvcs.Create(ctx, reused, metav1.CreateOptions{})
+							require.NoError(t, err)
+							denyDestination()
+							other.Spec.ClaimRef.UID = reused.UID
+							_, err = core.PersistentVolumes().Update(ctx, other, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							acknowledgeDestination()
+							changedBinding := func() {
+								wrong := pv.DeepCopy()
+								wrong.Spec.ClaimRef.UID = reused.UID
+								_, err := core.PersistentVolumes().Update(ctx, wrong, metav1.UpdateOptions{})
+								require.NoError(t, err)
+							}
+							onDestinationEvidence.Store(&changedBinding)
+							denyDestination()
+							require.Nil(t, onDestinationEvidence.Load())
+							_, err = core.PersistentVolumes().Update(ctx, pv, metav1.UpdateOptions{})
+							require.NoError(t, err)
 
 							remoteVA.Finalizers = nil
 							_, err = vas.Update(ctx, remoteVA, metav1.UpdateOptions{})
@@ -343,7 +430,7 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 							_, err = client.ControllerUnpublishVolume(ctx, unpublish)
 							require.NoError(t, err)
 							assertWire(true)
-							current, err = server.readAttachmentHistory(ctx, volume)
+							current, err := server.readAttachmentHistory(ctx, volume)
 							require.NoError(t, err)
 							require.NotNil(t, current.PendingReplacementAttach)
 							require.Equal(t, string(va.UID), current.PendingReplacementAttach.DetachCompletion.VAUID)

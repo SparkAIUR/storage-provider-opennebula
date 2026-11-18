@@ -265,9 +265,7 @@ func (s *ControllerServer) replacementWaitingConsumers(ctx context.Context, pv *
 		if !references || terminalPodMayBeReleased(pod) {
 			continue
 		}
-		if pod.DeletionTimestamp != nil || pod.UID == "" || pod.Spec.NodeName != node.Name ||
-			node.CreationTimestamp.IsZero() || !pod.CreationTimestamp.After(node.CreationTimestamp.Time) ||
-			!replacementPodPendingBeforeMount(pod) {
+		if !replacementPodWaitingOnNode(pod, node) {
 			return false, attachmentEvidenceUnavailable("replacement consumer may already be using the volume", nil)
 		}
 		consumers++
@@ -276,6 +274,12 @@ func (s *ControllerServer) replacementWaitingConsumers(ctx context.Context, pv *
 		return false, attachmentEvidenceUnavailable("replacement volume has multiple consumers", nil)
 	}
 	return consumers > 0, ctx.Err()
+}
+
+func replacementPodWaitingOnNode(pod *corev1.Pod, node *corev1.Node) bool {
+	return pod.DeletionTimestamp == nil && pod.UID != "" && pod.Spec.NodeName == node.Name &&
+		!node.CreationTimestamp.IsZero() && pod.CreationTimestamp.After(node.CreationTimestamp.Time) &&
+		replacementPodPendingBeforeMount(pod)
 }
 
 func replacementPodPendingBeforeMount(pod *corev1.Pod) bool {

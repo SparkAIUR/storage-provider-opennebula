@@ -137,11 +137,9 @@ func (p *PersistentDiskVolumeProvider) InspectReplacementAttach(ctx context.Cont
 	return &observed, ctx.Err()
 }
 
-func (p *PersistentDiskVolumeProvider) InspectReplacementRelease(ctx context.Context, imageID, vmID int, vmName string) (string, error) {
-	return p.inspectReplacementRelease(ctx, imageID, vmID, vmName, true)
-}
+var errReplacementVMSettling = errors.New("original Ceph VM release has not settled")
 
-func (p *PersistentDiskVolumeProvider) inspectReplacementRelease(ctx context.Context, imageID, vmID int, vmName string, settled bool) (string, error) {
+func (p *PersistentDiskVolumeProvider) InspectReplacementRelease(ctx context.Context, imageID, vmID int, vmName string) (string, error) {
 	deny := func() (string, error) {
 		return "", fmt.Errorf("%w: original Ceph VM release is unverified", ErrConflictingAttachmentEvidence)
 	}
@@ -167,13 +165,22 @@ func (p *PersistentDiskVolumeProvider) inspectReplacementRelease(ctx context.Con
 			return deny()
 		}
 		state, lcm, err := info.State()
-		if err != nil || settled && (state != vm.Active || lcm != vm.Running) && (state != vm.Poweroff || lcm != vm.LcmInit) {
+		if err != nil {
 			return deny()
 		}
 		if _, _, err := volumeDiskFromVM(info, imageID, vmID, true); !errors.Is(err, ErrAttachmentNotFound) {
 			return deny()
 		}
-		return info.Name, ctx.Err()
+		if (state == vm.Active && lcm == vm.Running) || (state == vm.Poweroff && lcm == vm.LcmInit) {
+			return info.Name, ctx.Err()
+		}
+		if state == vm.Active {
+			switch lcm {
+			case vm.Boot, vm.BootPoweroff, vm.BootSuspended, vm.BootStopped, vm.BootUndeploy, vm.ShutdownPoweroff:
+				return "", errReplacementVMSettling
+			}
+		}
+		return deny()
 	}
 	_, err = p.readVMInfo(ctx, vmID, vmDisks|vmState)
 	if IsAuthoritativeVolumeAbsence(err) && ctx.Err() == nil {
