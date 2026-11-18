@@ -1235,6 +1235,7 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 	}
 	hotplugTimeout := p.ComputeHotplugTimeout(sizeBytes)
 
+	readback, replacement := ctx.Value(replacementDetachReadbackKey{}).(replacementDetachReadback)
 	accepted := false
 	var authorityErr error
 	deny := func(err error) error {
@@ -1283,9 +1284,20 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 		if err := ctx.Err(); err != nil {
 			return deny(status.FromContextError(err).Err())
 		}
-		err = p.ctrl.VM(nodeID).Disk(diskID).DetachContext(ctx)
-		accepted = err == nil
-		return err
+		reply, err := p.ctrl.Client.VMDiskDetach(ctx, nodeID, diskID)
+		if err != nil {
+			return err
+		}
+		if replacement {
+			if reply == nil || reply.BodyInt() != nodeID || readback.recordAccepted == nil {
+				return deny(detachEvidenceError(ctx, "detach success reply is unverified", nil))
+			}
+			if err := readback.recordAccepted(ctx, vmName, volumeID, nodeID, diskID); err != nil {
+				return deny(err)
+			}
+		}
+		accepted = true
+		return nil
 	}
 	detachErr := detachDisk(ctx)
 	if err := ctx.Err(); err != nil {
@@ -1309,8 +1321,8 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 		if !attached && !ownershipLag && !errors.Is(infoErr, ErrAttachmentNotFound) {
 			return false, false, deny(detachEvidenceError(ctx, "detach readback is unverified", infoErr))
 		}
-		if original, replacement := ctx.Value(replacementDetachReadbackKey{}).(attachmentVMIdentity); accepted && !attached && replacement && original.id != 0 {
-			if _, err := p.InspectReplacementRelease(ctx, volumeID, original.id, original.name); err != nil {
+		if accepted && !attached && readback.originalVMID != 0 {
+			if _, err := p.InspectReplacementRelease(ctx, volumeID, readback.originalVMID, readback.originalVMName); err != nil {
 				if errors.Is(err, errReplacementVMSettling) {
 					return false, false, err
 				}
@@ -2479,7 +2491,7 @@ func (p *PersistentDiskVolumeProvider) getVolumeInNode(ctx context.Context, volu
 		return "", fmt.Errorf("image identity is unverified while checking attachment absence")
 	}
 	metadata, err := p.inspectVolumeAttachment(ctx, info.Name, vmInfo.Name, 0, acceptedDetach)
-	_, replacement := ctx.Value(replacementDetachReadbackKey{}).(attachmentVMIdentity)
+	_, replacement := ctx.Value(replacementDetachReadbackKey{}).(replacementDetachReadback)
 	if acceptedDetach && replacement && metadata != nil && len(metadata.DiskRecords) != 0 {
 		return "", fmt.Errorf("%w: replacement detach has additional disk owners", ErrConflictingAttachmentEvidence)
 	}

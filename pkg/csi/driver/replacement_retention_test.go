@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -128,6 +129,46 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 					restarted := newStickyTestDriver(t)
 					restarted.kubeRuntime.client = kube
 					require.NoError(t, restarted.volumeHistory.LoadFromConfigMap(ctx))
+					localMaintenance := mode == "retained" || strings.HasPrefix(mode, "remote-reschedule")
+					if localMaintenance {
+						restarted.maintenanceMode = NewMaintenanceModeManager(restarted, "default")
+						restarted.maintenanceMode.setState(true, false, false)
+						require.NoError(t, restarted.kubeRuntime.UpsertConfigMapData(ctx, "default", hotplugStateConfigMapName,
+							map[string]string{maintenanceModeKey: "true"}))
+						var maintenanceWrites atomic.Int32
+						for _, verb := range []string{"create", "update", "patch", "delete"} {
+							kube.PrependReactor(verb, "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+								var name string
+								switch action := action.(type) {
+								case ktesting.CreateAction:
+									name = action.GetObject().(*corev1.ConfigMap).Name
+								case ktesting.UpdateAction:
+									name = action.GetObject().(*corev1.ConfigMap).Name
+								case ktesting.PatchAction:
+									if action.GetName() == hotplugStateConfigMapName {
+										var patch struct {
+											Data map[string]json.RawMessage `json:"data"`
+										}
+										require.NoError(t, json.Unmarshal(action.GetPatch(), &patch))
+										for key := range patch.Data {
+											if isMaintenanceConfigMapKey(key) {
+												maintenanceWrites.Add(1)
+											}
+										}
+									}
+								case ktesting.DeleteAction:
+									name = action.GetName()
+								}
+								if name == hotplugStateConfigMapName {
+									maintenanceWrites.Add(1)
+								}
+								return false, nil, nil
+							})
+						}
+						t.Cleanup(func() {
+							require.Zero(t, maintenanceWrites.Load(), "verified Ceph lifecycle must not write maintenance state")
+						})
+					}
 					server = makeServer(restarted)
 					client = reviewControllerClient(t, server)
 					unpublish := &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name}
@@ -207,6 +248,7 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 						wire.vmNames[remoteVM] = remote.Name
 						wire.mu.Unlock()
 						remoteVA := replacementPublishVA(pv, remote)
+						remoteVA.CreationTimestamp = metav1.NewTime(remote.CreationTimestamp.Add(10 * time.Second))
 						remoteVA.Name = remoteFixtureVAName
 						remoteVA.UID = "remote-va-uid"
 						reconciler := NewAttachmentReconciler(server)
@@ -339,6 +381,13 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 								require.Equal(t, beforeCancellation, current)
 							}
 							acknowledgeDestination()
+							pv.Annotations[annotationRecoveryMode] = recoveryModeObserve
+							_, err = core.PersistentVolumes().Update(ctx, pv, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							denyDestination()
+							delete(pv.Annotations, annotationRecoveryMode)
+							_, err = core.PersistentVolumes().Update(ctx, pv, metav1.UpdateOptions{})
+							require.NoError(t, err)
 
 							remote.Status.VolumesInUse = []corev1.UniqueVolumeName{"kubernetes.io/csi/" + DefaultDriverName + "^" + volume}
 							_, err = nodes.UpdateStatus(ctx, remote, metav1.UpdateOptions{})
@@ -347,12 +396,14 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 							waiting := activePodForPVC("renewed-consumer", pvc.Name, remote.Name)
 							waiting.UID, waiting.Status.Phase = "renewed-consumer-uid", corev1.PodPending
 							waiting.ResourceVersion = "201"
-							waiting.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Second))
+							waiting.CreationTimestamp = metav1.NewTime(remoteVA.CreationTimestamp.Add(-5 * time.Second))
+							require.True(t, waiting.CreationTimestamp.Before(&remoteVA.CreationTimestamp))
 							waiting.Spec.Containers = []corev1.Container{{Name: "app", Image: "test"}}
 							_, err = pods.Create(ctx, waiting, metav1.CreateOptions{})
 							require.NoError(t, err)
 							denyDestination()
 							setPremountKubeletFixtureStatus(waiting, "ContainerCreating")
+							waiting.Status.StartTime = &deleting
 							_, err = pods.UpdateStatus(ctx, waiting, metav1.UpdateOptions{})
 							require.NoError(t, err)
 							acknowledgeDestination()

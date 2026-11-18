@@ -116,15 +116,16 @@ keeps the identities admitted for the detach. Before acknowledging Unpublish,
 the controller checks the current binding, attachment, release and protection.
 A change can block acknowledgement even after the history write commits.
 Independent readback can confirm a committed receipt whose write reply was lost.
-After an accepted detach, the controller waits within the hotplug deadline
-for the detached VM's stale image ownership to clear before recording release.
-This also covers a stale USED or USED_PERS image state after both ownership
-indicators have cleared, while the VM and disk census still agree on release.
-The same deadline covers original VM settlement, even if image ownership clears
-first. Recording completion requires a settled original VM or verified retirement.
-If the provider detach reply is lost without verified proof or the controller
-restarts before recording completion, a later caller holds the unresolved
-attempt even when both VMs appear idle.
+For a replacement detach, the driver records the provider's successful reply
+against the exact attempt, source attachment and disk identity before polling for
+release. This record allows a later controller request or reconciliation to check
+settlement without sending another detach. It does not authorize Unpublish
+success or publication on its own. The existing bounded poll covers stale image
+ownership and original VM settlement. Completion requires fresh provider absence
+and verified original VM release, along with the current Kubernetes scope and
+per-volume controls. An uncertain reply or a failed acceptance write leaves the
+attempt unresolved. Global local-disk maintenance does not govern these verified
+Ceph paths.
 
 An attached VolumeAttachment that predates a verified same-name Node
 replacement can converge after the controller proves release on both the pinned

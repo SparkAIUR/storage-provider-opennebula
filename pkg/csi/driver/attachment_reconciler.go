@@ -360,19 +360,19 @@ func (r *AttachmentReconciler) reconcileReleasedReplacementAttempts(ctx context.
 			continue
 		}
 		pv := pvs[volume]
-		if attempt.prepared() && attempt.matchesHistory(history) && attempt.Driver == s.driver.name &&
+		if (attempt.prepared() || attempt.detachAccepted()) && attempt.matchesHistory(history) && attempt.Driver == s.driver.name &&
 			pv != nil && attempt.PVUID == string(pv.UID) && len(disks[volume]) == 0 &&
-			len(vas[volume]) == 0 && !unresolved[volume] && !r.skipDiskAttachmentReconcile(ctx, volume, pv) {
+			(attempt.detachAccepted() || len(vas[volume]) == 0) && !unresolved[volume] && !r.skipDiskAttachmentReconcile(ctx, volume, pv) {
 			key := volume + "@" + attempt.Node + "@" + string(pv.UID) + "@" + attempt.ID
 			currentOrphans[key] = struct{}{}
 			if r.due(r.orphanSeen, key, now, r.orphanGrace) {
-				r.retireAbandonedPreparation(ctx, *attempt, pv.UID)
+				r.settleReleasedReplacement(ctx, *attempt, pv.UID)
 			}
 		}
 	}
 }
 
-func (r *AttachmentReconciler) retireAbandonedPreparation(ctx context.Context, attempt replacementAttachAttempt, pvUID types.UID) {
+func (r *AttachmentReconciler) settleReleasedReplacement(ctx context.Context, attempt replacementAttachAttempt, pvUID types.UID) {
 	s := r.server
 	nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(attempt.Node))
 	defer nodeRelease()
@@ -380,12 +380,14 @@ func (r *AttachmentReconciler) retireAbandonedPreparation(ctx context.Context, a
 	defer volumeRelease()
 	identity := physicalDetachIdentity{pvUID: pvUID, nodeUID: types.UID(attempt.ReplacementUID), imageID: attempt.ImageID, vmID: attempt.VMID,
 		diskID: -1, background: true, cephSingleWriter: true, replacement: &attempt}
-	err := s.checkPhysicalDetachAuthority(ctx, attempt.VolumeID, attempt.Node, &identity, true)
-	if err == nil {
+	var err error
+	if attempt.detachAccepted() {
+		err = s.completeVerifiedReplacementDetach(ctx, attempt.VolumeID, attempt.Node, &identity)
+	} else if err = s.checkPhysicalDetachAuthority(ctx, attempt.VolumeID, attempt.Node, &identity, detachReadback); err == nil {
 		err = s.retireVerifiedReplacement(ctx, attempt)
 	}
 	if err != nil {
-		klog.V(2).InfoS("Prepared replacement release is unverified", "volume", attempt.VolumeID, "node", attempt.Node, "err", err)
+		klog.V(2).InfoS("Replacement release is unverified", "volume", attempt.VolumeID, "node", attempt.Node, "err", err)
 	}
 }
 

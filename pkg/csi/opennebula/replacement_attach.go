@@ -15,8 +15,14 @@ const attachAttemptField = "CSI_ATTACH_ATTEMPT"
 type replacementAttachKey struct{}
 type replacementDetachReadbackKey struct{}
 
-func WithReplacementDetachReadback(ctx context.Context, originalVMID int, originalVMName string) context.Context {
-	return context.WithValue(ctx, replacementDetachReadbackKey{}, attachmentVMIdentity{id: originalVMID, name: originalVMName})
+type replacementDetachReadback struct {
+	originalVMID   int
+	originalVMName string
+	recordAccepted func(context.Context, string, int, int, int) error
+}
+
+func WithReplacementDetachReadback(ctx context.Context, originalVMID int, originalVMName string, recordAccepted func(context.Context, string, int, int, int) error) context.Context {
+	return context.WithValue(ctx, replacementDetachReadbackKey{}, replacementDetachReadback{originalVMID, originalVMName, recordAccepted})
 }
 
 type ReplacementAttachDispatch struct {
@@ -36,9 +42,19 @@ func (d *ReplacementAttachDispatch) DefinitelyIdle() bool {
 type ReplacementAttachInspector interface {
 	InspectReplacementRelease(context.Context, int, int, string) (string, error)
 	InspectReplacementAttach(context.Context, string, string, int, int, string) (*VolumeDiskRecord, error)
+	VerifyAcceptedReplacementDetach(ctx context.Context, volume, node string, imageID, vmID int, vmName string) error
 }
 
 func (p *PersistentDiskVolumeProvider) InspectReplacementAttach(ctx context.Context, volume, node string, imageID, vmID int, attempt string) (*VolumeDiskRecord, error) {
+	return p.inspectReplacementAttach(ctx, volume, node, imageID, vmID, attempt, "")
+}
+
+func (p *PersistentDiskVolumeProvider) VerifyAcceptedReplacementDetach(ctx context.Context, volume, node string, imageID, vmID int, vmName string) error {
+	_, err := p.inspectReplacementAttach(ctx, volume, node, imageID, vmID, "", vmName)
+	return err
+}
+
+func (p *PersistentDiskVolumeProvider) inspectReplacementAttach(ctx context.Context, volume, node string, imageID, vmID int, attempt, expectedVMName string) (*VolumeDiskRecord, error) {
 	version, err := p.ctrl.SystemVersionContext(ctx)
 	if err != nil || version != "7.4.0" {
 		return nil, fmt.Errorf("%w: replacement Ceph attach requires OpenNebula 7.4.0", ErrConflictingAttachmentEvidence)
@@ -50,7 +66,8 @@ func (p *PersistentDiskVolumeProvider) InspectReplacementAttach(ctx context.Cont
 	if err != nil {
 		return nil, err
 	}
-	if metadata.ImageID != imageID || metadata.RequestedNodeID != vmID {
+	if metadata.ImageID != imageID || metadata.RequestedNodeID != vmID ||
+		(expectedVMName != "" && metadata.requestedVMName != expectedVMName) {
 		return deny()
 	}
 	image, err := p.readAttachmentImageInfo(ctx, imageID)

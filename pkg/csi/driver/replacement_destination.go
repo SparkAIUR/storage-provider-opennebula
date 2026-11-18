@@ -47,7 +47,8 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 		pv.DeletionTimestamp == nil && pvc.DeletionTimestamp == nil
 	terminatingClaim := originalBound && pvc.DeletionTimestamp != nil
 	released := pv.Status.Phase == corev1.VolumeReleased && (pvc == nil || replaced || terminatingClaim)
-	if !liveBinding && !released && !(pv.Status.Phase == corev1.VolumeBound && terminatingClaim) {
+	terminatingBound := pv.Status.Phase == corev1.VolumeBound && terminatingClaim
+	if !liveBinding && !released && !terminatingBound {
 		return unavailable(nil)
 	}
 	if replaced {
@@ -103,7 +104,7 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 		return status.Error(codes.FailedPrecondition, "replacement destination release is blocked by recovery controls")
 	}
 	inUse := nodeReportsVolumeInUse(node, s.driver.name, volume)
-	waiting, err := s.replacementDestinationConsumers(ctx, claim, pvc, replaced, liveBinding, node, attachment, inUse)
+	waiting, err := s.replacementDestinationConsumers(ctx, claim, pvc, replaced, liveBinding, node, inUse)
 	if err != nil {
 		return unavailable(err)
 	}
@@ -120,9 +121,6 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 	}
 	if err := verifier.VerifyReplacementDestinationAbsent(ctx, volume, nodeName, imageID, vmID, sourceVMID); err != nil {
 		return unavailable(err)
-	}
-	if err := s.checkReplacementMaintenance(ctx); err != nil {
-		return err
 	}
 	target := opennebula.HostArtifactAttachmentTarget{NodeName: nodeName, VMID: vmID, ImageID: imageID, DiskID: -1}
 	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, replaced); err != nil {
@@ -141,7 +139,7 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 		!current.CreationTimestamp.Equal(&node.CreationTimestamp) || nodeReportsVolumeInUse(current, s.driver.name, volume) != inUse {
 		return unavailable(err)
 	}
-	finalWaiting, err := s.replacementDestinationConsumers(ctx, claim, pvc, replaced, liveBinding, current, attachment, inUse)
+	finalWaiting, err := s.replacementDestinationConsumers(ctx, claim, pvc, replaced, liveBinding, current, inUse)
 	if err != nil || !maps.Equal(waiting, finalWaiting) {
 		return unavailable(err)
 	}
@@ -149,7 +147,7 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 }
 
 func (s *ControllerServer) replacementDestinationConsumers(ctx context.Context, claim *corev1.ObjectReference, pvc *corev1.PersistentVolumeClaim,
-	replaced, liveBinding bool, node *corev1.Node, attachment detachAttachmentAuthority, inUse bool,
+	replaced, liveBinding bool, node *corev1.Node, inUse bool,
 ) (map[types.UID]string, error) {
 	pods, err := s.driver.kubeRuntime.client.CoreV1().Pods(claim.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -165,7 +163,7 @@ func (s *ControllerServer) replacementDestinationConsumers(ctx context.Context, 
 		if !usesClaim || terminalPodMayBeReleased(pod) || (pod.Spec.NodeName != "" && pod.Spec.NodeName != node.Name) {
 			continue
 		}
-		if !liveBinding || !replacementPodWaitingOnNode(pod, node) || !pod.CreationTimestamp.After(attachment.created) ||
+		if !liveBinding || !replacementPodWaitingOnNode(pod, node) ||
 			pod.CreationTimestamp.After(time.Now()) || (inUse && pod.Status.StartTime == nil) {
 			return nil, fmt.Errorf("destination consumer may already be using the volume")
 		}

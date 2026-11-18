@@ -8,8 +8,6 @@ import (
 	"strings"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -19,27 +17,6 @@ import (
 func nodeReportsVolumeInUse(node *corev1.Node, driver, volume string) bool {
 	name := corev1.UniqueVolumeName(fmt.Sprintf("kubernetes.io/csi/%s^%s", driver, volume))
 	return slices.Contains(node.Status.VolumesInUse, name)
-}
-
-func (s *ControllerServer) checkReplacementMaintenance(ctx context.Context) error {
-	manager := s.driver.maintenanceMode
-	if manager == nil {
-		return nil
-	}
-	cm, err := manager.runtime.GetConfigMap(ctx, manager.namespace, hotplugStateConfigMapName)
-	if err != nil && !apierrors.IsNotFound(err) {
-		return attachmentEvidenceUnavailable("replacement maintenance state is unreadable", err)
-	}
-	if manager.Active() {
-		return status.Error(codes.Unavailable, "replacement attachment is blocked by maintenance")
-	}
-	if err == nil {
-		active, _ := maintenanceModeActive(cm.Data)
-		if active {
-			return status.Error(codes.Unavailable, "replacement attachment is blocked by maintenance")
-		}
-	}
-	return ctx.Err()
 }
 
 func (s *ControllerServer) checkReplacedNodeStaleAttachment(ctx context.Context, volume, nodeName string, imageID, vmID int, history VolumeHistoryRecord, expected *storagev1.VolumeAttachment) (bool, error) {
@@ -148,9 +125,6 @@ func (s *ControllerServer) checkReplacedNodeStaleAttachment(ctx context.Context,
 	protection, err := s.localRWOProtectionProjection(ctx, volume, nodeName, runtimeCtx, false, true)
 	if err != nil || protection.Invalid || protection.Protected {
 		return deny(err)
-	}
-	if err := s.checkReplacementMaintenance(ctx); err != nil {
-		return true, err
 	}
 	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, false); err != nil {
 		return true, err

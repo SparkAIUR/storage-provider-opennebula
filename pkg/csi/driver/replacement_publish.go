@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
@@ -24,6 +25,7 @@ import (
 const (
 	replacementAttachPrepared = "prepared"
 	replacementAttachArmed    = "dispatch-possible"
+	replacementDetachAccepted = "detach-accepted"
 	replacementAttachDetached = "detach-completed"
 )
 
@@ -33,6 +35,11 @@ type replacementDetachCompletion struct {
 	DiskID string `json:"diskID"`
 	Target string `json:"target"`
 	Serial string `json:"serial"`
+}
+
+type replacementDetachAcceptance struct {
+	replacementDetachCompletion
+	VMName string `json:"vmName"`
 }
 
 type replacementAttachAttempt struct {
@@ -53,6 +60,7 @@ type replacementAttachAttempt struct {
 	VMID              int                         `json:"vmID"`
 	OriginalVMID      int                         `json:"originalVMID,omitempty"`
 	OriginalVMName    string                      `json:"originalVMName,omitempty"`
+	DetachAcceptance  replacementDetachAcceptance `json:"detachAcceptance,omitzero"`
 	DetachCompletion  replacementDetachCompletion `json:"detachCompletion,omitzero"`
 }
 
@@ -83,6 +91,10 @@ func (attempt replacementAttachAttempt) dispatchPossible() bool {
 	return attempt.Version == 2 && attempt.Phase == replacementAttachArmed
 }
 
+func (attempt replacementAttachAttempt) detachAccepted() bool {
+	return attempt.Version == 2 && attempt.Phase == replacementDetachAccepted
+}
+
 func (attempt replacementAttachAttempt) detached() bool {
 	return attempt.Version == 2 && attempt.Phase == replacementAttachDetached
 }
@@ -95,11 +107,19 @@ func (attempt replacementAttachAttempt) matchesHistory(history VolumeHistoryReco
 		}
 		originalVM = attempt.OriginalVMID
 	}
-	completion := attempt.DetachCompletion
-	diskID, diskErr := strconv.Atoi(completion.DiskID)
-	validPhase := (attempt.prepared() || attempt.dispatchPossible()) && completion == (replacementDetachCompletion{}) ||
-		attempt.detached() && completion.VAName == attempt.VAName && completion.VAUID != "" && diskErr == nil && diskID >= 0 &&
-			completion.Target != "" && completion.Serial == fmt.Sprintf("onecsi-%d", attempt.ImageID)
+	acceptance, completion := attempt.DetachAcceptance, attempt.DetachCompletion
+	validPhase := false
+	switch {
+	case attempt.prepared(), attempt.dispatchPossible():
+		validPhase = acceptance == (replacementDetachAcceptance{}) && completion == (replacementDetachCompletion{})
+	case attempt.detachAccepted():
+		validPhase = completion == (replacementDetachCompletion{}) && strings.TrimSpace(acceptance.VMName) != "" &&
+			((acceptance.VAName == "" && acceptance.VAUID == "") || (acceptance.VAName == attempt.VAName && acceptance.VAUID != "")) &&
+			acceptance.validDisk(attempt.ImageID)
+	case attempt.detached():
+		validPhase = acceptance == (replacementDetachAcceptance{}) && completion.VAName == attempt.VAName &&
+			completion.VAUID != "" && completion.validDisk(attempt.ImageID)
+	}
 	validVA := attempt.VAName != "" && attempt.VAUID != ""
 	token, err := hex.DecodeString(attempt.ID)
 	return err == nil && len(token) == 32 && validPhase && validVA && attempt.PVUID != "" && attempt.PVCUID != "" &&
@@ -109,6 +129,11 @@ func (attempt replacementAttachAttempt) matchesHistory(history VolumeHistoryReco
 		attempt.ImageID > 0 && attempt.ImageID == history.LastSuccessfulImageID &&
 		attempt.VMID > 0 && originalVM == history.LastSuccessfulOpenNebulaVMID &&
 		attempt.HistoryGeneration == replacementHistoryGeneration(history) && cephHistoryHasObservedAuthority(history)
+}
+
+func (proof replacementDetachCompletion) validDisk(imageID int) bool {
+	diskID, err := strconv.Atoi(proof.DiskID)
+	return err == nil && diskID >= 0 && strings.TrimSpace(proof.Target) != "" && proof.Serial == fmt.Sprintf("onecsi-%d", imageID)
 }
 
 func (s *ControllerServer) retireCompletedReplacement(ctx context.Context, history VolumeHistoryRecord) (bool, error) {
@@ -347,7 +372,13 @@ func (s *ControllerServer) inspectReplacementDisk(ctx context.Context, attempt r
 	if !ok {
 		return nil, attachmentEvidenceUnavailable("replacement Ceph attach inspection is unavailable", nil)
 	}
-	disk, err := inspector.InspectReplacementAttach(ctx, attempt.VolumeID, attempt.Node, attempt.ImageID, attempt.VMID, attempt.ID)
+	var disk *opennebula.VolumeDiskRecord
+	var err error
+	if attempt.detachAccepted() && !attached {
+		err = inspector.VerifyAcceptedReplacementDetach(ctx, attempt.VolumeID, attempt.Node, attempt.ImageID, attempt.VMID, attempt.DetachAcceptance.VMName)
+	} else {
+		disk, err = inspector.InspectReplacementAttach(ctx, attempt.VolumeID, attempt.Node, attempt.ImageID, attempt.VMID, attempt.ID)
+	}
 	if err != nil || (disk != nil) != attached {
 		return nil, attachmentEvidenceUnavailable("replacement Ceph attach outcome is unverified", err)
 	}
@@ -476,10 +507,11 @@ func (s *ControllerServer) checkReplacementAttemptReadback(ctx context.Context, 
 
 func (s *ControllerServer) completeReplacementAttach(ctx context.Context, req *csi.ControllerPublishVolumeRequest, attempt replacementAttachAttempt, node KubernetesNodeIdentity, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision) (successfulAttachmentObservation, error) {
 	var observation successfulAttachmentObservation
-	if !replacementPublishCanWrite(req) || attempt.Driver != s.driver.name || attempt.VolumeID != req.VolumeId || attempt.Node != req.NodeId || attempt.ReplacementUID != node.UID {
+	if !attempt.dispatchPossible() || !replacementPublishCanWrite(req) || attempt.Driver != s.driver.name ||
+		attempt.VolumeID != req.VolumeId || attempt.Node != req.NodeId || attempt.ReplacementUID != node.UID {
 		return observation, attachmentEvidenceUnavailable("replacement Ceph attach scope changed", nil)
 	}
-	if attempt.dispatchPossible() && attempt.VAName != "" && attempt.VAUID != "" {
+	if attempt.VAName != "" && attempt.VAUID != "" {
 		gone, err := s.replacementVAGone(ctx, attempt.VAName, attempt.VAUID)
 		if err != nil {
 			return observation, err

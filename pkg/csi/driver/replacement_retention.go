@@ -150,7 +150,7 @@ func (s *ControllerServer) observeMarkedReplacement(ctx context.Context, attempt
 		}
 		observation.vaName, observation.va, observation.requested = name, va, requested
 		observation.pvVersion, observation.pvcVersion = pv.ResourceVersion, pvc.ResourceVersion
-		return s.checkReplacementMaintenance(ctx)
+		return nil
 	}
 	if _, err := s.verifyReplacementBinding(ctx, history, attempt, disk.DiskID, proveVA); err != nil {
 		return deny(err)
