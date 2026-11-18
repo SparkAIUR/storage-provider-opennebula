@@ -433,9 +433,6 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 				s.driver.metrics.RecordOperation("create_volume", backend, "unavailable", time.Since(started))
 				return nil, err
 			}
-			if s.driver.featureGates.TopologyAccessibility {
-				response.Volume.AccessibleTopology = accessibleTopologyForDatastore(datastore)
-			}
 			setVolumeContextPlacement(response.Volume, datastore.Backend, datastore.ID, datastore.Name, string(selection.Policy))
 			s.driver.metrics.RecordOperation("create_volume", backend, "success", time.Since(started))
 			klog.V(3).InfoS("Volume already exists with the same size",

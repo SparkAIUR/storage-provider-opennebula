@@ -451,7 +451,7 @@ func decodeLocalDeviceReport(key, raw, volumeID string) (LocalDeviceMissingRepor
 		return report, fmt.Errorf("node device report identity is invalid")
 	}
 	if volumeID != "" && identity.VolumeID != volumeID {
-		if keyTargetsVolume {
+		if key == localDeviceReportKey(identity.Node, volumeID) {
 			return report, fmt.Errorf("node device report key is ambiguous")
 		}
 		return report, nil

@@ -652,9 +652,6 @@ func (r *AttachmentReconciler) deleteStaleVolumeAttachment(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	if history.LastSuccessfulImageID > 0 {
-		ctx = opennebula.WithExpectedImageID(ctx, history.LastSuccessfulImageID)
-	}
 	imageID, _, err := r.server.volumeProvider.VolumeExists(ctx, volume)
 	if err != nil || imageID <= 0 {
 		return fmt.Errorf("stale attachment image identity is unknown: %v", err)

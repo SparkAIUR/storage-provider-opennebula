@@ -383,6 +383,62 @@ func TestSupportBundleProjectsLiveMaintenanceAttachmentWithoutWrites(t *testing.
 	require.Equal(t, pv.Annotations, current.Annotations)
 }
 
+func TestSupportBundleProjectsLiveMaintenanceAttachmentConflict(t *testing.T) {
+	ctx := context.Background()
+	const volume = "vol-conflicting-diagnostics"
+	pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	nodeA, nodeB := newReadyNode("node-a", true), newReadyNode("node-b", true)
+	owned := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "owned", UID: "owned-uid"},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: DefaultDriverName, NodeName: nodeA.Name,
+			Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: true},
+	}
+	foreign := owned.DeepCopy()
+	foreign.Name, foreign.UID = "foreign", "foreign-uid"
+	foreign.Spec.Attacher, foreign.Spec.NodeName = "foreign.example", nodeB.Name
+	maintenance := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: hotplugStateConfigMapName, Namespace: namespaceFromServiceAccount()},
+		Data:       map[string]string{maintenanceModeKey: "true"},
+	}
+	objects := []kruntime.Object{pv, pvc, nodeA, nodeB, owned, foreign, maintenance}
+	inventory := newInventoryFakeClient(t,
+		&inventoryv1alpha1.OpenNebulaNode{ObjectMeta: metav1.ObjectMeta{Name: nodeA.Name}},
+		&inventoryv1alpha1.OpenNebulaNode{ObjectMeta: metav1.ObjectMeta{Name: nodeB.Name}},
+		&inventoryv1alpha1.OpenNebulaDatastore{
+			ObjectMeta: metav1.ObjectMeta{Name: "image-datastore"},
+			Status:     inventoryv1alpha1.OpenNebulaDatastoreStatus{ID: 1, Backend: "local"},
+		},
+	)
+	live := newMaintenanceTestDriver(t, objects...)
+	live.kubeRuntime.inventoryClient = inventory
+	require.Equal(t, 1, live.maintenanceMode.prepare(ctx).Conflicts)
+	prepared, err := live.kubeRuntime.client.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, prepared.Annotations[annotationLastAttachedNode])
+
+	client := fake.NewSimpleClientset(objects...)
+	cfg := config.LoadConfiguration()
+	cfg.OverrideVal(config.OpenNebulaCredentialsVar, "")
+	var output bytes.Buffer
+	require.NoError(t, writeSupportBundle(ctx, cfg, client, inventory, &output))
+	var bundle SupportBundle
+	require.NoError(t, json.Unmarshal(output.Bytes(), &bundle))
+	require.Len(t, bundle.VolumeAttachments, 2)
+	require.Equal(t, prepared.Annotations[annotationLastAttachedNode], bundle.VolumeHistory[volume].LastSuccessfulNodeName)
+	require.Empty(t, bundle.LastNodeProtection[volume].RequiredNode)
+	censuses := 0
+	for _, action := range client.Actions() {
+		require.Contains(t, []string{"get", "list"}, action.GetVerb())
+		if action.Matches("list", "volumeattachments") {
+			censuses++
+		}
+	}
+	require.Equal(t, 1, censuses)
+}
+
 func TestSupportBundleReturnsAttachmentListFailure(t *testing.T) {
 	modes := []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
 	pv, pvc := newLocalPVAndPVC("vol-active", modes, nil)

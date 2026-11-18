@@ -24,7 +24,17 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 	if strings.TrimSpace(volume) == "" || strings.TrimSpace(node) == "" {
 		return deny("volume and node are required")
 	}
-	metadata, err := p.InspectVolumeAttachment(ctx, volume, node)
+	imageID, err := p.lookupImageID(ctx, volume)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if err != nil {
+		return deny(fmt.Sprintf("live image lookup failed: %v", err))
+	}
+	if expected, pinned := ctx.Value(expectedImageIdentity{}).(int); pinned && expected != imageID {
+		return deny("live image identity differs from the pinned image")
+	}
+	metadata, err := p.InspectVolumeAttachment(WithExpectedImageID(ctx, imageID), volume, node)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
 	}

@@ -51,6 +51,8 @@ type nodeAttachmentProtocol struct {
 	claimNew          bool
 	ceph              bool
 	imageName         string
+	duplicateImage    bool
+	imageDatastoreID  int
 	diskTarget        string
 	ownerCount        int
 	ready             bool
@@ -126,7 +128,11 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 			if state.ownerCount > 0 {
 				count = state.ownerCount
 			}
-			return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>%s</NAME><STATE>%d</STATE><SIZE>128</SIZE><DATASTORE_ID>100</DATASTORE_ID><SOURCE>/fixture/disk</SOURCE><PERSISTENT>1</PERSISTENT><FORMAT>raw</FORMAT><RUNNING_VMS>%d</RUNNING_VMS><VMS>%s</VMS><TEMPLATE><PERSISTENT_TYPE>SHAREABLE</PERSISTENT_TYPE>%s</TEMPLATE></IMAGE>`, firstNonEmpty(state.imageName, "volume-test"), imageState, count, ids, tag)
+			datastoreID := state.imageDatastoreID
+			if datastoreID == 0 {
+				datastoreID = 100
+			}
+			return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>%s</NAME><STATE>%d</STATE><SIZE>128</SIZE><DATASTORE_ID>%d</DATASTORE_ID><SOURCE>/fixture/disk</SOURCE><PERSISTENT>1</PERSISTENT><FORMAT>raw</FORMAT><RUNNING_VMS>%d</RUNNING_VMS><VMS>%s</VMS><TEMPLATE><PERSISTENT_TYPE>SHAREABLE</PERSISTENT_TYPE>%s</TEMPLATE></IMAGE>`, firstNonEmpty(state.imageName, "volume-test"), imageState, datastoreID, count, ids, tag)
 		}
 		ok, body, code := 1, "", 0
 		if call.Method == state.failMethod {
@@ -134,7 +140,11 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 		} else {
 			switch call.Method {
 			case "one.imagepool.info":
-				body = "<IMAGE_POOL>" + imageXML() + "</IMAGE_POOL>"
+				body = "<IMAGE_POOL>" + imageXML()
+				if state.duplicateImage {
+					body += fmt.Sprintf("<IMAGE><ID>8</ID><NAME>%s</NAME></IMAGE>", firstNonEmpty(state.imageName, "volume-test"))
+				}
+				body += "</IMAGE_POOL>"
 			case "one.image.info":
 				body = imageXML()
 			case "one.vmpool.info":
@@ -148,7 +158,7 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 			case "one.datastorepool.info":
 				body = `<DATASTORE_POOL><DATASTORE><ID>100</ID><NAME>images</NAME><TYPE>IMAGE</TYPE><DS_MAD>fs</DS_MAD><TM_MAD>ssh</TM_MAD><STATE>0</STATE><TOTAL_MB>20000</TOTAL_MB><FREE_MB>10000</FREE_MB></DATASTORE><DATASTORE><ID>200</ID><NAME>system</NAME><TYPE>SYSTEM</TYPE><TM_MAD>ssh</TM_MAD><STATE>0</STATE></DATASTORE></DATASTORE_POOL>`
 				if state.ceph {
-					const rbdTemplate = `<TEMPLATE><DISK_TYPE>RBD</DISK_TYPE><POOL_NAME>fixture</POOL_NAME><CEPH_HOST>mon.example.invalid</CEPH_HOST><CEPH_USER>csi</CEPH_USER><CEPH_SECRET>fixture</CEPH_SECRET><BRIDGE_LIST>bridge.example.invalid</BRIDGE_LIST></TEMPLATE>`
+					const rbdTemplate = `<TEMPLATE><DISK_TYPE>RBD</DISK_TYPE><COMPATIBLE_SYS_DS>200</COMPATIBLE_SYS_DS><POOL_NAME>fixture</POOL_NAME><CEPH_HOST>mon.example.invalid</CEPH_HOST><CEPH_USER>csi</CEPH_USER><CEPH_SECRET>fixture</CEPH_SECRET><BRIDGE_LIST>bridge.example.invalid</BRIDGE_LIST></TEMPLATE>`
 					body = strings.NewReplacer("<DS_MAD>fs</DS_MAD>", "<DS_MAD>ceph</DS_MAD>", "<TM_MAD>ssh</TM_MAD>", "<TM_MAD>ceph</TM_MAD>",
 						"</DATASTORE>", rbdTemplate+"</DATASTORE>").Replace(body)
 				}
@@ -1893,8 +1903,15 @@ func (p *publishRestoreProbe) RestoreVolumeCapacity(ctx context.Context, volume 
 }
 
 func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
-	for _, tc := range []struct{ queued, stage bool }{{false, true}, {true, true}, {false, false}, {true, false}} {
-		t.Run(fmt.Sprintf("queued=%t/stage=%t", tc.queued, tc.stage), func(t *testing.T) {
+	for _, tc := range []struct {
+		queued, stage bool
+		drift         string
+	}{
+		{false, true, ""}, {true, true, ""}, {false, false, ""}, {true, false, ""},
+		{false, false, "duplicate-image"}, {true, false, "duplicate-image"},
+		{false, false, "system-datastore"}, {true, false, "system-datastore"},
+	} {
+		t.Run(fmt.Sprintf("queued=%t/stage=%t/drift=%s", tc.queued, tc.stage, tc.drift), func(t *testing.T) {
 			ctx := context.Background()
 			const volume = "volume-test"
 			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
@@ -2016,7 +2033,27 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 			}
 			_, err = kube.StorageV1().VolumeAttachments().Create(ctx, va, metav1.CreateOptions{})
 			require.NoError(t, err)
+			wire.mu.Lock()
+			switch tc.drift {
+			case "duplicate-image":
+				wire.duplicateImage = true
+			case "system-datastore":
+				wire.imageDatastoreID = 200
+			}
+			wire.mu.Unlock()
 			response, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+			if tc.drift != "" {
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.Nil(t, response)
+				after, err := server.readAttachmentHistory(ctx, volume)
+				require.NoError(t, err)
+				require.Equal(t, history, after)
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				require.Empty(t, wire.mutations)
+				require.Equal(t, map[int]int{41: 128}, wire.disks)
+				return
+			}
 			require.NoError(t, err)
 			require.NotNil(t, response)
 			retainedHistory, err := server.readAttachmentHistory(ctx, volume)
@@ -2299,6 +2336,7 @@ func TestCreateVolumeRetryReturnsObservedBackend(t *testing.T) {
 	ctx := context.Background()
 	driver := newStickyTestDriver(t)
 	driver.PluginConfig.OverrideVal(config.AllowedDatastoreTypesVar, "ceph")
+	driver.featureGates.TopologyAccessibility = true
 	provider, wire := nodeAttachmentProvider(t)
 	wire.mu.Lock()
 	wire.ceph, wire.version, wire.ready = true, "7.4.0", true
@@ -2317,6 +2355,7 @@ func TestCreateVolumeRetryReturnsObservedBackend(t *testing.T) {
 	require.Equal(t, "ceph", reply.Volume.VolumeContext[annotationBackend])
 	require.Equal(t, "100", reply.Volume.VolumeContext[annotationDatastoreID])
 	require.Equal(t, "images", reply.Volume.VolumeContext[annotationDatastoreName])
+	require.Empty(t, reply.Volume.AccessibleTopology)
 	require.Equal(t, "test-claim-uid", reply.Volume.VolumeContext[volumeContextUUID])
 	wire.mu.Lock()
 	defer wire.mu.Unlock()
@@ -2331,6 +2370,8 @@ func TestLegacyDiskCleanupVerifiesUndeclaredBackend(t *testing.T) {
 			{"foreground", "verified"}, {"orphan", "verified"}, {"stale", "verified"},
 			{"foreground", "unavailable"}, {"foreground", "contradictory"},
 			{"orphan", "unavailable"}, {"stale", "unavailable"},
+			{"foreground", "system-datastore"}, {"foreground", "declared-system"}, {"orphan", "system-datastore"}, {"stale", "system-datastore"},
+			{"stale", "duplicate-image"},
 		} {
 			t.Run(fmt.Sprintf("queued=%t/%s/%s", queued, tc.action, tc.evidence), func(t *testing.T) {
 				ctx := context.Background()
@@ -2343,6 +2384,9 @@ func TestLegacyDiskCleanupVerifiesUndeclaredBackend(t *testing.T) {
 					pv.Annotations[annotationBackend] = "ceph"
 					pv.Spec.CSI.VolumeAttributes = map[string]string{annotationBackend: "local"}
 				}
+				if tc.evidence == "declared-system" {
+					pv.Annotations[annotationBackend] = "ceph"
+				}
 				node := newReadyNode("node-old", true)
 				objects := []kruntime.Object{pv, pvc, node}
 				const attachmentName = "stale-undeclared-attachment"
@@ -2354,14 +2398,30 @@ func TestLegacyDiskCleanupVerifiesUndeclaredBackend(t *testing.T) {
 					})
 				}
 				driver := newStickyTestDriver(t, objects...)
+				if tc.action == "stale" {
+					_, err := driver.volumeHistory.Upsert(ctx, volume, func(history *VolumeHistoryRecord) {
+						history.Backend = "ceph"
+						history.LastSuccessfulImageID = 7
+						history.LastSuccessfulOpenNebulaVMID = 41
+						history.LastSuccessfulNodeName = node.Name
+						history.LastSuccessfulNodeUID = string(node.UID)
+						history.LastSuccessfulPublishTime = time.Now().Add(-time.Hour)
+					})
+					require.NoError(t, err)
+				}
 				provider, wire := nodeAttachmentProvider(t)
 				wire.mu.Lock()
 				wire.ceph, wire.version = true, "7.4.0"
 				if tc.action == "stale" {
 					delete(wire.disks, 41)
 				}
-				if tc.evidence == "unavailable" {
+				switch tc.evidence {
+				case "unavailable":
 					wire.failMethod = "one.datastorepool.info"
+				case "system-datastore", "declared-system":
+					wire.imageDatastoreID = 200
+				case "duplicate-image":
+					wire.duplicateImage = true
 				}
 				wire.mu.Unlock()
 				server := NewControllerServer(driver, provider, nil)
@@ -2373,11 +2433,15 @@ func TestLegacyDiskCleanupVerifiesUndeclaredBackend(t *testing.T) {
 				if tc.action == "foreground" {
 					client := reviewControllerClient(t, server)
 					reply, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
-					if tc.evidence == "verified" {
+					switch tc.evidence {
+					case "verified":
 						require.NoError(t, err)
 						require.NotNil(t, reply)
-					} else {
-						require.Equal(t, codes.Unavailable, status.Code(err))
+					case "declared-system":
+						require.Equal(t, codes.FailedPrecondition, status.Code(err), "%v", err)
+						require.Nil(t, reply)
+					default:
+						require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
 						require.Nil(t, reply)
 					}
 				} else {

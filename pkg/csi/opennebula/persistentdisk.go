@@ -2080,11 +2080,24 @@ func (p *PersistentDiskVolumeProvider) attachmentDatastore(ctx context.Context, 
 	if err != nil {
 		return Datastore{}, fmt.Errorf("cannot inspect attachment datastore %d: %w", datastoreID, err)
 	}
-	datastore, err := findDatastoreByID(pool.Datastores, datastoreID)
-	if err != nil {
-		return Datastore{}, err
+	matchesID := func(datastore datastoreSchema.Datastore) bool { return datastore.ID == datastoreID }
+	match := slices.IndexFunc(pool.Datastores, matchesID)
+	if match < 0 {
+		return Datastore{}, &datastoreConfigError{message: fmt.Sprintf("datastore %d was not found", datastoreID)}
 	}
+	if slices.ContainsFunc(pool.Datastores[match+1:], matchesID) {
+		return Datastore{}, &datastoreConfigError{message: fmt.Sprintf("datastore %d is ambiguous", datastoreID)}
+	}
+	datastore := pool.Datastores[match]
 	observed := datastoreFromSchema(datastore)
+	if observed.Category != string(datastoreSchema.Image) {
+		return Datastore{}, &datastoreConfigError{message: fmt.Sprintf("datastore %d is not an image datastore", datastoreID)}
+	}
+	for _, category := range []string{strings.TrimSpace(datastore.Type), getDatastoreAttribute(datastore, "TYPE")} {
+		if category != "" && category != "-" && normalizeDatastoreCategory(datastoreSchema.Datastore{Type: category}) != string(datastoreSchema.Image) {
+			return Datastore{}, &datastoreConfigError{message: fmt.Sprintf("datastore %d has conflicting image datastore categories", datastoreID)}
+		}
+	}
 	switch observed.Backend {
 	case "ceph", "cephfs", "local", "nfs":
 		return observed, nil

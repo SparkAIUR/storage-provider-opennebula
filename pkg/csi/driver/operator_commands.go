@@ -1263,13 +1263,7 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 	var attached map[string]string
 	var conflicts map[string]struct{}
 	if driver.maintenanceMode.Active() {
-		var owned []storagev1.VolumeAttachment
-		for _, va := range vaSnapshot.Items {
-			if va.Spec.Attacher == DefaultDriverName {
-				owned = append(owned, va)
-			}
-		}
-		attached, conflicts = maintenanceAttachedNodesByPV(owned)
+		attached, conflicts = maintenanceAttachedNodesByPV(vaSnapshot.Items)
 	}
 	demandSnapshot := map[string]VolumeDesiredState{}
 	protectionSnapshot := map[string]LocalRWOProtectionDecision{}
