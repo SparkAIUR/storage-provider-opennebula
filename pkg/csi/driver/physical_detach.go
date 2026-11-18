@@ -152,6 +152,9 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if history.LastSuccessfulNodeName == nodeName && history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != identity.vmID {
 		return status.Error(codes.Unavailable, "detach VM differs from observed history")
 	}
+	if history.LastSuccessfulNodeName == nodeName && history.LastSuccessfulDiskID != nil && identity.diskID >= 0 && *history.LastSuccessfulDiskID != identity.diskID {
+		return status.Error(codes.Unavailable, "detach disk slot differs from observed history")
+	}
 	control := resolvedRecoveryControlState(volume, runtimeCtx, VolumeRecoveryControlState{})
 	if control.Invalid || control.Active() {
 		return status.Error(codes.FailedPrecondition, "physical detach is blocked by recovery controls")

@@ -97,7 +97,7 @@ func TestControllerUnpublishCephObservedHistoryAuthority(t *testing.T) {
 				case "history-vm":
 					record.LastSuccessfulOpenNebulaVMID = -1
 				case "history-disk":
-					record.LastSuccessfulDiskID = -1
+					record.LastSuccessfulDiskID = new(-1)
 				case "va-backend":
 					f.va.Status.AttachmentMetadata[annotationBackend] = "local"
 					f.syncObjects(t)

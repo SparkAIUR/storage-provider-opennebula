@@ -160,7 +160,7 @@ func validateCephRetentionDisk(req *csi.ControllerUnpublishVolumeRequest, imageI
 	if history.LastSuccessfulImageID != disk.ImageID || history.LastSuccessfulNodeName != req.NodeId || history.LastSuccessfulNodeUID != string(authority.NodeUID) {
 		return cephRetentionUnavailable("observed volume history does not match image and node identity", nil)
 	}
-	if (history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != disk.NodeID) || (history.LastSuccessfulDiskID > 0 && history.LastSuccessfulDiskID != disk.DiskID) || (history.LastSuccessfulTarget != "" && history.LastSuccessfulTarget != disk.Target) || (history.LastSuccessfulDeviceSerial != "" && history.LastSuccessfulDeviceSerial != disk.DeviceSerial) {
+	if (history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != disk.NodeID) || (history.LastSuccessfulDiskID != nil && *history.LastSuccessfulDiskID != disk.DiskID) || (history.LastSuccessfulTarget != "" && history.LastSuccessfulTarget != disk.Target) || (history.LastSuccessfulDeviceSerial != "" && history.LastSuccessfulDeviceSerial != disk.DeviceSerial) {
 		return cephRetentionUnavailable("current device identity contradicts observed history", nil)
 	}
 	if disk.DeviceSerial != fmt.Sprintf("onecsi-%d", disk.ImageID) {
@@ -496,7 +496,8 @@ func decodeAttachmentHistory(raw, volumeID string) (VolumeHistoryRecord, error) 
 		return VolumeHistoryRecord{}, err
 	}
 	if history.VolumeID != volumeID || (history.Version != stateObjectVersion && (history.Version != 0 || isCephBackend(history.Backend))) ||
-		history.LastSuccessfulImageID < 0 || history.LastSuccessfulOpenNebulaVMID < 0 || history.LastSuccessfulDiskID < 0 {
+		history.LastSuccessfulImageID < 0 || history.LastSuccessfulOpenNebulaVMID < 0 ||
+		(history.LastSuccessfulDiskID != nil && *history.LastSuccessfulDiskID < 0) {
 		return VolumeHistoryRecord{}, fmt.Errorf("volume history identity or schema is invalid")
 	}
 	return history, nil

@@ -85,7 +85,7 @@ type VolumeHistoryRecord struct {
 	LastSuccessfulNodeUID        string             `json:"lastSuccessfulNodeUID,omitempty"`
 	LastSuccessfulOpenNebulaVMID int                `json:"lastSuccessfulOpenNebulaVMID,omitempty"`
 	LastSuccessfulImageID        int                `json:"lastSuccessfulImageID,omitempty"`
-	LastSuccessfulDiskID         int                `json:"lastSuccessfulDiskID,omitempty"`
+	LastSuccessfulDiskID         *int               `json:"lastSuccessfulDiskID,omitempty"`
 	LastSuccessfulTarget         string             `json:"lastSuccessfulTarget,omitempty"`
 	LastSuccessfulDeviceSerial   string             `json:"lastSuccessfulDeviceSerial,omitempty"`
 	LastSuccessfulPublishTime    time.Time          `json:"lastSuccessfulPublishTime,omitempty"`
@@ -180,6 +180,13 @@ func (m *VolumeHistoryManager) Get(volumeID string) (VolumeHistoryRecord, bool) 
 }
 
 func (m *VolumeHistoryManager) Upsert(ctx context.Context, volumeID string, mutate func(*VolumeHistoryRecord)) (VolumeHistoryRecord, error) {
+	return m.upsert(ctx, volumeID, func(state *VolumeHistoryRecord) error {
+		mutate(state)
+		return nil
+	})
+}
+
+func (m *VolumeHistoryManager) upsert(ctx context.Context, volumeID string, mutate func(*VolumeHistoryRecord) error) (VolumeHistoryRecord, error) {
 	if m == nil || strings.TrimSpace(volumeID) == "" {
 		return VolumeHistoryRecord{}, nil
 	}
@@ -189,16 +196,21 @@ func (m *VolumeHistoryManager) Upsert(ctx context.Context, volumeID string, muta
 		return VolumeHistoryRecord{}, err
 	}
 	defer release()
-	apply := func(state *VolumeHistoryRecord) {
+	apply := func(state *VolumeHistoryRecord) error {
 		state.VolumeID = volumeID
 		state.Version = stateObjectVersion
-		mutate(state)
+		if err := mutate(state); err != nil {
+			return err
+		}
 		state.VolumeID = volumeID
 		normalizeVolumeHistoryRecord(state)
+		return nil
 	}
 	state, _ := m.Get(volumeID)
 	if m.runtime == nil || !m.runtime.enabled {
-		apply(&state)
+		if err := apply(&state); err != nil {
+			return state, err
+		}
 		m.mu.Lock()
 		m.entries[volumeID] = state
 		m.mu.Unlock()
@@ -220,7 +232,9 @@ func (m *VolumeHistoryManager) Upsert(ctx context.Context, volumeID string, muta
 				return err
 			}
 		}
-		apply(&state)
+		if err := apply(&state); err != nil {
+			return err
+		}
 		payload, err := json.Marshal(state)
 		if err != nil {
 			return err

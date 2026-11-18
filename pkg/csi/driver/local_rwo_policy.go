@@ -477,14 +477,26 @@ func (ns *NodeServer) clearObservedStageRepair(ctx context.Context, volumeID str
 type successfulAttachmentObservation struct {
 	nodeName, nodeUID, target, serial string
 	vmID, imageID, diskID             int
+	newAttachment                     bool
+}
+
+var errRetainedAttachmentNodeChanged = errors.New("current Kubernetes Node UID does not match the retained attachment")
+
+func (state VolumeHistoryRecord) checkAttachmentNode(observation successfulAttachmentObservation) error {
+	if !observation.newAttachment && !state.Bootstrapped && volumeHistoryHasObservedSuccess(state) &&
+		state.LastSuccessfulNodeName == observation.nodeName && state.LastSuccessfulNodeUID != "" &&
+		state.LastSuccessfulNodeUID != observation.nodeUID {
+		return errRetainedAttachmentNodeChanged
+	}
+	return nil
 }
 
 func (state *VolumeHistoryRecord) observeSuccessfulAttachment(observation successfulAttachmentObservation) {
-	nodeChanged := (observation.nodeName != "" && observation.nodeName != state.LastSuccessfulNodeName) ||
+	nodeChanged := observation.newAttachment || (observation.nodeName != "" && observation.nodeName != state.LastSuccessfulNodeName) ||
 		(observation.nodeUID != "" && state.LastSuccessfulNodeUID != "" && observation.nodeUID != state.LastSuccessfulNodeUID)
 	vmChanged := observation.vmID > 0 && state.LastSuccessfulOpenNebulaVMID > 0 && observation.vmID != state.LastSuccessfulOpenNebulaVMID
 	imageChanged := observation.imageID > 0 && state.LastSuccessfulImageID > 0 && observation.imageID != state.LastSuccessfulImageID
-	diskChanged := (observation.diskID >= 0 && state.LastSuccessfulDiskID > 0 && observation.diskID != state.LastSuccessfulDiskID) ||
+	diskChanged := (observation.diskID >= 0 && state.LastSuccessfulDiskID != nil && observation.diskID != *state.LastSuccessfulDiskID) ||
 		(observation.target != "" && state.LastSuccessfulTarget != "" && observation.target != state.LastSuccessfulTarget) ||
 		(observation.serial != "" && state.LastSuccessfulDeviceSerial != "" && observation.serial != state.LastSuccessfulDeviceSerial)
 	if nodeChanged || vmChanged {
@@ -494,7 +506,7 @@ func (state *VolumeHistoryRecord) observeSuccessfulAttachment(observation succes
 		state.LastSuccessfulOpenNebulaVMID = 0
 	}
 	if nodeChanged || vmChanged || imageChanged || diskChanged {
-		state.LastSuccessfulDiskID = 0
+		state.LastSuccessfulDiskID = nil
 		state.LastSuccessfulTarget = ""
 		state.LastSuccessfulDeviceSerial = ""
 		state.LastHealthyIdentity = nil
@@ -508,7 +520,7 @@ func (state *VolumeHistoryRecord) observeSuccessfulAttachment(observation succes
 		state.LastSuccessfulImageID = observation.imageID
 	}
 	if observation.diskID >= 0 {
-		state.LastSuccessfulDiskID = observation.diskID
+		state.LastSuccessfulDiskID = new(observation.diskID)
 	}
 	state.LastSuccessfulTarget = firstNonEmpty(observation.target, state.LastSuccessfulTarget)
 	state.LastSuccessfulDeviceSerial = firstNonEmpty(observation.serial, state.LastSuccessfulDeviceSerial)
@@ -525,10 +537,11 @@ func (s *ControllerServer) publishNodeIdentity(ctx context.Context, nodeName str
 	return identity, nil
 }
 
-func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target, adoptedSerial string, admittedNode KubernetesNodeIdentity) (successfulAttachmentObservation, error) {
+func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target, adoptedSerial string, admittedNode KubernetesNodeIdentity, newAttachment bool) (successfulAttachmentObservation, error) {
 	observation := successfulAttachmentObservation{
 		nodeName: strings.TrimSpace(requestedNode), target: strings.TrimSpace(target),
 		imageID: imageID, vmID: vmID, diskID: -1, serial: firstNonEmpty(adoptedSerial, fmt.Sprintf("onecsi-%d", imageID)),
+		newAttachment: newAttachment,
 	}
 	if observation.target == "" || imageID <= 0 || vmID <= 0 {
 		return observation, attachmentEvidenceUnavailable("publish attachment identity is incomplete", nil)
@@ -605,16 +618,27 @@ func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volume
 		return observation, attachmentEvidenceUnavailable("publish Kubernetes Node identity changed", nil)
 	}
 	observation.nodeUID = admittedNode.UID
+	if !newAttachment && s.driver.volumeHistory != nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
+		history, err := s.readAttachmentHistory(ctx, volumeID)
+		if err != nil {
+			return observation, attachmentEvidenceUnavailable("publish attachment history is unverified", err)
+		}
+		if err := history.checkAttachmentNode(observation); err != nil {
+			return observation, status.Error(codes.Unavailable, err.Error())
+		}
+	}
 	return observation, ctx.Err()
 }
 
-func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID string, observation successfulAttachmentObservation, sourceContext map[string]string, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision) {
+func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID string, observation successfulAttachmentObservation, sourceContext map[string]string, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision) error {
 	if s == nil || s.driver == nil || s.driver.volumeHistory == nil || strings.TrimSpace(volumeID) == "" {
-		return
+		return nil
 	}
-	observation.diskID = max(0, observation.diskID)
 	now := time.Now().UTC()
-	_, err := s.driver.volumeHistory.Upsert(ctx, volumeID, func(state *VolumeHistoryRecord) {
+	_, err := s.driver.volumeHistory.upsert(ctx, volumeID, func(state *VolumeHistoryRecord) error {
+		if err := state.checkAttachmentNode(observation); err != nil {
+			return err
+		}
 		state.PVName = firstNonEmpty(state.PVName, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVName }), strings.TrimSpace(sourceContext[paramPVName]))
 		state.PVCNamespace = firstNonEmpty(state.PVCNamespace, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVCNamespace }), strings.TrimSpace(sourceContext[paramPVCNamespace]))
 		state.PVCName = firstNonEmpty(state.PVCName, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVCName }), strings.TrimSpace(sourceContext[paramPVCName]))
@@ -635,9 +659,12 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 		state.BootstrappedAt = time.Time{}
 		state.BootstrappedFields = nil
 		state.observeSuccessfulAttachment(observation)
-		state.LastSuccessfulNodeUID = observation.nodeUID
 		state.LastSuccessfulPublishTime = now
+		return nil
 	})
+	if errors.Is(err, errRetainedAttachmentNodeChanged) {
+		return status.Error(codes.Unavailable, err.Error())
+	}
 	if err == nil {
 		s.driver.metrics.RecordVolumeHistory("publish", "persisted")
 		if protection != nil && protection.OverrideUsed && protection.RuntimeContext != nil {
@@ -646,6 +673,7 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 			s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonCrossNodeOverrideUsed, protection.Message)
 		}
 	}
+	return nil
 }
 
 func (s *ControllerServer) recordSafeDetach(ctx context.Context, volumeID, nodeID string) {
@@ -676,7 +704,10 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 		observation.serial = firstNonEmpty(localDiskObservedDeviceSerial(identity), localDiskAssertedDeviceSerial(identity))
 		observation.target = localDiskAssertedDiskTarget(identity)
 	}
-	_, err := ns.Driver.volumeHistory.Upsert(ctx, volumeID, func(state *VolumeHistoryRecord) {
+	_, err := ns.Driver.volumeHistory.upsert(ctx, volumeID, func(state *VolumeHistoryRecord) error {
+		if err := state.checkAttachmentNode(observation); err != nil {
+			return err
+		}
 		state.PVName = firstNonEmpty(state.PVName, strings.TrimSpace(publishContext[paramPVName]))
 		state.PVCNamespace = firstNonEmpty(state.PVCNamespace, strings.TrimSpace(publishContext[paramPVCNamespace]))
 		state.PVCName = firstNonEmpty(state.PVCName, strings.TrimSpace(publishContext[paramPVCName]))
@@ -695,6 +726,7 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 				state.LastSuccessfulImageID = imageID
 			}
 		}
+		return nil
 	})
 	if err == nil {
 		ns.Driver.metrics.RecordVolumeHistory("stage", "persisted")
@@ -784,7 +816,10 @@ func (s *ControllerServer) classifyRepairRequiredLookup(ctx context.Context, vol
 	lastKnownNodeUID := strings.TrimSpace(history.LastSuccessfulNodeUID)
 	lastKnownVMID := history.LastSuccessfulOpenNebulaVMID
 	lastKnownImageID := history.LastSuccessfulImageID
-	lastKnownDiskID := history.LastSuccessfulDiskID
+	lastKnownDiskID := 0
+	if history.LastSuccessfulDiskID != nil {
+		lastKnownDiskID = *history.LastSuccessfulDiskID
+	}
 	lastKnownTarget := strings.TrimSpace(history.LastSuccessfulTarget)
 	lastKnownSerial := strings.TrimSpace(history.LastSuccessfulDeviceSerial)
 	if history.Backend == "" && runtimeCtx != nil {

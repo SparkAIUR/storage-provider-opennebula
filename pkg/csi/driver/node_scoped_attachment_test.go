@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -46,6 +47,7 @@ type nodeAttachmentProtocol struct {
 	extraDiskBefore   string
 	extraDiskByVM     map[int]string
 	poolExtraDisk     string
+	directDiskFields  string
 	marker            int64
 	mutations         []string
 	failMethod        string
@@ -129,6 +131,9 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				}
 				if state.diskTransfer != "" {
 					disk = strings.Replace(disk, "<TM_MAD>ssh</TM_MAD>", "<TM_MAD>"+state.diskTransfer+"</TM_MAD>", 1)
+				}
+				if direct && id == 41 && state.directDiskFields != "" {
+					disk = strings.TrimSuffix(disk, "</DISK>") + state.directDiskFields + "</DISK>"
 				}
 			}
 			if id == 41 && state.replacementDisk {
@@ -1258,6 +1263,56 @@ func TestControllerUnpublishRejectsLateAmbiguousImageName(t *testing.T) {
 	}
 }
 
+func TestControllerUnpublishRejectsConflictingFinalDiskFields(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, tc := range []struct{ name, fields string }{
+			{"resize", "<RESIZE>NO</RESIZE><RESIZE>YES</RESIZE>"},
+			{"image", "<IMAGE_ID>8</IMAGE_ID>"},
+			{"slot", "<DISK_ID>3</DISK_ID>"},
+		} {
+			t.Run(fmt.Sprintf("queued=%t/%s", queued, tc.name), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+				node := newReadyNode("node-old", true)
+				driver := newStickyTestDriver(t, pv, pvc, node)
+				driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+				var protocol *nodeAttachmentProtocol
+				var armed atomic.Bool
+				var reads atomic.Int32
+				provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+					if method == "one.vm.info" && armed.Load() && reads.Add(1) == 2 {
+						protocol.mu.Lock()
+						protocol.directDiskFields = tc.fields
+						protocol.mu.Unlock()
+					}
+				})
+				protocol = wire
+				probe := &detachCensusProbe{PersistentDiskVolumeProvider: provider, beforeDetach: func() { armed.Store(true) }}
+				server := NewControllerServer(driver, probe, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+				}
+				reply, err := reviewControllerClient(t, server).ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.ErrorContains(t, err, "detach disk identity or completed capacity is unverified")
+				require.Nil(t, reply)
+				history, err := server.readAttachmentHistory(ctx, volume)
+				require.NoError(t, err)
+				require.True(t, history.LastSafeDetachTime.IsZero())
+				require.EqualValues(t, 2, reads.Load())
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				require.Equal(t, tc.fields, wire.directDiskFields)
+				require.Zero(t, wire.detachAttempts)
+				require.Empty(t, wire.mutations)
+				require.Contains(t, wire.disks, 41)
+			})
+		}
+	}
+}
+
 func TestForegroundAndStickyDetachPreserveProviderNoOpOutcome(t *testing.T) {
 	for _, action := range []string{"unpublish", "expiry", "expiry-recreated", "transfer"} {
 		t.Run(action, func(t *testing.T) {
@@ -1698,6 +1753,87 @@ func TestControllerPublishPinsAdmittedKubernetesNode(t *testing.T) {
 	}
 }
 
+func TestPublishAndStagePreserveRetainedNodeUIDUntilFreshAttach(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queued=%t", queued), func(t *testing.T) {
+			ctx := context.Background()
+			const volume = "volume-test"
+			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+			node := newReadyNode("node-old", true)
+			driver := newStickyTestDriver(t, pv, pvc, node)
+			driver.nodeID = node.Name
+			driver.featureGates = defaultFeatureGates()
+			driver.PluginConfig.OverrideVal(config.NodeDeviceRescanOnMissEnabledVar, false)
+			driver.PluginConfig.OverrideVal(config.NodeDeviceUdevSettleTimeoutSecondsVar, 0)
+			provider, wire := nodeAttachmentProvider(t)
+			wire.mu.Lock()
+			wire.ceph, wire.disks[41], wire.marker = true, 128, 128*1024*1024
+			wire.mu.Unlock()
+			server := NewControllerServer(driver, provider, nil)
+			if queued {
+				driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+				driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+			}
+			client := reviewControllerClient(t, server)
+			publish := newPublishReq(volume, node.Name)
+			publish.VolumeCapability.GetMount().FsType = "ext4"
+			published, err := client.ControllerPublishVolume(ctx, publish)
+			require.NoError(t, err)
+			before, err := server.readAttachmentHistory(ctx, volume)
+			require.NoError(t, err)
+			require.Equal(t, string(node.UID), before.LastSuccessfulNodeUID)
+
+			nodes := driver.kubeRuntime.client.CoreV1().Nodes()
+			require.NoError(t, nodes.Delete(ctx, node.Name, metav1.DeleteOptions{}))
+			replacement := node.DeepCopy()
+			replacement.UID = "replacement-uid"
+			_, err = nodes.Create(ctx, replacement, metav1.CreateOptions{})
+			require.NoError(t, err)
+
+			reply, err := client.ControllerPublishVolume(ctx, publish)
+			require.Equal(t, codes.Unavailable, status.Code(err))
+			require.ErrorContains(t, err, "does not match the retained attachment")
+			require.Nil(t, reply)
+			afterRetry, err := server.readAttachmentHistory(ctx, volume)
+			require.NoError(t, err)
+			require.Equal(t, before, afterRetry)
+
+			diskPath := withTestDiskPath(t)
+			require.NoError(t, os.WriteFile(filepath.Join(diskPath, "vdb"), []byte("fixture"), 0o600))
+			ns := NewNodeServer(driver, mount.NewSafeFormatAndMount(mount.NewFakeMounter(nil), reviewDeviceSerialFixture(t, func(string) string { return "onecsi-7" })))
+			ns.localDiskSessions = newLocalDiskSessionStore(t.TempDir())
+			stage, err := ns.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
+				VolumeId: volume, StagingTargetPath: t.TempDir(), VolumeCapability: publish.VolumeCapability, PublishContext: published.PublishContext,
+			})
+			require.NoError(t, err)
+			require.NotNil(t, stage)
+			afterStage, err := server.readAttachmentHistory(ctx, volume)
+			require.NoError(t, err)
+			require.Equal(t, before, afterStage)
+
+			wire.mu.Lock()
+			unchangedMutations := append([]string(nil), wire.mutations...)
+			delete(wire.disks, 41)
+			wire.mu.Unlock()
+			require.Empty(t, unchangedMutations)
+			consumer := activePodForPVC("fresh-consumer", pvc.Name, node.Name)
+			_, err = driver.kubeRuntime.client.CoreV1().Pods(consumer.Namespace).Create(ctx, consumer, metav1.CreateOptions{})
+			require.NoError(t, err)
+			fresh, err := client.ControllerPublishVolume(ctx, publish)
+			require.NoError(t, err)
+			require.Equal(t, "onecsi-7", fresh.GetPublishContext()[publishContextDeviceSerial])
+			afterAttach, err := server.readAttachmentHistory(ctx, volume)
+			require.NoError(t, err)
+			require.Equal(t, string(replacement.UID), afterAttach.LastSuccessfulNodeUID)
+			require.Equal(t, new(2), afterAttach.LastSuccessfulDiskID)
+			require.True(t, afterAttach.LastSuccessfulPublishTime.After(before.LastSuccessfulPublishTime))
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			require.Equal(t, []string{"attach:41:false"}, wire.mutations)
+		})
+	}
+}
+
 func TestControllerPublishVerifiesDiskSlot(t *testing.T) {
 	for _, tc := range []struct {
 		name, slot   string
@@ -1737,7 +1873,7 @@ func TestControllerPublishVerifiesDiskSlot(t *testing.T) {
 				require.Equal(t, "vdb", reply.GetPublishContext()["volumeName"])
 				require.Equal(t, "onecsi-7", reply.GetPublishContext()[publishContextDeviceSerial])
 				require.False(t, history.LastSuccessfulPublishTime.IsZero())
-				require.Zero(t, history.LastSuccessfulDiskID)
+				require.Equal(t, new(0), history.LastSuccessfulDiskID)
 			} else {
 				require.Equal(t, codes.Unavailable, status.Code(err))
 				require.Nil(t, reply)
@@ -1775,6 +1911,12 @@ func TestAttachmentInventorySharesDatastorePoolPerPass(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "local", datastore.Backend)
 	require.EqualValues(t, 3, datastoreReads.Load())
+	wire.mu.Lock()
+	wire.extraDiskByVM[42] = strings.Replace(wire.extraDiskByVM[42], "</DISK>", "<RESIZE>NO</RESIZE><RESIZE>YES</RESIZE></DISK>", 1)
+	wire.mu.Unlock()
+	attachments, _, err := provider.ListCurrentAttachments(ctx)
+	require.ErrorIs(t, err, opennebula.ErrConflictingAttachmentEvidence)
+	require.Empty(t, attachments)
 }
 
 func TestProviderDetachPreservesParentCancellationDuringPollAndRetry(t *testing.T) {
@@ -2312,15 +2454,22 @@ func TestUnpublishJoiningStickyExpiryVerifiesOwnCompletion(t *testing.T) {
 }
 
 func TestUnpublishDeniesAbsenceWhenCSISerialIdentifiesTheDisk(t *testing.T) {
-	for _, imageReference := range []string{"", "<IMAGE_ID>8</IMAGE_ID>"} {
-		t.Run(fmt.Sprintf("image-reference=%q", imageReference), func(t *testing.T) {
+	for _, tc := range []struct {
+		name, fields, message string
+		invalidInventory      bool
+	}{
+		{"missing-image-id", "<SERIAL>onecsi-7</SERIAL>", "malformed VM disk image identity", true},
+		{"conflicting-image-id", "<IMAGE_ID>8</IMAGE_ID><SERIAL>onecsi-7</SERIAL>", "CSI disk serial contradicts VM disk image identity", false},
+		{"aliased-serial", "<IMAGE_ID>8</IMAGE_ID><SERIAL>onecsi-8</SERIAL><SERIAL>onecsi-007</SERIAL>", "repeated VM disk field SERIAL", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
 			provider, protocol := nodeAttachmentProvider(t)
 			protocol.mu.Lock()
 			delete(protocol.disks, 41)
-			protocol.extraDiskBefore = "<DISK><DISK_ID>4</DISK_ID><TARGET>vdb</TARGET><SERIAL>onecsi-7</SERIAL>" + imageReference + "</DISK>"
+			protocol.extraDiskBefore = "<DISK><DISK_ID>4</DISK_ID><TARGET>vdb</TARGET>" + tc.fields + "</DISK>"
 			protocol.mu.Unlock()
 
 			client := reviewControllerClient(t, NewControllerServer(driver, provider, nil))
@@ -2328,13 +2477,9 @@ func TestUnpublishDeniesAbsenceWhenCSISerialIdentifiesTheDisk(t *testing.T) {
 			require.Nil(t, reply)
 			require.Equal(t, codes.Unavailable, status.Code(err))
 			_, err = provider.GetVolumeInNode(ctx, 7, 41)
-			if imageReference == "" {
-				require.ErrorContains(t, err, "malformed VM disk image identity")
-			} else {
-				require.ErrorContains(t, err, "CSI disk serial contradicts VM disk image identity")
-			}
+			require.ErrorContains(t, err, tc.message)
 			attachments, _, err := provider.ListCurrentAttachments(ctx)
-			if imageReference == "" {
+			if tc.invalidInventory {
 				require.Error(t, err)
 			} else {
 				require.NoError(t, err)
@@ -2574,7 +2719,7 @@ func TestControllerPublishMoveClearsStaleAttachmentPinsWhenCensusFails(t *testin
 			require.NoError(t, err)
 			require.Equal(t, oldNode.Name, before.LastSuccessfulNodeName)
 			require.Equal(t, 41, before.LastSuccessfulOpenNebulaVMID)
-			require.Equal(t, 2, before.LastSuccessfulDiskID)
+			require.Equal(t, new(2), before.LastSuccessfulDiskID)
 			_, err = client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: oldNode.Name})
 			require.NoError(t, err)
 
@@ -2595,7 +2740,7 @@ func TestControllerPublishMoveClearsStaleAttachmentPinsWhenCensusFails(t *testin
 			require.Equal(t, 7, moved.LastSuccessfulImageID)
 			require.Equal(t, "vdb", moved.LastSuccessfulTarget)
 			require.Equal(t, 42, moved.LastSuccessfulOpenNebulaVMID)
-			require.Equal(t, 2, moved.LastSuccessfulDiskID)
+			require.Equal(t, new(2), moved.LastSuccessfulDiskID)
 
 			_, err = client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: newNode.Name})
 			require.NoError(t, err)
@@ -2631,6 +2776,10 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 		{false, false, "duplicate-image"}, {true, false, "duplicate-image"},
 		{false, false, "system-datastore"}, {true, false, "system-datastore"},
 		{false, false, "late-duplicate-id"}, {true, false, "late-duplicate-id"},
+		{false, false, "late-duplicate-resize"}, {true, false, "late-duplicate-resize"},
+		{false, true, "zero-slot"}, {true, true, "zero-slot"},
+		{false, false, "zero-slot-changed"}, {true, false, "zero-slot-changed"},
+		{false, false, "legacy-slot-omitted"}, {true, false, "legacy-slot-omitted"},
 	} {
 		t.Run(fmt.Sprintf("queued=%t/stage=%t/drift=%s", tc.queued, tc.stage, tc.drift), func(t *testing.T) {
 			ctx := context.Background()
@@ -2653,11 +2802,16 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 			driver.PluginConfig.OverrideVal(config.NodeDeviceUdevSettleTimeoutSecondsVar, 0)
 			var protocol *nodeAttachmentProtocol
 			var unpublishActive atomic.Bool
-			var imageReads atomic.Int32
+			var imageReads, directReads atomic.Int32
 			provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
 				if tc.drift == "late-duplicate-id" && unpublishActive.Load() && method == "one.image.info" && imageReads.Add(1) == 4 {
 					protocol.mu.Lock()
 					protocol.prependImageID = true
+					protocol.mu.Unlock()
+				}
+				if tc.drift == "late-duplicate-resize" && unpublishActive.Load() && method == "one.vm.info" && directReads.Add(1) == 2 {
+					protocol.mu.Lock()
+					protocol.directDiskFields = "<RESIZE>NO</RESIZE><RESIZE>YES</RESIZE>"
 					protocol.mu.Unlock()
 				}
 			})
@@ -2665,6 +2819,10 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 			wire.mu.Lock()
 			wire.ceph, wire.version = true, "7.4.0"
 			wire.disks[41], wire.marker = 128, 128*1024*1024
+			zeroSlot := strings.HasPrefix(tc.drift, "zero-slot") || tc.drift == "legacy-slot-omitted"
+			if zeroSlot {
+				wire.diskSlot = "0"
+			}
 			wire.mu.Unlock()
 			probe := &publishRestoreProbe{PersistentDiskVolumeProvider: provider}
 			server := NewControllerServer(driver, probe, nil)
@@ -2707,6 +2865,9 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, "ceph", publishedHistory.Backend)
 			require.Equal(t, 7, publishedHistory.LastSuccessfulImageID)
+			if zeroSlot {
+				require.Equal(t, new(0), publishedHistory.LastSuccessfulDiskID)
+			}
 
 			history := publishedHistory
 			if tc.stage {
@@ -2734,6 +2895,9 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 				require.Equal(t, "ceph", history.Backend)
 				require.Equal(t, 7, history.LastSuccessfulImageID)
 				require.False(t, history.LastSuccessfulStageTime.IsZero())
+				if zeroSlot {
+					require.Equal(t, new(0), history.LastSuccessfulDiskID)
+				}
 			} else {
 				require.True(t, history.LastSuccessfulStageTime.IsZero())
 			}
@@ -2768,6 +2932,26 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 			require.Equal(t, pvc.Namespace, rebound.PublishContext[paramPVCNamespace])
 			history, err = server.readAttachmentHistory(ctx, volume)
 			require.NoError(t, err)
+			if tc.drift == "legacy-slot-omitted" {
+				_, err = driver.volumeHistory.Upsert(ctx, volume, func(record *VolumeHistoryRecord) {
+					record.LastSuccessfulDiskID = nil
+				})
+				require.NoError(t, err)
+				history, err = server.readAttachmentHistory(ctx, volume)
+				require.NoError(t, err)
+				require.Nil(t, history.LastSuccessfulDiskID)
+			}
+			if zeroSlot {
+				cm, err := driver.kubeRuntime.GetConfigMap(ctx, "default", volumeHistoryStateConfigMapName)
+				require.NoError(t, err)
+				var fields map[string]json.RawMessage
+				require.NoError(t, json.Unmarshal([]byte(cm.Data[volume]), &fields))
+				if tc.drift == "legacy-slot-omitted" {
+					require.NotContains(t, fields, "lastSuccessfulDiskID")
+				} else {
+					require.JSONEq(t, "0", string(fields["lastSuccessfulDiskID"]))
+				}
+			}
 			deleting := metav1.Now()
 			va := &storagev1.VolumeAttachment{
 				ObjectMeta: metav1.ObjectMeta{Name: "rebound-static-va", UID: "rebound-static-va-uid", DeletionTimestamp: &deleting, Finalizers: []string{"external-attacher/" + DefaultDriverName}},
@@ -2782,13 +2966,27 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 				wire.duplicateImage = true
 			case "system-datastore":
 				wire.imageDatastoreID = 200
+			case "zero-slot-changed":
+				wire.diskSlot = "2"
 			}
 			wire.mu.Unlock()
 			unpublishActive.Store(true)
 			response, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
-			if tc.drift != "" {
+			if tc.drift != "" && tc.drift != "zero-slot" && tc.drift != "legacy-slot-omitted" {
 				require.Equal(t, codes.Unavailable, status.Code(err))
 				require.Nil(t, response)
+				switch tc.drift {
+				case "late-duplicate-resize":
+					require.ErrorContains(t, err, "provider")
+					require.EqualValues(t, 2, directReads.Load())
+				case "zero-slot-changed":
+					require.ErrorContains(t, err, "device identity contradicts observed history")
+					require.NoError(t, kube.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{}))
+					reply, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+					require.Equal(t, codes.Unavailable, status.Code(err))
+					require.ErrorContains(t, err, "detach disk slot differs from observed history")
+					require.Nil(t, reply)
+				}
 				after, err := server.readAttachmentHistory(ctx, volume)
 				require.NoError(t, err)
 				require.Equal(t, history, after)
@@ -2980,7 +3178,7 @@ func TestCephSameVMFreshAttachReplacesUnobservedDiskSlot(t *testing.T) {
 			require.NoError(t, err)
 			before, err := server.readAttachmentHistory(ctx, volume)
 			require.NoError(t, err)
-			require.Equal(t, 2, before.LastSuccessfulDiskID)
+			require.Equal(t, new(2), before.LastSuccessfulDiskID)
 			_, err = client.ControllerUnpublishVolume(ctx, unpublish)
 			require.NoError(t, err)
 			wire.mu.Lock()
@@ -3007,7 +3205,7 @@ func TestCephSameVMFreshAttachReplacesUnobservedDiskSlot(t *testing.T) {
 			probe.failCensus.Store(false)
 			after, err := server.readAttachmentHistory(ctx, volume)
 			require.NoError(t, err)
-			require.Equal(t, 3, after.LastSuccessfulDiskID)
+			require.Equal(t, new(3), after.LastSuccessfulDiskID)
 			require.Equal(t, before.LastSuccessfulOpenNebulaVMID, after.LastSuccessfulOpenNebulaVMID)
 			require.Equal(t, before.LastSuccessfulImageID, after.LastSuccessfulImageID)
 

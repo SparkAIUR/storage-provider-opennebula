@@ -26,7 +26,7 @@ func TestVolumeHistoryUpsertMergesIndependentWriters(t *testing.T) {
 	_, err := controller.Upsert(ctx, "vol-1", func(state *VolumeHistoryRecord) {
 		state.LastSuccessfulPublishTime = publishTime
 		state.LastSuccessfulOpenNebulaVMID = 208
-		state.LastSuccessfulDiskID = 3
+		state.LastSuccessfulDiskID = new(3)
 	})
 	require.NoError(t, err)
 	stageTime := publishTime.Add(time.Minute)
@@ -45,7 +45,7 @@ func TestVolumeHistoryUpsertMergesIndependentWriters(t *testing.T) {
 	require.Equal(t, publishTime, state.LastSuccessfulPublishTime)
 	require.Equal(t, stageTime, state.LastSuccessfulStageTime)
 	require.Equal(t, 208, state.LastSuccessfulOpenNebulaVMID)
-	require.Equal(t, 3, state.LastSuccessfulDiskID)
+	require.Equal(t, new(3), state.LastSuccessfulDiskID)
 	require.Equal(t, "node-a", state.LastSafeDetachNodeName)
 	require.Equal(t, "fs-uuid", state.LastHealthyIdentity.ObservedFromDevice.Filesystem.FilesystemUUID)
 }
@@ -62,7 +62,7 @@ func TestVolumeHistoryUpsertRetriesAgainstLatestRecord(t *testing.T) {
 			runtimeClient := &KubeRuntime{client: client, enabled: true}
 			manager := NewVolumeHistoryManager(runtimeClient, "default")
 			if !createRace {
-				_, err := manager.Upsert(ctx, "vol-1", func(state *VolumeHistoryRecord) { state.LastSuccessfulDiskID = 1 })
+				_, err := manager.Upsert(ctx, "vol-1", func(state *VolumeHistoryRecord) { state.LastSuccessfulDiskID = new(1) })
 				require.NoError(t, err)
 			}
 			verb := "update"
@@ -75,7 +75,7 @@ func TestVolumeHistoryUpsertRetriesAgainstLatestRecord(t *testing.T) {
 				if calls != 1 {
 					return false, nil, nil
 				}
-				state := VolumeHistoryRecord{VolumeID: "vol-1", LastSuccessfulDiskID: 7, LastSuccessfulOpenNebulaVMID: 208}
+				state := VolumeHistoryRecord{VolumeID: "vol-1", LastSuccessfulDiskID: new(7), LastSuccessfulOpenNebulaVMID: 208}
 				payload, err := json.Marshal(state)
 				require.NoError(t, err)
 				cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: volumeHistoryStateConfigMapName, Namespace: "default", ResourceVersion: "2"}, Data: map[string]string{"vol-1": string(payload), "vol-other": "preserved"}}
@@ -88,11 +88,15 @@ func TestVolumeHistoryUpsertRetriesAgainstLatestRecord(t *testing.T) {
 				return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), cm.Name, errors.New("concurrent writer"))
 			})
 			state, err := manager.Upsert(ctx, "vol-1", func(state *VolumeHistoryRecord) {
-				state.LastSuccessfulDiskID++
+				slot := 0
+				if state.LastSuccessfulDiskID != nil {
+					slot = *state.LastSuccessfulDiskID
+				}
+				state.LastSuccessfulDiskID = new(slot + 1)
 				state.LastSafeDetachNodeName = "node-a"
 			})
 			require.NoError(t, err)
-			require.Equal(t, 8, state.LastSuccessfulDiskID)
+			require.Equal(t, new(8), state.LastSuccessfulDiskID)
 			require.Equal(t, 208, state.LastSuccessfulOpenNebulaVMID)
 			cm, err := runtimeClient.GetConfigMap(ctx, "default", volumeHistoryStateConfigMapName)
 			require.NoError(t, err)
@@ -108,13 +112,13 @@ func TestVolumeHistoryUpsertDoesNotCacheFailedWrite(t *testing.T) {
 	ctx := context.Background()
 	client := fake.NewSimpleClientset()
 	manager := NewVolumeHistoryManager(&KubeRuntime{client: client, enabled: true}, "default")
-	_, err := manager.Upsert(ctx, "vol-1", func(state *VolumeHistoryRecord) { state.LastSuccessfulDiskID = 1 })
+	_, err := manager.Upsert(ctx, "vol-1", func(state *VolumeHistoryRecord) { state.LastSuccessfulDiskID = new(1) })
 	require.NoError(t, err)
 	client.PrependReactor("update", "configmaps", func(ktesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.New("API unavailable")
 	})
-	_, err = manager.Upsert(ctx, "vol-1", func(state *VolumeHistoryRecord) { state.LastSuccessfulDiskID = 2 })
+	_, err = manager.Upsert(ctx, "vol-1", func(state *VolumeHistoryRecord) { state.LastSuccessfulDiskID = new(2) })
 	require.Error(t, err)
 	cached, _ := manager.Get("vol-1")
-	require.Equal(t, 1, cached.LastSuccessfulDiskID)
+	require.Equal(t, new(1), cached.LastSuccessfulDiskID)
 }

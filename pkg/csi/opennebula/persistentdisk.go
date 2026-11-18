@@ -1432,12 +1432,50 @@ func hasDiskBacking(disk shared.Disk, serial string) bool {
 }
 
 func diskImageReferenceForVolume(disk shared.Disk, volumeID int, requireComplete bool) (int, bool, error) {
+	if requireComplete {
+		if err := validateAttachmentDiskFields(disk, volumeID); err != nil {
+			return 0, false, err
+		}
+	}
 	id, present, err := diskImageReference(disk, !requireComplete)
 	var conflict *diskImageConflict
 	if errors.As(err, &conflict) && conflict.imageID != volumeID && conflict.serialID != volumeID {
 		return 0, false, nil
 	}
 	return id, present, err
+}
+
+func validateAttachmentDiskFields(disk shared.Disk, imageID int) error {
+	seen := make(map[string]struct{})
+	for _, pair := range disk.Pairs {
+		switch key := pair.Key(); key {
+		case "IMAGE_ID", "DISK_ID", "TARGET", "SERIAL", "PERSISTENT", "CLONE", "TM_MAD", "LN_TARGET",
+			"SIZE", "SIZE_PREV", "RESIZE", "IMAGE", "IMAGE_UNAME", "IMAGE_UID", "SOURCE", "ORIGINAL_SOURCE", "TYPE", "VOLATILE":
+			if _, duplicate := seen[key]; duplicate && !diskIdentifiesOtherImage(disk, imageID) {
+				return fmt.Errorf("%w: repeated VM disk field %s", ErrConflictingAttachmentEvidence, key)
+			}
+			seen[key] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func diskIdentifiesOtherImage(disk shared.Disk, imageID int) bool {
+	if imageID < 0 || len(disk.GetPairs(string(shared.ImageID))) != 1 {
+		return false
+	}
+	id, err := disk.GetI(shared.ImageID)
+	if err != nil || id < 0 || id == imageID {
+		return false
+	}
+	for _, serial := range disk.GetPairs(string(shared.Serial)) {
+		suffix, isCSI := strings.CutPrefix(strings.ToLower(strings.TrimSpace(serial.Value)), "onecsi-")
+		serialID, err := strconv.Atoi(suffix)
+		if isCSI && err == nil && serialID == imageID {
+			return false
+		}
+	}
+	return true
 }
 
 func validateUniqueVMDiskSlot(disks []shared.Disk, diskID int) error {
@@ -2046,6 +2084,11 @@ func (p *PersistentDiskVolumeProvider) getVolumeInNode(ctx context.Context, volu
 	var target string
 	disks := vmInfo.Template.GetDisks()
 	for _, disk := range disks {
+		if !requireCompleteImageReferences {
+			if err := validateAttachmentDiskFields(disk, volumeID); err != nil {
+				return "", err
+			}
+		}
 		diskImageID, present, err := diskImageReferenceForVolume(disk, volumeID, requireCompleteImageReferences)
 		if err != nil {
 			return "", err
@@ -2156,26 +2199,25 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeDisk(ctx context.Context, im
 	if err != nil {
 		return VolumeDiskRecord{}, err
 	}
-	_, disk, err := volumeDiskFromVM(info, imageID, vmID, false)
-	if err != nil {
-		return VolumeDiskRecord{}, err
-	}
 	disks := info.Template.GetDisks()
 	for _, candidate := range disks {
 		if _, err := attachmentDiskImage(candidate, imageID); errors.Is(err, ErrConflictingAttachmentEvidence) {
 			return VolumeDiskRecord{}, err
 		}
 	}
+	_, disk, err := volumeDiskFromVM(info, imageID, vmID, false)
+	if err != nil {
+		return VolumeDiskRecord{}, err
+	}
 	return attachmentDiskRecord(info, disks, *disk)
 }
 
 func attachmentDiskImage(disk shared.Disk, imageID int) (bool, error) {
-	imageFields := disk.GetPairs(string(shared.ImageID))
-	if len(imageFields) > 1 && slices.ContainsFunc(disk.GetInts(string(shared.ImageID)), func(id int) bool { return id == imageID }) {
-		return false, fmt.Errorf("%w: repeated VM disk image identity", ErrConflictingAttachmentEvidence)
-	}
 	id, present, err := diskImageReferenceForVolume(disk, imageID, true)
 	if err != nil {
+		if errors.Is(err, ErrConflictingAttachmentEvidence) {
+			return false, err
+		}
 		if _, permissivePresent, permissiveErr := diskImageReference(disk, true); permissiveErr == nil && !permissivePresent {
 			serial, _ := disk.Get(shared.Serial)
 			if !hasDiskBacking(disk, serial) {
@@ -2188,16 +2230,6 @@ func attachmentDiskImage(disk shared.Disk, imageID int) (bool, error) {
 }
 
 func attachmentDiskRecord(info *vm.VM, disks []shared.Disk, disk shared.Disk) (VolumeDiskRecord, error) {
-	seen := make(map[string]bool)
-	for _, pair := range disk.Pairs {
-		switch key := pair.Key(); shared.DiskKeys(key) {
-		case shared.ImageID, shared.DiskID, shared.TargetDisk, shared.Serial:
-			if seen[key] {
-				return VolumeDiskRecord{}, fmt.Errorf("%w: repeated VM disk field %s", ErrConflictingAttachmentEvidence, key)
-			}
-			seen[key] = true
-		}
-	}
 	slot, err := disk.GetI(shared.DiskID)
 	if err != nil || slot < 0 {
 		return VolumeDiskRecord{}, fmt.Errorf("%w: disk slot is invalid", ErrConflictingAttachmentEvidence)
@@ -2318,6 +2350,9 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 	for _, vmInfo := range vmPool.VMs {
 		vmNames[vmInfo.Name] = append(vmNames[vmInfo.Name], vmInfo.ID)
 		for _, disk := range vmInfo.Template.GetDisks() {
+			if err := validateAttachmentDiskFields(disk, -1); err != nil {
+				return nil, nil, err
+			}
 			diskImageID, present, diskErr := diskImageReference(disk, false)
 			var conflict *diskImageConflict
 			if errors.As(diskErr, &conflict) {
