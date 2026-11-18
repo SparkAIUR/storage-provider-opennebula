@@ -2480,7 +2480,7 @@ func (p *PersistentDiskVolumeProvider) getVolumeInNode(ctx context.Context, volu
 					return "", fmt.Errorf("%w: replacement detach has additional disk owners", ErrConflictingAttachmentEvidence)
 				}
 				if original.id != 0 {
-					if _, releaseErr := p.InspectReplacementRelease(ctx, volumeID, original.id, original.name); releaseErr != nil {
+					if _, releaseErr := p.inspectReplacementRelease(ctx, volumeID, original.id, original.name, false); releaseErr != nil {
 						return "", releaseErr
 					}
 				}

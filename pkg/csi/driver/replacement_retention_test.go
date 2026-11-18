@@ -25,7 +25,7 @@ const remoteFixtureVAName = "csi-ac85754d1970193a7b964d41879b5a4ea619375d488aa78
 func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 	for _, queued := range []bool{false, true} {
 		for _, distinctVM := range []bool{false, true} {
-			for _, mode := range []string{"retained", "successor-deleted", "successor-remote-before-detach", "successor-expanded", "remote-reschedule", "remote-reschedule-finalized", "released-reused", "released-reused-no-va", "released-rebound", "released-unbound", "released-old-pod"} {
+			for _, mode := range []string{"retained", "successor-deleted", "successor-remote-before-detach", "successor-expanded", "remote-reschedule", "remote-reschedule-finalized", "remote-reschedule-cancel-before", "remote-reschedule-cancel-after", "released-reused", "released-reused-no-va", "released-rebound", "released-unbound", "released-old-pod"} {
 				t.Run(fmt.Sprintf("queued=%t/distinctVM=%t/%s", queued, distinctVM, mode), func(t *testing.T) {
 					ctx := context.Background()
 					const volume = "volume-test"
@@ -38,7 +38,14 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 					original := newReadyNode("node-old", true)
 					original.UID = "original-node-uid"
 					driver := newStickyTestDriver(t, pv, pvc, original)
-					provider, wire := nodeAttachmentProvider(t)
+					var onDestinationEvidence atomic.Pointer[func()]
+					provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+						if method == "one.system.version" {
+							if change := onDestinationEvidence.Swap(nil); change != nil {
+								(*change)()
+							}
+						}
+					})
 					wire.mu.Lock()
 					wire.disks[41], wire.marker = 128, 128*1024*1024
 					wire.ceph, wire.version = true, "7.4.0"
@@ -181,7 +188,7 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 					}
 
 					if strings.HasPrefix(mode, "remote-reschedule") {
-						finalized := mode == "remote-reschedule-finalized"
+						finalized := mode != "remote-reschedule"
 						const remoteVM = 43
 						remote := newReadyNode("remote-node", true)
 						remote.UID = "remote-node-uid"
@@ -224,6 +231,132 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
 						require.Error(t, err, "foreground Unpublish cannot use the remote demand exception")
 						assertWire(false)
+
+						if strings.HasPrefix(mode, "remote-reschedule-cancel-") {
+							detached := mode == "remote-reschedule-cancel-after"
+							_, err = vas.Create(ctx, remoteVA, metav1.CreateOptions{})
+							require.NoError(t, err)
+							if detached {
+								reconcile()
+							}
+							assertWire(detached)
+							beforeCancellation, err := server.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.NotNil(t, beforeCancellation.PendingReplacementAttach)
+							require.Equal(t, detached, beforeCancellation.PendingReplacementAttach.detached())
+
+							require.NoError(t, pods.Delete(ctx, demand.Name, metav1.DeleteOptions{}))
+							deleting := metav1.Now()
+							remoteVA.DeletionTimestamp = &deleting
+							remoteVA.Finalizers = []string{"external-attacher/" + DefaultDriverName}
+							_, err = vas.Update(ctx, remoteVA, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							reconcile()
+							_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+							require.Error(t, err, "source cannot complete while the canceled destination blocks its proof")
+							assertWire(detached)
+
+							destinationRequest := &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: remote.Name}
+							denyDestination := func() {
+								t.Helper()
+								_, err := client.ControllerUnpublishVolume(ctx, destinationRequest)
+								require.Error(t, err)
+								current, err := server.readAttachmentHistory(ctx, volume)
+								require.NoError(t, err)
+								require.Equal(t, beforeCancellation, current)
+								assertWire(detached)
+							}
+							for _, invalidate := range []func(*storagev1.VolumeAttachment){
+								func(va *storagev1.VolumeAttachment) { va.Status.Attached = true },
+								func(va *storagev1.VolumeAttachment) { va.Spec.Attacher = "foreign.example.com" },
+							} {
+								wrong := remoteVA.DeepCopy()
+								invalidate(wrong)
+								_, err = vas.Update(ctx, wrong, metav1.UpdateOptions{})
+								require.NoError(t, err)
+								denyDestination()
+							}
+							require.NoError(t, vas.Delete(ctx, remoteVA.Name, metav1.DeleteOptions{}))
+							wrong := remoteVA.DeepCopy()
+							wrong.Name = "other-destination"
+							_, err = vas.Create(ctx, wrong, metav1.CreateOptions{})
+							require.NoError(t, err)
+							denyDestination()
+							require.NoError(t, vas.Delete(ctx, wrong.Name, metav1.DeleteOptions{}))
+							_, err = vas.Create(ctx, remoteVA, metav1.CreateOptions{})
+							require.NoError(t, err)
+
+							localUse := demand.DeepCopy()
+							localUse.DeletionTimestamp = &deleting
+							_, err = pods.Create(ctx, localUse, metav1.CreateOptions{})
+							require.NoError(t, err)
+							denyDestination()
+							require.NoError(t, pods.Delete(ctx, localUse.Name, metav1.DeleteOptions{}))
+
+							wire.mu.Lock()
+							wire.disks[remoteVM] = 128
+							wire.mu.Unlock()
+							denyDestination()
+							wire.mu.Lock()
+							delete(wire.disks, remoteVM)
+							wire.mu.Unlock()
+
+							changedVA := func() {
+								wrong := remoteVA.DeepCopy()
+								wrong.UID = "changed-destination-va"
+								_, err := vas.Update(ctx, wrong, metav1.UpdateOptions{})
+								require.NoError(t, err)
+							}
+							onDestinationEvidence.Store(&changedVA)
+							denyDestination()
+							require.Nil(t, onDestinationEvidence.Load())
+							_, err = vas.Update(ctx, remoteVA, metav1.UpdateOptions{})
+							require.NoError(t, err)
+
+							changedNode := func() {
+								wrong := remote.DeepCopy()
+								wrong.UID = "changed-destination-node"
+								_, err := nodes.Update(ctx, wrong, metav1.UpdateOptions{})
+								require.NoError(t, err)
+							}
+							onDestinationEvidence.Store(&changedNode)
+							denyDestination()
+							require.Nil(t, onDestinationEvidence.Load())
+							_, err = nodes.Update(ctx, remote, metav1.UpdateOptions{})
+							require.NoError(t, err)
+
+							kube.ClearActions()
+							_, err = client.ControllerUnpublishVolume(ctx, destinationRequest)
+							require.NoError(t, err)
+							for _, action := range kube.Actions() {
+								require.Contains(t, []string{"get", "list"}, action.GetVerb(), "destination acknowledgement must be read-only")
+							}
+							assertWire(detached)
+							current, err := server.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.Equal(t, beforeCancellation, current)
+
+							remoteVA.Finalizers = nil
+							_, err = vas.Update(ctx, remoteVA, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							require.NoError(t, vas.Delete(ctx, remoteVA.Name, metav1.DeleteOptions{}))
+							_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+							require.NoError(t, err)
+							assertWire(true)
+							current, err = server.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.NotNil(t, current.PendingReplacementAttach)
+							require.Equal(t, string(va.UID), current.PendingReplacementAttach.DetachCompletion.VAUID)
+							va.Finalizers = nil
+							_, err = vas.Update(ctx, va, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							require.NoError(t, vas.Delete(ctx, va.Name, metav1.DeleteOptions{}))
+							reconcile()
+							current, err = server.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.Nil(t, current.PendingReplacementAttach)
+							return
+						}
 
 						invalid := remoteVA.DeepCopy()
 						invalid.Status.Attached = true

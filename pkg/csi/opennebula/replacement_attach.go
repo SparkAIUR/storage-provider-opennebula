@@ -138,6 +138,10 @@ func (p *PersistentDiskVolumeProvider) InspectReplacementAttach(ctx context.Cont
 }
 
 func (p *PersistentDiskVolumeProvider) InspectReplacementRelease(ctx context.Context, imageID, vmID int, vmName string) (string, error) {
+	return p.inspectReplacementRelease(ctx, imageID, vmID, vmName, true)
+}
+
+func (p *PersistentDiskVolumeProvider) inspectReplacementRelease(ctx context.Context, imageID, vmID int, vmName string, settled bool) (string, error) {
 	deny := func() (string, error) {
 		return "", fmt.Errorf("%w: original Ceph VM release is unverified", ErrConflictingAttachmentEvidence)
 	}
@@ -163,7 +167,7 @@ func (p *PersistentDiskVolumeProvider) InspectReplacementRelease(ctx context.Con
 			return deny()
 		}
 		state, lcm, err := info.State()
-		if err != nil || (state != vm.Active || lcm != vm.Running) && (state != vm.Poweroff || lcm != vm.LcmInit) {
+		if err != nil || settled && (state != vm.Active || lcm != vm.Running) && (state != vm.Poweroff || lcm != vm.LcmInit) {
 			return deny()
 		}
 		if _, _, err := volumeDiskFromVM(info, imageID, vmID, true); !errors.Is(err, ErrAttachmentNotFound) {
@@ -176,4 +180,46 @@ func (p *PersistentDiskVolumeProvider) InspectReplacementRelease(ctx context.Con
 		return "", nil
 	}
 	return deny()
+}
+
+type ReplacementDestinationAbsenceVerifier interface {
+	VerifyReplacementDestinationAbsent(ctx context.Context, volume, node string, imageID, vmID, sourceVMID int) error
+}
+
+func (p *PersistentDiskVolumeProvider) VerifyReplacementDestinationAbsent(ctx context.Context, volume, node string, imageID, vmID, sourceVMID int) error {
+	deny := func() error {
+		return fmt.Errorf("%w: replacement destination disk absence is unverified", ErrConflictingAttachmentEvidence)
+	}
+	if imageID <= 0 || vmID <= 0 || vmID == sourceVMID || node == "" {
+		return deny()
+	}
+	version, err := p.ctrl.SystemVersionContext(ctx)
+	if err != nil || version != "7.4.0" {
+		return deny()
+	}
+	datastore, err := p.InspectVolumeDatastore(ctx, volume, imageID)
+	if err != nil || datastore.Backend != "ceph" {
+		return deny()
+	}
+	metadata, err := p.inspectVolumeAttachment(ctx, volume, node, vmID, false)
+	if err != nil {
+		return err
+	}
+	present, err := attachmentPresence(metadata, volume, imageID, vmID)
+	if err != nil || present {
+		return deny()
+	}
+	switch len(metadata.DiskRecords) {
+	case 0:
+		if img.State(metadata.ImageStateRaw) != img.Ready {
+			return deny()
+		}
+	case 1:
+		if metadata.DiskRecords[0].NodeID != sourceVMID {
+			return deny()
+		}
+	default:
+		return deny()
+	}
+	return ctx.Err()
 }

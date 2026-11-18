@@ -4195,6 +4195,8 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 			"distinct-vm-abandoned-replay-completion-conflict-changed-generation", "distinct-vm-abandoned-replay-completion-conflict-changed-provider",
 			"same-vm-abandoned-replay-post-detach-pod", "distinct-vm-abandoned-replay-post-detach-pod", "distinct-vm-abandoned-post-detach-pod",
 			"same-vm-abandoned-replay-detach-lag", "distinct-vm-abandoned-replay-detach-lag-retry",
+			"distinct-vm-abandoned-replay-detach-lag-reboot", "distinct-vm-abandoned-replay-detach-lag-persistent-reboot",
+			"distinct-vm-abandoned-replay-detach-lag-original-conflict",
 			"distinct-vm-abandoned-replay-missing-va-pins", "distinct-vm-abandoned-replay-missing-va-name", "distinct-vm-abandoned-replay-missing-va-uid",
 			"distinct-vm-abandoned-replay-wrong-va-uid", "distinct-vm-abandoned-hidden-pinned-va",
 			"distinct-vm-abandoned-replay-post-detach-protection", "distinct-vm-abandoned-post-detach-protection", "distinct-vm-abandoned-replay-replaced-va", "distinct-vm-abandoned-replay-protection", "distinct-vm-abandoned-completion-lost-ack", "distinct-vm-abandoned", "distinct-vm-orphan", "distinct-vm-abandoned-released", "distinct-vm-abandoned-rebound", "distinct-vm-orphan-released", "distinct-vm-abandoned-wrong-marker", "distinct-vm-abandoned-consumer",
@@ -4897,7 +4899,9 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						require.NoError(t, vas.Delete(ctx, publishVA.Name, metav1.DeleteOptions{}))
 					}
 					ownershipLag := strings.Contains(mode, "-detach-lag")
-					lagReplies := 0
+					lagReplies, transitionalOriginalReads := 0, 0
+					persistentReboot := strings.HasSuffix(mode, "-persistent-reboot")
+					originalConflict := strings.HasSuffix(mode, "-original-conflict")
 					if ownershipLag {
 						wire.mu.Lock()
 						wire.rejectFirstDetach = strings.HasSuffix(mode, "-retry")
@@ -4907,6 +4911,21 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 								return strings.Replace(body, "<STATE>1</STATE>", "<STATE>8</STATE>", 1)
 							}
 							return body
+						}
+						if strings.HasSuffix(mode, "-reboot") || originalConflict {
+							wire.alterDirectVM = func(body string) string {
+								if _, attached := wire.disks[vmID]; attached {
+									return body
+								}
+								if originalConflict {
+									return strings.Replace(body, "<NAME>retired-vm</NAME>", "<NAME>unrelated-vm</NAME>", 1)
+								}
+								if persistentReboot || lagReplies < 9 {
+									transitionalOriginalReads++
+									return strings.Replace(body, "<LCM_STATE>3</LCM_STATE>", "<LCM_STATE>2</LCM_STATE>", 1)
+								}
+								return body
+							}
 						}
 						wire.mu.Unlock()
 					}
@@ -5001,6 +5020,24 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						reconcile()
 					} else {
 						err = unpublish(restarted)
+					}
+					if persistentReboot || originalConflict {
+						require.Error(t, err)
+						current, err := NewControllerServer(driver, provider, nil).readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.Equal(t, stored, current)
+						require.Error(t, unpublish(restarted))
+						wire.mu.Lock()
+						defer wire.mu.Unlock()
+						require.Equal(t, 1, wire.detachAttempts)
+						require.Equal(t, []string{fmt.Sprintf("attach:%d:false", vmID), fmt.Sprintf("detach:%d", vmID)}, wire.mutations)
+						if persistentReboot {
+							require.Equal(t, 9, lagReplies)
+							require.Positive(t, transitionalOriginalReads)
+						} else {
+							require.Less(t, lagReplies, 9, "an original VM name conflict must stop interim polling")
+						}
+						return
 					}
 					if invalidPins || wrongVA || hiddenPinnedVA {
 						require.Equal(t, codes.Unavailable, status.Code(err))
@@ -5264,6 +5301,9 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						require.Equal(t, []string{fmt.Sprintf("attach:%d:false", vmID), fmt.Sprintf("detach:%d", vmID)}, wire.mutations)
 						if ownershipLag {
 							require.Equal(t, 9, lagReplies)
+							if strings.HasSuffix(mode, "-reboot") {
+								require.Positive(t, transitionalOriginalReads)
+							}
 							if wire.rejectFirstDetach {
 								require.Equal(t, 2, wire.detachAttempts)
 							} else {
@@ -5434,7 +5474,7 @@ func TestControllerAttachHonorsLateVolumeWideHostQuarantine(t *testing.T) {
 			} else if tc.volume == "volume-test" && tc.failures == 2 {
 				wantCode = codes.FailedPrecondition
 			}
-			require.Equal(t, !(tc.before && wantCode != codes.OK), called.Load())
+			require.Equal(t, !tc.before || wantCode == codes.OK, called.Load())
 			wire.mu.Lock()
 			defer wire.mu.Unlock()
 			if wantCode != codes.OK {

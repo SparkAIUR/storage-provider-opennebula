@@ -62,6 +62,10 @@ func (s *ControllerServer) detachVolumeAttachments(ctx context.Context, pvName, 
 	return attachments, nil
 }
 
+func csiVolumeAttachmentName(volume, driver, node string) string {
+	return fmt.Sprintf("csi-%x", sha256.Sum256([]byte(volume+driver+node)))
+}
+
 func detachAttachmentSnapshot(va *storagev1.VolumeAttachment) detachAttachmentAuthority {
 	return detachAttachmentAuthority{
 		uid: va.UID, created: va.CreationTimestamp.Time, attacher: va.Spec.Attacher, node: va.Spec.NodeName,
@@ -280,7 +284,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		return attachmentEvidenceUnavailable("replacement detach has no verified source or destination for current remote demand", nil)
 	}
 	if destinationVAName != "" && (!remoteReplacement || destinationVA.node != desired.NodeName ||
-		destinationVAName != fmt.Sprintf("csi-%x", sha256.Sum256([]byte(volume+s.driver.name+desired.NodeName)))) {
+		destinationVAName != csiVolumeAttachmentName(volume, s.driver.name, desired.NodeName)) {
 		return attachmentEvidenceUnavailable("replacement detach destination differs from current demand", nil)
 	}
 	if identity.attachments != nil && remoteReplacement != (identity.remoteNodeUID != "") {
@@ -612,7 +616,13 @@ func (s *ControllerServer) finishVerifiedReplacementAbsence(ctx context.Context,
 	if attempt == nil {
 		return s.checkReplacedNodeStaleAttachment(ctx, volume, node, identity.imageID, identity.vmID, history, nil)
 	}
-	if attempt.Node != node || (!attempt.prepared() && !attempt.detached()) || !attempt.matchesHistory(history) {
+	if !attempt.matchesHistory(history) {
+		return true, attachmentEvidenceUnavailable("replacement attachment release is unresolved", nil)
+	}
+	if attempt.Node != node {
+		return true, s.verifyCanceledReplacementDestination(ctx, history, *attempt, node, identity.imageID, identity.vmID)
+	}
+	if !attempt.prepared() && !attempt.detached() {
 		return true, attachmentEvidenceUnavailable("replacement attachment release is unresolved", nil)
 	}
 	if err := s.resolvePhysicalDetachIdentity(ctx, volume, node, &identity); err != nil {
