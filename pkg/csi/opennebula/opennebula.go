@@ -138,6 +138,10 @@ type VolumeDatastoreInspector interface {
 	InspectVolumeDatastore(ctx context.Context, volume string, imageID int) (Datastore, error)
 }
 
+type VolumeAbsenceVerifier interface {
+	VerifyVolumeAbsent(ctx context.Context, volume string, imageID int) error
+}
+
 type VolumeAttachmentInspector interface {
 	InspectVolumeAttachment(ctx context.Context, volume string, node string) (*VolumeAttachmentMetadata, error)
 }

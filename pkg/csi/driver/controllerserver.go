@@ -1161,12 +1161,33 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	if err != nil && !errors.Is(err, opennebula.ErrVolumeNotFound) {
 		return nil, attachmentEvidenceUnavailable("volume lookup is unknown", err)
 	}
+	history := s.currentVolumeHistory(req.VolumeId)
 	if errors.Is(err, opennebula.ErrVolumeNotFound) {
+		if history.LastSuccessfulImageID > 0 {
+			nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(req.NodeId))
+			defer nodeRelease()
+			volumeRelease := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
+			defer volumeRelease()
+
+			current, err := s.readAttachmentHistory(ctx, req.VolumeId)
+			if err != nil || current.LastSuccessfulImageID != history.LastSuccessfulImageID {
+				return nil, attachmentEvidenceUnavailable("missing volume history is unverified", err)
+			}
+			verifier, ok := s.volumeProvider.(opennebula.VolumeAbsenceVerifier)
+			if !ok {
+				return nil, attachmentEvidenceUnavailable("provider cannot verify missing volume ownership", nil)
+			}
+			if err := verifier.VerifyVolumeAbsent(ctx, req.VolumeId, current.LastSuccessfulImageID); err != nil {
+				return nil, attachmentEvidenceUnavailable("missing volume ownership is unverified", err)
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
 		klog.V(1).InfoS("Volume not found, skipping volume unpublish",
 			"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId)
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
-	history := s.currentVolumeHistory(req.VolumeId)
 	if volumeID <= 0 || (history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != volumeID) {
 		return nil, attachmentEvidenceUnavailable("live volume identity differs from the expected image", nil)
 	}

@@ -152,17 +152,10 @@ func validateCephRetentionDisk(req *csi.ControllerUnpublishVolumeRequest, imageI
 	if !cephHistoryHasObservedAuthority(history) {
 		return cephRetentionUnavailable("history has no observed success authority", nil)
 	}
-	matchesBinding := func(pv, pvc, namespace string) bool {
-		for key, expected := range map[string]string{paramPVName: pv, paramPVCName: pvc, paramPVCNamespace: namespace} {
-			if observed, present := authority.AttachmentMetadata[key]; present && (expected == "" || strings.TrimSpace(observed) != expected) {
-				return false
-			}
+	for key, expected := range map[string]string{paramPVName: authority.PVName, paramPVCName: authority.PVCName, paramPVCNamespace: authority.PVCNamespace} {
+		if observed, present := authority.AttachmentMetadata[key]; present && strings.TrimSpace(observed) != expected {
+			return cephRetentionUnavailable("VolumeAttachment metadata contradicts the current binding", nil)
 		}
-		return true
-	}
-	if !matchesBinding(authority.PVName, authority.PVCName, authority.PVCNamespace) &&
-		!matchesBinding(history.PVName, history.PVCName, history.PVCNamespace) {
-		return cephRetentionUnavailable("VolumeAttachment metadata contradicts current and historical binding names", nil)
 	}
 	if history.LastSuccessfulImageID != disk.ImageID || history.LastSuccessfulNodeName != req.NodeId || history.LastSuccessfulNodeUID != string(authority.NodeUID) {
 		return cephRetentionUnavailable("observed volume history does not match image and node identity", nil)

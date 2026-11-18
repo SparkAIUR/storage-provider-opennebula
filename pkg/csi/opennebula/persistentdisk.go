@@ -164,16 +164,27 @@ func (p *PersistentDiskVolumeProvider) CreateVolume(ctx context.Context, name st
 }
 
 func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume string) error {
-	volumeID, _, err := p.VolumeExists(ctx, volume)
-	if IsAuthoritativeVolumeAbsence(err) {
+	expectedID, _ := ctx.Value(expectedImageIdentity{}).(int)
+	volumeID, err := p.lookupImageID(ctx, volume)
+	if errors.Is(err, ErrVolumeNotFound) {
+		if expectedID > 0 {
+			return p.VerifyVolumeAbsent(ctx, volume, expectedID)
+		}
 		return nil
 	}
 	if err != nil {
 		return err
 	}
+	if expectedID > 0 && volumeID != expectedID {
+		return fmt.Errorf("live image differs from the expected deletion identity")
+	}
+	ctx = WithExpectedImageID(ctx, volumeID)
 	info, err := p.ctrl.Image(volumeID).InfoContext(ctx, true)
 	if err != nil {
 		return fmt.Errorf("cannot establish deletion authority for image %d: %w", volumeID, err)
+	}
+	if info.ID != volumeID || info.Name != volume {
+		return fmt.Errorf("image information differs from the expected deletion identity")
 	}
 	state, err := info.State()
 	if err != nil {
@@ -192,16 +203,57 @@ func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume 
 	if err != nil {
 		return err
 	}
-	if metadata.ImageID != volumeID || len(metadata.DiskRecords) != 0 || metadata.ImageRunningVMs != 0 || len(metadata.ImageVMIDs) != 0 {
+	if metadata.ImageID != volumeID || metadata.ImageName != volume || len(metadata.DiskRecords) != 0 || metadata.ImageRunningVMs != 0 || len(metadata.ImageVMIDs) != 0 {
 		return fmt.Errorf("image %d ownership is not consistently absent", volumeID)
 	}
 	if strings.TrimSpace(info.Source) == "" {
 		return fmt.Errorf("image %d has no backend SOURCE; cleanup cannot be established", volumeID)
 	}
+	liveID, err := p.lookupImageID(ctx, volume)
+	if err != nil {
+		return fmt.Errorf("cannot verify live image identity before deletion: %w", err)
+	}
+	if liveID != volumeID {
+		return fmt.Errorf("live image identity changed before deletion")
+	}
 	if err := p.ctrl.Image(volumeID).DeleteContext(ctx); err != nil {
 		return fmt.Errorf("delete image %d: %w", volumeID, err)
 	}
 	return p.waitForResourceStatusContext(ctx, volumeID, p.hotplugPolicy.BaseTimeout, p.volumeDeletedContext)
+}
+
+func (p *PersistentDiskVolumeProvider) VerifyVolumeAbsent(ctx context.Context, volume string, imageID int) error {
+	if imageID <= 0 {
+		return fmt.Errorf("image identity is required to verify volume absence")
+	}
+	if _, err := p.ctrl.Image(imageID).InfoContext(ctx, true); !IsAuthoritativeVolumeAbsence(err) {
+		if err != nil {
+			return fmt.Errorf("cannot verify pinned image absence: %w", err)
+		}
+		return fmt.Errorf("pinned image still exists")
+	}
+	pool, err := p.ctrl.VMs().InfoContext(ctx)
+	if err != nil {
+		return fmt.Errorf("cannot verify pinned image ownership: %w", err)
+	}
+	for _, info := range pool.VMs {
+		for _, disk := range info.Template.GetDisks() {
+			id, present, err := diskImageReferenceForVolume(disk, imageID, true)
+			if err != nil {
+				return err
+			}
+			if present && id == imageID {
+				return fmt.Errorf("pinned image still has a VM disk reference")
+			}
+		}
+	}
+	if _, err := p.lookupImageID(ctx, volume); !errors.Is(err, ErrVolumeNotFound) {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("volume handle now resolves to a live image")
+	}
+	return ctx.Err()
 }
 
 func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name string, sourceVolume string, selection DatastoreSelectionConfig) (*VolumeCreateResult, error) {
@@ -1364,6 +1416,9 @@ func (p *PersistentDiskVolumeProvider) lookupImageID(ctx context.Context, name s
 	found := -1
 	for _, v := range pool.Images {
 		if v.Name == name {
+			if v.ID < 0 {
+				return -1, fmt.Errorf("invalid image identity for volume handle")
+			}
 			if found != -1 {
 				return -1, fmt.Errorf("duplicate image name %q", name)
 			}
@@ -2102,6 +2157,17 @@ func (p *PersistentDiskVolumeProvider) attachmentDatastore(ctx context.Context, 
 	case "ceph", "fs", "local", "fs_lvm", "fs_lvm_ssh", "nfs", "nas":
 		if observed.Backend != backend || (observed.TMMad != "" && !attachmentTransferMatchesBackend(observed.TMMad, backend)) {
 			return Datastore{}, &datastoreConfigError{message: fmt.Sprintf("datastore %d drivers disagree with backend %q", datastoreID, observed.Backend)}
+		}
+		if backend == "ceph" {
+			rootType := strings.ToUpper(strings.TrimSpace(datastore.DiskType))
+			templateRaw, _ := datastore.Template.GetStr(cephAttrDiskType)
+			templateType := strings.ToUpper(strings.TrimSpace(templateRaw))
+			if observed.TMMad != "ceph" ||
+				(rootType == "" && templateType == "") ||
+				(rootType != "" && rootType != "3" && rootType != cephDiskTypeRBD) ||
+				(templateType != "" && templateType != cephDiskTypeRBD) {
+				return Datastore{}, &datastoreConfigError{message: fmt.Sprintf("datastore %d lacks consistent Ceph RBD evidence", datastoreID)}
+			}
 		}
 		return observed, nil
 	default:

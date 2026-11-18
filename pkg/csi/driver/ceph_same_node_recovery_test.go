@@ -832,9 +832,9 @@ func TestControllerUnpublishCephPreservesKnownExpiredQuarantine(t *testing.T) {
 }
 
 func TestControllerUnpublishCephCurrentBindingRetainsPinnedSameImage(t *testing.T) {
-	for _, queued := range []bool{false, true} {
-		t.Run(fmt.Sprint(queued), func(t *testing.T) {
-			f := newCephRestartTestFixture(t, queued)
+	for _, tc := range []struct{ queued, historicalNames bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+		t.Run(fmt.Sprintf("queued=%t/historical-names=%t", tc.queued, tc.historicalNames), func(t *testing.T) {
+			f := newCephRestartTestFixture(t, tc.queued)
 			ctx := context.Background()
 			client := f.server.driver.kubeRuntime.client
 			before, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
@@ -865,6 +865,12 @@ func TestControllerUnpublishCephCurrentBindingRetainsPinnedSameImage(t *testing.
 			va.DeletionTimestamp = nil
 			va.Spec.Source.PersistentVolumeName = &pv.Name
 			attachedStatus := va.Status
+			if !tc.historicalNames {
+				attachedStatus.AttachmentMetadata = map[string]string{
+					publishContextOpenNebulaImageID: "3137", publishContextDeviceSerial: "onecsi-3137", "volumeName": "vdb",
+					paramPVName: pv.Name, paramPVCName: pvc.Name, paramPVCNamespace: pvc.Namespace,
+				}
+			}
 			va.Status = storagev1.VolumeAttachmentStatus{}
 			va, err = client.StorageV1().VolumeAttachments().Create(ctx, va, metav1.CreateOptions{})
 			require.NoError(t, err)
@@ -887,8 +893,13 @@ func TestControllerUnpublishCephCurrentBindingRetainsPinnedSameImage(t *testing.
 				return disk, nil
 			}
 			response, err := f.unpublish(t)
-			require.NoError(t, err)
-			require.NotNil(t, response)
+			if tc.historicalNames {
+				require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+				require.Nil(t, response)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, response)
+			}
 			after, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
 			require.Equal(t, before, after)
 			f.requireNoProviderMutation(t)

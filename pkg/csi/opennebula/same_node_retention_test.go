@@ -16,6 +16,7 @@ type retentionProtocolCase struct {
 	imageName, serial, target, persistence, diskFacts, resize, requestedSize string
 	imageOwners, extraVM, extraDisk, failMethod, datastoreBackend            string
 	datastoreType, datastoreTemplateType, datastoreTransfer                  string
+	datastoreDiskType, datastoreTemplateDiskType                             string
 	missingDatastore, duplicateDatastore                                     bool
 	beforeReply                                                              func(string)
 }
@@ -23,6 +24,7 @@ type retentionProtocolCase struct {
 func retentionProtocolFixture(t *testing.T, modify func(*retentionProtocolCase)) (*PersistentDiskVolumeProvider, *atomic.Int32) {
 	t.Helper()
 	cfg := retentionProtocolCase{imageSize: 1024, diskSize: 1024, imageID: 7, vmID: 11, diskID: 2, imageState: 8, vmState: 3, lcmState: 3, imageName: "volume-test", serial: "onecsi-7", target: "vdb", persistence: "1", diskFacts: persistentNoneDiskFacts, imageOwners: "<ID>11</ID>", datastoreBackend: "ceph", datastoreType: "IMAGE"}
+	cfg.datastoreTransfer, cfg.datastoreTemplateDiskType = "ceph", "RBD"
 	if modify != nil {
 		modify(&cfg)
 	}
@@ -30,7 +32,7 @@ func retentionProtocolFixture(t *testing.T, modify func(*retentionProtocolCase))
 	image := func() string {
 		datastore := ""
 		if cfg.datastoreBackend != "" {
-			datastore = "<DATASTORE_ID>100</DATASTORE_ID>"
+			datastore = "<DATASTORE_ID>124</DATASTORE_ID>"
 		}
 		return fmt.Sprintf(`<IMAGE><ID>%d</ID><NAME>%s</NAME><STATE>%d</STATE><SIZE>%d</SIZE><PERSISTENT>%s</PERSISTENT>%s<RUNNING_VMS>1</RUNNING_VMS><VMS>%s</VMS><TEMPLATE>%s</TEMPLATE></IMAGE>`, cfg.imageID, cfg.imageName, cfg.imageState, cfg.imageSize, cfg.persistence, datastore, cfg.imageOwners, cfg.requestedSize)
 	}
@@ -60,7 +62,7 @@ func retentionProtocolFixture(t *testing.T, modify func(*retentionProtocolCase))
 			if cfg.missingDatastore {
 				return true, "<DATASTORE_POOL/>", 0
 			}
-			datastore := fmt.Sprintf(`<DATASTORE><ID>100</ID><TYPE>%s</TYPE><DS_MAD>%s</DS_MAD><TM_MAD>%s</TM_MAD><TEMPLATE><TYPE>%s</TYPE></TEMPLATE></DATASTORE>`, cfg.datastoreType, cfg.datastoreBackend, cfg.datastoreTransfer, cfg.datastoreTemplateType)
+			datastore := fmt.Sprintf(`<DATASTORE><ID>124</ID><TYPE>%s</TYPE><DS_MAD>%s</DS_MAD><TM_MAD>%s</TM_MAD><DISK_TYPE>%s</DISK_TYPE><TEMPLATE><TYPE>%s</TYPE><DISK_TYPE>%s</DISK_TYPE></TEMPLATE></DATASTORE>`, cfg.datastoreType, cfg.datastoreBackend, cfg.datastoreTransfer, cfg.datastoreDiskType, cfg.datastoreTemplateType, cfg.datastoreTemplateDiskType)
 			if cfg.duplicateDatastore {
 				datastore += datastore
 			}
@@ -77,7 +79,7 @@ func TestSameNodeRetentionReadOnlyEvidence(t *testing.T) {
 	p, mutations := retentionProtocolFixture(t, func(c *retentionProtocolCase) {
 		c.extraDisk = `<DISK><DISK_ID>0</DISK_ID><TYPE>CDROM</TYPE></DISK>`
 		c.datastoreType, c.datastoreTemplateType = "0", "IMAGE_DS"
-		c.datastoreTransfer = "ceph"
+		c.datastoreDiskType = "3"
 	})
 	evidence, err := p.InspectSameNodeRetention(context.Background(), "volume-test", "node-test")
 	require.NoError(t, err)
@@ -94,9 +96,15 @@ func TestSameNodeRetentionRejectsUncertainOrUnsafeEvidence(t *testing.T) {
 		"system datastore":                      func(c *retentionProtocolCase) { c.datastoreType = "SYSTEM" },
 		"conflicting datastore categories":      func(c *retentionProtocolCase) { c.datastoreTemplateType = "SYSTEM_DS" },
 		"conflicting datastore drivers":         func(c *retentionProtocolCase) { c.datastoreTransfer = "ssh" },
-		"duplicate datastore ID":                func(c *retentionProtocolCase) { c.duplicateDatastore = true },
-		"unstable image":                        func(c *retentionProtocolCase) { c.imageState = 9 },
-		"image capacity overflow":               func(c *retentionProtocolCase) { c.imageSize = 1 << 50 },
+		"blank Ceph datastore transfer":         func(c *retentionProtocolCase) { c.datastoreTransfer = "" },
+		"missing RBD disk type":                 func(c *retentionProtocolCase) { c.datastoreTemplateDiskType = "" },
+		"conflicting root disk type":            func(c *retentionProtocolCase) { c.datastoreDiskType = "FILE" },
+		"conflicting template disk type": func(c *retentionProtocolCase) {
+			c.datastoreDiskType, c.datastoreTemplateDiskType = "3", "FILE"
+		},
+		"duplicate datastore ID":  func(c *retentionProtocolCase) { c.duplicateDatastore = true },
+		"unstable image":          func(c *retentionProtocolCase) { c.imageState = 9 },
+		"image capacity overflow": func(c *retentionProtocolCase) { c.imageSize = 1 << 50 },
 		"fresh VM identity changed": func(c *retentionProtocolCase) {
 			c.beforeReply = func(method string) {
 				if method == "one.vm.info" {
@@ -244,7 +252,8 @@ func TestVerifyAttachmentBackendRequiresPositiveDatastoreAndDiskFacts(t *testing
 		{name: "NFS via ssh", datastore: "nfs", transfer: "ssh", expected: "nfs"},
 		{name: "NFS via shared", datastore: "nfs", transfer: "shared", expected: "nfs"},
 		{name: "NFS datastore with shared transfer", datastore: "nfs", datastoreTransfer: "shared", transfer: "shared", expected: "nfs"},
-		{name: "Ceph", datastore: "ceph", transfer: "ceph", expected: "ceph"},
+		{name: "Ceph", datastore: "ceph", datastoreTransfer: "ceph", transfer: "ceph", expected: "ceph"},
+		{name: "Ceph without datastore transfer", datastore: "ceph", transfer: "ceph", expected: "ceph", failure: "lacks consistent Ceph RBD evidence"},
 		{name: "ambiguous ssh", datastore: "fs", transfer: "ssh", expected: "local", failedRead: true, failure: "cannot inspect attachment datastore"},
 		{name: "missing declared datastore", datastore: "nfs", transfer: "ssh", expected: "nfs", missingDatastore: true, failure: "was not found"},
 		{name: "undeclared datastore", transfer: "ssh", expected: "local", failure: "no valid datastore identity"},

@@ -14,6 +14,10 @@ import (
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type cephDeletionProtocolProvider struct {
@@ -104,6 +108,62 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 			require.NotNil(t, response)
 			require.EqualValues(t, 1, deletes.Load())
 			require.Zero(t, otherMutations.Load())
+		})
+	}
+}
+
+func TestControllerDeleteCephVerifiesMissingImageOwnership(t *testing.T) {
+	for _, mode := range []string{"retained-disk", "serial-reference", "unknown-ownership", "replacement-image", "hidden-handle", "confirmed-absent"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			const volume = "volume-test"
+			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+			pv.Finalizers = []string{"external-provisioner.volume.kubernetes.io/finalizer"}
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
+			provider, wire := nodeAttachmentProvider(t)
+			server := NewControllerServer(driver, provider, nil)
+			history, err := driver.volumeHistory.Upsert(ctx, volume, func(record *VolumeHistoryRecord) {
+				record.Backend = "ceph"
+				record.LastSuccessfulImageID = 7
+				record.LastSuccessfulPublishTime = time.Now().UTC().Add(-time.Hour)
+			})
+			require.NoError(t, err)
+			wire.mu.Lock()
+			wire.ceph, wire.missingImage = true, true
+			switch mode {
+			case "serial-reference":
+				delete(wire.disks, 41)
+				wire.extraDiskBefore = "<DISK><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SERIAL>onecsi-7</SERIAL></DISK>"
+			case "unknown-ownership":
+				wire.failMethod = "one.vmpool.info"
+			case "replacement-image":
+				wire.duplicateImage, wire.replacementDisk = true, true
+			case "hidden-handle":
+				wire.hideImageName = true
+				wire.missingImage = false
+			case "confirmed-absent":
+				delete(wire.disks, 41)
+			}
+			wire.mu.Unlock()
+
+			response, err := reviewControllerClient(t, server).DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: volume})
+			if mode == "confirmed-absent" {
+				require.NoError(t, err)
+				require.NotNil(t, response)
+			} else {
+				require.Equal(t, codes.FailedPrecondition, status.Code(err), "%v", err)
+				require.Nil(t, response)
+			}
+			currentPV, err := driver.kubeRuntime.client.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, pv.Finalizers, currentPV.Finalizers)
+			currentHistory, err := server.readAttachmentHistory(ctx, volume)
+			require.NoError(t, err)
+			require.Equal(t, history, currentHistory)
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			require.Empty(t, wire.mutations)
+			require.Zero(t, wire.detachAttempts)
 		})
 	}
 }

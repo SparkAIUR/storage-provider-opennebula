@@ -53,6 +53,7 @@ type nodeAttachmentProtocol struct {
 	imageName         string
 	duplicateImage    bool
 	missingImage      bool
+	hideImageName     bool
 	replacementDisk   bool
 	imageDatastoreID  int
 	imageTransfer     string
@@ -147,7 +148,7 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 			switch call.Method {
 			case "one.imagepool.info":
 				body = "<IMAGE_POOL>"
-				if !state.missingImage {
+				if !state.missingImage && !state.hideImageName {
 					body += imageXML()
 				}
 				if state.duplicateImage {
@@ -920,7 +921,7 @@ func TestProviderDetachRetryRespectsHotplugDeadline(t *testing.T) {
 
 func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"same-node", "replacement-uid", "replacement-vm", "vm-changed-before-dispatch", "duplicate-image", "replacement-image", "late-duplicate-image", "missing-image"} {
+		for _, mode := range []string{"same-node", "replacement-uid", "replacement-vm", "vm-changed-before-dispatch", "duplicate-image", "replacement-image", "late-duplicate-image", "missing-image", "hidden-handle", "missing-image-retained-disk", "missing-image-unknown-ownership", "missing-image-malformed-disk"} {
 			t.Run(fmt.Sprintf("queued=%v/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
@@ -930,7 +931,7 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 					node.UID = "replacement-uid"
 				}
 				driver := newStickyTestDriver(t, pv, pvc, node, newReadyNode("node-new", true))
-				_, err := driver.volumeHistory.Upsert(ctx, "volume-test", func(record *VolumeHistoryRecord) {
+				before, err := driver.volumeHistory.Upsert(ctx, "volume-test", func(record *VolumeHistoryRecord) {
 					record.Backend = "ceph"
 					record.LastSuccessfulPublishTime = time.Now().UTC().Add(-time.Hour)
 					record.LastSuccessfulImageID = 7
@@ -965,6 +966,17 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 					delete(state.disks, 41)
 					state.missingImage = mode != "duplicate-image"
 					state.duplicateImage, state.replacementDisk = mode != "missing-image", mode != "missing-image"
+				case "missing-image-retained-disk", "missing-image-unknown-ownership", "missing-image-malformed-disk":
+					state.missingImage = true
+					if mode == "missing-image-unknown-ownership" {
+						state.failMethod = "one.vmpool.info"
+					}
+					if mode == "missing-image-malformed-disk" {
+						delete(state.disks, 41)
+						state.extraDiskBefore = "<DISK><IMAGE_ID>invalid</IMAGE_ID></DISK>"
+					}
+				case "hidden-handle":
+					state.hideImageName = true
 				}
 				state.mu.Unlock()
 				controller := NewControllerServer(driver, provider, nil)
@@ -974,7 +986,8 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 				}
 				client := reviewControllerClient(t, controller)
 				response, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: "volume-test", NodeId: "node-old"})
-				history, _ := driver.volumeHistory.Get("volume-test")
+				history, historyErr := controller.readAttachmentHistory(ctx, "volume-test")
+				require.NoError(t, historyErr)
 				switch mode {
 				case "same-node":
 					require.NoError(t, err)
@@ -983,16 +996,16 @@ func TestControllerUnpublishBindsAbsenceToHistoricalNode(t *testing.T) {
 				case "missing-image":
 					require.NoError(t, err)
 					require.NotNil(t, response)
-					require.True(t, history.LastSafeDetachTime.IsZero())
+					require.Equal(t, before, history)
 				default:
 					require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
 					require.Nil(t, response)
-					require.True(t, history.LastSafeDetachTime.IsZero())
+					require.Equal(t, before, history)
 				}
 				state.mu.Lock()
 				defer state.mu.Unlock()
 				require.Empty(t, state.mutations)
-				if strings.Contains(mode, "vm") {
+				if strings.Contains(mode, "vm") || mode == "missing-image-retained-disk" {
 					require.Contains(t, state.disks, 41)
 				}
 				if mode == "duplicate-image" || mode == "replacement-image" || mode == "late-duplicate-image" {
