@@ -173,6 +173,15 @@ func cephRetentionAccessMode(modes []corev1.PersistentVolumeAccessMode) bool {
 	return len(modes) == 1 && hasSingleWriterAccessMode(modes)
 }
 
+func completedRetentionCapacity(pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim) (int64, string, bool) {
+	completed := pv.Spec.Capacity.Storage()
+	requested := pvc.Spec.Resources.Requests.Storage()
+	capacity := completed.Value()
+	ok := requested.Sign() > 0 && requested.Cmp(*completed) <= 0 && capacity > 0 &&
+		pvc.Status.Capacity.Storage().Cmp(*completed) == 0 && len(pvc.Status.Conditions) == 0 && len(pvc.Status.AllocatedResourceStatuses) == 0
+	return capacity, requested.String(), ok
+}
+
 func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, runtimeCtx *VolumeRuntimeContext, nodeID, diskID int) (*cephRetentionAuthority, error) {
 	backend, err := runtimeCtx.verifiedAttachmentBackend()
 	if err != nil || !isCephBackend(backend) {
@@ -197,10 +206,8 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if !cephRetentionAccessMode(pv.Spec.AccessModes) || !slices.Equal(pv.Spec.AccessModes, pvc.Spec.AccessModes) {
 		return nil, status.Error(codes.FailedPrecondition, "Ceph same-node retention requires matching RWO or RWOP access modes")
 	}
-	completedCapacity := pv.Spec.Capacity.Storage()
-	capacity := completedCapacity.Value()
-	requestedCapacity := pvc.Spec.Resources.Requests.Storage()
-	if requestedCapacity.Sign() <= 0 || requestedCapacity.Cmp(*completedCapacity) > 0 || capacity <= 0 || pvc.Status.Capacity.Storage().Cmp(*completedCapacity) != 0 || len(pvc.Status.Conditions) > 0 || len(pvc.Status.AllocatedResourceStatuses) > 0 {
+	capacity, requestedCapacity, ok := completedRetentionCapacity(pv, pvc)
+	if !ok {
 		return nil, cephRetentionUnavailable("PVC capacity is pending or inconsistent", nil)
 	}
 	identity, err := runtime.NodeIdentity(ctx, req.NodeId)
@@ -210,7 +217,7 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if !identity.Exists || !identity.Ready || identity.Deleting || identity.UID == "" {
 		return nil, cephRetentionUnavailable("node identity is unknown or not Ready", nil)
 	}
-	authority := &cephRetentionAuthority{PVName: pv.Name, PVUID: pv.UID, PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVCUID: pvc.UID, NodeUID: types.UID(identity.UID), Capacity: capacity, RequestedCapacity: requestedCapacity.String()}
+	authority := &cephRetentionAuthority{PVName: pv.Name, PVUID: pv.UID, PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVCUID: pvc.UID, NodeUID: types.UID(identity.UID), Capacity: capacity, RequestedCapacity: requestedCapacity}
 	attachments, err := s.detachVolumeAttachments(ctx, pv.Name, "")
 	if err != nil {
 		return nil, cephRetentionUnavailable("VolumeAttachment lookup failed", err)

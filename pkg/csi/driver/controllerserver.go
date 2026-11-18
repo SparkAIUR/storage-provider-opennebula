@@ -1324,6 +1324,14 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	}
 
 	if isCephBackend(backend) && cephRetentionAccessMode(recoveryRuntimeCtx.AccessModes) {
+		if attempt := history.PendingReplacementAttach; attempt != nil && attempt.dispatchPossible() {
+			if handled, err := s.rescueMarkedReplacementUnpublish(ctx, req.VolumeId, req.NodeId, volumeID, nodeID); handled {
+				if err != nil {
+					return nil, err
+				}
+				return &csi.ControllerUnpublishVolumeResponse{}, nil
+			}
+		}
 		if rescued, response, rescueErr := s.rescueCephSameNodeUnpublish(ctx, req, volumeID, nodeID, recoveryRuntimeCtx); rescued {
 			return response, rescueErr
 		}

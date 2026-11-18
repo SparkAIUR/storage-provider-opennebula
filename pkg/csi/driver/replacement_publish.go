@@ -163,12 +163,19 @@ func (s *ControllerServer) replacementPublishHistory(ctx context.Context, req *c
 	return history, replacement, nil
 }
 
-func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, req *csi.ControllerPublishVolumeRequest, history VolumeHistoryRecord, attempt replacementAttachAttempt, diskID int) (replacementAttachAttempt, error) {
+func replacementPublishCanWrite(req *csi.ControllerPublishVolumeRequest) bool {
+	mode := req.GetVolumeCapability().GetAccessMode().GetMode()
+	return !req.GetReadonly() && (mode == csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER || mode == csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER)
+}
+
+type replacementVAProof func(name string, va detachAttachmentAuthority, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim) error
+
+func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, history VolumeHistoryRecord, attempt replacementAttachAttempt, diskID int, proveVA replacementVAProof) (replacementAttachAttempt, error) {
 	unavailable := func() (replacementAttachAttempt, error) {
 		return attempt, status.Error(codes.Unavailable, "replacement Ceph attach release, binding or demand is unverified")
 	}
 	client := s.driver.kubeRuntime.client.CoreV1()
-	pv, err := s.ownedDeletionPV(ctx, req.VolumeId)
+	pv, err := s.ownedDeletionPV(ctx, attempt.VolumeID)
 	if err != nil || pv == nil || pv.DeletionTimestamp != nil || pv.Status.Phase != corev1.VolumeBound ||
 		pv.Name != history.PVName || !cephRetentionAccessMode(pv.Spec.AccessModes) {
 		return unavailable()
@@ -187,11 +194,7 @@ func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, req *cs
 		return unavailable()
 	}
 	attempt.PVUID, attempt.PVCUID = string(pv.UID), string(pvc.UID)
-	mode := req.GetVolumeCapability().GetAccessMode().GetMode()
-	if req.Readonly || (mode != csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER && mode != csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER) {
-		return unavailable()
-	}
-	node, err := client.Nodes().Get(ctx, req.NodeId, metav1.GetOptions{})
+	node, err := client.Nodes().Get(ctx, attempt.Node, metav1.GetOptions{})
 	if err != nil || string(node.UID) != attempt.ReplacementUID || node.DeletionTimestamp != nil || node.CreationTimestamp.IsZero() ||
 		!slices.ContainsFunc(node.Status.Conditions, func(c corev1.NodeCondition) bool {
 			return c.Type == corev1.NodeReady && c.Status == corev1.ConditionTrue
@@ -204,27 +207,31 @@ func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, req *cs
 	}
 	for name, attachment := range attachments {
 		if name == "" || attachment.attacher != attempt.Driver || attachment.node != attempt.Node || attachment.uid == "" ||
-			attachment.deleting || attachment.attached || !attachment.created.After(node.CreationTimestamp.Time) || validateAttachmentImageAssertions(attachment.metadata, attempt.ImageID) != nil ||
-			(pinned && (attempt.VAName != name || attempt.VAUID != string(attachment.uid))) {
+			!attachment.created.After(node.CreationTimestamp.Time) || validateAttachmentImageAssertions(attachment.metadata, attempt.ImageID) != nil {
 			return unavailable()
 		}
-		attempt.VAName, attempt.VAUID = name, string(attachment.uid)
+		if proveVA == nil {
+			if attachment.deleting || attachment.attached || (pinned && (attempt.VAName != name || attempt.VAUID != string(attachment.uid))) {
+				return unavailable()
+			}
+			attempt.VAName, attempt.VAUID = name, string(attachment.uid)
+		}
 	}
 	runtimeCtx := &VolumeRuntimeContext{PVName: pv.Name, PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVCUID: pvc.UID,
 		verifiedClaimBinding: true, PVAnnotations: pv.Annotations, PVCAnnotations: pvc.Annotations, Backend: backend, AccessModes: pv.Spec.AccessModes}
-	control := resolvedRecoveryControlState(req.VolumeId, runtimeCtx, VolumeRecoveryControlState{})
+	control := resolvedRecoveryControlState(attempt.VolumeID, runtimeCtx, VolumeRecoveryControlState{})
 	if control.Invalid || control.Active() {
 		return attempt, status.Error(codes.FailedPrecondition, "replacement Ceph attach is blocked by recovery controls")
 	}
-	protection, err := s.localRWOProtectionProjection(ctx, req.VolumeId, req.NodeId, runtimeCtx, false, true)
-	if err != nil || protection.Invalid || (protection.Protected && protection.RequiredNode != "" && protection.RequiredNode != req.NodeId && !protection.OverrideUsed) {
+	protection, err := s.localRWOProtectionProjection(ctx, attempt.VolumeID, attempt.Node, runtimeCtx, false, true)
+	if err != nil || protection.Invalid || (protection.Protected && protection.RequiredNode != "" && protection.RequiredNode != attempt.Node && !protection.OverrideUsed) {
 		return unavailable()
 	}
 	target := opennebula.HostArtifactAttachmentTarget{NodeName: attempt.Node, VMID: attempt.VMID, ImageID: attempt.ImageID, DiskID: diskID}
-	if err := s.recheckAttachmentAuthority(ctx, req.VolumeId, runtimeCtx, target, pv, pvc, false); err != nil {
+	if err := s.recheckAttachmentAuthority(ctx, attempt.VolumeID, runtimeCtx, target, pv, pvc, false); err != nil {
 		return attempt, err
 	}
-	current, err := client.Nodes().Get(ctx, req.NodeId, metav1.GetOptions{})
+	current, err := client.Nodes().Get(ctx, attempt.Node, metav1.GetOptions{})
 	if err != nil || current.UID != node.UID || !current.CreationTimestamp.Equal(&node.CreationTimestamp) ||
 		current.DeletionTimestamp != nil ||
 		!slices.ContainsFunc(current.Status.Conditions, func(c corev1.NodeCondition) bool {
@@ -234,6 +241,13 @@ func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, req *cs
 	}
 	if waiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, current); err != nil || !waiting {
 		return unavailable()
+	}
+	if proveVA != nil {
+		for name, attachment := range attachments {
+			if err := proveVA(name, attachment, pv, pvc); err != nil {
+				return attempt, err
+			}
+		}
 	}
 	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
 		return attempt, err
@@ -307,7 +321,7 @@ func premountContainerStatuses(statuses []corev1.ContainerStatus, declared func(
 }
 
 func (s *ControllerServer) verifyReplacementAttempt(ctx context.Context, req *csi.ControllerPublishVolumeRequest, attempt replacementAttachAttempt, attached bool) (*opennebula.VolumeDiskRecord, error) {
-	if attempt.Driver != s.driver.name || attempt.VolumeID != req.VolumeId || attempt.Node != req.NodeId {
+	if !replacementPublishCanWrite(req) || attempt.Driver != s.driver.name || attempt.VolumeID != req.VolumeId || attempt.Node != req.NodeId {
 		return nil, attachmentEvidenceUnavailable("replacement Ceph attach scope changed", nil)
 	}
 	if !attempt.dispatchPossible() {
@@ -325,7 +339,7 @@ func (s *ControllerServer) verifyReplacementAttempt(ctx context.Context, req *cs
 	if disk != nil {
 		diskID = disk.DiskID
 	}
-	_, err = s.verifyReplacementBinding(ctx, req, history, attempt, diskID)
+	_, err = s.verifyReplacementBinding(ctx, history, attempt, diskID, nil)
 	return disk, err
 }
 
@@ -404,7 +418,10 @@ func (s *ControllerServer) beginReplacementAttach(ctx context.Context, req *csi.
 			attempt.OriginalVMName = name
 		}
 	}
-	attempt, err = s.verifyReplacementBinding(ctx, req, history, attempt, -1)
+	if !replacementPublishCanWrite(req) {
+		return nil, attachmentEvidenceUnavailable("replacement Ceph attach requires single-writer Publish", nil)
+	}
+	attempt, err = s.verifyReplacementBinding(ctx, history, attempt, -1, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -460,8 +477,17 @@ func (s *ControllerServer) checkReplacementAttemptReadback(ctx context.Context, 
 
 func (s *ControllerServer) completeReplacementAttach(ctx context.Context, req *csi.ControllerPublishVolumeRequest, attempt replacementAttachAttempt, node KubernetesNodeIdentity, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision) (successfulAttachmentObservation, error) {
 	var observation successfulAttachmentObservation
-	if attempt.Driver != s.driver.name || attempt.VolumeID != req.VolumeId || attempt.Node != req.NodeId || attempt.ReplacementUID != node.UID {
+	if !replacementPublishCanWrite(req) || attempt.Driver != s.driver.name || attempt.VolumeID != req.VolumeId || attempt.Node != req.NodeId || attempt.ReplacementUID != node.UID {
 		return observation, attachmentEvidenceUnavailable("replacement Ceph attach scope changed", nil)
+	}
+	if attempt.dispatchPossible() && attempt.VAName != "" && attempt.VAUID != "" {
+		gone, err := s.replacementOriginalVAGone(ctx, attempt)
+		if err != nil {
+			return observation, err
+		}
+		if gone {
+			return s.completeRetainedReplacement(ctx, req, attempt, node, runtimeCtx)
+		}
 	}
 	disk, err := s.verifyReplacementAttempt(ctx, req, attempt, true)
 	if err != nil {

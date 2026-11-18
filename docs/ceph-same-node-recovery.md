@@ -47,17 +47,29 @@ disk carries that exact value and the original admission still matches.
 A prepared attempt can resume after a restart. Each caller proposes a new
 attempt ID in the conditional update that advances it to dispatch-possible.
 Only the acknowledged winner can send the attach, after reading back the exact
-record and rechecking current authority. Replacement Publish requires the same
-owned, unattached VolumeAttachment through dispatch and completion. If that update's reply is lost, the
-same caller can retire its exact ID after independent readback because it knows
+record and rechecking current authority. Replacement dispatch requires the
+same owned, unattached VolumeAttachment throughout. If the authorization
+update's reply is lost, the same caller can retire its exact ID after independent readback because it knows
 it has sent no attach. This retirement can finish after the request is canceled
 or demand ends. A prepared attempt can also retire after verified
 abandonment and a conditional update that rules out concurrent arming.
 
+If the marked attach takes effect and its reply is lost, a new waiting Pod
+on the admitted replacement Node can coexist with logical deletion of the
+exact pinned VolumeAttachment. The controller rechecks the binding, demand
+and protections and observes the sole marked disk twice, including its serial,
+slot and completed capacity. This acknowledgement leaves the disk, pending
+attempt and successful history intact. Once the pinned attachment UID is gone,
+Publish can complete against an eligible owned successor on that Node after
+rechecking the same disk and current authority. Only verified Publish advances
+the successful attachment history. Neither step issues another provider
+mutation.
+
 If demand disappears after dispatch, Unpublish or the reconciler can detach
 only the exact marked disk after verifying current release. An owned Released
-PV can use its original claim reference after the claim is gone. Idle snapshots
-alone do not prove that a possibly sent attach cannot still take effect.
+PV can use its original claim reference after the claim is gone, including when
+a different claim UID has reused the name and is verifiably bound to another PV.
+Idle snapshots alone do not prove that a possibly sent attach cannot still take effect.
 Unpublish and DeleteVolume stay blocked while that attempt is unresolved.
 
 After a verified physical detach for a deleting VolumeAttachment, the controller

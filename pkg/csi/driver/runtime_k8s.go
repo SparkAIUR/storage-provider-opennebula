@@ -443,6 +443,21 @@ func (r *KubeRuntime) attachmentClaim(ctx context.Context, pv *corev1.Persistent
 	return pvc, false, nil
 }
 
+func (r *KubeRuntime) verifyReleasedClaimNameReuse(ctx context.Context, original *corev1.PersistentVolume, reused *corev1.PersistentVolumeClaim) error {
+	if original.Status.Phase != corev1.VolumeReleased || reused.Status.Phase != corev1.ClaimBound ||
+		reused.Spec.VolumeName == "" || reused.Spec.VolumeName == original.Name {
+		return attachmentEvidenceUnavailable("reused claim name has no verified independent binding", nil)
+	}
+	other, err := r.client.CoreV1().PersistentVolumes().Get(ctx, reused.Spec.VolumeName, metav1.GetOptions{})
+	if err != nil || other.Status.Phase != corev1.VolumeBound || other.DeletionTimestamp != nil || other.UID == "" || other.UID == original.UID ||
+		other.Spec.ClaimRef == nil || other.Spec.ClaimRef.UID != reused.UID ||
+		other.Spec.ClaimRef.Namespace != reused.Namespace || other.Spec.ClaimRef.Name != reused.Name ||
+		(other.Spec.CSI != nil && other.Spec.CSI.Driver == original.Spec.CSI.Driver && other.Spec.CSI.VolumeHandle == original.Spec.CSI.VolumeHandle) {
+		return attachmentEvidenceUnavailable("reused claim name has no verified independent binding", err)
+	}
+	return ctx.Err()
+}
+
 func (r *KubeRuntime) ResolveVolumeRuntimeContext(ctx context.Context, volumeHandle string) (*VolumeRuntimeContext, error) {
 	if r == nil || !r.enabled {
 		return nil, fmt.Errorf("kubernetes runtime is not enabled")

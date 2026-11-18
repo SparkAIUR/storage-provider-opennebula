@@ -183,10 +183,15 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			attempt.Node != nodeName || attempt.ImageID != identity.imageID || attempt.VMID != identity.vmID ||
 			attempt.ReplacementUID != string(identity.nodeUID) || attempt.PVUID != string(pv.UID) ||
 			pv.Name != history.PVName || (!bound && !released) || !cephRetentionAccessMode(pv.Spec.AccessModes) ||
-			!isCephBackend(backend) || replacement || claim == nil || attempt.PVCUID != string(claim.UID) ||
+			!isCephBackend(backend) || claim == nil || attempt.PVCUID != string(claim.UID) ||
 			claim.Namespace != history.PVCNamespace || claim.Name != history.PVCName ||
-			(pvc != nil && !slices.Equal(pv.Spec.AccessModes, pvc.Spec.AccessModes)) {
+			(pvc != nil && !replacement && !slices.Equal(pv.Spec.AccessModes, pvc.Spec.AccessModes)) {
 			return attachmentEvidenceUnavailable("replacement detach binding or identity is unverified", nil)
+		}
+		if replacement {
+			if err := runtime.verifyReleasedClaimNameReuse(ctx, pv, pvc); err != nil {
+				return err
+			}
 		}
 		va, pinned := attachments[attempt.VAName]
 		if len(attachments) != 0 || attempt.detached() {
@@ -265,7 +270,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	}
 	receipt := readback && replacementDetach && attempt.detached()
 	terminalOnNode := false
-	if claim := pv.Spec.ClaimRef; claim != nil && !receipt {
+	if claim := pv.Spec.ClaimRef; claim != nil && (!receipt || replacement) {
 		pods, err := runtime.client.CoreV1().Pods(claim.Namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return attachmentEvidenceUnavailable("cannot verify Pod release", err)
@@ -329,7 +334,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			return err
 		}
 	}
-	if receipt {
+	if receipt && !replacement {
 		waiting, err = s.replacementWaitingConsumers(ctx, pv, pvc, node)
 		if err != nil {
 			return err
@@ -340,6 +345,11 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	}
 	if !waiting && nodeReportsVolumeInUse(node, s.driver.name, volume) {
 		return status.Error(codes.Unavailable, "detach node still reports the volume in use")
+	}
+	if replacementDetach && replacement {
+		if err := runtime.verifyReleasedClaimNameReuse(ctx, pv, pvc); err != nil {
+			return err
+		}
 	}
 	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, attachmentNode, attachments); err != nil {
 		return err
