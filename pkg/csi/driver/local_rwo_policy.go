@@ -497,7 +497,7 @@ func (state *VolumeHistoryRecord) observeSuccessfulAttachment(observation succes
 	state.LastSuccessfulDeviceSerial = firstNonEmpty(observation.serial, state.LastSuccessfulDeviceSerial)
 }
 
-func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target string, sourceContext map[string]string, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision, metadata *opennebula.VolumeAttachmentMetadata) {
+func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target string, sourceContext map[string]string, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision, metadata *opennebula.VolumeAttachmentMetadata, freshAttach bool) {
 	if s == nil || s.driver == nil || s.driver.volumeHistory == nil || strings.TrimSpace(volumeID) == "" {
 		return
 	}
@@ -527,6 +527,9 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 				break
 			}
 		}
+	}
+	if freshAttach && observation.diskID < 0 {
+		observation.diskID = 0
 	}
 	now := time.Now().UTC()
 	_, err := s.driver.volumeHistory.Upsert(ctx, volumeID, func(state *VolumeHistoryRecord) {

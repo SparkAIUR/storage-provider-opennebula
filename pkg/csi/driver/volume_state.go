@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 )
@@ -430,6 +431,12 @@ func (m *VolumeRepairStateManager) Get(volumeID string) (VolumeRepairState, bool
 
 func decodeLocalDeviceReport(key, raw, volumeID string) (LocalDeviceMissingReport, error) {
 	var report LocalDeviceMissingReport
+	if volumeID != "" && !strings.HasSuffix(key, "."+sanitizeLocalDeviceReportKey(volumeID)) {
+		node, handle, split := strings.Cut(key, ".")
+		if split && handle != "" && len(validation.IsDNS1123Subdomain(node)) == 0 && len(validation.IsConfigMapKey(key)) == 0 {
+			return report, nil
+		}
+	}
 	var identity struct {
 		Node     string `json:"node"`
 		VolumeID string `json:"volumeID"`

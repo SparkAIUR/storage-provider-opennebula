@@ -170,6 +170,10 @@ func validateCephRetentionDisk(req *csi.ControllerUnpublishVolumeRequest, imageI
 	return nil
 }
 
+func cephRetentionAccessMode(modes []corev1.PersistentVolumeAccessMode) bool {
+	return len(modes) == 1 && hasSingleWriterAccessMode(modes)
+}
+
 func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, runtimeCtx *VolumeRuntimeContext, nodeID, diskID int) (*cephRetentionAuthority, error) {
 	backend, err := runtimeCtx.verifiedAttachmentBackend()
 	if err != nil || !isCephBackend(backend) {
@@ -191,7 +195,7 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if pvc.UID != pv.Spec.ClaimRef.UID || pvc.UID == "" || pvc.DeletionTimestamp != nil || pvc.Status.Phase != corev1.ClaimBound || pvc.Spec.VolumeName != pv.Name {
 		return nil, cephRetentionUnavailable("bound PVC identity changed or is incomplete", nil)
 	}
-	if !hasSingleWriterAccessMode(pv.Spec.AccessModes) || !hasSingleWriterAccessMode(pvc.Spec.AccessModes) || len(pv.Spec.AccessModes) != 1 || len(pvc.Spec.AccessModes) != 1 || pv.Spec.AccessModes[0] != pvc.Spec.AccessModes[0] {
+	if !cephRetentionAccessMode(pv.Spec.AccessModes) || !slices.Equal(pv.Spec.AccessModes, pvc.Spec.AccessModes) {
 		return nil, status.Error(codes.FailedPrecondition, "Ceph same-node retention requires matching RWO or RWOP access modes")
 	}
 	completedCapacity := pv.Spec.Capacity.Storage()
@@ -274,6 +278,10 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 		return nil, cephRetentionUnavailable("RWOP volume has multiple consumers", nil)
 	}
 	sort.Strings(authority.ConsumerUIDs)
+	currentNode, err := runtime.NodeIdentity(ctx, req.NodeId)
+	if err != nil || !currentNode.Exists || !currentNode.Ready || currentNode.Deleting || currentNode.UID != identity.UID {
+		return nil, cephRetentionUnavailable("node identity or readiness changed during retention checks", err)
+	}
 	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
 		return nil, err
 	}

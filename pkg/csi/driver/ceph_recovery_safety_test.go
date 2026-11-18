@@ -487,7 +487,7 @@ func TestControllerUnpublishCephLateDemandCannotAcknowledge(t *testing.T) {
 
 func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"null", "identity-only", "missing-count", "missing-last-observation", "reversed-observation", "unrelated-reversed-observation", "unrelated-invalid-schema", "wrong-report-key", "unknown-confirmation", "unknown-failure", "host-key", "host-owner"} {
+		for _, mode := range []string{"null", "unrelated-null", "ambiguous-null", "invalid-key-null", "identity-only", "missing-count", "missing-last-observation", "reversed-observation", "unrelated-reversed-observation", "unrelated-invalid-schema", "wrong-report-key", "unknown-confirmation", "unknown-failure", "host-key", "host-owner"} {
 			t.Run(fmt.Sprintf("%v/%s", queued, mode), func(t *testing.T) {
 				f := newCephRestartTestFixture(t, queued)
 				key := localDeviceReportKey(f.node.Name, cephRestartVolume)
@@ -496,6 +496,12 @@ func TestControllerUnpublishCephRejectsMalformedSecondaryProtection(t *testing.T
 				switch mode {
 				case "null":
 					raw = "null"
+				case "unrelated-null":
+					key, raw = localDeviceReportKey(f.node.Name, "other-volume"), "null"
+				case "ambiguous-null":
+					key, raw = localDeviceReportKey(f.node.Name, "other."+cephRestartVolume), "null"
+				case "invalid-key-null":
+					key, raw = "unattributable", "null"
 				case "identity-only":
 					raw = fmt.Sprintf(`{"node":%q,"volumeID":%q}`, f.node.Name, cephRestartVolume)
 				case "unrelated-invalid-schema":
@@ -973,5 +979,53 @@ func TestControllerUnpublishCephRejectsVAReplacementDuringFinalProtectionRead(t 
 			require.True(t, history.LastSafeDetachTime.IsZero())
 			f.requireNoProviderMutation(t)
 		})
+	}
+}
+
+func TestControllerUnpublishCephRechecksNodeAfterProtectionReads(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, change := range []string{"uid", "deleting", "readiness"} {
+			t.Run(fmt.Sprintf("queued=%t/%s", queued, change), func(t *testing.T) {
+				f := newCephRestartTestFixture(t, queued)
+				kube := f.server.driver.kubeRuntime.client.(*fake.Clientset)
+				var readNode, changed atomic.Bool
+				kube.PrependReactor("get", "nodes", func(ktesting.Action) (bool, kruntime.Object, error) {
+					if f.provider.inspections.Load() == 2 {
+						readNode.Store(true)
+					}
+					return false, nil, nil
+				})
+				kube.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+					if action.(ktesting.GetAction).GetName() != hostArtifactStateConfigMapName ||
+						!readNode.Load() || !changed.CompareAndSwap(false, true) {
+						return false, nil, nil
+					}
+					node := f.node.DeepCopy()
+					nodes := corev1.SchemeGroupVersion.WithResource("nodes")
+					switch change {
+					case "uid":
+						node.UID = "replacement-node"
+						require.NoError(t, kube.Tracker().Delete(nodes, "", node.Name))
+						require.NoError(t, kube.Tracker().Create(nodes, node, ""))
+					case "deleting":
+						now := metav1.Now()
+						node.DeletionTimestamp = &now
+						require.NoError(t, kube.Tracker().Update(nodes, node, ""))
+					case "readiness":
+						node.Status.Conditions[0].Status = corev1.ConditionFalse
+						require.NoError(t, kube.Tracker().Update(nodes, node, ""))
+					}
+					return false, nil, nil
+				})
+				resp, err := f.unpublish(t)
+				require.True(t, changed.Load())
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.ErrorContains(t, err, "node identity or readiness changed")
+				require.Nil(t, resp)
+				history, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
+				require.True(t, history.LastSafeDetachTime.IsZero())
+				f.requireNoProviderMutation(t)
+			})
+		}
 	}
 }
