@@ -42,6 +42,7 @@ type nodeAttachmentProtocol struct {
 	abortFirstAttach    bool
 	alterDirectImage    func(string) string
 	loseAttachReply     bool
+	loseDetachReply     bool
 	attachDiskTemplate  string
 	attachAttempt       string
 	attachAttemptVM     int
@@ -305,6 +306,9 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 					state.attachAttempt = ""
 				}
 				state.mutations = append(state.mutations, fmt.Sprintf("detach:%d", id))
+				if state.loseDetachReply {
+					panic(http.ErrAbortHandler)
+				}
 				body = strconv.Itoa(id)
 			case "one.system.version":
 				body = state.version
@@ -4034,8 +4038,8 @@ func setReplacementHistoryVersion(t *testing.T, driver *Driver) {
 func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 	for _, queued := range []bool{false, true} {
 		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "safe-detach-updated", "unknown", "final-refusal", "write-conflict", "lost-write-reply", "readback-failed", "readback-unproven", "prepared-outage", "armed-outage", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
-			"distinct-vm-abandoned", "distinct-vm-orphan", "distinct-vm-abandoned-wrong-marker", "distinct-vm-abandoned-consumer",
-			"distinct-vm-abandoned-late-uid", "distinct-vm-abandoned-late-quarantine", "distinct-vm-abandoned-terminating", "distinct-vm-abandoned-readback", "distinct-vm-still-owned", "distinct-vm-unreadable-original", "distinct-vm-original-changed", "distinct-vm-marker-mismatch", "distinct-vm-node-changed", "distinct-vm-destination-changed", "other-version"} {
+			"distinct-vm-abandoned", "distinct-vm-orphan", "distinct-vm-abandoned-released", "distinct-vm-abandoned-rebound", "distinct-vm-orphan-released", "distinct-vm-abandoned-wrong-marker", "distinct-vm-abandoned-consumer",
+			"distinct-vm-abandoned-late-uid", "distinct-vm-abandoned-late-quarantine", "distinct-vm-abandoned-terminating", "distinct-vm-abandoned-readback", "distinct-vm-abandoned-no-disk-orphan", "distinct-vm-abandoned-no-disk-stale-va", "distinct-vm-abandoned-no-disk-original-owner", "distinct-vm-abandoned-detach-reply", "distinct-vm-abandoned-retire-conflict", "phase-less", "distinct-vm-still-owned", "distinct-vm-unreadable-original", "distinct-vm-original-changed", "distinct-vm-marker-mismatch", "distinct-vm-node-changed", "distinct-vm-destination-changed", "other-version"} {
 			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				const volume = "volume-test"
@@ -4048,7 +4052,10 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				var pendingWritten, readbackFailed, apiOutage, outageInjected, abandoned atomic.Bool
 				var detachProofs atomic.Int32
 				interruptedAdmission := mode == "prepared-outage" || mode == "armed-outage" || mode == "concurrent-prepared"
-				cleanup := strings.HasPrefix(mode, "distinct-vm-abandoned") || mode == "distinct-vm-orphan"
+				orphan := strings.HasPrefix(mode, "distinct-vm-orphan")
+				cleanup := strings.HasPrefix(mode, "distinct-vm-abandoned") || orphan
+				lostReadback := mode == "distinct-vm-abandoned-readback" || strings.HasPrefix(mode, "distinct-vm-abandoned-no-disk")
+				interruptedCleanup := lostReadback || mode == "distinct-vm-abandoned-detach-reply" || mode == "distinct-vm-abandoned-retire-conflict"
 				var lostWriteToken string
 				var wire *nodeAttachmentProtocol
 				var failBeforeDispatch atomic.Bool
@@ -4067,7 +4074,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							require.True(t, active)
 						}
 					}
-					if abandoned.Load() && mode == "distinct-vm-abandoned-readback" && method == "one.image.info" {
+					if abandoned.Load() && lostReadback && method == "one.image.info" {
 						wire.mu.Lock()
 						if _, attached := wire.disks[42]; !attached {
 							wire.failMethod = method
@@ -4345,6 +4352,12 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					})
 				case "safe-detach-updated":
 					NewControllerServer(driver, provider, nil).recordSafeDetach(ctx, volume, "prior-node")
+				case "phase-less":
+					stored, err = driver.volumeHistory.Upsert(ctx, volume, func(history *VolumeHistoryRecord) {
+						attempt := *history.PendingReplacementAttach
+						attempt.Version, attempt.Phase = 1, ""
+						history.PendingReplacementAttach = &attempt
+					})
 				}
 				require.NoError(t, err)
 				driver.volumeHistory = NewVolumeHistoryManager(driver.kubeRuntime, driver.volumeHistory.namespace)
@@ -4362,16 +4375,92 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					default:
 						require.NoError(t, kube.CoreV1().Pods(pvc.Namespace).Delete(ctx, consumer.Name, metav1.DeleteOptions{}))
 					}
-					abandoned.Store(true)
-					switch mode {
-					case "distinct-vm-orphan":
-						reconciler := NewAttachmentReconciler(NewControllerServer(driver, provider, nil))
-						reconciler.orphanGrace = 0
-						require.NoError(t, reconciler.ReconcileOnce(ctx))
-						require.NoError(t, reconciler.ReconcileOnce(ctx))
-					default:
-						_, err = restarted.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+					if strings.HasSuffix(mode, "-released") || strings.HasSuffix(mode, "-rebound") {
+						require.NoError(t, kube.CoreV1().PersistentVolumeClaims(pvc.Namespace).Delete(ctx, pvc.Name, metav1.DeleteOptions{}))
+						pv.Status.Phase = corev1.VolumeReleased
+						_, err := kube.CoreV1().PersistentVolumes().UpdateStatus(ctx, pv, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						if strings.HasSuffix(mode, "-rebound") {
+							newClaim := pvc.DeepCopy()
+							newClaim.UID, newClaim.Spec.VolumeName = "new-claim", ""
+							_, err := kube.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(ctx, newClaim, metav1.CreateOptions{})
+							require.NoError(t, err)
+						}
 					}
+					if mode == "distinct-vm-abandoned-detach-reply" {
+						wire.mu.Lock()
+						wire.loseDetachReply = true
+						wire.mu.Unlock()
+					}
+					if mode == "distinct-vm-abandoned-retire-conflict" {
+						rejected := false
+						kube.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+							cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
+							if cm.Name != volumeHistoryStateConfigMapName || rejected {
+								return false, nil, nil
+							}
+							var current VolumeHistoryRecord
+							require.NoError(t, json.Unmarshal([]byte(cm.Data[volume]), &current))
+							if current.PendingReplacementAttach != nil {
+								return false, nil, nil
+							}
+							rejected = true
+							return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), cm.Name, errors.New("retirement resource version changed"))
+						})
+					}
+					abandoned.Store(true)
+					reconcile := func() {
+						r := NewAttachmentReconciler(NewControllerServer(driver, provider, nil))
+						r.orphanGrace, r.staleVAGrace = 0, 0
+						require.NoError(t, r.ReconcileOnce(ctx))
+						require.NoError(t, r.ReconcileOnce(ctx))
+					}
+					unpublish := func(client csi.ControllerClient) error {
+						_, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+						return err
+					}
+					if orphan {
+						reconcile()
+					} else {
+						err = unpublish(restarted)
+					}
+					if interruptedCleanup {
+						require.Error(t, err)
+						current, err := NewControllerServer(driver, provider, nil).readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.Equal(t, stored.PendingReplacementAttach, current.PendingReplacementAttach)
+						require.True(t, current.LastSafeDetachTime.IsZero())
+						abandoned.Store(false)
+						wire.mu.Lock()
+						wire.failMethod = ""
+						if mode == "distinct-vm-abandoned-no-disk-original-owner" {
+							wire.disks[41] = 128
+						}
+						wire.mu.Unlock()
+						driver.volumeHistory = NewVolumeHistoryManager(driver.kubeRuntime, driver.volumeHistory.namespace)
+					}
+					switch mode {
+					case "distinct-vm-abandoned-no-disk-orphan":
+						reconcile()
+						err = nil
+					case "distinct-vm-abandoned-no-disk-stale-va":
+						deleting := metav1.Now()
+						va := &storagev1.VolumeAttachment{
+							ObjectMeta: metav1.ObjectMeta{Name: "released-va", UID: "released-va", ResourceVersion: "101", DeletionTimestamp: &deleting, Finalizers: []string{"external-attacher/" + driver.name}},
+							Spec:       storagev1.VolumeAttachmentSpec{Attacher: driver.name, NodeName: node.Name, Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name}},
+							Status:     storagev1.VolumeAttachmentStatus{Attached: true},
+						}
+						_, err := kube.StorageV1().VolumeAttachments().Create(ctx, va, metav1.CreateOptions{})
+						require.NoError(t, err)
+						reconcile()
+						stillPending, err := NewControllerServer(driver, provider, nil).readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.Equal(t, stored.PendingReplacementAttach, stillPending.PendingReplacementAttach)
+					}
+					if interruptedCleanup && mode != "distinct-vm-abandoned-no-disk-orphan" {
+						err = unpublish(makeClient(driver))
+					}
+
 					current, historyErr := NewControllerServer(driver, provider, nil).readAttachmentHistory(ctx, volume)
 					require.NoError(t, historyErr)
 					require.Equal(t, stored.LastSuccessfulPublishTime, current.LastSuccessfulPublishTime)
@@ -4381,11 +4470,16 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					defer wire.mu.Unlock()
 					require.Equal(t, 1, wire.attachAttempts)
 					switch mode {
-					case "distinct-vm-abandoned", "distinct-vm-orphan":
+					case "distinct-vm-abandoned", "distinct-vm-orphan", "distinct-vm-abandoned-released", "distinct-vm-orphan-released",
+						"distinct-vm-abandoned-readback", "distinct-vm-abandoned-no-disk-orphan", "distinct-vm-abandoned-no-disk-stale-va",
+						"distinct-vm-abandoned-detach-reply", "distinct-vm-abandoned-retire-conflict":
 						require.NoError(t, err)
 						require.Equal(t, []string{"attach:42:false", "detach:42"}, wire.mutations)
 						require.Nil(t, current.PendingReplacementAttach)
-					case "distinct-vm-abandoned-readback":
+						if interruptedCleanup {
+							require.True(t, current.LastSafeDetachTime.IsZero())
+						}
+					case "distinct-vm-abandoned-no-disk-original-owner":
 						require.Error(t, err)
 						require.Equal(t, []string{"attach:42:false", "detach:42"}, wire.mutations)
 						require.Equal(t, stored.PendingReplacementAttach, current.PendingReplacementAttach)

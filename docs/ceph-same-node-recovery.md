@@ -28,6 +28,10 @@ PV and PVC UID comparisons establish the current binding. The controller recheck
 
 The provider and Kubernetes observations are bounded checks. Controller locks serialize this controller's operations. External Kubernetes and OpenNebula actors can still change attachment state after the last read. Same-node physical retention does not prove an old process stopped, inspect guest mounts, revoke writer access or fence database writers. Database/operator fencing and the ordinary publish/node-stage identity checks remain necessary. Pending or terminal Pod phase alone is not proof that a disk is unmounted.
 
+AUTO requires a positive original provider VM ID in observed history,
+including records with only a successful Stage timestamp. A legacy row without
+that pin cannot establish same-VM continuity.
+
 ## Publish after Node replacement
 
 A Publish to a replacement Kubernetes Node with the same name is a separate
@@ -49,9 +53,13 @@ definitively refused dispatch. Elapsed time and an idle snapshot alone cannot
 establish that an earlier request is out of flight.
 
 If demand disappears, ordinary Unpublish or reconciler cleanup can detach the
-abandoned disk after verifying its exact marker and current release. Verified
-detach readback retires the matching attempt and preserves the original Publish
-history. The attempt supplies no authority for Stage, retention, or DeleteVolume.
+abandoned disk after verifying its exact marker and current release. An owned
+Released PV can use its original claim reference even after that claim is gone.
+A retry can retire the matching attempt without another detach after independently
+verifying settled absence on both pinned VMs and current release. The reconciler
+can do this after restart when no VolumeAttachment remains. The original Publish
+history is preserved. The attempt supplies no authority for Stage, retention,
+or DeleteVolume.
 
 ## Validation and rollout
 

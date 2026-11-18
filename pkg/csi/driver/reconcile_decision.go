@@ -300,6 +300,9 @@ func (s *ControllerServer) evaluateVolumeDetachDecision(ctx context.Context, dec
 	}
 	if !evidence.Attached {
 		if err := s.verifyDetachAbsenceTarget(ctx, evidence.VolumeID, evidence.NodeID, evidence.OpenNebulaImageID, evidence.OpenNebulaNodeID, ""); err != nil {
+			if errors.Is(err, errReplacementDetachPending) {
+				return decision
+			}
 			return decision.with(VolumeReconcilePause, "attachment_absence_unverified", status.Code(err), status.Convert(err).Message())
 		}
 		return decision.with(VolumeReconcileComplete, "already_detached", codes.OK,

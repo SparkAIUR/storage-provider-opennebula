@@ -104,6 +104,7 @@ func newCephRestartTestFixture(t *testing.T, queued bool) *cephRestartTestFixtur
 		record.PVCName = pvc.Name
 		record.PVCNamespace = pvc.Namespace
 		record.LastSuccessfulImageID = 3137
+		record.LastSuccessfulOpenNebulaVMID = 575
 		record.LastSuccessfulNodeName = node.Name
 		record.LastSuccessfulNodeUID = string(node.UID)
 		record.LastSuccessfulDeviceSerial = "onecsi-3137"

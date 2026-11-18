@@ -157,10 +157,10 @@ func validateCephRetentionDisk(req *csi.ControllerUnpublishVolumeRequest, imageI
 			return cephRetentionUnavailable("VolumeAttachment metadata contradicts the current binding", nil)
 		}
 	}
-	if history.LastSuccessfulImageID != disk.ImageID || history.LastSuccessfulNodeName != req.NodeId || history.LastSuccessfulNodeUID != string(authority.NodeUID) {
+	if history.LastSuccessfulImageID != disk.ImageID || history.LastSuccessfulNodeName != req.NodeId || history.LastSuccessfulNodeUID != string(authority.NodeUID) || history.LastSuccessfulOpenNebulaVMID <= 0 || history.LastSuccessfulOpenNebulaVMID != disk.NodeID {
 		return cephRetentionUnavailable("observed volume history does not match image and node identity", nil)
 	}
-	if (history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != disk.NodeID) || (history.LastSuccessfulDiskID != nil && *history.LastSuccessfulDiskID != disk.DiskID) || (history.LastSuccessfulTarget != "" && history.LastSuccessfulTarget != disk.Target) || (history.LastSuccessfulDeviceSerial != "" && history.LastSuccessfulDeviceSerial != disk.DeviceSerial) {
+	if (history.LastSuccessfulDiskID != nil && *history.LastSuccessfulDiskID != disk.DiskID) || (history.LastSuccessfulTarget != "" && history.LastSuccessfulTarget != disk.Target) || (history.LastSuccessfulDeviceSerial != "" && history.LastSuccessfulDeviceSerial != disk.DeviceSerial) {
 		return cephRetentionUnavailable("current device identity contradicts observed history", nil)
 	}
 	if disk.DeviceSerial != fmt.Sprintf("onecsi-%d", disk.ImageID) {

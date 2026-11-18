@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -79,36 +80,57 @@ func growthCompatibilityFixture(t *testing.T, version string, restoring bool, op
 			return cfg.versionReply()
 		case "one.vm.diskresize":
 			st.resizeCalls.Add(1)
-			st.sizeMB.Store(256)
 			return true, "11", 0
 		case "one.image.update":
 			if st.resizeCalls.Load() > 0 {
 				require.Greater(t, st.completedReads.Load(), cfg.pendingReads, "metadata only after completed provider readback")
 			}
 			st.metadataWrites.Add(1)
-			st.marker.Store(256 * sizeConversion)
 			return true, "7", 0
 		default:
 			st.otherMutations.Add(1)
 			return false, "unexpected operation", 0x800
 		}
 	}, func(method string, raw []byte) {
-		if method != "one.image.update" {
+		if method != "one.vm.diskresize" && method != "one.image.update" {
 			return
 		}
 		var call struct {
 			Params []struct {
 				Value struct {
 					Text string `xml:"string"`
+					Int  int    `xml:"int"`
+					I4   int    `xml:"i4"`
+					I8   int    `xml:"i8"`
 				} `xml:"value"`
 			} `xml:"params>param"`
 		}
 		require.NoError(t, xml.Unmarshal(raw, &call))
 		require.Len(t, call.Params, 4)
-		require.Contains(t, call.Params[2].Value.Text, requestedSizeTag)
-		for _, protected := range []string{"PROTECTED", "UID", "GID", "PERSISTENT"} {
-			require.NotContains(t, call.Params[2].Value.Text, protected)
+		number := func(i int) int {
+			value := call.Params[i].Value
+			return value.Int + value.I4 + value.I8
 		}
+		if method == "one.vm.diskresize" {
+			require.Equal(t, 11, number(1))
+			require.Equal(t, 2, number(2))
+			size, err := strconv.ParseInt(call.Params[3].Value.Text, 10, 64)
+			require.NoError(t, err)
+			require.EqualValues(t, 256, size)
+			st.sizeMB.Store(size)
+			return
+		}
+		require.Equal(t, 7, number(1))
+		require.Equal(t, 1, number(3))
+		key, quoted, found := strings.Cut(strings.TrimSpace(call.Params[2].Value.Text), "=")
+		require.True(t, found)
+		require.Equal(t, requestedSizeTag, strings.TrimSpace(key))
+		value, err := strconv.Unquote(strings.TrimSpace(quoted))
+		require.NoError(t, err)
+		capacity, err := strconv.ParseInt(value, 10, 64)
+		require.NoError(t, err)
+		require.Equal(t, st.sizeMB.Load()*sizeConversion, capacity)
+		st.marker.Store(capacity)
 	})
 	return p, st
 }

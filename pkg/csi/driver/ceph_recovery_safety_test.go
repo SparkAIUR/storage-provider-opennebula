@@ -69,14 +69,14 @@ func (p *cleanupReadbackProvider) DetachVolumeWithAuthority(ctx context.Context,
 
 func TestControllerUnpublishCephObservedHistoryAuthority(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"publish", "stage-only", "no-success", "bootstrap", "bootstrap-source", "bootstrap-with-timestamp", "history-backend", "history-schema", "history-vm", "history-disk", "va-backend"} {
+		for _, mode := range []string{"publish", "stage-only", "stage-only-without-vm", "no-success", "bootstrap", "bootstrap-source", "bootstrap-with-timestamp", "history-backend", "history-schema", "history-vm", "history-vm-replaced", "history-vm-missing", "history-disk", "va-backend"} {
 			t.Run(fmt.Sprintf("%v/%s", queued, mode), func(t *testing.T) {
 				f := newCephRestartTestFixture(t, queued)
 				record, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
 				if mode != "publish" && mode != "bootstrap-with-timestamp" && mode != "bootstrap-source" {
 					record.LastSuccessfulPublishTime = time.Time{}
 				}
-				if mode == "stage-only" {
+				if mode == "stage-only" || mode == "stage-only-without-vm" {
 					record.LastSuccessfulStageTime = time.Date(2026, 11, 16, 0, 0, 0, 0, time.UTC)
 				}
 				if mode == "bootstrap" || mode == "bootstrap-with-timestamp" {
@@ -86,7 +86,7 @@ func TestControllerUnpublishCephObservedHistoryAuthority(t *testing.T) {
 					record.EvidenceSource = volumeHistoryEvidenceSourceBootstrap
 				}
 				switch mode {
-				case "history-backend", "history-schema", "history-vm", "history-disk", "va-backend":
+				case "history-backend", "history-schema", "history-vm", "history-vm-replaced", "history-vm-missing", "history-disk", "va-backend":
 					record.LastSuccessfulPublishTime = time.Now().UTC()
 				}
 				switch mode {
@@ -96,6 +96,12 @@ func TestControllerUnpublishCephObservedHistoryAuthority(t *testing.T) {
 					record.Version = 42
 				case "history-vm":
 					record.LastSuccessfulOpenNebulaVMID = -1
+				case "history-vm-replaced":
+					record.LastSuccessfulOpenNebulaVMID = 574
+				case "history-vm-missing", "stage-only-without-vm":
+					record.LastSuccessfulOpenNebulaVMID = 0
+					f.va.Status.AttachmentMetadata = nil
+					f.syncObjects(t)
 				case "history-disk":
 					record.LastSuccessfulDiskID = new(-1)
 				case "va-backend":

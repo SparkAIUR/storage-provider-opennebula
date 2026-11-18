@@ -296,6 +296,8 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 		}
 	}
 
+	r.reconcileAbsentReplacementAttempts(ctx, pvByHandle, attachmentsByVolume, vaByVolume, unresolvedVolume, currentOrphans, now)
+
 	for idx := range vaList.Items {
 		va := &vaList.Items[idx]
 		if va.Spec.Attacher != r.server.driver.name || va.Spec.Source.PersistentVolumeName == nil || !va.Status.Attached || va.UID == "" {
@@ -331,6 +333,51 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 	r.prune(r.divergentSeen, currentDivergent)
 	r.prune(r.multiAttachSeen, currentMultiAttach)
 	return nil
+}
+
+func (r *AttachmentReconciler) reconcileAbsentReplacementAttempts(ctx context.Context, pvs map[string]*corev1.PersistentVolume, disks map[string][]opennebula.ObservedAttachment, vas map[string][]storagev1.VolumeAttachment, unresolved map[string]bool, currentOrphans map[string]struct{}, now time.Time) {
+	s := r.server
+	manager := s.driver.volumeHistory
+	if manager == nil {
+		return
+	}
+	cm, err := manager.runtime.GetConfigMap(ctx, manager.namespace, volumeHistoryStateConfigMapName)
+	if err != nil {
+		return
+	}
+	for volume, raw := range cm.Data {
+		pv := pvs[volume]
+		if pv == nil || len(disks[volume]) != 0 || len(vas[volume]) != 0 || unresolved[volume] {
+			continue
+		}
+		history, err := decodeAttachmentHistory(raw, volume)
+		if err != nil || history.PendingReplacementAttach == nil {
+			continue
+		}
+		attempt := history.PendingReplacementAttach
+		if !attempt.dispatchPossible() || !attempt.matchesHistory(history) || attempt.Driver != s.driver.name ||
+			attempt.PVUID != string(pv.UID) || r.skipDiskAttachmentReconcile(ctx, volume, pv) {
+			continue
+		}
+		key := volume + "@" + attempt.Node + "@" + string(pv.UID) + "@" + attempt.ID
+		currentOrphans[key] = struct{}{}
+		if r.due(r.orphanSeen, key, now, r.orphanGrace) {
+			r.finishAbsentReplacementOrphan(ctx, *attempt, pv.UID)
+		}
+	}
+}
+
+func (r *AttachmentReconciler) finishAbsentReplacementOrphan(ctx context.Context, attempt replacementAttachAttempt, pvUID types.UID) {
+	s := r.server
+	nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(attempt.Node))
+	defer nodeRelease()
+	volumeRelease := s.driver.operationLocks.Acquire(controllerVolumeLockKey(attempt.VolumeID))
+	defer volumeRelease()
+	identity := physicalDetachIdentity{pvUID: pvUID, nodeUID: types.UID(attempt.ReplacementUID), imageID: attempt.ImageID, vmID: attempt.VMID,
+		diskID: -1, background: true, cephSingleWriter: true, replacement: &attempt}
+	if err := s.retireAbsentReplacementDetach(ctx, attempt.VolumeID, attempt.Node, &identity); err != nil {
+		klog.V(2).InfoS("Replacement attachment absence is unverified", "volume", attempt.VolumeID, "node", attempt.Node, "err", err)
+	}
 }
 
 func attachmentNodesByVM(vmNames opennebula.VMNameInventory, nodes []corev1.Node) map[int]*corev1.Node {
@@ -512,6 +559,14 @@ func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, att
 		return errAttachmentSkipped
 	}
 	confirmedAbsent := func(ctx context.Context) error {
+		identity := physicalDetachIdentity{pvUID: pvUID, nodeUID: nodeUID, imageID: attachment.ImageID, vmID: attachment.NodeID,
+			diskID: attachment.DiskID, background: true, backend: backend, cephSingleWriter: cephSingleWriter}
+		if handled, err := r.server.finishReplacementDetachAbsence(ctx, attachment.VolumeHandle, attachment.NodeName, identity); handled {
+			if err != nil {
+				return err
+			}
+			return errAttachmentAbsent
+		}
 		if err := r.server.verifyDetachAbsenceTarget(ctx, attachment.VolumeHandle, attachment.NodeName, attachment.ImageID, attachment.NodeID, nodeUID); err != nil {
 			return err
 		}
@@ -580,7 +635,10 @@ func (r *AttachmentReconciler) detachObservedAttachment(ctx context.Context, att
 	if err == nil && !detached {
 		if _, observedErr := r.server.volumeProvider.GetVolumeInNode(ctx, attachment.ImageID, attachment.NodeID); observedErr != nil {
 			if errors.Is(observedErr, opennebula.ErrAttachmentNotFound) {
-				return confirmedAbsent(ctx)
+				if err := r.server.verifyDetachAbsenceTarget(ctx, attachment.VolumeHandle, attachment.NodeName, attachment.ImageID, attachment.NodeID, nodeUID); err != nil {
+					return err
+				}
+				return errAttachmentAbsent
 			}
 			return observedErr
 		}
@@ -671,6 +729,9 @@ func (r *AttachmentReconciler) deleteStaleVolumeAttachment(ctx context.Context, 
 	history, err := r.server.readAttachmentHistory(ctx, volume)
 	if err != nil {
 		return err
+	}
+	if history.PendingReplacementAttach != nil && history.LastSuccessfulNodeName == va.Spec.NodeName {
+		return errAttachmentSkipped
 	}
 	imageID, _, err := r.server.volumeProvider.VolumeExists(ctx, volume)
 	if err != nil || imageID < 0 {

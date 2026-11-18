@@ -1520,6 +1520,14 @@ func (s *ControllerServer) confirmUnpublishAbsence(ctx context.Context, req *csi
 			return nil, status.Error(codes.Aborted, "unpublish completion is unverified while the volume is attached; retry the request")
 		}
 	}
+	if !retiredRequired {
+		if handled, err := s.finishReplacementDetachAbsence(ctx, req.VolumeId, req.NodeId, physicalDetachIdentity{imageID: imageID, vmID: vmID, diskID: -1}); handled {
+			if err != nil {
+				return nil, err
+			}
+			return &csi.ControllerUnpublishVolumeResponse{}, nil
+		}
+	}
 	if err := s.checkDetachAbsenceTarget(ctx, req.VolumeId, req.NodeId, imageID, vmID, "", retiredRequired); err != nil {
 		return nil, err
 	}
@@ -2225,6 +2233,19 @@ func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *cs
 		return false, nil, nil
 	}
 	decision := s.evaluateVolumeReconcile(ctx, req.NodeId, "detach", req.VolumeId)
+	if decision.Action == VolumeReconcileProceed && errors.Is(decision.Evidence.AttachedErr, opennebula.ErrAttachmentNotFound) {
+		if decision.Evidence.OpenNebulaImageID != imageID || decision.Evidence.OpenNebulaNodeID != vmID {
+			return true, nil, attachmentEvidenceUnavailable("replacement detach provider identity changed", nil)
+		}
+		handled, err := s.finishReplacementDetachAbsence(ctx, req.VolumeId, req.NodeId, physicalDetachIdentity{imageID: imageID, vmID: vmID, diskID: -1})
+		if !handled {
+			return true, nil, attachmentEvidenceUnavailable("replacement detach attempt changed", nil)
+		}
+		if err != nil {
+			return true, nil, err
+		}
+		return true, &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
 	switch decision.Action {
 	case VolumeReconcileComplete:
 		if !errors.Is(decision.Evidence.AttachedErr, opennebula.ErrAttachmentNotFound) ||

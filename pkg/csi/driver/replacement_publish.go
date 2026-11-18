@@ -66,13 +66,13 @@ func (attempt replacementAttachAttempt) prepared() bool {
 }
 
 func (attempt replacementAttachAttempt) dispatchPossible() bool {
-	return attempt.Version == 1 && attempt.Phase == "" || attempt.Version == 2 && attempt.Phase == replacementAttachArmed
+	return attempt.Version == 2 && attempt.Phase == replacementAttachArmed
 }
 
 func (attempt replacementAttachAttempt) matchesHistory(history VolumeHistoryRecord) bool {
 	originalVM := attempt.VMID
 	if attempt.OriginalVMID != 0 || attempt.OriginalVMName != "" {
-		if attempt.OriginalVMID <= 0 || attempt.OriginalVMID == attempt.VMID || (attempt.Version == 1 && attempt.OriginalVMName == "") {
+		if attempt.OriginalVMID <= 0 || attempt.OriginalVMID == attempt.VMID {
 			return false
 		}
 		originalVM = attempt.OriginalVMID
