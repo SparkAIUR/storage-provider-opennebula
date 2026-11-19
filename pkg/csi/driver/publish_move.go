@@ -3,9 +3,11 @@ package driver
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -29,6 +31,25 @@ type pendingPublishMove struct {
 	Source, Destination                publishMoveNode
 	Image, Slot                        int
 	Target, Serial                     string
+	Renewal                            *publishMoveGrant `json:"renewal,omitempty"`
+}
+
+type publishMoveGrant struct {
+	Digest  string
+	Expires time.Time
+}
+
+func (move pendingPublishMove) authorizedGrant() publishMoveGrant {
+	if move.Renewal != nil {
+		return *move.Renewal
+	}
+	return publishMoveGrant{Digest: move.Grant, Expires: move.Expires}
+}
+
+func (move pendingPublishMove) receipt() string {
+	grant := move.authorizedGrant()
+	move.Grant, move.Expires, move.Renewal = grant.Digest, grant.Expires, nil
+	return publishMoveDigest(move)
 }
 
 type publishMoveSourceKey struct{}
@@ -73,10 +94,7 @@ func publishMoveGenerationBeforeRelease(history VolumeHistoryRecord, volume stri
 }
 
 func samePendingPublishMove(a, b *pendingPublishMove) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return *a == *b
+	return reflect.DeepEqual(a, b)
 }
 
 func publishMoveBinding(binding *VolumeRuntimeContext, driver, volume string) string {
@@ -263,7 +281,7 @@ func (s *ControllerServer) consumePublishMove(ctx context.Context, req *csi.Cont
 	deny := attachmentEvidenceUnavailable("Publish move grant consumption is unverified", nil)
 	binding := admission.binding
 	pvs := s.driver.kubeRuntime.client.CoreV1().PersistentVolumes()
-	token := publishMoveDigest(move)
+	grant, token := move.authorizedGrant(), move.receipt()
 	consumed := *binding
 	consumed.PVAnnotations = cloneStringMap(binding.PVAnnotations)
 	delete(consumed.PVAnnotations, annotationAllowCrossNodeUntil)
@@ -277,13 +295,13 @@ func (s *ControllerServer) consumePublishMove(ctx context.Context, req *csi.Cont
 			return nil
 		}
 		if pv.ResourceVersion == "" || pv.Annotations[annotationPublishMoveReceipt] != move.Reservation || !publishPVMatches(pv, binding, s.driver.name, req.VolumeId) ||
-			publishMoveDigest(pv.Annotations[annotationAllowCrossNodeUntil]) != move.Grant {
+			publishMoveDigest(pv.Annotations[annotationAllowCrossNodeUntil]) != grant.Digest {
 			return deny
 		}
 		if err := verify(ctx); err != nil {
 			return err
 		}
-		if !move.Expires.After(time.Now()) {
+		if !grant.Expires.After(time.Now()) {
 			return deny
 		}
 		delete(pv.Annotations, annotationAllowCrossNodeUntil)
@@ -331,23 +349,37 @@ func (s *ControllerServer) resumePublishMove(ctx context.Context, req *csi.Contr
 	}
 	raw, present := binding.PVAnnotations[annotationAllowCrossNodeUntil]
 	receipt := binding.PVAnnotations[annotationPublishMoveReceipt]
+	grant := move.authorizedGrant()
+	renewal := move.Renewal
+	if renewal != nil {
+		digest, err := hex.DecodeString(renewal.Digest)
+		if err != nil || len(digest) != sha256.Size || renewal.Digest == move.Grant || renewal.Expires.IsZero() {
+			return nil, true, deny
+		}
+	}
 	policyBinding := *binding
 	if !present {
-		if receipt != publishMoveDigest(move) || !move.Expires.After(time.Now()) {
+		if receipt != move.receipt() || !grant.Expires.After(time.Now()) {
 			return nil, true, deny
 		}
 		policyBinding.PVAnnotations = cloneStringMap(binding.PVAnnotations)
-		policyBinding.PVAnnotations[annotationAllowCrossNodeUntil] = move.Expires.Format(time.RFC3339Nano)
-	} else if receipt != move.Reservation {
-		return nil, true, deny
-	}
-	deadline := move.Expires
-	renewed := present && publishMoveDigest(raw) != move.Grant
-	if present {
-		var valid bool
-		deadline, valid = crossNodeOverrideDeadline(binding)
-		if !valid || !deadline.After(time.Now()) || (!renewed && !deadline.Equal(move.Expires)) {
+		policyBinding.PVAnnotations[annotationAllowCrossNodeUntil] = grant.Expires.Format(time.RFC3339Nano)
+	} else {
+		deadline, valid := crossNodeOverrideDeadline(binding)
+		if receipt != move.Reservation || !valid || !deadline.After(time.Now()) {
 			return nil, true, deny
+		}
+		digest := publishMoveDigest(raw)
+		if digest == grant.Digest {
+			if !deadline.Equal(grant.Expires) {
+				return nil, true, deny
+			}
+		} else {
+			if digest == move.Grant {
+				return nil, true, deny
+			}
+			grant = publishMoveGrant{Digest: digest, Expires: deadline}
+			renewal = &grant
 		}
 	}
 	placement, err := s.localRWOProtectionProjection(ctx, req.VolumeId, req.NodeId, &policyBinding, false, false)
@@ -359,7 +391,7 @@ func (s *ControllerServer) resumePublishMove(ctx context.Context, req *csi.Contr
 	if control.Invalid || control.ManualActive() {
 		return nil, true, deny
 	}
-	placement.OverrideUsed, placement.OverrideExpiresAt = true, deadline
+	placement.OverrideUsed, placement.OverrideExpiresAt = true, grant.Expires
 	protect, err := s.publishProtectionCheck(ctx, req.VolumeId, req.NodeId, binding, placement, control, move.Destination.VM, move.Image)
 	if err != nil {
 		return nil, true, err
@@ -370,35 +402,52 @@ func (s *ControllerServer) resumePublishMove(ctx context.Context, req *csi.Contr
 	if err != nil || disk.diskID != move.Slot || disk.serial != move.Serial {
 		return nil, true, deny
 	}
-	authorized := move
-	if renewed {
-		grant := *move
-		grant.Grant, grant.Expires = publishMoveDigest(raw), deadline
-		authorized = &grant
-	}
 	publishContext := s.publishContextForVolume(ctx, req.VolumeId, disk, 0, req.GetVolumeContext())
-	completed, err := s.finishPublishMove(ctx, req, disk, node, admission, move, authorized, publishContext)
+	completed, err := s.finishPublishMove(ctx, req, disk, node, admission, move, renewal, publishContext)
 	if err != nil {
 		return nil, true, err
 	}
 	return completed, true, s.recheckPublishTarget(completed.withAdmission(ctx), req, disk, node)
 }
 
-func (s *ControllerServer) finishPublishMove(ctx context.Context, req *csi.ControllerPublishVolumeRequest, disk successfulAttachmentObservation, node KubernetesNodeIdentity, admission publishPVAdmission, move, authorized *pendingPublishMove, publishContext map[string]string) (*diskPublishCompletion, error) {
-	renewed := authorized.Grant != move.Grant
-	grantBinding := admission.binding
+func (s *ControllerServer) finishPublishMove(ctx context.Context, req *csi.ControllerPublishVolumeRequest, disk successfulAttachmentObservation, node KubernetesNodeIdentity, admission publishPVAdmission, move *pendingPublishMove, renewal *publishMoveGrant, publishContext map[string]string) (*diskPublishCompletion, error) {
+	grantBinding := *admission.binding
+	if renewal != nil {
+		if _, present := grantBinding.PVAnnotations[annotationAllowCrossNodeUntil]; !present {
+			grantBinding.PVAnnotations = cloneStringMap(grantBinding.PVAnnotations)
+			grantBinding.PVAnnotations[annotationAllowCrossNodeUntil] = renewal.Expires.Format(time.RFC3339Nano)
+		}
+	}
 	verify := func(ctx context.Context) error {
-		if err := s.verifyPublishMove(ctx, req, move, admission.binding, renewed); err != nil {
+		if err := s.verifyPublishMove(ctx, req, move, admission.binding, renewal != nil); err != nil {
 			return err
 		}
-		if renewed {
-			if err := s.checkPublishMoveRenewal(ctx, req, move, grantBinding, authorized.Expires); err != nil {
+		if renewal != nil {
+			if err := s.checkPublishMoveRenewal(ctx, req, move, &grantBinding, renewal.Expires); err != nil {
 				return err
 			}
 		}
 		return s.recheckPublishTarget(ctx, req, disk, node)
 	}
-	binding, err := s.consumePublishMove(ctx, req, authorized, admission, verify)
+	if renewal != nil && (move.Renewal == nil || *move.Renewal != *renewal) {
+		updated := *move
+		updated.Renewal = renewal
+		deny := attachmentEvidenceUnavailable("Publish move renewal could not be persisted", nil)
+		if _, err := s.driver.volumeHistory.upsert(ctx, req.VolumeId, func(current *VolumeHistoryRecord) error {
+			if !samePendingPublishMove(current.PendingPublishMove, move) || publishMoveGeneration(*current) != move.Prior {
+				return deny
+			}
+			if err := verify(ctx); err != nil {
+				return err
+			}
+			current.PendingPublishMove = &updated
+			return nil
+		}); err != nil {
+			return nil, deny
+		}
+		move = &updated
+	}
+	binding, err := s.consumePublishMove(ctx, req, move, admission, verify)
 	if err != nil {
 		return nil, err
 	}
@@ -408,23 +457,40 @@ func (s *ControllerServer) finishPublishMove(ctx context.Context, req *csi.Contr
 		admission: admission, annotatePlacement: true, move: move,
 	}
 	ctx = completed.withAdmission(ctx)
+	var sourceHold StickyAttachmentState
 	if err := s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, disk, req.GetVolumeContext(), binding, time.Time{}, move, func() error {
 		if err := verify(ctx); err != nil {
 			return err
 		}
-		if state, held := s.driver.stickyAttachments.Get(req.VolumeId); held && state.NodeID == move.Source.Name {
+		state, held := s.driver.stickyAttachments.Get(req.VolumeId)
+		sourceHold = StickyAttachmentState{}
+		if held && state.NodeID == move.Source.Name {
 			if (state.PVCUID != "" && state.PVCUID != binding.PVCUID) ||
 				(state.PVCName != "" && state.PVCName != binding.PVCName) ||
 				(state.PVCNamespace != "" && state.PVCNamespace != binding.PVCNamespace) {
 				return attachmentEvidenceUnavailable("Publish move sticky attachment claim changed", nil)
 			}
-			if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
-				return attachmentEvidenceUnavailable("could not release the prior sticky attachment hold", nil)
+			if renewal != nil {
+				sourceHold = state
+			} else {
+				if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
+					return attachmentEvidenceUnavailable("could not release the prior sticky attachment hold", nil)
+				}
 			}
 		}
 		return nil
 	}); err != nil {
 		return nil, err
+	}
+	if sourceHold.VolumeID != "" {
+		if current, held := s.driver.stickyAttachments.Get(req.VolumeId); held {
+			if current != sourceHold {
+				return nil, attachmentEvidenceUnavailable("Publish move sticky attachment hold changed", nil)
+			}
+			if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
+				return nil, attachmentEvidenceUnavailable("could not release the prior sticky attachment hold", nil)
+			}
+		}
 	}
 	return completed, nil
 }
