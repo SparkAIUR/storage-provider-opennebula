@@ -17,36 +17,36 @@ Use a provider-qualified discovery reference to locate its immutable record. `7.
 
 Run these checks after the appropriate [candidate publication](../.github/workflows/release-csi.yaml) or [stable promotion](../.github/workflows/promote-csi.yaml) finishes. Record the exact workflow run and attempt, and confirm success, the expected workflow and event, the source commit, the release identity, and the required-reviewer environment approval. For stable, also verify the successful exact-head [native qualification](../.github/workflows/native-qualification.yaml) run and attempt referenced by the promotion. In the controlled workspace, retrieve the exact `candidate.json` and `native.json` used by that promotion. If run, attempt, and artifact bytes cannot be tied to the protected execution, stop.
 
-Set `csi_tag`, `release_run`, `release_attempt`, `assets`, and `channel` from that readback. Use `candidates` for an RC or `qualified` for stable. Use a fresh local `assets` directory. Use the readback values only after the entire block succeeds. The tag fetch updates local `FETCH_HEAD` only.
+Set `csi_tag`, `release_run`, `release_attempt`, `assets`, and `channel` from that readback. Use `candidates` for an RC or `qualified` for stable. Use a fresh local `assets` directory. Run the block in Bash with authenticated `gh`, `git`, `curl`, `cmp`, Docker Buildx, `helm`, and `shasum` available. Use the readback values only after the entire block succeeds. The tag fetch updates local `FETCH_HEAD` only.
 
-```sh
+```bash
 (
-  set -eu
+  set -u
   repo=SparkAIUR/storage-provider-opennebula
   chart=opennebula-csi-${csi_tag#v}.tgz
   pages=https://sparkaiur.github.io/storage-provider-opennebula/charts/$channel
-  rtk proxy gh api --hostname github.com "repos/$repo/actions/runs/$release_run/attempts/$release_attempt" \
-    --jq '{path,event,head_sha,conclusion,run_attempt}'
-  rtk proxy git fetch --no-tags origin "refs/tags/$csi_tag"
-  rtk proxy git rev-parse 'FETCH_HEAD^{commit}' 'FETCH_HEAD^{tree}'
-  rtk proxy gh release download "$csi_tag" --repo "github.com/$repo" --dir "$assets" --pattern "$chart"
-  rtk proxy curl -fsSL "$pages/$chart" -o "$assets/served-chart.tgz"
-  rtk proxy cmp "$assets/$chart" "$assets/served-chart.tgz"
-  rtk proxy curl -fsSL "$pages/index.yaml" -o "$assets/index.yaml"
-  ghcr_digest=$(rtk proxy docker buildx imagetools inspect \
-    "ghcr.io/sparkaiur/opennebula-csi:$csi_tag" --format '{{.Manifest.Digest}}')
-  dockerhub_digest=$(rtk proxy docker buildx imagetools inspect \
-    "docker.io/nudevco/opennebula-csi:$csi_tag" --format '{{.Manifest.Digest}}')
+  gh api --hostname github.com "repos/$repo/actions/runs/$release_run/attempts/$release_attempt" \
+    --jq '{path,event,head_sha,conclusion,run_attempt}' || exit
+  git fetch --no-tags origin "refs/tags/$csi_tag" || exit
+  git rev-parse 'FETCH_HEAD^{commit}' 'FETCH_HEAD^{tree}' || exit
+  gh release download "$csi_tag" --repo "github.com/$repo" --dir "$assets" --pattern "$chart" || exit
+  curl -fsSL "$pages/$chart" -o "$assets/served-chart.tgz" || exit
+  cmp "$assets/$chart" "$assets/served-chart.tgz" || exit
+  curl -fsSL "$pages/index.yaml" -o "$assets/index.yaml" || exit
+  ghcr_digest=$(docker buildx imagetools inspect \
+    "ghcr.io/sparkaiur/opennebula-csi:$csi_tag" --format '{{.Manifest.Digest}}') || exit
+  dockerhub_digest=$(docker buildx imagetools inspect \
+    "docker.io/nudevco/opennebula-csi:$csi_tag" --format '{{.Manifest.Digest}}') || exit
   test -n "$ghcr_digest" && test "$ghcr_digest" = "$dockerhub_digest" || exit 1
   if [ "$channel" = candidates ]; then
-    rtk proxy gh release download "$csi_tag" --repo "github.com/$repo" --dir "$assets" \
-      --pattern image.txt --pattern source-commit.txt --pattern source-tree.txt --pattern SHA256SUMS
+    gh release download "$csi_tag" --repo "github.com/$repo" --dir "$assets" \
+      --pattern image.txt --pattern source-commit.txt --pattern source-tree.txt --pattern SHA256SUMS || exit
     for asset in image.txt source-commit.txt source-tree.txt SHA256SUMS; do
-      test -f "$assets/$asset"
+      test -f "$assets/$asset" || exit
     done
   fi
-  rtk proxy helm show chart "$assets/$chart"
-  rtk proxy shasum -a 256 "$assets/$chart"
+  helm show chart "$assets/$chart" || exit
+  shasum -a 256 "$assets/$chart" || exit
   printf 'OCI index digest %s\n' "$ghcr_digest"
 )
 ```
@@ -74,11 +74,11 @@ Save `release-readback.json` in controlled storage with these fields. Values in 
 
 For a candidate, the helper derives the evidence URL from `publication`. Set `evidence.sha256` to the SHA-256 of the downloaded `SHA256SUMS` bytes. Include the affected SYSTEM/SELF exclusion only for a 7.4.0 candidate. For stable, change `csiTag` to `v0.6.0`, use only the first two exclusions, add the protected qualification `runId` and `runAttempt` to `evidence`, and set `evidence.sha256` to the raw-byte SHA-256 of `native.json`. An authenticated reviewer approves the exact readback file hash in the protected release record after verifying the scope, authenticity, and publication checks. Retrieve `approved_readback_sha256` from that approval.
 
-The authoritative discovery location is the asset named `release-compatibility-<discovery-reference>.json` on the already-published canonical CSI GitHub Release. After protected approval, run the following Bash block from a checkout containing the helper, with authenticated `gh` and `jq` available. Set `records` and `published_records` to separate existing local directories and use an empty `published_records` for each readback. For stable, set `qualification` to the controlled directory holding the two qualification inputs.
+The authoritative discovery location is the asset named `release-compatibility-<discovery-reference>.json` on the already-published canonical CSI GitHub Release. After protected approval, run the following Bash block from a checkout containing the helper, with authenticated `gh`, `jq`, and `uv` available. Set `records` and `published_records` to separate existing local directories and use an empty `published_records` for each readback. For stable, set `qualification` to the controlled directory holding the two qualification inputs.
 
 ```bash
 (
-  set -euo pipefail
+  set -uo pipefail
   repo=SparkAIUR/storage-provider-opennebula
   if [ "$channel" = qualified ]; then
     set -- --qualification "$qualification"
@@ -86,20 +86,20 @@ The authoritative discovery location is the asset named `release-compatibility-<
     set --
   fi
   compatibility_record() {
-    rtk proxy uv run --no-project --with PyYAML==6.0.3 python hack/release_compatibility.py \
+    uv run --no-project --with PyYAML==6.0.3 python hack/release_compatibility.py \
       --readback release-readback.json --approved-readback-sha256 "$approved_readback_sha256" \
       --release-assets "$assets" "$@"
   }
 
-  record_path=$(compatibility_record author --record-dir "$records" "$@")
+  record_path=$(compatibility_record author --record-dir "$records" "$@") || exit
   record_name=${record_path##*/}
-  csi_tag=$(jq -er '.csiTag' "$record_path")
-  release_id=$(rtk proxy gh api --hostname github.com "repos/$repo/releases/tags/$csi_tag" \
-    --jq 'select(.draft == false) | .id | select(type == "number" and . > 0)')
+  csi_tag=$(jq -er '.csiTag' "$record_path") || exit
+  release_id=$(gh api --hostname github.com "repos/$repo/releases/tags/$csi_tag" \
+    --jq 'select(.draft == false) | .id | select(type == "number" and . > 0)') || exit
   : "${release_id:?expected an existing published CSI release}"
 
   lookup_asset() {
-    rtk proxy gh api --hostname github.com --paginate --slurp "repos/$repo/releases/$release_id/assets" |
+    gh api --hostname github.com --paginate --slurp "repos/$repo/releases/$release_id/assets" |
       jq -er --arg name "$record_name" '
         if type != "array" or length == 0 or any(.[]; type != "array")
         then error("invalid release asset listing") else . end |
@@ -109,20 +109,20 @@ The authoritative discovery location is the asset named `release-compatibility-<
         else error("ambiguous or incomplete compatibility asset") end'
   }
 
-  asset_id=$(lookup_asset)
+  asset_id=$(lookup_asset) || exit
   if [ -z "$asset_id" ]; then
     if ! (
       record_dir=$(dirname -- "$record_path") &&
         CDPATH= cd -P -- "$record_dir/." &&
-        rtk proxy gh release upload "$csi_tag" --repo "github.com/$repo" "$record_name"
+        gh release upload "$csi_tag" --repo "github.com/$repo" "$record_name"
     ); then
       printf '%s\n' 'Upload failed. Checking whether an identical asset was published.' >&2
     fi
-    asset_id=$(lookup_asset)
+    asset_id=$(lookup_asset) || exit
   fi
   : "${asset_id:?expected a published compatibility asset}"
-  rtk proxy gh api --hostname github.com -H 'Accept: application/octet-stream' \
-    "repos/$repo/releases/assets/$asset_id" > "$published_records/$record_name"
+  gh api --hostname github.com -H 'Accept: application/octet-stream' \
+    "repos/$repo/releases/assets/$asset_id" > "$published_records/$record_name" || exit
   compatibility_record verify --record-dir "$published_records" "$@"
 )
 ```
