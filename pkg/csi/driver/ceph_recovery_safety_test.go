@@ -418,7 +418,7 @@ func (p staleCleanupTestProvider) InspectVolumeDatastore(ctx context.Context, vo
 }
 
 func TestAttachmentReconcilerStaleIdentityAndAbsence(t *testing.T) {
-	for _, mode := range []string{"absent", "foreign-driver", "foreign-attacher", "replacement-before-read", "replacement-before-list", "replacement-at-delete", "replaced-pv", "unknown", "reattached", "replacement-vm", "va-image", "va-serial"} {
+	for _, mode := range []string{"absent", "foreign-driver", "foreign-attacher", "replacement-before-read", "replacement-before-list", "replacement-at-delete", "replaced-pv", "pv-replaced-during-grace", "pv-replaced-at-absence", "unknown", "reattached", "replacement-vm", "va-image", "va-serial"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			f := newCephRestartTestFixture(t, false)
@@ -446,7 +446,18 @@ func TestAttachmentReconcilerStaleIdentityAndAbsence(t *testing.T) {
 			client := f.server.driver.kubeRuntime.client.(*fake.Clientset)
 			base := new(MockOpenNebulaVolumeProviderTestify)
 			base.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{}, nil, nil)
-			base.On("VolumeExists", mock.Anything, cephRestartVolume).Return(3137, 1024, nil)
+			replacePV := func() {
+				replacement := f.pv.DeepCopy()
+				replacement.UID = "replacement-pv"
+				require.NoError(t, client.Tracker().Update(corev1.SchemeGroupVersion.WithResource("persistentvolumes"), replacement, ""))
+			}
+			imageReads := 0
+			base.On("VolumeExists", mock.Anything, cephRestartVolume).Run(func(mock.Arguments) {
+				imageReads++
+				if mode == "pv-replaced-at-absence" && imageReads == 2 {
+					replacePV()
+				}
+			}).Return(3137, 1024, nil)
 			base.On("InspectVolumeDatastore", mock.Anything, cephRestartVolume, 3137).Return(opennebula.Datastore{Backend: "ceph"}, nil).Maybe()
 			base.On("NodeExists", mock.Anything, "node-a").Return(vmID, nil)
 			physical := &cleanupReadbackProvider{MockOpenNebulaVolumeProviderTestify: base}
@@ -469,11 +480,7 @@ func TestAttachmentReconcilerStaleIdentityAndAbsence(t *testing.T) {
 				replace()
 			}
 			if mode == "replaced-pv" {
-				physical.beforeRead = func() {
-					replacement := f.pv.DeepCopy()
-					replacement.UID = "replacement-pv"
-					require.NoError(t, client.Tracker().Update(corev1.SchemeGroupVersion.WithResource("persistentvolumes"), replacement, ""))
-				}
+				physical.beforeRead = replacePV
 			}
 			deletes := 0
 			client.PrependReactor("delete", "volumeattachments", func(action ktesting.Action) (bool, kruntime.Object, error) {
@@ -489,8 +496,20 @@ func TestAttachmentReconcilerStaleIdentityAndAbsence(t *testing.T) {
 				return false, nil, nil
 			})
 			r := NewAttachmentReconciler(NewControllerServer(f.server.driver, staleCleanupTestProvider{physical}, nil))
-			r.staleVASeen[string(f.va.UID)] = time.Now().Add(-2 * r.staleVAGrace)
+			if mode == "pv-replaced-during-grace" {
+				require.NoError(t, r.ReconcileOnce(ctx))
+				require.Len(t, r.staleVASeen, 1)
+				for key := range r.staleVASeen {
+					r.staleVASeen[key] = time.Now().Add(-2 * r.staleVAGrace)
+				}
+				replacePV()
+			} else {
+				r.staleVASeen[staleVAKey(f.pv.UID, f.va.UID)] = time.Now().Add(-2 * r.staleVAGrace)
+			}
 			require.NoError(t, r.ReconcileOnce(ctx))
+			if mode == "pv-replaced-at-absence" {
+				require.Equal(t, 2, imageReads)
+			}
 			va, err := client.StorageV1().VolumeAttachments().Get(ctx, f.va.Name, metav1.GetOptions{})
 			if mode == "absent" {
 				require.True(t, apierrors.IsNotFound(err))
@@ -534,8 +553,8 @@ func TestAttachmentReconcilerDoesNotCombineForeignHandleOwnership(t *testing.T) 
 	base.On("NodeExists", mock.Anything, "node-a").Return(575, nil)
 	physical := &cleanupReadbackProvider{MockOpenNebulaVolumeProviderTestify: base}
 	r := NewAttachmentReconciler(NewControllerServer(f.server.driver, staleCleanupTestProvider{physical}, nil))
-	r.staleVASeen[string(f.va.UID)] = time.Now().Add(-2 * r.staleVAGrace)
-	r.staleVASeen[string(foreignVA.UID)] = time.Now().Add(-2 * r.staleVAGrace)
+	r.staleVASeen[staleVAKey(f.pv.UID, f.va.UID)] = time.Now().Add(-2 * r.staleVAGrace)
+	r.staleVASeen[staleVAKey(foreignPV.UID, foreignVA.UID)] = time.Now().Add(-2 * r.staleVAGrace)
 	require.NoError(t, r.ReconcileOnce(ctx))
 	_, err = client.StorageV1().VolumeAttachments().Get(ctx, f.va.Name, metav1.GetOptions{})
 	require.True(t, apierrors.IsNotFound(err))

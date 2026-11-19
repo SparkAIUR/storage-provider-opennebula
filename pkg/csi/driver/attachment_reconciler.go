@@ -172,7 +172,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 			continue
 		}
 		pv := pvByName[*va.Spec.Source.PersistentVolumeName]
-		if pv == nil || pv.Spec.CSI == nil || ambiguousHandles[pv.Spec.CSI.VolumeHandle] {
+		if pv == nil || pv.UID == "" || pv.Spec.CSI == nil || ambiguousHandles[pv.Spec.CSI.VolumeHandle] {
 			continue
 		}
 		vaByVolume[pv.Spec.CSI.VolumeHandle] = append(vaByVolume[pv.Spec.CSI.VolumeHandle], va)
@@ -316,7 +316,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 		if _, ok := attachmentByVolumeNode[volumeHandle+"@"+va.Spec.NodeName]; ok {
 			continue
 		}
-		key := string(va.UID)
+		key := staleVAKey(pv.UID, va.UID)
 		currentStaleVAs[key] = struct{}{}
 		if !r.due(r.staleVASeen, key, now, r.staleVAGrace) {
 			continue
@@ -718,6 +718,10 @@ func attachmentCleanupOutcome(err error) string {
 	return "unknown_or_failed"
 }
 
+func staleVAKey(pvUID, vaUID types.UID) string {
+	return string(pvUID) + "/" + string(vaUID)
+}
+
 func (r *AttachmentReconciler) deleteStaleVolumeAttachment(ctx context.Context, pv *corev1.PersistentVolume, va *storagev1.VolumeAttachment) error {
 	if r.server.driver.operationLocks == nil || pv.UID == "" || va.UID == "" || va.ResourceVersion == "" {
 		return fmt.Errorf("stale attachment identity is incomplete")
@@ -729,21 +733,22 @@ func (r *AttachmentReconciler) deleteStaleVolumeAttachment(ctx context.Context, 
 	defer volumeRelease()
 	client := r.server.driver.kubeRuntime.client
 	checkIdentity := func() error {
-		currentPV, err := client.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
-		if err != nil {
-			return err
+		if r.skipDiskAttachmentReconcile(ctx, volume, pv) {
+			return errAttachmentSkipped
 		}
 		currentVA, err := client.StorageV1().VolumeAttachments().Get(ctx, va.Name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
+		currentPV, err := client.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
 		if currentPV.UID != pv.UID || currentPV.ResourceVersion != pv.ResourceVersion || !reflect.DeepEqual(currentPV.Spec, pv.Spec) ||
 			currentVA.UID != va.UID || currentVA.ResourceVersion != va.ResourceVersion || !reflect.DeepEqual(currentVA.Spec, va.Spec) ||
+			!reflect.DeepEqual(currentVA.Status, va.Status) || !reflect.DeepEqual(currentVA.DeletionTimestamp, va.DeletionTimestamp) ||
 			!currentVA.Status.Attached || currentVA.Spec.Attacher != r.server.driver.name {
 			return fmt.Errorf("stale attachment identity changed")
-		}
-		if r.skipDiskAttachmentReconcile(ctx, volume, currentPV) {
-			return errAttachmentSkipped
 		}
 		return nil
 	}
@@ -802,12 +807,12 @@ func (r *AttachmentReconciler) deleteStaleVolumeAttachment(ctx context.Context, 
 		if _, err := r.server.volumeProvider.GetVolumeInNode(ctx, imageID, nodeID); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
 			return fmt.Errorf("stale attachment absence is unverified: %v", err)
 		}
-		if err := checkIdentity(); err != nil {
-			return err
-		}
 		if err := r.server.verifyDetachAbsenceTarget(ctx, volume, va.Spec.NodeName, imageID, nodeID, types.UID(identity.UID)); err != nil {
 			return err
 		}
+	}
+	if err := checkIdentity(); err != nil {
+		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err

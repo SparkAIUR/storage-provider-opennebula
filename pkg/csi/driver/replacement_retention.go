@@ -63,15 +63,18 @@ func (s *ControllerServer) recheckReplacementVolumeAttachment(ctx context.Contex
 	return ctx.Err()
 }
 
-func validateMarkedReplacementMetadata(va detachAttachmentAuthority, pv *corev1.PersistentVolume, target, serial string) error {
+func validateMarkedReplacementMetadata(va detachAttachmentAuthority, pv *corev1.PersistentVolume, target string, imageID int) error {
 	if backend, present := va.metadata[annotationBackend]; present && !isCephBackend(backend) {
 		return attachmentEvidenceUnavailable("marked replacement VolumeAttachment backend changed", nil)
 	}
 	if value, present := va.metadata["volumeName"]; present && strings.TrimPrefix(strings.TrimSpace(value), "/dev/") != target {
 		return attachmentEvidenceUnavailable("marked replacement VolumeAttachment target changed", nil)
 	}
+	if err := validateAttachmentImageAssertions(va.metadata, imageID); err != nil {
+		return attachmentEvidenceUnavailable("marked replacement VolumeAttachment image or serial changed", err)
+	}
 	for key, expected := range map[string]string{
-		publishContextDeviceSerial: serial, paramPVName: pv.Name, paramPVCName: pv.Spec.ClaimRef.Name, paramPVCNamespace: pv.Spec.ClaimRef.Namespace,
+		paramPVName: pv.Name, paramPVCName: pv.Spec.ClaimRef.Name, paramPVCNamespace: pv.Spec.ClaimRef.Namespace,
 	} {
 		if value, present := va.metadata[key]; present && strings.TrimSpace(value) != expected {
 			return attachmentEvidenceUnavailable("marked replacement VolumeAttachment metadata changed", nil)
@@ -130,7 +133,8 @@ func (s *ControllerServer) observeMarkedReplacement(ctx context.Context, attempt
 	}
 	capacity, err := inspector.InspectSameNodeRetention(opennebula.WithExpectedImageID(ctx, attempt.ImageID), attempt.VolumeID, attempt.Node)
 	if err != nil || capacity == nil || capacity.VolumeID != attempt.VolumeID || capacity.ImageID != attempt.ImageID ||
-		capacity.NodeID != attempt.VMID || capacity.DiskID != disk.DiskID || capacity.Target != disk.Target || capacity.DeviceSerial != disk.Serial {
+		capacity.NodeID != attempt.VMID || capacity.DiskID != disk.DiskID || capacity.Target != disk.Target ||
+		!opennebula.DeviceSerialMatchesImage(capacity.DeviceSerial, attempt.ImageID) {
 		return deny(err)
 	}
 	observation.disk, observation.capacity = *disk, capacity.SizeBytes
@@ -149,7 +153,7 @@ func (s *ControllerServer) observeMarkedReplacement(ctx context.Context, attempt
 		if size != capacity.SizeBytes || (!ok && (!markedFilesystemResizePending(pv, pvc) || (publish != nil && publish.GetVolumeCapability().GetMount() == nil))) {
 			return attachmentEvidenceUnavailable("marked replacement Ceph capacity is pending or inconsistent", nil)
 		}
-		if err := validateMarkedReplacementMetadata(va, pv, disk.Target, disk.Serial); err != nil {
+		if err := validateMarkedReplacementMetadata(va, pv, disk.Target, attempt.ImageID); err != nil {
 			return err
 		}
 		observation.vaName, observation.va, observation.requested = name, va, requested

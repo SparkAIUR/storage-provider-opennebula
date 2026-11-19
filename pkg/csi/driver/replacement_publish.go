@@ -143,7 +143,7 @@ func (attempt replacementAttachAttempt) matchesHistory(history VolumeHistoryReco
 
 func (proof replacementDetachCompletion) validDisk(imageID int) bool {
 	diskID, err := strconv.Atoi(proof.DiskID)
-	return err == nil && diskID >= 0 && strings.TrimSpace(proof.Target) != "" && proof.Serial == fmt.Sprintf("onecsi-%d", imageID)
+	return err == nil && diskID >= 0 && strings.TrimSpace(proof.Target) != "" && opennebula.DeviceSerialMatchesImage(proof.Serial, imageID)
 }
 
 func (s *ControllerServer) retireCompletedReplacement(ctx context.Context, history VolumeHistoryRecord) (bool, error) {
@@ -259,10 +259,7 @@ func (s *ControllerServer) checkReplacementSuccessor(ctx context.Context, attemp
 		va.node != attempt.Node || va.attacher != attempt.Driver || va.uid == "" || string(va.uid) == attempt.VAUID || va.attached {
 		return attachmentEvidenceUnavailable("replacement successor is unverified", nil)
 	}
-	if err := validateAttachmentImageAssertions(va.metadata, attempt.ImageID); err != nil {
-		return attachmentEvidenceUnavailable("replacement successor image is unverified", err)
-	}
-	if err := validateMarkedReplacementMetadata(va, pv, "", fmt.Sprintf("onecsi-%d", attempt.ImageID)); err != nil {
+	if err := validateMarkedReplacementMetadata(va, pv, "", attempt.ImageID); err != nil {
 		return err
 	}
 	return s.checkReplacementVAOrigin(ctx, attempt, pv.Name, name, va)
@@ -307,8 +304,7 @@ func (s *ControllerServer) verifyReadOnlyPriorRelease(ctx context.Context, histo
 	va := attachments[name]
 	if err != nil || va.node != nodeName || va.attacher != s.driver.name ||
 		va.uid == "" || va.deleting || va.attached || !va.created.After(node.CreationTimestamp.Time) ||
-		validateAttachmentImageAssertions(va.metadata, imageID) != nil ||
-		validateMarkedReplacementMetadata(va, pv, "", fmt.Sprintf("onecsi-%d", imageID)) != nil {
+		validateMarkedReplacementMetadata(va, pv, "", imageID) != nil {
 		return deny(err)
 	}
 	var waiting waitingConsumers
@@ -662,6 +658,14 @@ func (s *ControllerServer) inspectReplacementDisk(ctx context.Context, attempt r
 	}
 	if err != nil || (disk != nil) != attached {
 		return nil, attachmentEvidenceUnavailable("replacement Ceph attach outcome is unverified", err)
+	}
+	if disk != nil {
+		if !opennebula.DeviceSerialMatchesImage(disk.Serial, attempt.ImageID) {
+			return nil, attachmentEvidenceUnavailable("replacement Ceph attach serial is unverified", nil)
+		}
+		observed := *disk
+		observed.Serial = fmt.Sprintf("onecsi-%d", attempt.ImageID)
+		disk = &observed
 	}
 	if attempt.OriginalVMID != 0 {
 		if name, err := inspector.InspectReplacementRelease(ctx, attempt.ImageID, attempt.OriginalVMID, attempt.OriginalVMName); err != nil || (name != "" && name != attempt.OriginalVMName) {

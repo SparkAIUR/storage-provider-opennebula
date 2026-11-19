@@ -2605,7 +2605,7 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeDisk(ctx context.Context, im
 	if image.ID != imageID || len(image.VMs.ID) != 1 || image.VMs.ID[0] != vmID {
 		return VolumeDiskRecord{}, fmt.Errorf("%w: image ownership contradicts the selected VM disk", ErrConflictingAttachmentEvidence)
 	}
-	return attachmentDiskRecord(info, info.Template.GetDisks(), *disk)
+	return attachmentDiskRecord(info, info.Template.GetDisks(), *disk, imageID)
 }
 
 func publishDiskFromVM(info *vm.VM, imageID, vmID int) (int, *shared.Disk, error) {
@@ -2669,7 +2669,7 @@ func verifiedDiskTarget(disks []shared.Disk, selected shared.Disk) (string, erro
 	return target, nil
 }
 
-func attachmentDiskRecord(info *vm.VM, disks []shared.Disk, disk shared.Disk) (VolumeDiskRecord, error) {
+func attachmentDiskRecord(info *vm.VM, disks []shared.Disk, disk shared.Disk, imageID int) (VolumeDiskRecord, error) {
 	slot, err := disk.GetI(shared.DiskID)
 	if err != nil || slot < 0 {
 		return VolumeDiskRecord{}, fmt.Errorf("%w: disk slot is invalid", ErrConflictingAttachmentEvidence)
@@ -2682,6 +2682,9 @@ func attachmentDiskRecord(info *vm.VM, disks []shared.Disk, disk shared.Disk) (V
 		return VolumeDiskRecord{}, err
 	}
 	serial, _ := disk.Get(shared.Serial)
+	if backing, err := disk.GetI(shared.ImageID); err == nil && backing == imageID && DeviceSerialMatchesImage(serial, imageID) {
+		serial = fmt.Sprintf("onecsi-%d", imageID)
+	}
 	readOnly := disk.GetPairs("READONLY")
 	return VolumeDiskRecord{NodeName: info.Name, NodeID: info.ID, DiskID: slot, Target: target, Serial: serial,
 		ReadOnly: len(readOnly) == 1 && readOnly[0].Value == "YES", ReplacementMarked: len(disk.GetPairs(attachAttemptField)) != 0}, nil
@@ -2761,7 +2764,7 @@ func (p *PersistentDiskVolumeProvider) inspectVolumeAttachment(ctx context.Conte
 			if !matches {
 				continue
 			}
-			record, err := attachmentDiskRecord(&vmInfo, disks, disk)
+			record, err := attachmentDiskRecord(&vmInfo, disks, disk, volumeID)
 			if err != nil {
 				return nil, err
 			}

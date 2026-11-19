@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,8 +16,109 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
+
+type detachAuthorizationFixture struct {
+	*opennebula.PersistentDiskVolumeProvider
+	beforeAuthorize func()
+}
+
+func (p detachAuthorizationFixture) DetachVolumeWithAuthority(ctx context.Context, volume, node string, vm int, backend string, owner opennebula.DetachOwnerCheck, authorize opennebula.DetachAuthorization) (bool, error) {
+	return p.PersistentDiskVolumeProvider.DetachVolumeWithAuthority(ctx, volume, node, vm, backend, owner, func(ctx context.Context, image, vm, disk int) error {
+		p.beforeAuthorize()
+		return authorize(ctx, image, vm, disk)
+	})
+}
+
+func TestDetachRechecksPlacementDeadlineAtDispatch(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, background := range []bool{false, true} {
+			for _, expire := range []bool{false, true} {
+				t.Run(fmt.Sprintf("queued=%t/background=%t/expire=%t", queued, background, expire), func(t *testing.T) {
+					ctx := context.Background()
+					const volume = "volume-test"
+					pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+					pv.Status.Phase, pvc.Status.Phase = corev1.VolumeBound, corev1.ClaimBound
+					node, destination := newReadyNode("node-old", true), newReadyNode("node-new", true)
+					deadline := time.Now().UTC().Add(time.Minute)
+					if expire {
+						deadline = time.Now().UTC().Add(2 * time.Second)
+					}
+					pv.Annotations[annotationRequiredNode] = destination.Name
+					pv.Annotations[annotationAllowCrossNodeUntil] = deadline.Format(time.RFC3339Nano)
+					objects := []kruntime.Object{pv, pvc, node, destination}
+					if !background {
+						deleting := metav1.Now()
+						objects = append(objects, &storagev1.VolumeAttachment{
+							ObjectMeta: metav1.ObjectMeta{Name: "source-va", UID: "source-uid", DeletionTimestamp: &deleting, Finalizers: []string{"external-attacher/" + DefaultDriverName}},
+							Spec: storagev1.VolumeAttachmentSpec{Attacher: DefaultDriverName, NodeName: node.Name,
+								Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name}},
+							Status: storagev1.VolumeAttachmentStatus{Attached: true},
+						})
+					}
+					driver := newStickyTestDriver(t, objects...)
+					driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
+					_, err := driver.volumeHistory.Upsert(ctx, volume, func(record *VolumeHistoryRecord) {
+						record.Backend, record.LastSuccessfulNodeName = "local", node.Name
+						record.LastSuccessfulPublishTime = time.Now().UTC().Add(-time.Minute)
+					})
+					require.NoError(t, err)
+					var inCallback, expired atomic.Bool
+					var podReads atomic.Int32
+					if expire {
+						driver.kubeRuntime.client.(*fake.Clientset).PrependReactor("list", "pods", func(action ktesting.Action) (bool, kruntime.Object, error) {
+							if inCallback.Load() && action.GetNamespace() == pvc.Namespace && podReads.Add(1) == 2 {
+								require.True(t, time.Now().UTC().Before(deadline))
+								for remaining := deadline.Sub(time.Now().UTC()); remaining > 0; remaining = deadline.Sub(time.Now().UTC()) {
+									time.Sleep(remaining)
+								}
+								expired.Store(true)
+							}
+							return false, nil, nil
+						})
+					}
+					provider, wire := nodeAttachmentProvider(t)
+					server := NewControllerServer(driver, detachAuthorizationFixture{provider, func() { inCallback.Store(true) }}, nil)
+					if queued {
+						driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+						driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+					}
+					if background {
+						r := NewAttachmentReconciler(server)
+						r.orphanGrace = 0
+						require.NoError(t, r.ReconcileOnce(ctx))
+						require.NoError(t, r.ReconcileOnce(ctx))
+					} else {
+						reply, err := reviewControllerClient(t, server).ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+						if expire {
+							require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+							require.ErrorContains(t, err, "detach placement grant expired before dispatch")
+							require.Nil(t, reply)
+						} else {
+							require.NoError(t, err)
+							require.NotNil(t, reply)
+						}
+					}
+					require.True(t, inCallback.Load())
+					wire.mu.Lock()
+					defer wire.mu.Unlock()
+					if expire {
+						require.True(t, expired.Load())
+						require.Empty(t, wire.mutations)
+						require.Contains(t, wire.disks, 41)
+					} else {
+						require.Equal(t, []string{"detach:41"}, wire.mutations)
+					}
+				})
+			}
+		}
+	}
+}
 
 func TestProviderDetachRequiresDurableCompletedCapacity(t *testing.T) {
 	for _, pending := range []bool{false, true} {

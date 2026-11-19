@@ -52,6 +52,23 @@ type physicalDetachIdentity struct {
 	remoteVMID            int
 	remoteWaiting         waitingConsumers
 	retiredSource         bool
+	placementGrant        detachPlacementGrant
+}
+
+type detachPlacementGrant struct {
+	override      string
+	expires       time.Time
+	requiredNode  string
+	requiredUntil time.Time
+}
+
+func (grant detachPlacementGrant) checkExpiry() error {
+	now := time.Now().UTC()
+	if (!grant.expires.IsZero() && !grant.expires.After(now)) ||
+		(!grant.requiredUntil.IsZero() && !grant.requiredUntil.After(now)) {
+		return attachmentEvidenceUnavailable("detach placement grant expired before dispatch", nil)
+	}
+	return nil
 }
 
 type detachAttachmentAuthority struct {
@@ -253,7 +270,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			return attachmentEvidenceUnavailable("replacement detach binding or identity is unverified", nil)
 		}
 		if canceledSuccessor && destinationVAName != "" {
-			if err := validateMarkedReplacementMetadata(destinationVA, pv, "", attempt.DetachAcceptance.Serial); err != nil {
+			if err := validateMarkedReplacementMetadata(destinationVA, pv, "", attempt.ImageID); err != nil {
 				return err
 			}
 		}
@@ -261,7 +278,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			if string(destinationVA.uid) == attempt.VAUID || destinationVA.uid == localVA.uid {
 				return attachmentEvidenceUnavailable("prepared replacement destination identity changed", nil)
 			}
-			if err := validateMarkedReplacementMetadata(destinationVA, pv, "", fmt.Sprintf("onecsi-%d", attempt.ImageID)); err != nil {
+			if err := validateMarkedReplacementMetadata(destinationVA, pv, "", attempt.ImageID); err != nil {
 				return err
 			}
 		}
@@ -274,7 +291,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			if localVAName != attempt.VAName || localVA.attached {
 				return attachmentEvidenceUnavailable("prepared replacement detach attachment identity changed", nil)
 			}
-			if err := validateMarkedReplacementMetadata(localVA, pv, "", fmt.Sprintf("onecsi-%d", attempt.ImageID)); err != nil {
+			if err := validateMarkedReplacementMetadata(localVA, pv, "", attempt.ImageID); err != nil {
 				return err
 			}
 		}
@@ -287,7 +304,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 				return attachmentEvidenceUnavailable("completed replacement detach attachment identity changed", nil)
 			}
 			if !canceledSuccessor {
-				if err := validateMarkedReplacementMetadata(localVA, pv, completion.Target, completion.Serial); err != nil {
+				if err := validateMarkedReplacementMetadata(localVA, pv, completion.Target, attempt.ImageID); err != nil {
 					return err
 				}
 			}
@@ -321,7 +338,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			}
 		}
 		if disk != nil {
-			if err := validateMarkedReplacementMetadata(localVA, pv, disk.Target, disk.Serial); err != nil {
+			if err := validateMarkedReplacementMetadata(localVA, pv, disk.Target, attempt.ImageID); err != nil {
 				return err
 			}
 			if (identity.diskID >= 0 && identity.diskID != disk.DiskID) ||
@@ -385,8 +402,23 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	}
 	orphan, _ := s.orphanTeardownEligible(ctx, volume, nodeName, runtimeCtx, desired, nil)
 	override, _ := crossNodeOverrideDeadline(runtimeCtx)
-	if protection.Protected && protection.RequiredNode == nodeName && !bypassProtectionForOrphanTeardown(protection, orphan) && !override.After(time.Now().UTC()) {
+	requiresOverride := protection.Protected && protection.RequiredNode == nodeName && !bypassProtectionForOrphanTeardown(protection, orphan)
+	if requiresOverride && !override.After(time.Now().UTC()) {
 		return status.Error(codes.Unavailable, "physical detach is blocked by local volume protection")
+	}
+	var placementGrant detachPlacementGrant
+	if !readback && (requiresOverride || protection.OverrideUsed) {
+		placementGrant.override = pv.Annotations[annotationAllowCrossNodeUntil]
+		placementGrant.expires = override
+		if protection.Source == protectionSourceExplicitRequiredNode {
+			placementGrant.requiredNode = protection.RequiredNode
+			if protection.ExplicitRequiredNodeUntil != nil {
+				placementGrant.requiredUntil = protection.ExplicitRequiredNodeUntil.UTC()
+			}
+		}
+	}
+	if !readback && identity.attachments != nil && placementGrant != identity.placementGrant {
+		return attachmentEvidenceUnavailable("detach placement grant changed before dispatch", nil)
 	}
 	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, replacement); err != nil {
 		return err
@@ -499,7 +531,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			}
 			waitingTarget = &opennebula.HostArtifactAttachmentTarget{NodeName: destination.Name, VMID: vmID, ImageID: attempt.ImageID, DiskID: -1}
 			if retiredRemote {
-				if string(destinationVA.uid) == attempt.VAUID || validateMarkedReplacementMetadata(destinationVA, pv, "", attempt.DetachAcceptance.Serial) != nil {
+				if string(destinationVA.uid) == attempt.VAUID || validateMarkedReplacementMetadata(destinationVA, pv, "", attempt.ImageID) != nil {
 					return attachmentEvidenceUnavailable("retired replacement destination attachment is unverified", nil)
 				}
 				identity.remoteVMID = vmID
@@ -618,6 +650,9 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		identity.pvName, identity.claimRef = pv.Name, *pv.Spec.ClaimRef
 	}
 	identity.attachments = attachments
+	if !readback {
+		identity.placementGrant = placementGrant
+	}
 	identity.backend = backend
 	identity.retiredSource = retiredSource
 	if retiredRemote {
@@ -1052,12 +1087,18 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 		if imageID != identity.imageID || vmID != identity.vmID || (identity.diskID >= 0 && diskID != identity.diskID) {
 			return status.Error(codes.Unavailable, "provider attachment identity changed before detach")
 		}
+		if err := identity.placementGrant.checkExpiry(); err != nil {
+			return err
+		}
 		attempt := identity
 		attempt.diskID = diskID
 		if err := s.checkPhysicalDetachAuthority(ctx, volume, node, &attempt, detachDispatch); err != nil {
 			return err
 		}
 		if err := s.checkPublishMoveAdmission(ctx, volume); err != nil {
+			return err
+		}
+		if err := attempt.placementGrant.checkExpiry(); err != nil {
 			return err
 		}
 		identity = attempt

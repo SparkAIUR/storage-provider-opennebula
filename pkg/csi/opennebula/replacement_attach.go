@@ -152,7 +152,7 @@ func (p *PersistentDiskVolumeProvider) inspectReplacementAttach(ctx context.Cont
 		return nil, err
 	}
 	size, err := completedSelectedDiskSize(info, *disk)
-	observed, recordErr := attachmentDiskRecord(info, info.Template.GetDisks(), *disk)
+	observed, recordErr := attachmentDiskRecord(info, info.Template.GetDisks(), *disk, imageID)
 	if err != nil || size <= 0 || recordErr != nil || observed != metadata.DiskRecords[0] ||
 		observed.Serial != fmt.Sprintf("onecsi-%d", imageID) {
 		return deny()

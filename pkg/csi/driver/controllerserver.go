@@ -2245,7 +2245,7 @@ func (s *ControllerServer) completeDiskPublish(ctx context.Context, req *csi.Con
 		if err != nil {
 			return nil, err
 		}
-		return s.finishPublishMove(ctx, req, observation, admittedNode, admission, move, publishContext)
+		return s.finishPublishMove(ctx, req, observation, admittedNode, admission, move, move, publishContext)
 	}
 	var adoptedAt time.Time
 	if observation.adopted {

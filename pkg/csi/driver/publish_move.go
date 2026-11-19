@@ -151,7 +151,7 @@ func (s *ControllerServer) releaseUnsentPublishMove(ctx context.Context, req *cs
 	}
 	destination, err := s.publishMoveNode(ctx, req.NodeId)
 	if err != nil || destination.UID != node.UID || destination.VM != vmID ||
-		s.verifyPublishMoveSource(ctx, req, move.source, imageID, reserved) != nil {
+		s.verifyPublishMoveSource(ctx, req, move.source, imageID, reserved, false) != nil {
 		return
 	}
 	originalReceipt := original.binding.PVAnnotations[annotationPublishMoveReceipt]
@@ -204,12 +204,12 @@ func (s *ControllerServer) startPublishMove(ctx context.Context, req *csi.Contro
 	return move, nil
 }
 
-func (s *ControllerServer) verifyPublishMove(ctx context.Context, req *csi.ControllerPublishVolumeRequest, move *pendingPublishMove, binding *VolumeRuntimeContext) error {
+func (s *ControllerServer) verifyPublishMove(ctx context.Context, req *csi.ControllerPublishVolumeRequest, move *pendingPublishMove, binding *VolumeRuntimeContext, renewed bool) error {
 	deny := attachmentEvidenceUnavailable("Publish move authority changed or is unverified", nil)
 	if move.Binding == "" || move.Binding != publishMoveBinding(binding, s.driver.name, req.VolumeId) ||
 		move.Destination.Name != req.NodeId || move.Source.Name == req.NodeId || move.Source.VM == move.Destination.VM ||
 		move.Image <= 0 || move.Slot < 0 || move.Target == "" || move.Serial != fmt.Sprintf("onecsi-%d", move.Image) ||
-		!move.Expires.After(time.Now()) {
+		move.Expires.IsZero() {
 		return deny
 	}
 	history, err := s.readAttachmentHistory(ctx, req.VolumeId)
@@ -217,10 +217,16 @@ func (s *ControllerServer) verifyPublishMove(ctx context.Context, req *csi.Contr
 		publishMoveGeneration(history) != move.Prior {
 		return deny
 	}
-	return s.verifyPublishMoveSource(ctx, req, move.Source, move.Image, binding)
+	if renewed {
+		target := opennebula.HostArtifactAttachmentTarget{NodeName: move.Source.Name, VMID: move.Source.VM, ImageID: move.Image, DiskID: -1}
+		if err := s.attachmentProtectionChecks(ctx, req.VolumeId, binding, target); err != nil {
+			return err
+		}
+	}
+	return s.verifyPublishMoveSource(ctx, req, move.Source, move.Image, binding, renewed)
 }
 
-func (s *ControllerServer) verifyPublishMoveSource(ctx context.Context, req *csi.ControllerPublishVolumeRequest, original publishMoveNode, imageID int, binding *VolumeRuntimeContext) error {
+func (s *ControllerServer) verifyPublishMoveSource(ctx context.Context, req *csi.ControllerPublishVolumeRequest, original publishMoveNode, imageID int, binding *VolumeRuntimeContext, requireDemand bool) error {
 	deny := attachmentEvidenceUnavailable("Publish move source or demand is unverified", nil)
 	source, err := s.publishMoveNode(ctx, original.Name)
 	if err != nil || source != original {
@@ -235,10 +241,22 @@ func (s *ControllerServer) verifyPublishMoveSource(ctx context.Context, req *csi
 	}
 	desired, err := s.driver.kubeRuntime.DesiredNodeForVolume(ctx, req.VolumeId)
 	if err != nil || desired.PVName != binding.PVName || desired.PVCName != binding.PVCName || desired.PVCNamespace != binding.PVCNamespace ||
-		desired.PVDeleting || desired.PVCDeleting || desired.MultipleNodes || (desired.Desired && desired.NodeName != req.NodeId) {
+		desired.PVDeleting || desired.PVCDeleting || desired.MultipleNodes || (desired.Desired && desired.NodeName != req.NodeId) ||
+		(requireDemand && (!desired.Desired || desired.DemandSource != volumeDemandSourceActivePod)) {
 		return deny
 	}
 	return ctx.Err()
+}
+
+func (s *ControllerServer) checkPublishMoveRenewal(ctx context.Context, req *csi.ControllerPublishVolumeRequest, move *pendingPublishMove, binding *VolumeRuntimeContext, deadline time.Time) error {
+	placement, err := s.localRWOProtectionProjection(ctx, req.VolumeId, req.NodeId, binding, false, false)
+	if err != nil || placement.Invalid || !placement.OverrideUsed || !placement.OverrideExpiresAt.Equal(deadline) ||
+		placement.InferredRequiredNode != move.Source.Name ||
+		(placement.Source == protectionSourceExplicitRequiredNode && placement.RequiredNode != req.NodeId) ||
+		!deadline.After(time.Now()) {
+		return attachmentEvidenceUnavailable("Publish move renewal authority is unverified", err)
+	}
+	return nil
 }
 
 func (s *ControllerServer) consumePublishMove(ctx context.Context, req *csi.ControllerPublishVolumeRequest, move *pendingPublishMove, admission publishPVAdmission, verify func(context.Context) error) (*VolumeRuntimeContext, error) {
@@ -308,14 +326,14 @@ func (s *ControllerServer) resumePublishMove(ctx context.Context, req *csi.Contr
 	deny := attachmentEvidenceUnavailable("pending Publish move authority is unverified", nil)
 	binding := admission.binding
 	if move.Image != imageID || move.Destination.UID != node.UID || req.Readonly || !replacementPublishCanWrite(req) ||
-		binding == nil || move.Binding != publishMoveBinding(binding, s.driver.name, req.VolumeId) || !move.Expires.After(time.Now()) {
+		binding == nil || move.Binding != publishMoveBinding(binding, s.driver.name, req.VolumeId) {
 		return nil, true, deny
 	}
 	raw, present := binding.PVAnnotations[annotationAllowCrossNodeUntil]
 	receipt := binding.PVAnnotations[annotationPublishMoveReceipt]
 	policyBinding := *binding
 	if !present {
-		if receipt != publishMoveDigest(move) {
+		if receipt != publishMoveDigest(move) || !move.Expires.After(time.Now()) {
 			return nil, true, deny
 		}
 		policyBinding.PVAnnotations = cloneStringMap(binding.PVAnnotations)
@@ -324,10 +342,11 @@ func (s *ControllerServer) resumePublishMove(ctx context.Context, req *csi.Contr
 		return nil, true, deny
 	}
 	deadline := move.Expires
+	renewed := present && publishMoveDigest(raw) != move.Grant
 	if present {
 		var valid bool
 		deadline, valid = crossNodeOverrideDeadline(binding)
-		if !valid || !deadline.After(time.Now()) {
+		if !valid || !deadline.After(time.Now()) || (!renewed && !deadline.Equal(move.Expires)) {
 			return nil, true, deny
 		}
 	}
@@ -351,43 +370,35 @@ func (s *ControllerServer) resumePublishMove(ctx context.Context, req *csi.Contr
 	if err != nil || disk.diskID != move.Slot || disk.serial != move.Serial {
 		return nil, true, deny
 	}
-	if present && publishMoveDigest(raw) != move.Grant {
-		if err := s.verifyPublishMove(ctx, req, move, binding); err != nil {
-			return nil, true, err
-		}
-		renewed := *move
-		renewed.Grant, renewed.Expires = publishMoveDigest(raw), deadline
-		_, err := s.driver.volumeHistory.upsert(ctx, req.VolumeId, func(current *VolumeHistoryRecord) error {
-			if !samePendingPublishMove(current.PendingPublishMove, move) || publishMoveGeneration(*current) != move.Prior {
-				return deny
-			}
-			if err := recheckPublishPVImage(ctx); err != nil {
-				return err
-			}
-			current.PendingPublishMove = &renewed
-			return nil
-		})
-		if err != nil {
-			return nil, true, deny
-		}
-		move = &renewed
+	authorized := move
+	if renewed {
+		grant := *move
+		grant.Grant, grant.Expires = publishMoveDigest(raw), deadline
+		authorized = &grant
 	}
 	publishContext := s.publishContextForVolume(ctx, req.VolumeId, disk, 0, req.GetVolumeContext())
-	completed, err := s.finishPublishMove(ctx, req, disk, node, admission, move, publishContext)
+	completed, err := s.finishPublishMove(ctx, req, disk, node, admission, move, authorized, publishContext)
 	if err != nil {
 		return nil, true, err
 	}
 	return completed, true, s.recheckPublishTarget(completed.withAdmission(ctx), req, disk, node)
 }
 
-func (s *ControllerServer) finishPublishMove(ctx context.Context, req *csi.ControllerPublishVolumeRequest, disk successfulAttachmentObservation, node KubernetesNodeIdentity, admission publishPVAdmission, move *pendingPublishMove, publishContext map[string]string) (*diskPublishCompletion, error) {
+func (s *ControllerServer) finishPublishMove(ctx context.Context, req *csi.ControllerPublishVolumeRequest, disk successfulAttachmentObservation, node KubernetesNodeIdentity, admission publishPVAdmission, move, authorized *pendingPublishMove, publishContext map[string]string) (*diskPublishCompletion, error) {
+	renewed := authorized.Grant != move.Grant
+	grantBinding := admission.binding
 	verify := func(ctx context.Context) error {
-		if err := s.verifyPublishMove(ctx, req, move, admission.binding); err != nil {
+		if err := s.verifyPublishMove(ctx, req, move, admission.binding, renewed); err != nil {
 			return err
+		}
+		if renewed {
+			if err := s.checkPublishMoveRenewal(ctx, req, move, grantBinding, authorized.Expires); err != nil {
+				return err
+			}
 		}
 		return s.recheckPublishTarget(ctx, req, disk, node)
 	}
-	binding, err := s.consumePublishMove(ctx, req, move, admission, verify)
+	binding, err := s.consumePublishMove(ctx, req, authorized, admission, verify)
 	if err != nil {
 		return nil, err
 	}

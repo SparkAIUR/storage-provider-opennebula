@@ -168,7 +168,7 @@ func TestAttachmentReconcilerDeletesStaleVolumeAttachment(t *testing.T) {
 
 	server := NewControllerServer(driver, staleAttachmentTestProvider{mockProvider}, &MockSharedFilesystemProviderTestify{})
 	reconciler := NewAttachmentReconciler(server)
-	reconciler.staleVASeen["va-owned"] = time.Now().Add(-2 * reconciler.staleVAGrace)
+	reconciler.staleVASeen[staleVAKey(pv.UID, va.UID)] = time.Now().Add(-2 * reconciler.staleVAGrace)
 
 	require.NoError(t, reconciler.ReconcileOnce(context.Background()))
 
@@ -316,7 +316,8 @@ func TestAttachmentReconcilerSkipsSharedFilesystemVolumeAttachments(t *testing.T
 	server := NewControllerServer(driver, mockProvider, &MockSharedFilesystemProviderTestify{})
 	reconciler := NewAttachmentReconciler(server)
 	for _, va := range vas {
-		reconciler.staleVASeen[string(va.UID)] = time.Now().Add(-2 * reconciler.staleVAGrace)
+		pvUID := types.UID(*va.Spec.Source.PersistentVolumeName)
+		reconciler.staleVASeen[staleVAKey(pvUID, va.UID)] = time.Now().Add(-2 * reconciler.staleVAGrace)
 	}
 
 	require.NoError(t, reconciler.ReconcileOnce(context.Background()))
@@ -324,7 +325,8 @@ func TestAttachmentReconcilerSkipsSharedFilesystemVolumeAttachments(t *testing.T
 	for _, va := range vas {
 		_, err := driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(context.Background(), va.Name, metav1.GetOptions{})
 		assert.NoError(t, err, "shared filesystem VolumeAttachment %s should not be deleted", va.Name)
-		assert.NotContains(t, reconciler.staleVASeen, string(va.UID), "shared filesystem VolumeAttachment %s should not be tracked as stale", va.Name)
+		assert.NotContains(t, reconciler.staleVASeen, staleVAKey(types.UID(*va.Spec.Source.PersistentVolumeName), va.UID),
+			"shared filesystem VolumeAttachment %s should not be tracked as stale", va.Name)
 	}
 	mockProvider.AssertExpectations(t)
 }

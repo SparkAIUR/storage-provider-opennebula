@@ -107,7 +107,7 @@ func (p *PersistentDiskVolumeProvider) observeGrowthTarget(ctx context.Context, 
 		if err != nil || slot != diskID {
 			return "", nil, fmt.Errorf("restoration attachment or disk slot is unverified")
 		}
-		observed, err := attachmentDiskRecord(info, info.Template.GetDisks(), *disk)
+		observed, err := attachmentDiskRecord(info, info.Template.GetDisks(), *disk, imageID)
 		if err != nil || observed != censusDisk {
 			return "", nil, fmt.Errorf("restoration disk differs from the owner census")
 		}
@@ -194,7 +194,7 @@ func (p *PersistentDiskVolumeProvider) verifyRestorationCensus(ctx context.Conte
 		if err != nil {
 			return VolumeDiskRecord{}, err
 		}
-		record, err := attachmentDiskRecord(&info, info.Template.GetDisks(), *disk)
+		record, err := attachmentDiskRecord(&info, info.Template.GetDisks(), *disk, imageID)
 		if err != nil {
 			return VolumeDiskRecord{}, err
 		}

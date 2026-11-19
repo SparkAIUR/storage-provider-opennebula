@@ -88,10 +88,7 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 			sourceAttachment = observed
 		}
 	}
-	if err := validateAttachmentImageAssertions(attachment.metadata, imageID); err != nil {
-		return unavailable(err)
-	}
-	if err := validateMarkedReplacementMetadata(attachment, pv, "", fmt.Sprintf("onecsi-%d", imageID)); err != nil {
+	if err := validateMarkedReplacementMetadata(attachment, pv, "", imageID); err != nil {
 		return err
 	}
 
@@ -219,7 +216,7 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 			if attempt.VAName != csiVolumeAttachmentName(volume, s.driver.name, attempt.Node) {
 				return unavailable(nil)
 			}
-			if err := validateMarkedReplacementMetadata(sourceAttachment, pv, "", fmt.Sprintf("onecsi-%d", imageID)); err != nil {
+			if err := validateMarkedReplacementMetadata(sourceAttachment, pv, "", imageID); err != nil {
 				return err
 			}
 			if err := s.recheckReplacementVolumeAttachment(ctx, pv.Name, attempt.VAName, sourceAttachment); err != nil {

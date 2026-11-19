@@ -119,6 +119,15 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 						require.Equal(t, len(expected)-1, wire.detachAttempts)
 					}
 					assertWire(false)
+					if mode == "retained" || mode == "released-reused" {
+						wire.mu.Lock()
+						wire.attachedDisks[target]["SERIAL"] = "ONECSI-7"
+						wire.alterDirectVM = func(xml string) string {
+							return strings.ReplaceAll(xml, "<SERIAL>ONECSI-7</SERIAL>", "<SERIAL>onEcSI-7</SERIAL>")
+						}
+						wire.mu.Unlock()
+						va.Status.AttachmentMetadata = map[string]string{publishContextDeviceSerial: "OnEcSi-7"}
+					}
 					lost, err := server.readAttachmentHistory(ctx, volume)
 					require.NoError(t, err)
 					require.NotNil(t, lost.PendingReplacementAttach)
@@ -678,6 +687,18 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 					va.Status.Attached = distinctVM
 					_, err = vas.Update(ctx, va, metav1.UpdateOptions{})
 					require.NoError(t, err)
+
+					if mode == "retained" {
+						wire.mu.Lock()
+						wire.attachedDisks[target]["SERIAL"] = "ONECSI-8"
+						wire.mu.Unlock()
+						_, err = client.ControllerUnpublishVolume(ctx, unpublish)
+						require.Error(t, err, "a contradictory image serial cannot authorize retention")
+						assertWire(false)
+						wire.mu.Lock()
+						wire.attachedDisks[target]["SERIAL"] = "ONECSI-7"
+						wire.mu.Unlock()
+					}
 
 					wire.mu.Lock()
 					nonce := wire.attachAttempt

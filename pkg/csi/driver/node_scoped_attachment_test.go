@@ -552,10 +552,11 @@ func TestProviderRequestedVMCapacityWithMultipleAttachments(t *testing.T) {
 
 func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"shared=true", "shared=false", "conflict", "renewed", "replaced", "claim-replaced", "replaced-after-grant", "revoked-after-attach", "revoked-on-conflict", "malformed", "expired", "history-write-fails", "pending-write-fails", "pending-write-lost", "grant-write-fails", "lost-grant-reply", "competing-history"} {
+		for _, mode := range []string{"shared=true", "shared=false", "conflict", "renewed", "renewed-after-expiry", "renewed-without-demand", "renewed-write-unknown", "replaced", "claim-replaced", "replaced-after-grant", "revoked-after-attach", "revoked-on-conflict", "malformed", "expired", "history-write-fails", "pending-write-fails", "pending-write-lost", "grant-write-fails", "lost-grant-reply", "competing-history"} {
 			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				shared := mode == "shared=true"
+				postExpiry := strings.HasPrefix(mode, "renewed-")
 				provider, state := nodeAttachmentProvider(t)
 				accessMode := corev1.ReadWriteOnce
 				if shared {
@@ -563,7 +564,11 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 				}
 				pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{accessMode}, nil)
 				pv.ResourceVersion = "1"
-				pv.Annotations[annotationAllowCrossNodeUntil] = time.Now().UTC().Add(time.Minute).Format(time.RFC3339)
+				deadline := time.Now().UTC().Add(time.Minute)
+				if postExpiry {
+					deadline = time.Now().UTC().Add(3 * time.Second)
+				}
+				pv.Annotations[annotationAllowCrossNodeUntil] = deadline.Format(time.RFC3339Nano)
 				consumer := activePodForPVC("move-consumer", pvc.Name, "node-new")
 				consumer.UID = "move-consumer-uid"
 				driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true), newReadyNode("node-new", true), consumer)
@@ -600,7 +605,13 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 				} else if mode != "shared=false" && mode != "revoked-after-attach" && !shared {
 					kube.PrependReactor("update", "persistentvolumes", func(action ktesting.Action) (bool, kruntime.Object, error) {
 						pending := action.(ktesting.UpdateAction).GetObject().(*corev1.PersistentVolume)
-						if pending.Annotations[annotationAllowCrossNodeUntil] != "" || !injected.CompareAndSwap(false, true) {
+						if pending.Annotations[annotationAllowCrossNodeUntil] != "" {
+							return false, nil, nil
+						}
+						if !injected.CompareAndSwap(false, true) {
+							if mode == "renewed-write-unknown" && time.Now().UTC().After(deadline) {
+								return true, nil, context.DeadlineExceeded
+							}
 							return false, nil, nil
 						}
 						gvr := corev1.SchemeGroupVersion.WithResource("persistentvolumes")
@@ -632,7 +643,7 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 						case "conflict":
 							current.Annotations["fixture.example/description"] = "updated"
 							current.Annotations[annotationPlacementSummary] = "externally refreshed placement summary"
-						case "renewed":
+						case "renewed", "renewed-after-expiry", "renewed-without-demand", "renewed-write-unknown":
 							current.Annotations[annotationAllowCrossNodeUntil] = renewed
 						case "revoked-on-conflict":
 							delete(current.Annotations, annotationAllowCrossNodeUntil)
@@ -688,19 +699,23 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 				require.NoError(t, err)
 				response, err := client.ControllerPublishVolume(ctx, req)
 				switch mode {
-				case "replaced", "replaced-after-grant", "claim-replaced", "revoked-after-attach", "revoked-on-conflict", "malformed", "expired", "renewed", "history-write-fails", "pending-write-fails", "pending-write-lost", "grant-write-fails", "lost-grant-reply", "competing-history":
+				case "replaced", "replaced-after-grant", "claim-replaced", "revoked-after-attach", "revoked-on-conflict", "malformed", "expired", "renewed", "renewed-after-expiry", "renewed-without-demand", "renewed-write-unknown", "history-write-fails", "pending-write-fails", "pending-write-lost", "grant-write-fails", "lost-grant-reply", "competing-history":
 					require.Equal(t, codes.Unavailable, status.Code(err))
 					require.Nil(t, response)
 					after, err := controller.readAttachmentHistory(ctx, req.VolumeId)
 					require.NoError(t, err)
 					require.Equal(t, before.LastSuccessfulPublishTime, after.LastSuccessfulPublishTime)
 					require.Equal(t, before.LastSuccessfulNodeName, after.LastSuccessfulNodeName)
+					if postExpiry {
+						require.NotNil(t, after.PendingPublishMove)
+						require.True(t, after.PendingPublishMove.Expires.Equal(deadline))
+					}
 				default:
 					require.NoError(t, err)
 					require.Equal(t, "vdb", response.GetPublishContext()["volumeName"])
 				}
 				switch mode {
-				case "history-write-fails", "pending-write-fails", "pending-write-lost", "grant-write-fails", "lost-grant-reply", "renewed", "revoked-on-conflict", "revoked-after-attach", "malformed", "expired", "claim-replaced", "competing-history":
+				case "history-write-fails", "pending-write-fails", "pending-write-lost", "grant-write-fails", "lost-grant-reply", "renewed", "renewed-after-expiry", "renewed-without-demand", "renewed-write-unknown", "revoked-on-conflict", "revoked-after-attach", "malformed", "expired", "claim-replaced", "competing-history":
 					current, err := kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
 					require.NoError(t, err)
 					switch mode {
@@ -708,8 +723,16 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 						require.NotContains(t, current.Annotations, annotationAllowCrossNodeUntil)
 					case "pending-write-fails", "pending-write-lost", "grant-write-fails":
 						require.Equal(t, pv.Annotations[annotationAllowCrossNodeUntil], current.Annotations[annotationAllowCrossNodeUntil])
-					case "renewed":
+					case "renewed", "renewed-after-expiry", "renewed-without-demand", "renewed-write-unknown":
 						require.Equal(t, renewed, current.Annotations[annotationAllowCrossNodeUntil])
+					}
+					if postExpiry {
+						for remaining := deadline.Sub(time.Now().UTC()); remaining >= 0; remaining = deadline.Sub(time.Now().UTC()) {
+							time.Sleep(remaining)
+						}
+					}
+					if mode == "renewed-without-demand" {
+						require.NoError(t, kube.CoreV1().Pods(consumer.Namespace).Delete(ctx, consumer.Name, metav1.DeleteOptions{}))
 					}
 					restarted := newStickyTestDriver(t)
 					restarted.kubeRuntime.client = kube
@@ -720,11 +743,19 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 						restarted.hotplugQueue = NewHotplugQueueManager(nil, "default", restarted.metrics, 5*time.Second, time.Second)
 						restarted.hotplugQueue.Configure(true, 0, 0, 0, restart.validateHotplugQueueRequest)
 					}
+					state.mu.Lock()
+					mutations := append([]string(nil), state.mutations...)
+					state.mu.Unlock()
 					retried, err := reviewControllerClient(t, restart).ControllerPublishVolume(ctx, req)
+					if postExpiry {
+						state.mu.Lock()
+						require.Equal(t, mutations, state.mutations)
+						state.mu.Unlock()
+					}
 					history, historyErr := restart.readAttachmentHistory(ctx, req.VolumeId)
 					require.NoError(t, historyErr)
 					switch mode {
-					case "history-write-fails", "pending-write-lost", "grant-write-fails", "lost-grant-reply", "renewed":
+					case "history-write-fails", "pending-write-lost", "grant-write-fails", "lost-grant-reply", "renewed", "renewed-after-expiry":
 						require.NoError(t, err)
 						require.Equal(t, "vdb", retried.GetPublishContext()["volumeName"])
 						require.Equal(t, req.NodeId, history.LastSuccessfulNodeName)
@@ -756,7 +787,7 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 					stickyConfig, err := kube.CoreV1().ConfigMaps("default").Get(ctx, stickyAttachmentStateConfigMapName, metav1.GetOptions{})
 					require.NoError(t, err)
 					switch mode {
-					case "shared=false", "conflict", "history-write-fails", "pending-write-lost", "grant-write-fails", "lost-grant-reply", "renewed":
+					case "shared=false", "conflict", "history-write-fails", "pending-write-lost", "grant-write-fails", "lost-grant-reply", "renewed", "renewed-after-expiry":
 						require.NotContains(t, stickyConfig.Data, "volume-test")
 					default:
 						require.Contains(t, stickyConfig.Data, "volume-test")
@@ -771,6 +802,8 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 						require.Equal(t, "not a timestamp", current.Annotations[annotationAllowCrossNodeUntil])
 					case "expired":
 						require.Equal(t, expired, current.Annotations[annotationAllowCrossNodeUntil])
+					case "renewed-without-demand", "renewed-write-unknown":
+						require.Equal(t, renewed, current.Annotations[annotationAllowCrossNodeUntil])
 					case "replaced", "replaced-after-grant":
 						require.Equal(t, types.UID("replacement-pv"), current.UID)
 						require.Equal(t, pv.Annotations[annotationAllowCrossNodeUntil], current.Annotations[annotationAllowCrossNodeUntil])
@@ -795,7 +828,7 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 					}
 				}
 				switch mode {
-				case "shared=false", "conflict", "history-write-fails", "pending-write-lost", "grant-write-fails", "lost-grant-reply", "renewed":
+				case "shared=false", "conflict", "history-write-fails", "pending-write-lost", "grant-write-fails", "lost-grant-reply", "renewed", "renewed-after-expiry":
 					require.Equal(t, 1, usedEvents)
 				default:
 					require.Zero(t, usedEvents)

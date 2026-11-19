@@ -224,8 +224,7 @@ func (s *ControllerServer) observeReboundOrphanRelease(ctx context.Context, hist
 			(!observed.deleting && (pv.Status.Phase != corev1.VolumeBound || destination.node != nil || va.Spec.NodeName == canceledNode)) ||
 			(pvc != nil && !reboundClaimReused(pv, pvc) && (pvc.CreationTimestamp.IsZero() || observed.created.Before(pvc.CreationTimestamp.Time))) ||
 			pv.CreationTimestamp.IsZero() || observed.created.Before(pv.CreationTimestamp.Time) ||
-			validateAttachmentImageAssertions(observed.metadata, attempt.ImageID) != nil ||
-			validateMarkedReplacementMetadata(observed, pv, "", attempt.DetachAcceptance.Serial) != nil {
+			validateMarkedReplacementMetadata(observed, pv, "", attempt.ImageID) != nil {
 			return deny(nil)
 		}
 		attachment, err := s.verifyReboundAttachmentNode(ctx, attempt, node, observed)

@@ -947,7 +947,7 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 		state.observeSuccessfulAttachment(observation)
 		state.PendingPublishMove = nil
 		if move != nil {
-			state.LastPublishMoveReceipt = publishMoveDigest(move)
+			state.LastPublishMoveReceipt = runtimeCtx.PVAnnotations[annotationPublishMoveReceipt]
 		}
 		state.LastSuccessfulPublishTime = now
 		return nil
@@ -965,7 +965,7 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 		}
 		current, err := s.readAttachmentHistory(ctx, volumeID)
 		if err != nil || current.PendingReplacementAttach != nil || current.PendingPublishMove != nil ||
-			(move != nil && current.LastPublishMoveReceipt != publishMoveDigest(move)) ||
+			(move != nil && current.LastPublishMoveReceipt != runtimeCtx.PVAnnotations[annotationPublishMoveReceipt]) ||
 			!current.matchesPublishedDisk(observation) || !current.LastSuccessfulPublishTime.Equal(now) {
 			return attachmentEvidenceUnavailable("verified Publish attachment readback failed", nil)
 		}
