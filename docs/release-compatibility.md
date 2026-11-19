@@ -17,11 +17,41 @@ Use a provider-qualified discovery reference to locate its immutable record. `7.
 
 Run these checks after the appropriate [candidate publication](../.github/workflows/release-csi.yaml) or [stable promotion](../.github/workflows/promote-csi.yaml) finishes. Record the exact workflow run and attempt, and confirm success, the expected workflow and event, the source commit, the release identity, and the required-reviewer environment approval. For stable, also verify the successful exact-head [native qualification](../.github/workflows/native-qualification.yaml) run and attempt referenced by the promotion. In the controlled workspace, retrieve the exact `candidate.json` and `native.json` used by that promotion. If run, attempt, and artifact bytes cannot be tied to the protected execution, stop.
 
-Set `csi_tag`, `release_run`, `release_attempt`, `assets`, and `channel` from that readback. Use `candidates` for an RC or `qualified` for stable. Use a fresh local `assets` directory. Run the block in Bash with authenticated `gh`, `git`, `curl`, `cmp`, Docker Buildx, `helm`, and `shasum` available. Use the readback values only after the entire block succeeds. The tag fetch updates local `FETCH_HEAD` only.
+Define these functions in the Bash session used for readback and publication. They use authenticated `gh` and `jq`.
+
+```bash
+published_release_id() {
+  jq -er --arg tag "$1" '
+    select(.tag_name == $tag and .draft == false and (.published_at | type == "string" and length > 0)) |
+    .id | select(type == "number" and . > 0 and floor == .)'
+}
+
+list_release_assets() {
+  gh api --hostname github.com --paginate --slurp "repos/$repo/releases/$1/assets"
+}
+
+find_release_asset_id() {
+  jq -er --arg name "$1" '
+    if type != "array" or length == 0 or any(.[]; type != "array")
+    then error("invalid release asset listing") else . end |
+    [.[][] | select(.name == $name)] |
+    if length == 0 then ""
+    elif length == 1 and .[0].state == "uploaded"
+    then .[0].id | select(type == "number" and . > 0 and floor == .)
+    else error("ambiguous or incomplete release asset") end'
+}
+
+download_release_asset() {
+  gh api --hostname github.com -H 'Accept: application/octet-stream' \
+    "repos/$repo/releases/assets/$1"
+}
+```
+
+Set `csi_tag`, `release_run`, `release_attempt`, `assets`, and `channel` from that readback. Use `candidates` for an RC or `qualified` for stable. Use a fresh local `assets` directory. The readback also needs `git`, `curl`, `cmp`, Docker Buildx, `helm`, and `shasum`. Use the readback values only after the entire block succeeds. The tag fetch updates local `FETCH_HEAD` only.
 
 ```bash
 (
-  set -u
+  set -uo pipefail
   repo=SparkAIUR/storage-provider-opennebula
   chart=opennebula-csi-${csi_tag#v}.tgz
   pages=https://sparkaiur.github.io/storage-provider-opennebula/charts/$channel
@@ -29,7 +59,18 @@ Set `csi_tag`, `release_run`, `release_attempt`, `assets`, and `channel` from th
     --jq '{path,event,head_sha,conclusion,run_attempt}' || exit
   git fetch --no-tags origin "refs/tags/$csi_tag" || exit
   git rev-parse 'FETCH_HEAD^{commit}' 'FETCH_HEAD^{tree}' || exit
-  gh release download "$csi_tag" --repo "github.com/$repo" --dir "$assets" --pattern "$chart" || exit
+  release_id=$(gh api --hostname github.com "repos/$repo/releases/tags/$csi_tag" |
+    published_release_id "$csi_tag") || exit
+  asset_list=$(list_release_assets "$release_id") || exit
+  required_assets=("$chart")
+  if [ "$channel" = candidates ]; then
+    required_assets+=(image.txt source-commit.txt source-tree.txt SHA256SUMS)
+  fi
+  for asset in "${required_assets[@]}"; do
+    asset_id=$(find_release_asset_id "$asset" <<< "$asset_list") || exit
+    : "${asset_id:?missing required release asset}"
+    download_release_asset "$asset_id" > "$assets/$asset" || exit
+  done
   curl -fsSL "$pages/$chart" -o "$assets/served-chart.tgz" || exit
   cmp "$assets/$chart" "$assets/served-chart.tgz" || exit
   curl -fsSL "$pages/index.yaml" -o "$assets/index.yaml" || exit
@@ -38,16 +79,9 @@ Set `csi_tag`, `release_run`, `release_attempt`, `assets`, and `channel` from th
   dockerhub_digest=$(docker buildx imagetools inspect \
     "docker.io/nudevco/opennebula-csi:$csi_tag" --format '{{.Manifest.Digest}}') || exit
   test -n "$ghcr_digest" && test "$ghcr_digest" = "$dockerhub_digest" || exit 1
-  if [ "$channel" = candidates ]; then
-    gh release download "$csi_tag" --repo "github.com/$repo" --dir "$assets" \
-      --pattern image.txt --pattern source-commit.txt --pattern source-tree.txt --pattern SHA256SUMS || exit
-    for asset in image.txt source-commit.txt source-tree.txt SHA256SUMS; do
-      test -f "$assets/$asset" || exit
-    done
-  fi
   helm show chart "$assets/$chart" || exit
   shasum -a 256 "$assets/$chart" || exit
-  printf 'OCI index digest %s\n' "$ghcr_digest"
+  printf 'GitHub release ID %s\nOCI index digest %s\n' "$release_id" "$ghcr_digest"
 )
 ```
 
@@ -55,7 +89,7 @@ Confirm the matching `opennebula-csi` index entry has the exact version, served 
 
 ## Author and verify the record
 
-Save `release-readback.json` in controlled storage with these fields. Values in angle brackets below are placeholders for the observed values. `runId` and `runAttempt` are positive JSON integers. `chartSHA256` and `evidence.sha256` are lowercase hex without a `sha256:` prefix.
+Save `release-readback.json` in controlled storage with these fields. Values in angle brackets below are placeholders for the observed values. Use the GitHub release ID printed by the readback for `publication.releaseId`. The `releaseId`, `runId`, and `runAttempt` fields take positive JSON integers. `chartSHA256` and `evidence.sha256` are lowercase hex without a `sha256:` prefix.
 
 ```json
 {
@@ -67,14 +101,14 @@ Save `release-readback.json` in controlled storage with these fields. Values in 
   "sourceTree": "<tag tree>",
   "imageDigest": "sha256:<matching OCI index digest>",
   "chartSHA256": "<downloaded and served chart SHA-256>",
-  "publication": {"runId": 0, "runAttempt": 0},
+  "publication": {"releaseId": 0, "runId": 0, "runAttempt": 0},
   "evidence": {"sha256": "<evidence SHA-256>"}
 }
 ```
 
 For a candidate, the helper derives the evidence URL from `publication`. Set `evidence.sha256` to the SHA-256 of the downloaded `SHA256SUMS` bytes. Include the affected SYSTEM/SELF exclusion only for a 7.4.0 candidate. For stable, change `csiTag` to `v0.6.0`, use only the first two exclusions, add the protected qualification `runId` and `runAttempt` to `evidence`, and set `evidence.sha256` to the raw-byte SHA-256 of `native.json`. An authenticated reviewer approves the exact readback file hash in the protected release record after verifying the scope, authenticity, and publication checks. Retrieve `approved_readback_sha256` from that approval.
 
-The authoritative discovery location is the asset named `release-compatibility-<discovery-reference>.json` on the already-published canonical CSI GitHub Release. After protected approval, run the following Bash block from a checkout containing the helper, with authenticated `gh`, `jq`, and `uv` available. Set `records` and `published_records` to separate existing local directories and use an empty `published_records` for each readback. For stable, set `qualification` to the controlled directory holding the two qualification inputs.
+The authoritative discovery location is the asset named `release-compatibility-<discovery-reference>.json` on the canonical GitHub Release identified by the approved `publication.releaseId`. After protected approval, run the following Bash block from a checkout containing the helper, with the functions above, authenticated `gh`, `jq`, and `uv` available. Set `records` and `published_records` to separate existing local directories and use an empty `published_records` for each readback. For stable, set `qualification` to the controlled directory holding the two qualification inputs.
 
 ```bash
 (
@@ -94,39 +128,32 @@ The authoritative discovery location is the asset named `release-compatibility-<
   record_path=$(compatibility_record author --record-dir "$records" "$@") || exit
   record_name=${record_path##*/}
   csi_tag=$(jq -er '.csiTag' "$record_path") || exit
-  release_id=$(gh api --hostname github.com "repos/$repo/releases/tags/$csi_tag" \
-    --jq 'select(.draft == false) | .id | select(type == "number" and . > 0)') || exit
-  : "${release_id:?expected an existing published CSI release}"
+  release_id=$(jq -er '.publication.releaseId' "$record_path") || exit
+  release_path=repos/$repo/releases/$release_id
 
-  lookup_asset() {
-    gh api --hostname github.com --paginate --slurp "repos/$repo/releases/$release_id/assets" |
-      jq -er --arg name "$record_name" '
-        if type != "array" or length == 0 or any(.[]; type != "array")
-        then error("invalid release asset listing") else . end |
-        [.[][] | select(.name == $name)] |
-        if length == 0 then ""
-        elif length == 1 and .[0].state == "uploaded" then .[0].id | select(type == "number" and . > 0)
-        else error("ambiguous or incomplete compatibility asset") end'
+  lookup_record_asset() {
+    list_release_assets "$release_id" | find_release_asset_id "$record_name"
   }
 
-  asset_id=$(lookup_asset) || exit
+  asset_id=$(lookup_record_asset) || exit
+  current_release_id=$(gh api --hostname github.com "$release_path" |
+    published_release_id "$csi_tag") || exit
+  test "$current_release_id" = "$release_id" || exit 1
   if [ -z "$asset_id" ]; then
-    if ! (
-      record_dir=$(dirname -- "$record_path") &&
-        CDPATH= cd -P -- "$record_dir/." &&
-        gh release upload "$csi_tag" --repo "github.com/$repo" "$record_name"
-    ); then
+    if ! gh api --hostname github.com --method POST --silent \
+      "https://uploads.github.com/$release_path/assets" \
+      -H 'Content-Type: application/octet-stream' --raw-field "name=$record_name" \
+      --input "$record_path"; then
       printf '%s\n' 'Upload failed. Checking whether an identical asset was published.' >&2
     fi
-    asset_id=$(lookup_asset) || exit
+    asset_id=$(lookup_record_asset) || exit
   fi
   : "${asset_id:?expected a published compatibility asset}"
-  gh api --hostname github.com -H 'Accept: application/octet-stream' \
-    "repos/$repo/releases/assets/$asset_id" > "$published_records/$record_name" || exit
+  download_release_asset "$asset_id" > "$published_records/$record_name" || exit
   compatibility_record verify --record-dir "$published_records" "$@"
 )
 ```
 
-A failed or ambiguous lookup stops publication. If the exact asset already exists, the block verifies its bytes against the approved readback and skips the upload. A confirmed absence permits a create-only upload. Readback after the upload attempt also covers a concurrent publisher winning the race for the same asset name. Retries succeed only when the downloaded bytes match. Keep earlier assets in place and send changed scope, source, digests, run attempt or evidence back for review. A changed artifact needs fresh custody and native qualification before any stable claim. See the [GitHub release asset API](https://docs.github.com/en/rest/releases/assets) and [upload command](https://cli.github.com/manual/gh_release_upload).
+A failed or ambiguous lookup stops publication. If the exact asset already exists, the block verifies its bytes against the approved readback and skips the upload. A confirmed absence permits a create-only upload to the approved release ID after confirming its published state and tag. GitHub CLI takes the request body and its length from the generated file. Readback after the upload attempt also covers a concurrent publisher winning the race for the same asset name. Retries succeed only when the downloaded bytes match. Keep earlier assets in place and send changed release identity, scope, source, digests, run attempt or evidence back for review. A changed artifact needs fresh custody and native qualification before any stable claim. See the [GitHub release asset API](https://docs.github.com/en/rest/releases/assets) and [`gh api` file input](https://cli.github.com/manual/gh_api).
 
 The helper checks local bytes, exact identity and version, and the complete native receipt contract for stable. Protected operators and workflows authenticate approvals, workflow runs, artifact origin, runtime version, and the actual native test results. Local fixtures cannot provide those facts. Keep credentials, operational receipts, and controlled qualification inputs in their approved storage. The existing promotion workflow attaches its qualification inputs to the GitHub release. Before promotion, verify whether those inputs are cleared for that release's audience and contain only approved material. If the workflow would expose controlled material, hold promotion until its publication step is addressed under separate review.

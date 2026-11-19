@@ -39,6 +39,15 @@ def set_node_count(bundle, count):
     bundle["nodePods"]["items"] = pods
 
 
+def set_pod_images(pod, images, names):
+    containers = [{"name": name, "image": images[name]} for name in names]
+    pod["spec"]["containers"] = containers
+    pod["status"]["containerStatuses"] = [
+        {"name": container["name"], "ready": True, "imageID": container["image"]}
+        for container in containers
+    ]
+
+
 class ReleaseCompatibilityTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -62,7 +71,7 @@ class ReleaseCompatibilityTest(unittest.TestCase):
             "sourceCommit": "b" * 40,
             "sourceTree": "c" * 40,
             "imageDigest": "sha256:" + "a" * 64,
-            "publication": {"runId": 111, "runAttempt": 1},
+            "publication": {"releaseId": 314, "runId": 111, "runAttempt": 1},
         }
 
     def write_chart(self, version, app_version):
@@ -92,11 +101,40 @@ class ReleaseCompatibilityTest(unittest.TestCase):
     def stable_assets(self):
         fixtures.EvidenceTest.setUp(self)
         self.candidate["chartVersion"] = "0.6.0-rc.4"
-        self.candidate["images"]["opennebula-csi"] = (
-            "nudevco/opennebula-csi@" + self.readback["imageDigest"]
-        )
+        self.readback["imageDigest"] = "sha256:" + "7" * 64
+        driver_image = "nudevco/opennebula-csi@" + self.readback["imageDigest"]
+        images = {
+            "opennebula-csi": driver_image,
+            "inventory-controller": driver_image,
+            **{
+                name: f"registry.k8s.io/sig-storage/{repository}@sha256:{digit * 64}"
+                for name, repository, digit in (
+                    ("csi-provisioner", "csi-provisioner", "1"),
+                    ("csi-attacher", "csi-attacher", "2"),
+                    ("csi-resizer", "csi-resizer", "3"),
+                    ("csi-node-driver-registrar", "csi-node-driver-registrar", "4"),
+                    ("liveness-probe", "livenessprobe", "5"),
+                    ("csi-snapshotter", "csi-snapshotter", "6"),
+                )
+            },
+        }
+        self.candidate["images"] = images
+        self.bundle["daemonset"]["metadata"]["name"] = "opennebula-csi-node"
+        self.bundle["revisions"]["items"][0]["metadata"]["name"] = "opennebula-csi-node-ds-new"
+        for pod in self.bundle["nodePods"]["items"]:
+            set_pod_images(pod, images, ("opennebula-csi", "csi-node-driver-registrar", "liveness-probe"))
+        controller, inventory = self.bundle["controlPods"]["items"]
+        set_pod_images(controller, images, (
+            "opennebula-csi", "csi-provisioner", "csi-attacher", "csi-resizer", "liveness-probe",
+        ))
+        set_pod_images(inventory, images, ("inventory-controller",))
+        for workload, pod in (("controller", controller), ("inventory", inventory)):
+            resource = self.bundle[workload]
+            resource["metadata"]["name"] = f"opennebula-csi-{workload}"
+            resource["spec"]["template"]["spec"]["containers"] = copy.deepcopy(pod["spec"]["containers"])
         self.readback["csiTag"] = "v0.6.0"
         self.readback["exclusions"].pop()
+        self.readback["publication"]["releaseId"] = 315
         self.readback["evidence"] = {"runId": 222, "runAttempt": 3}
         self.write_chart("0.6.0", "v0.6.0-rc.4")
         (self.qualification / "candidate.json").write_text(json.dumps(self.candidate))
@@ -186,6 +224,7 @@ class ReleaseCompatibilityTest(unittest.TestCase):
         record = json.loads(original)
         self.assertEqual(record["status"], "target-only")
         publication_url = f"{RUNS_URL}/111/attempts/1"
+        self.assertEqual(record["publication"]["releaseId"], 314)
         self.assertEqual(record["publication"]["url"], publication_url)
         self.assertEqual(record["evidence"]["url"], publication_url)
         self.assert_hash_bindings(
@@ -197,6 +236,12 @@ class ReleaseCompatibilityTest(unittest.TestCase):
             build_record(self.readback_bytes(), raw_sha256(data), self.assets)
         with self.assertRaisesRegex(ValueError, "immutable record differs"):
             store_record(self.records, self.record(), verify=False)
+        self.readback["publication"]["runAttempt"] = 1
+        self.readback["publication"]["releaseId"] = 315
+        for verify in (False, True):
+            with self.assertRaisesRegex(ValueError, "immutable record differs"):
+                store_record(self.records, self.record(), verify=verify)
+        self.readback["publication"]["releaseId"] = 314
         self.assertEqual(path.read_bytes(), original)
 
         self.readback["openNebulaVersion"] = "7.4.2"
@@ -218,8 +263,24 @@ class ReleaseCompatibilityTest(unittest.TestCase):
         self.assertEqual(record["discoveryRef"], "7.4.0-csi.0.6.0")
         self.assertEqual(record["status"], "native-verified")
         self.assertEqual(record["chart"]["appVersion"], "v0.6.0-rc.4")
+        self.assertEqual(record["publication"]["releaseId"], 315)
         self.assertEqual(record["publication"]["url"], f"{RUNS_URL}/111/attempts/1")
         self.assertEqual(record["evidence"]["url"], f"{RUNS_URL}/222/attempts/3")
+        driver_digests = set()
+        for cluster in self.receipt["clusters"].values():
+            bundle = cluster["readback"]
+            pods = bundle["nodePods"]["items"] + bundle["controlPods"]["items"]
+            for pod in pods:
+                (driver_status,) = (
+                    status for status in pod["status"]["containerStatuses"]
+                    if status["name"] in ("opennebula-csi", "inventory-controller")
+                )
+                driver_digests.add(driver_status["imageID"].split("@", 1)[1])
+        (observed_digest,) = driver_digests
+        self.assertEqual(record["images"], [
+            f"ghcr.io/sparkaiur/opennebula-csi@{observed_digest}",
+            f"docker.io/nudevco/opennebula-csi@{observed_digest}",
+        ])
         self.assert_hash_bindings(
             record, self.assets / "opennebula-csi-0.6.0.tgz", data, self.qualification / "native.json",
         )
@@ -248,6 +309,14 @@ class ReleaseCompatibilityTest(unittest.TestCase):
         self.write_receipt()
         with self.assertRaisesRegex(ValueError, "complete stable contract"):
             self.record(self.qualification)
+
+    def test_release_id_must_be_a_positive_integer(self):
+        self.candidate_assets()
+        for release_id in (0, -1, True, 314.0, "314"):
+            with self.subTest(release_id=release_id):
+                self.readback["publication"]["releaseId"] = release_id
+                with self.assertRaisesRegex(ValueError, "invalid GitHub release ID"):
+                    self.record()
 
     def test_stable_rejects_nine_node_hplsvc(self):
         self.stable_assets()

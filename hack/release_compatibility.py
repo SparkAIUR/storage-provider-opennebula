@@ -80,9 +80,12 @@ def build_record(readback_bytes, readback_sha256, assets, qualification=None):
         "published chart name or version differs",
     )
 
-    publication = run_url(readback["publication"])
+    publication = readback["publication"]
+    release_id = publication["releaseId"]
+    require(type(release_id) is int and release_id > 0, "invalid GitHub release ID")
+    publication_url = run_url(publication)
     evidence = readback["evidence"]
-    evidence_url = run_url(evidence) if stable else publication
+    evidence_url = run_url(evidence) if stable else publication_url
     if stable:
         require(qualification is not None, "stable requires protected native evidence")
         candidate = json.loads((qualification / "candidate.json").read_bytes())
@@ -149,7 +152,11 @@ def build_record(readback_bytes, readback_sha256, assets, qualification=None):
             "url": f"{CHARTS}/{channel}/{chart_name}",
             "sha256": chart_sha256,
         },
-        "publication": {"url": publication, "readbackSHA256": readback_sha256},
+        "publication": {
+            "releaseId": release_id,
+            "url": publication_url,
+            "readbackSHA256": readback_sha256,
+        },
         "evidence": {
             "kind": evidence_kind,
             "url": evidence_url,
