@@ -766,7 +766,7 @@ func (s *ControllerServer) checkDetachAbsencePVImage(ctx context.Context, volume
 	if err != nil {
 		return attachmentEvidenceUnavailable("cannot verify detach absence PV identity", err)
 	}
-	if pv != nil && (isCephBackend(pv.Annotations[annotationBackend]) || isCephBackend(pv.Spec.CSI.VolumeAttributes[annotationBackend]) || isCephBackend(history.Backend)) {
+	if pv != nil && pvDeclaresCephImage(pv, history) {
 		return validatePVImageAssertions(pv.Spec.CSI.VolumeAttributes, imageID)
 	}
 	return nil
@@ -869,6 +869,21 @@ func (s *ControllerServer) finishVerifiedReplacementAbsence(ctx context.Context,
 	if !attempt.matchesHistory(history) {
 		return true, attachmentEvidenceUnavailable("replacement attachment release is unresolved", nil)
 	}
+	if !retiredRequired && attempt.acceptedOrphan() {
+		pv, err := s.ownedDeletionPV(ctx, volume)
+		if err != nil {
+			return true, attachmentEvidenceUnavailable("replacement detach binding is unreadable", err)
+		}
+		if reboundOrphanPV(pv, *attempt) {
+			if identity.imageID != attempt.ImageID {
+				return true, attachmentEvidenceUnavailable("rebound attachment image changed", nil)
+			}
+			if _, err := s.verifyReboundOrphanRelease(ctx, history, *attempt, node, identity.vmID); err != nil {
+				return true, err
+			}
+			return true, s.checkReplacementAttemptReadback(ctx, *attempt)
+		}
+	}
 	if retiredRequired {
 		identity.pvUID, identity.nodeUID = types.UID(attempt.PVUID), types.UID(attempt.ReplacementUID)
 		identity.replacement = attempt
@@ -912,177 +927,13 @@ func (s *ControllerServer) retireVerifiedReplacement(ctx context.Context, attemp
 	return nil
 }
 
-func (s *ControllerServer) checkAcceptedDetachIdentity(ctx context.Context, volume, node string, identity *physicalDetachIdentity) error {
-	unavailable := func(err error) error {
-		return attachmentEvidenceUnavailable("accepted replacement detach identity changed", err)
-	}
-	runtime := s.driver.kubeRuntime
-	attempt := identity.replacement
-	source := make(map[string]detachAttachmentAuthority)
-	for name, va := range identity.attachments {
-		if va.node == node {
-			source[name] = va
-		}
-	}
-	pv, err := s.ownedDeletionPV(ctx, volume)
-	if err != nil || pv == nil {
-		return unavailable(err)
-	}
-	claim := pv.Spec.ClaimRef
-	rebound := pv.UID != identity.pvUID || pv.Name != identity.pvName || claim == nil ||
-		claim.UID != identity.claimRef.UID || claim.Name != identity.claimRef.Name || claim.Namespace != identity.claimRef.Namespace
-	if rebound {
-		if !identity.background || identity.attachments == nil || len(source) != 0 ||
-			string(identity.pvUID) != attempt.PVUID || string(identity.claimRef.UID) != attempt.PVCUID {
-			return unavailable(nil)
-		}
-		history, err := s.readAttachmentHistory(ctx, volume)
-		if err != nil || !attempt.matchesHistory(history) || history.PVName != identity.pvName ||
-			history.PVCNamespace != identity.claimRef.Namespace || history.PVCName != identity.claimRef.Name {
-			return unavailable(err)
-		}
-		_, pvc, err := s.verifyReboundOrphanBinding(ctx, history, *attempt, pv)
-		if err != nil {
-			return err
-		}
-		if datastore, err := s.inspectVolumeDatastore(ctx, volume, identity.imageID); err != nil || !isCephBackend(datastore.Backend) {
-			return unavailable(err)
-		}
-		target := opennebula.HostArtifactAttachmentTarget{NodeName: node, VMID: identity.replacementDisk.NodeID, ImageID: identity.imageID, DiskID: identity.replacementDisk.DiskID}
-		if err := s.attachmentProtectionChecks(ctx, volume, nil, target); err != nil {
-			return err
-		}
-		if identity.pvName != pv.Name {
-			oldSource, err := s.detachVolumeAttachments(ctx, identity.pvName, node)
-			if err != nil || len(oldSource) != 0 {
-				return unavailable(err)
-			}
-		}
-		if err := s.checkAcceptedDetachSource(ctx, node, identity, pv, source, true); err != nil {
-			return err
-		}
-		return s.recheckAttachmentBinding(ctx, pv, pvc, false)
-	}
-	backend, err := persistentVolumeBackend(pv)
-	if err != nil {
-		if !identity.backendInferred || !errors.Is(err, errAttachmentBackendUndeclared) {
-			return unavailable(err)
-		}
-	} else if backend != identity.backend {
-		return unavailable(nil)
-	}
-	if isCephBackend(identity.backend) {
-		if err := validatePVImageAssertions(pv.Spec.CSI.VolumeAttributes, identity.imageID); err != nil {
-			return err
-		}
-	}
-	pvc, err := runtime.client.CoreV1().PersistentVolumeClaims(claim.Namespace).Get(ctx, claim.Name, metav1.GetOptions{})
-	if err != nil && !apierrors.IsNotFound(err) {
-		return unavailable(err)
-	}
-	if pv.Status.Phase != corev1.VolumeBound && pv.Status.Phase != corev1.VolumeReleased {
-		return unavailable(nil)
-	}
-	if err == nil {
-		if pvc == nil || pvc.UID == "" || pvc.Name != claim.Name || pvc.Namespace != claim.Namespace {
-			return unavailable(nil)
-		}
-		if pvc.UID == claim.UID {
-			if pvc.Spec.VolumeName != pv.Name {
-				return unavailable(nil)
-			}
-		} else if !pendingReplacementClaim(pv, pvc) {
-			if err := runtime.verifyIndependentClaimBinding(ctx, pv, pvc); err != nil {
-				return err
-			}
-		}
-	}
-	return s.checkAcceptedDetachSource(ctx, node, identity, pv, source, false)
-}
-
-func (s *ControllerServer) checkAcceptedDetachSource(ctx context.Context, node string, identity *physicalDetachIdentity, pv *corev1.PersistentVolume, source map[string]detachAttachmentAuthority, rebound bool) error {
-	unavailable := func(err error) error {
-		return attachmentEvidenceUnavailable("accepted replacement detach source identity changed", err)
-	}
-	runtime := s.driver.kubeRuntime
-	attempt := identity.replacement
-	current, err := runtime.client.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
-	retiredSource := apierrors.IsNotFound(err)
-	if !retiredSource && (err != nil || current == nil || current.Name != node || current.UID != identity.nodeUID) {
-		return unavailable(err)
-	}
-	if retiredSource {
-		if string(identity.nodeUID) != attempt.ReplacementUID || identity.attachments == nil {
-			return unavailable(nil)
-		}
-		if len(source) != 0 {
-			if va, pinned := source[attempt.VAName]; !pinned || len(source) != 1 ||
-				va.uid == "" || !va.deleting || va.attacher != attempt.Driver {
-				return unavailable(nil)
-			}
-		}
-	}
-	currentAttachments, err := s.detachVolumeAttachments(ctx, pv.Name, "")
-	if err != nil {
-		return err
-	}
-	currentSource := make(map[string]detachAttachmentAuthority)
-	for name, va := range currentAttachments {
-		if strings.TrimSpace(va.node) == node {
-			currentSource[name] = va
-		}
-	}
-	if !retiredSource && !rebound && len(source) == 0 && len(currentSource) == 1 && len(currentAttachments) <= 2 {
-		for name, va := range currentSource {
-			if current.CreationTimestamp.IsZero() || !va.created.After(current.CreationTimestamp.Time) {
-				return unavailable(nil)
-			}
-			for remoteName, remote := range currentAttachments {
-				if remoteName == name {
-					continue
-				}
-				if !replacementRemoteAttachment(*attempt, remoteName, remote) || remote.uid == va.uid ||
-					string(remote.uid) == attempt.VAUID || validateAttachmentImageAssertions(remote.metadata, identity.imageID) != nil {
-					return unavailable(nil)
-				}
-				if err := validateMarkedReplacementMetadata(remote, pv, "", identity.replacementDisk.Serial); err != nil {
-					return err
-				}
-				destination, err := runtime.client.CoreV1().Nodes().Get(ctx, remote.node, metav1.GetOptions{})
-				if err != nil || !replacementDestinationReleased(destination, remote.node, remote, *attempt) {
-					return unavailable(err)
-				}
-			}
-			return s.checkReplacementSuccessor(ctx, *attempt, pv, name, va)
-		}
-	}
-	if !reflect.DeepEqual(source, currentSource) {
-		return unavailable(nil)
-	}
-	if va, present := source[attempt.VAName]; present {
-		currentVA, err := runtime.client.StorageV1().VolumeAttachments().Get(ctx, attempt.VAName, metav1.GetOptions{})
-		if err != nil || currentVA == nil || !matchesVolumeAttachment(pv.Name, currentVA) || !reflect.DeepEqual(va, detachAttachmentSnapshot(currentVA)) {
-			return unavailable(err)
-		}
-	} else if retiredSource || rebound {
-		if _, err := runtime.client.StorageV1().VolumeAttachments().Get(ctx, attempt.VAName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-			return unavailable(err)
-		}
-	} else if gone, err := s.replacementVAGone(ctx, attempt.VAName, attempt.VAUID); err != nil || !gone {
-		return unavailable(err)
-	}
-	if retiredSource {
-		if _, err := runtime.client.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-			return unavailable(err)
-		}
-	}
-	return ctx.Err()
-}
-
 func (s *ControllerServer) recordReplacementDetachAcceptance(ctx context.Context, volume, node, vmName string, imageID, vmID, diskID int, identity *physicalDetachIdentity) error {
 	attempt := identity.replacement
 	disk := identity.replacementDisk
-	if attempt == nil || !attempt.dispatchPossible() || imageID != identity.imageID || vmID != disk.NodeID ||
+	if attempt == nil || !attempt.dispatchPossible() || attempt.Driver != s.driver.name ||
+		attempt.VolumeID != volume || attempt.Node != node || attempt.ReplacementUID != string(identity.nodeUID) ||
+		attempt.PVUID != string(identity.pvUID) || attempt.PVCUID != string(identity.claimRef.UID) || identity.attachments == nil ||
+		imageID != attempt.ImageID || imageID != identity.imageID || vmID != attempt.VMID || vmID != disk.NodeID ||
 		vmName != disk.NodeName || diskID != disk.DiskID {
 		return attachmentEvidenceUnavailable("accepted replacement detach scope is unverified", nil)
 	}
@@ -1100,12 +951,10 @@ func (s *ControllerServer) recordReplacementDetachAcceptance(ctx context.Context
 		accepted.DetachAcceptance.VAName, accepted.DetachAcceptance.VAUID = attempt.VAName, string(va.uid)
 	}
 	err := retryOnConflict(retry.DefaultRetry, func() error {
-		if err := s.checkAcceptedDetachIdentity(ctx, volume, node, identity); err != nil {
-			return err
-		}
 		_, writeErr := s.driver.volumeHistory.updateHistory(ctx, volume, true, func(current *VolumeHistoryRecord) error {
 			if current.PendingReplacementAttach == nil || *current.PendingReplacementAttach != *attempt ||
-				!attempt.matchesHistory(*current) || !accepted.matchesHistory(*current) {
+				!accepted.matchesHistory(*current) || current.PVName != identity.pvName ||
+				current.PVCName != identity.claimRef.Name || current.PVCNamespace != identity.claimRef.Namespace {
 				return fmt.Errorf("replacement attachment history changed before recording detach acceptance")
 			}
 			current.PendingReplacementAttach = &accepted

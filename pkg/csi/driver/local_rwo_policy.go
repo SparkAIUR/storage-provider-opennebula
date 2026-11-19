@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 )
 
@@ -550,18 +551,44 @@ func (s *ControllerServer) publishNodeIdentity(ctx context.Context, nodeName str
 type publishPVImageCheckKey struct{}
 
 func (s *ControllerServer) publishPVImageCheck(ctx context.Context, volumeID string, imageID int, binding *VolumeRuntimeContext, history VolumeHistoryRecord) (func(context.Context) error, error) {
-	if binding == nil {
-		return nil, nil
-	}
-	if !isCephBackend(binding.Backend) && !isCephBackend(binding.backendAttribute) && !isCephBackend(history.Backend) {
+	runtime := s.driver.kubeRuntime
+	if runtime == nil || !runtime.enabled {
 		return nil, nil
 	}
 	check := func(ctx context.Context) error {
-		pv, err := s.driver.kubeRuntime.client.CoreV1().PersistentVolumes().Get(ctx, binding.PVName, metav1.GetOptions{})
-		if err != nil || pv == nil || pv.UID != binding.pvUID || pv.Spec.CSI == nil || pv.Spec.CSI.Driver != s.driver.name || pv.Spec.CSI.VolumeHandle != volumeID {
-			return attachmentEvidenceUnavailable("Ceph Publish PV identity is unverified", err)
+		volumes := runtime.client.CoreV1().PersistentVolumes()
+		name, uid := "", types.UID("")
+		if binding != nil {
+			name, uid = binding.PVName, binding.pvUID
+		} else {
+			pv, err := s.ownedDeletionPV(ctx, volumeID)
+			if err != nil {
+				return attachmentEvidenceUnavailable("Publish PV identity is unreadable", err)
+			}
+			if pv == nil {
+				return nil
+			}
+			name, uid = pv.Name, pv.UID
 		}
-		return validatePVImageAssertions(pv.Spec.CSI.VolumeAttributes, imageID)
+		pv, err := volumes.Get(ctx, name, metav1.GetOptions{})
+		if err != nil || pv == nil || pv.UID != uid || pv.Spec.CSI == nil || pv.Spec.CSI.Driver != s.driver.name || pv.Spec.CSI.VolumeHandle != volumeID {
+			return attachmentEvidenceUnavailable("Publish PV identity is unverified", err)
+		}
+		if pvDeclaresCephImage(pv, history) {
+			if pv.UID == "" {
+				return attachmentEvidenceUnavailable("Ceph Publish PV UID is unverified", nil)
+			}
+			if err := validatePVImageAssertions(pv.Spec.CSI.VolumeAttributes, imageID); err != nil {
+				return err
+			}
+			if pv.Status.Phase == corev1.VolumeBound {
+				pvc, replaced, err := runtime.attachmentClaim(ctx, pv)
+				if err != nil || pvc == nil || replaced {
+					return attachmentEvidenceUnavailable("Ceph Publish claim identity is unverified", err)
+				}
+			}
+		}
+		return nil
 	}
 	return check, check(ctx)
 }
@@ -686,6 +713,9 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 	}
 	now := time.Now().UTC()
 	_, err := s.driver.volumeHistory.updateHistory(ctx, volumeID, observation.replacementAttempt != nil, func(state *VolumeHistoryRecord) error {
+		if err := recheckPublishPVImage(ctx); err != nil {
+			return err
+		}
 		if err := state.checkAttachmentNode(observation); err != nil {
 			return err
 		}
@@ -719,6 +749,9 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 	})
 	if errors.Is(err, errRetainedAttachmentNodeChanged) {
 		return status.Error(codes.Unavailable, err.Error())
+	}
+	if status.Code(err) == codes.Unavailable {
+		return err
 	}
 	if observation.replacementAttempt != nil {
 		if err != nil {

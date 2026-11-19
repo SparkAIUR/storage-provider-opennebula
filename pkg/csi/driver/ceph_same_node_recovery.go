@@ -493,6 +493,10 @@ func isCephBackend(backend string) bool {
 	return strings.EqualFold(strings.TrimSpace(backend), "ceph")
 }
 
+func pvDeclaresCephImage(pv *corev1.PersistentVolume, history VolumeHistoryRecord) bool {
+	return isCephBackend(pv.Annotations[annotationBackend]) || isCephBackend(pv.Spec.CSI.VolumeAttributes[annotationBackend]) || isCephBackend(history.Backend)
+}
+
 func validatePVImageAssertions(attributes map[string]string, imageID int) error {
 	if validateAttachmentImageAssertions(attributes, imageID) != nil {
 		return attachmentEvidenceUnavailable("PV image ID or device serial differs from the provider image", nil)

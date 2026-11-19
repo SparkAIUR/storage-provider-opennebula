@@ -612,3 +612,71 @@ func TestMissingImageRejectsMalformedOrUnpinnedOwnedHistory(t *testing.T) {
 		}
 	}
 }
+
+func TestControllerDeleteCephPVImageAssertions(t *testing.T) {
+	for _, mode := range []string{"absent", "matching", "wrong-image", "blank-image", "wrong-serial", "marked-conflict", "late-conflict"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			const volume = "volume-test"
+			pv, _ := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+			pv.ResourceVersion = "1"
+			pv.Status.Phase = corev1.VolumeReleased
+			pv.Finalizers = []string{"external-provisioner.volume.kubernetes.io/finalizer"}
+			attrs := map[string]string{publishContextOpenNebulaImageID: "7", publishContextDeviceSerial: "onecsi-7"}
+			switch mode {
+			case "absent":
+				attrs = nil
+			case "wrong-image":
+				attrs[publishContextOpenNebulaImageID] = "8"
+			case "blank-image":
+				attrs[publishContextOpenNebulaImageID] = ""
+			case "wrong-serial", "marked-conflict":
+				attrs[publishContextDeviceSerial] = "onecsi-8"
+			}
+			if mode == "marked-conflict" {
+				pv.Annotations[annotationDeleteVolumeIdentity] = fmt.Sprintf(
+					`{"version":1,"pvUID":%q,"driver":%q,"handle":%q,"imageID":7}`, pv.UID, DefaultDriverName, volume)
+			}
+			pv.Spec.CSI.VolumeAttributes = attrs
+			driver := newStickyTestDriver(t, pv)
+			kube := driver.kubeRuntime.client.(*fake.Clientset)
+			var census atomic.Int32
+			provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+				if mode == "late-conflict" && method == "one.vmpool.infoextended" && census.Add(1) == 2 {
+					current, err := kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+					require.NoError(t, err)
+					current.Spec.CSI.VolumeAttributes[publishContextDeviceSerial] = "onecsi-8"
+					_, err = kube.CoreV1().PersistentVolumes().Update(ctx, current, metav1.UpdateOptions{})
+					require.NoError(t, err)
+				}
+			})
+			wire.mu.Lock()
+			wire.ceph, wire.allowImageDelete = true, true
+			delete(wire.disks, 41)
+			wire.mu.Unlock()
+
+			reply, err := reviewControllerClient(t, NewControllerServer(driver, provider, nil)).DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: volume})
+			current, getErr := kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+			require.NoError(t, getErr)
+			require.Equal(t, pv.Finalizers, current.Finalizers)
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			switch mode {
+			case "absent", "matching":
+				require.NoError(t, err)
+				require.NotNil(t, reply)
+				require.Equal(t, []string{"image-delete:7"}, wire.mutations)
+			default:
+				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				require.Nil(t, reply)
+				require.Empty(t, wire.mutations)
+				if mode == "late-conflict" {
+					require.Equal(t, int32(2), census.Load())
+					require.NotEmpty(t, current.Annotations[annotationDeleteVolumeIdentity])
+				} else {
+					require.Equal(t, pv.Annotations[annotationDeleteVolumeIdentity], current.Annotations[annotationDeleteVolumeIdentity])
+				}
+			}
+		})
+	}
+}

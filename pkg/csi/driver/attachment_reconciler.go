@@ -386,8 +386,7 @@ func (r *AttachmentReconciler) settleReleasedReplacement(ctx context.Context, hi
 	identity := physicalDetachIdentity{pvUID: pv.UID, nodeUID: types.UID(attempt.ReplacementUID), imageID: attempt.ImageID, vmID: attempt.VMID,
 		diskID: -1, background: true, cephSingleWriter: true, replacement: &attempt}
 	var err error
-	if attempt.acceptedOrphan() && (attempt.PVUID != string(pv.UID) ||
-		(pv.Spec.ClaimRef != nil && string(pv.Spec.ClaimRef.UID) != attempt.PVCUID)) {
+	if attempt.acceptedOrphan() && reboundOrphanPV(pv, attempt) {
 		err = s.retireReboundOrphanReceipt(ctx, history, attempt)
 	} else if successor && (attempt.acceptedOrphan() || attempt.prepared()) {
 		err = s.retireReplacementForSuccessor(ctx, history, attempt)

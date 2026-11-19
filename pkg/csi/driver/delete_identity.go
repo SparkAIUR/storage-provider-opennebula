@@ -108,6 +108,9 @@ func (s *ControllerServer) prepareVolumeDeletion(ctx context.Context, volume str
 		expectedVersion = pv.ResourceVersion
 		if !marked && history.LastSuccessfulImageID <= 0 {
 			stage = func(ctx context.Context, actualImageID int) error {
+				if err := verify(ctx, actualImageID); err != nil {
+					return err
+				}
 				var err error
 				expectedVersion, raw, err = s.markPVDeletion(ctx, pv, volume, actualImageID)
 				if err != nil {
@@ -188,6 +191,11 @@ func (s *ControllerServer) verifyPVDeletion(ctx context.Context, pv *corev1.Pers
 		if current.Name != pv.Name || current.UID != pv.UID || current.ResourceVersion != expectedVersion ||
 			!apiequality.Semantic.DeepEqual(current.Spec.ClaimRef, pv.Spec.ClaimRef) || currentMarked != marked || currentRaw != raw {
 			return fmt.Errorf("PV deletion identity changed during admission")
+		}
+		if pvDeclaresCephImage(current, history) {
+			if err := validatePVImageAssertions(current.Spec.CSI.VolumeAttributes, imageID); err != nil {
+				return err
+			}
 		}
 	}
 	if manager := s.driver.volumeHistory; manager != nil && manager.runtime != nil && manager.runtime.enabled {
