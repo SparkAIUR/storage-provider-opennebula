@@ -1,5 +1,10 @@
 # Decisions
 
+## Exact OpenNebula release compatibility
+
+- HUMAN: Retain CSI and Helm release versions and use provider-qualified discovery references for exact OpenNebula patches. Treat 7.4.2 as a new validation target.
+- AI: Bind the compatibility record to approved publication readback and reuse the full native contract for stable. See the [release compatibility policy](docs/release-compatibility.md).
+
 ## 2026-09-09, CephFS recovery
 
 - HUMAN: Keep AMD's shared CephFS PVC and `/data/tmp`; do not migrate temp storage to `emptyDir`.
