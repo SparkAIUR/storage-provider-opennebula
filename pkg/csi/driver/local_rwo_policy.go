@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 )
 
@@ -546,6 +547,32 @@ func (s *ControllerServer) publishNodeIdentity(ctx context.Context, nodeName str
 	return identity, nil
 }
 
+type publishPVImageCheckKey struct{}
+
+func (s *ControllerServer) publishPVImageCheck(ctx context.Context, volumeID string, imageID int, binding *VolumeRuntimeContext, history VolumeHistoryRecord) (func(context.Context) error, error) {
+	if binding == nil {
+		return nil, nil
+	}
+	if !isCephBackend(binding.Backend) && !isCephBackend(binding.backendAttribute) && !isCephBackend(history.Backend) {
+		return nil, nil
+	}
+	check := func(ctx context.Context) error {
+		pv, err := s.driver.kubeRuntime.client.CoreV1().PersistentVolumes().Get(ctx, binding.PVName, metav1.GetOptions{})
+		if err != nil || pv == nil || pv.UID != binding.pvUID || pv.Spec.CSI == nil || pv.Spec.CSI.Driver != s.driver.name || pv.Spec.CSI.VolumeHandle != volumeID {
+			return attachmentEvidenceUnavailable("Ceph Publish PV identity is unverified", err)
+		}
+		return validatePVImageAssertions(pv.Spec.CSI.VolumeAttributes, imageID)
+	}
+	return check, check(ctx)
+}
+
+func recheckPublishPVImage(ctx context.Context) error {
+	if check, ok := ctx.Value(publishPVImageCheckKey{}).(func(context.Context) error); ok {
+		return check(ctx)
+	}
+	return nil
+}
+
 func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target, adoptedSerial string, admittedNode KubernetesNodeIdentity, newAttachment bool) (successfulAttachmentObservation, error) {
 	observation := successfulAttachmentObservation{
 		nodeName: strings.TrimSpace(requestedNode), target: strings.TrimSpace(target),
@@ -623,6 +650,9 @@ func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volume
 		return observation, attachmentEvidenceUnavailable("publish VM identity changed or is unverified", err)
 	}
 	if err := s.checkPublishedAttachmentNode(ctx, volumeID, requestedNode, admittedNode, newAttachment); err != nil {
+		return observation, err
+	}
+	if err := recheckPublishPVImage(ctx); err != nil {
 		return observation, err
 	}
 	observation.nodeUID = admittedNode.UID

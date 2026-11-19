@@ -3524,15 +3524,22 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 			require.NoError(t, err)
 			publish.VolumeContext = pv.Spec.CSI.VolumeAttributes
 			if tc.drift == "rebind-then-replace" {
-				inconsistent := pv.DeepCopy()
-				inconsistent.Spec.CSI.VolumeAttributes[publishContextOpenNebulaImageID] = "8"
-				_, err = kube.CoreV1().PersistentVolumes().Update(ctx, inconsistent, metav1.UpdateOptions{})
-				require.NoError(t, err)
-				_, _ = client.ControllerPublishVolume(ctx, publish)
-				unverified, err := server.readAttachmentHistory(ctx, volume)
-				require.NoError(t, err)
-				require.Equal(t, history.PVName, unverified.PVName)
-				require.Equal(t, history.PVCName, unverified.PVCName)
+				for _, assertion := range []struct{ key, value string }{
+					{publishContextOpenNebulaImageID, "8"},
+					{publishContextDeviceSerial, "onecsi-8"},
+					{publishContextDeviceSerial, ""},
+				} {
+					inconsistent := pv.DeepCopy()
+					inconsistent.Spec.CSI.VolumeAttributes[assertion.key] = assertion.value
+					_, err = kube.CoreV1().PersistentVolumes().Update(ctx, inconsistent, metav1.UpdateOptions{})
+					require.NoError(t, err)
+					denied, err := client.ControllerPublishVolume(ctx, publish)
+					require.Equal(t, codes.Unavailable, status.Code(err))
+					require.Nil(t, denied)
+					unverified, err := server.readAttachmentHistory(ctx, volume)
+					require.NoError(t, err)
+					require.Equal(t, history, unverified)
+				}
 				_, err = kube.CoreV1().PersistentVolumes().Update(ctx, pv, metav1.UpdateOptions{})
 				require.NoError(t, err)
 			}
@@ -4299,8 +4306,11 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 			"distinct-vm-abandoned-replay-retired-completed", "distinct-vm-abandoned-replay-retired-accepted",
 			"same-vm-abandoned-replay-wire-retired", "distinct-vm-abandoned-replay-wire-retired",
 			"distinct-vm-orphan-wire-retired", "distinct-vm-orphan-retired-accepted", "distinct-vm-orphan-lost-wire-retired",
-			"distinct-vm-orphan-remote-wire-retired", "distinct-vm-orphan-remote-retired-accepted",
+			"distinct-vm-orphan-remote-wire-retired", "distinct-vm-orphan-remote-retired-accepted", "distinct-vm-orphan-remote-late-wire-retired",
+			"distinct-vm-orphan-remote-replaced-wire-retired", "distinct-vm-orphan-remote-terminating-wire-retired",
 			"distinct-vm-orphan-static-retired-accepted", "distinct-vm-orphan-static-same-name-retired-accepted",
+			"distinct-vm-orphan-static-waiting-retired-accepted", "distinct-vm-orphan-static-same-name-reused-pv-waiting-retired-accepted",
+			"distinct-vm-orphan-rebound-wire-retired", "distinct-vm-orphan-rebound-lost-wire-retired",
 			"prepared-abandoned-waiting-remote-retired-publish", "prepared-abandoned-waiting-remote-retired-reconcile-distinct-vm",
 			"prepared-abandoned-retired-without-va", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
 			"distinct-vm-inflight", "same-vm-abandoned-replay",
@@ -4332,6 +4342,9 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				pv.Status.Phase, pvc.Status.Phase = corev1.VolumeBound, corev1.ClaimBound
 				pvc.Spec.AccessModes = pv.Spec.AccessModes
 				node := newReadyNode("node-old", true)
+				if strings.Contains(mode, "-reused-pv-") {
+					pv.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
+				}
 				driver := newStickyTestDriver(t, pv, pvc, node)
 				kube := driver.kubeRuntime.client.(*fake.Clientset)
 				var pendingWritten, readbackFailed, apiOutage, outageInjected, abandoned atomic.Bool
@@ -4390,8 +4403,12 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				retiredAccepted := strings.HasSuffix(mode, "-retired-accepted")
 				retiredCompleted := strings.HasSuffix(mode, "-retired-completed")
 				orphanRetirement := orphan && (wireRetired || retiredAccepted)
-				orphanLostReply := mode == "distinct-vm-orphan-lost-wire-retired"
+				orphanLostReply := orphanRetirement && strings.HasSuffix(mode, "-lost-wire-retired")
 				orphanRemoteRetirement := orphanRetirement && strings.Contains(mode, "-orphan-remote-")
+				lateRemote := orphanRemoteRetirement && strings.Contains(mode, "-remote-late-")
+				replacedRemote := orphanRemoteRetirement && strings.Contains(mode, "-remote-replaced-")
+				terminatingRemote := orphanRemoteRetirement && strings.Contains(mode, "-remote-terminating-")
+				wireStaticRebind := orphanRetirement && strings.Contains(mode, "-orphan-rebound-")
 				orphanStaticRetirement := orphanRetirement && strings.Contains(mode, "-orphan-static-")
 				wireClaimGone := strings.HasSuffix(mode, "-wire-claim-gone")
 				wireClaimChanged := strings.HasSuffix(mode, "-wire-claim-changed")
@@ -4430,6 +4447,39 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							wire.mu.Lock()
 							wire.omitVMID, wire.missingVMID = wire.attachAttemptVM, wire.attachAttemptVM
 							wire.mu.Unlock()
+						}
+						if lateRemote {
+							_, err := vas.Create(ctx, remoteVA, metav1.CreateOptions{})
+							require.NoError(t, err)
+							_, err = kube.CoreV1().Pods(pvc.Namespace).Create(ctx, remotePod, metav1.CreateOptions{})
+							require.NoError(t, err)
+						}
+						if replacedRemote {
+							require.NoError(t, vas.Delete(ctx, remoteVA.Name, metav1.DeleteOptions{}))
+							successor := remoteVA.DeepCopy()
+							successor.UID = "changed-during-detach"
+							_, err := vas.Create(ctx, successor, metav1.CreateOptions{})
+							require.NoError(t, err)
+						}
+						if terminatingRemote {
+							terminating := remotePod.DeepCopy()
+							now := metav1.Now()
+							terminating.DeletionTimestamp = &now
+							_, err := kube.CoreV1().Pods(pvc.Namespace).Update(ctx, terminating, metav1.UpdateOptions{})
+							require.NoError(t, err)
+						}
+						if wireStaticRebind {
+							pvs, claims := kube.CoreV1().PersistentVolumes(), kube.CoreV1().PersistentVolumeClaims(pvc.Namespace)
+							rebound, currentClaim := pv.DeepCopy(), pvc.DeepCopy()
+							rebound.UID, currentClaim.UID = "rebound-during-detach", "claim-rebound-during-detach"
+							rebound.Spec.ClaimRef.UID = currentClaim.UID
+							rebound.Annotations[annotationRecoveryMode] = recoveryModeObserve
+							require.NoError(t, pvs.Delete(ctx, pv.Name, metav1.DeleteOptions{}))
+							require.NoError(t, claims.Delete(ctx, pvc.Name, metav1.DeleteOptions{}))
+							_, err := pvs.Create(ctx, rebound, metav1.CreateOptions{})
+							require.NoError(t, err)
+							_, err = claims.Create(ctx, currentClaim, metav1.CreateOptions{})
+							require.NoError(t, err)
 						}
 						if wireNodeChange {
 							current, err := nodes.Get(ctx, node.Name, metav1.GetOptions{})
@@ -5904,10 +5954,12 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						if orphanRemoteRetirement {
 							_, err := nodes.Create(ctx, remoteNode, metav1.CreateOptions{})
 							require.NoError(t, err)
-							_, err = vas.Create(ctx, remoteVA, metav1.CreateOptions{})
-							require.NoError(t, err)
-							_, err = kube.CoreV1().Pods(pvc.Namespace).Create(ctx, remotePod, metav1.CreateOptions{})
-							require.NoError(t, err)
+							if !lateRemote {
+								_, err = vas.Create(ctx, remoteVA, metav1.CreateOptions{})
+								require.NoError(t, err)
+								_, err = kube.CoreV1().Pods(pvc.Namespace).Create(ctx, remotePod, metav1.CreateOptions{})
+								require.NoError(t, err)
+							}
 							wire.mu.Lock()
 							wire.vmNames[43] = remoteNode.Name
 							wire.mu.Unlock()
@@ -5937,19 +5989,59 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						deletion := &csi.DeleteVolumeRequest{VolumeId: volume}
 						_, err = retry.DeleteVolume(ctx, deletion)
 						require.ErrorContains(t, err, "replacement attachment holds volume deletion")
+						if terminatingRemote {
+							reconcileDriver(fresh)
+							current, err := s.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.Equal(t, received, current)
+							pods := kube.CoreV1().Pods(pvc.Namespace)
+							require.NoError(t, pods.Delete(ctx, remotePod.Name, metav1.DeleteOptions{}))
+							waiter := remotePod.DeepCopy()
+							waiter.UID = "waiting-after-terminating-pod"
+							_, err = pods.Create(ctx, waiter, metav1.CreateOptions{})
+							require.NoError(t, err)
+						}
+						if wireStaticRebind {
+							reconcileDriver(fresh)
+							settled, err := s.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							if !orphanLostReply {
+								received.PendingReplacementAttach = nil
+							}
+							require.Equal(t, received, settled)
+							wire.mu.Lock()
+							defer wire.mu.Unlock()
+							require.Equal(t, []string{"attach:42:false", "detach:42"}, wire.mutations)
+							return
+						}
 						if orphanStaticRetirement {
 							pvs := kube.CoreV1().PersistentVolumes()
 							claims := kube.CoreV1().PersistentVolumeClaims(pvc.Namespace)
 							currentPV, currentPVC := pv.DeepCopy(), pvc.DeepCopy()
 							currentPV.UID, currentPVC.UID = "rebound-pv-uid", "rebound-pvc-uid"
+							reusedPV := strings.Contains(mode, "-reused-pv-")
+							waitingRebind := strings.Contains(mode, "-waiting-")
+							if reusedPV {
+								currentPV.UID = pv.UID
+							}
+							if waitingRebind {
+								currentPVC.CreationTimestamp = metav1.NewTime(time.Now().Add(-30 * time.Second))
+								if !reusedPV {
+									currentPV.CreationTimestamp = currentPVC.CreationTimestamp
+								}
+							}
 							currentPV.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimRetain
 							if !strings.Contains(mode, "same-name") {
 								currentPV.Name, currentPVC.Name = "rebound-pv", "rebound-pvc"
 							}
 							currentPV.Spec.ClaimRef.Name, currentPV.Spec.ClaimRef.UID = currentPVC.Name, currentPVC.UID
 							currentPVC.Spec.VolumeName = currentPV.Name
-							require.NoError(t, pvs.Delete(ctx, pv.Name, metav1.DeleteOptions{}))
-							_, err = pvs.Create(ctx, currentPV, metav1.CreateOptions{})
+							if reusedPV {
+								_, err = pvs.Update(ctx, currentPV, metav1.UpdateOptions{})
+							} else {
+								require.NoError(t, pvs.Delete(ctx, pv.Name, metav1.DeleteOptions{}))
+								_, err = pvs.Create(ctx, currentPV, metav1.CreateOptions{})
+							}
 							require.NoError(t, err)
 							stillHeld := func() {
 								t.Helper()
@@ -6003,6 +6095,27 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							})
 							stillHeld()
 							conflict.Store(false)
+							if waitingRebind {
+								_, err = nodes.Create(ctx, remoteNode, metav1.CreateOptions{})
+								require.NoError(t, err)
+								wire.mu.Lock()
+								wire.vmNames[43] = remoteNode.Name
+								wire.mu.Unlock()
+								waitingVA := remoteVA.DeepCopy()
+								waitingVA.Spec.Source.PersistentVolumeName = &currentPV.Name
+								waitingVA.CreationTimestamp = latePod.CreationTimestamp
+								_, err = vas.Create(ctx, waitingVA, metav1.CreateOptions{})
+								require.NoError(t, err)
+								waiter = remotePod.DeepCopy()
+								waiter.Spec.Volumes[0].PersistentVolumeClaim.ClaimName = currentPVC.Name
+								active := waiter.DeepCopy()
+								active.Status.ContainerStatuses[0].ContainerID = "containerd://running"
+								_, err = pods.Create(ctx, active, metav1.CreateOptions{})
+								require.NoError(t, err)
+								stillHeld()
+								_, err = pods.UpdateStatus(ctx, waiter, metav1.UpdateOptions{})
+								require.NoError(t, err)
+							}
 							kube.ClearActions()
 							reconcileDriver(fresh)
 							for _, action := range kube.Actions() {
@@ -6018,8 +6131,17 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							require.NoError(t, err)
 							require.Equal(t, expectedHistory, cleaned)
 							wire.mu.Lock()
-							defer wire.mu.Unlock()
 							require.Equal(t, []string{"attach:42:false", "detach:42"}, wire.mutations)
+							wire.expectedAttachNonce, wire.loseAttachReply = nil, false
+							wire.mu.Unlock()
+							if waitingRebind {
+								published, err := retry.ControllerPublishVolume(ctx, newPublishReq(volume, remoteNode.Name))
+								require.NoError(t, err)
+								require.Equal(t, "7", published.PublishContext[publishContextOpenNebulaImageID])
+								wire.mu.Lock()
+								defer wire.mu.Unlock()
+								require.Equal(t, []string{"attach:42:false", "detach:42", "attach:43:false"}, wire.mutations)
+							}
 							return
 						}
 						if orphanLostReply {
@@ -6060,6 +6182,10 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							wire.missingVMID = vmID
 							wire.mu.Unlock()
 							if orphanRemoteRetirement {
+								remoteVA, err := vas.Get(ctx, remoteVA.Name, metav1.GetOptions{})
+								require.NoError(t, err)
+								remotePod, err := pods.Get(ctx, remotePod.Name, metav1.GetOptions{})
+								require.NoError(t, err)
 								conflicting := remoteVA.DeepCopy()
 								conflicting.Spec.Attacher = "foreign.example"
 								_, err = vas.Update(ctx, conflicting, metav1.UpdateOptions{})

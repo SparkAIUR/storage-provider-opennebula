@@ -371,22 +371,23 @@ func (r *AttachmentReconciler) reconcileReleasedReplacementAttempts(ctx context.
 			key := volume + "@" + attempt.Node + "@" + string(pv.UID) + "@" + attempt.ID
 			currentOrphans[key] = struct{}{}
 			if r.due(r.orphanSeen, key, now, r.orphanGrace) {
-				r.settleReleasedReplacement(ctx, history, *attempt, pv.UID, successor)
+				r.settleReleasedReplacement(ctx, history, *attempt, pv, successor)
 			}
 		}
 	}
 }
 
-func (r *AttachmentReconciler) settleReleasedReplacement(ctx context.Context, history VolumeHistoryRecord, attempt replacementAttachAttempt, pvUID types.UID, successor bool) {
+func (r *AttachmentReconciler) settleReleasedReplacement(ctx context.Context, history VolumeHistoryRecord, attempt replacementAttachAttempt, pv *corev1.PersistentVolume, successor bool) {
 	s := r.server
 	nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(attempt.Node))
 	defer nodeRelease()
 	volumeRelease := s.driver.operationLocks.Acquire(controllerVolumeLockKey(attempt.VolumeID))
 	defer volumeRelease()
-	identity := physicalDetachIdentity{pvUID: pvUID, nodeUID: types.UID(attempt.ReplacementUID), imageID: attempt.ImageID, vmID: attempt.VMID,
+	identity := physicalDetachIdentity{pvUID: pv.UID, nodeUID: types.UID(attempt.ReplacementUID), imageID: attempt.ImageID, vmID: attempt.VMID,
 		diskID: -1, background: true, cephSingleWriter: true, replacement: &attempt}
 	var err error
-	if attempt.acceptedOrphan() && attempt.PVUID != string(pvUID) {
+	if attempt.acceptedOrphan() && (attempt.PVUID != string(pv.UID) ||
+		(pv.Spec.ClaimRef != nil && string(pv.Spec.ClaimRef.UID) != attempt.PVCUID)) {
 		err = s.retireReboundOrphanReceipt(ctx, history, attempt)
 	} else if successor && (attempt.acceptedOrphan() || attempt.prepared()) {
 		err = s.retireReplacementForSuccessor(ctx, history, attempt)
@@ -774,6 +775,11 @@ func (r *AttachmentReconciler) deleteStaleVolumeAttachment(ctx context.Context, 
 	}
 	if backend != "" && backend != datastore.Backend || history.Backend != "" && !strings.EqualFold(history.Backend, datastore.Backend) {
 		return fmt.Errorf("stale attachment backend differs from current or historical declarations")
+	}
+	if isCephBackend(datastore.Backend) {
+		if err := validatePVImageAssertions(pv.Spec.CSI.VolumeAttributes, imageID); err != nil {
+			return err
+		}
 	}
 	if err := validateAttachmentImageAssertions(va.Status.AttachmentMetadata, imageID); err != nil {
 		return err

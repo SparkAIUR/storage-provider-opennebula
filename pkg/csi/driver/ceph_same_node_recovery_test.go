@@ -261,6 +261,15 @@ func TestControllerUnpublishCephRejectsDeletingNodeInEitherSnapshot(t *testing.T
 func TestControllerUnpublishCephRejectsUnverifiedRetention(t *testing.T) {
 	cases := map[string]func(*testing.T, *cephRestartTestFixture){
 		"missing PV UID": func(t *testing.T, f *cephRestartTestFixture) { f.pv.UID = "" },
+		"PV image pin contradicts current disk": func(t *testing.T, f *cephRestartTestFixture) {
+			f.pv.Spec.CSI.VolumeAttributes = map[string]string{publishContextOpenNebulaImageID: "3138"}
+		},
+		"PV serial contradicts current disk": func(t *testing.T, f *cephRestartTestFixture) {
+			f.pv.Spec.CSI.VolumeAttributes = map[string]string{publishContextDeviceSerial: "onecsi-3138"}
+		},
+		"PV image pin is blank": func(t *testing.T, f *cephRestartTestFixture) {
+			f.pv.Spec.CSI.VolumeAttributes = map[string]string{publishContextOpenNebulaImageID: " "}
+		},
 		"VA image pin contradicts current PV": func(t *testing.T, f *cephRestartTestFixture) {
 			f.va.Status.AttachmentMetadata[publishContextOpenNebulaImageID] = "3138"
 		},

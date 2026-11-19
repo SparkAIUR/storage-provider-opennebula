@@ -824,7 +824,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	if err != nil {
 		return nil, err
 	}
-	lookup, _, runtimeCtx, lookupErr := s.lookupVolumeForPublish(ctx, req.VolumeId, req.NodeId)
+	lookup, imageHistory, runtimeCtx, lookupErr := s.lookupVolumeForPublish(ctx, req.VolumeId, req.NodeId)
 	if lookupErr != nil {
 		outcome := "not_found"
 		if status.Code(lookupErr) == codes.FailedPrecondition {
@@ -836,6 +836,13 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, lookupErr
 	}
 	volumeID := lookup.ImageID
+	checkPublishPV, err := s.publishPVImageCheck(ctx, req.VolumeId, volumeID, runtimeCtx, imageHistory)
+	if err != nil {
+		return nil, err
+	}
+	if checkPublishPV != nil {
+		ctx = context.WithValue(ctx, publishPVImageCheckKey{}, checkPublishPV)
+	}
 
 	nodeID, err := s.volumeProvider.NodeExists(ctx, req.NodeId)
 	if err != nil || nodeID == -1 {
@@ -983,6 +990,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
 		defer release()
 
+		if err := recheckPublishPVImage(queueCtx); err != nil {
+			return err
+		}
 		history, replacement, err := s.replacementPublishHistory(queueCtx, req, runtimeCtx, publishNode)
 		if err != nil {
 			return err
@@ -1501,6 +1511,9 @@ func (s *ControllerServer) confirmMissingUnpublish(ctx context.Context, volume, 
 	}
 	if err := verifier.VerifyVolumeAbsent(ctx, volume, history.LastSuccessfulImageID, vmIDs...); err != nil {
 		return attachmentEvidenceUnavailable("missing volume ownership is unverified", err)
+	}
+	if err := s.checkDetachAbsencePVImage(ctx, volume, history.LastSuccessfulImageID, history); err != nil {
+		return err
 	}
 	_, err = s.detachAbsenceNodeRetired(ctx, node, history, "")
 	return err
@@ -2132,7 +2145,10 @@ func (s *ControllerServer) restoreRetainedVolumeCapacity(ctx context.Context, re
 
 func (s *ControllerServer) publishMutationContext(ctx context.Context, req *csi.ControllerPublishVolumeRequest, vmID, imageID int, admittedNode KubernetesNodeIdentity, newAttachment bool) context.Context {
 	return opennebula.WithPublishMutationAuthorization(ctx, req.VolumeId, req.NodeId, vmID, imageID, func(ctx context.Context) error {
-		return s.checkPublishedAttachmentNode(ctx, req.VolumeId, req.NodeId, admittedNode, newAttachment)
+		if err := s.checkPublishedAttachmentNode(ctx, req.VolumeId, req.NodeId, admittedNode, newAttachment); err != nil {
+			return err
+		}
+		return recheckPublishPVImage(ctx)
 	})
 }
 

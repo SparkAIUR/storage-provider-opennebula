@@ -248,6 +248,9 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if history.VolumeID != req.VolumeId || !cephHistoryHasObservedAuthority(history) {
 		return nil, cephRetentionUnavailable("observed volume history is unavailable", nil)
 	}
+	if err := validatePVImageAssertions(pv.Spec.CSI.VolumeAttributes, history.LastSuccessfulImageID); err != nil {
+		return nil, err
+	}
 	target := opennebula.HostArtifactAttachmentTarget{
 		NodeName: req.NodeId, VMID: nodeID, DiskID: diskID, ImageID: history.LastSuccessfulImageID,
 	}
@@ -488,6 +491,13 @@ func (runtimeCtx *VolumeRuntimeContext) verifiedAttachmentBackend() (string, err
 
 func isCephBackend(backend string) bool {
 	return strings.EqualFold(strings.TrimSpace(backend), "ceph")
+}
+
+func validatePVImageAssertions(attributes map[string]string, imageID int) error {
+	if validateAttachmentImageAssertions(attributes, imageID) != nil {
+		return attachmentEvidenceUnavailable("PV image ID or device serial differs from the provider image", nil)
+	}
+	return nil
 }
 
 func validateAttachmentImageAssertions(metadata map[string]string, imageID int) error {

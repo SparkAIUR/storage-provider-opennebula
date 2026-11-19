@@ -30,6 +30,9 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 	if err != nil || !isCephBackend(backend) {
 		return unavailable(err)
 	}
+	if err := validatePVImageAssertions(pv.Spec.CSI.VolumeAttributes, imageID); err != nil {
+		return err
+	}
 	runtime := s.driver.kubeRuntime
 	claim := pv.Spec.ClaimRef
 	if claim == nil || string(claim.UID) != attempt.PVCUID || claim.Namespace != history.PVCNamespace || claim.Name != history.PVCName {

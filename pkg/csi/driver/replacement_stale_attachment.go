@@ -62,6 +62,9 @@ func (s *ControllerServer) checkReplacedNodeStaleAttachment(ctx context.Context,
 	if err != nil || !isCephBackend(backend) {
 		return deny(err)
 	}
+	if err := validatePVImageAssertions(pv.Spec.CSI.VolumeAttributes, imageID); err != nil {
+		return true, err
+	}
 	pvc, replaced, err := runtime.attachmentClaim(ctx, pv)
 	if err != nil || replaced || pvc == nil || pvc.DeletionTimestamp != nil || pvc.Status.Phase != corev1.ClaimBound ||
 		pvc.Namespace != history.PVCNamespace || pvc.Name != history.PVCName || pvc.CreationTimestamp.IsZero() ||

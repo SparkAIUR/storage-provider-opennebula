@@ -286,6 +286,9 @@ func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, history
 	if err != nil || !isCephBackend(backend) {
 		return unavailable()
 	}
+	if err := validatePVImageAssertions(pv.Spec.CSI.VolumeAttributes, attempt.ImageID); err != nil {
+		return attempt, err
+	}
 	pvc, replaced, err := s.driver.kubeRuntime.attachmentClaim(ctx, pv)
 	if err != nil || replaced || pvc == nil || pvc.DeletionTimestamp != nil || pvc.Status.Phase != corev1.ClaimBound ||
 		!slices.Equal(pv.Spec.AccessModes, pvc.Spec.AccessModes) || pvc.Namespace != history.PVCNamespace || pvc.Name != history.PVCName {
