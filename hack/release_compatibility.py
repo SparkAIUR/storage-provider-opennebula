@@ -82,7 +82,7 @@ def build_record(readback_bytes, readback_sha256, assets, qualification=None):
 
     publication = run_url(readback["publication"])
     evidence = readback["evidence"]
-    evidence_url = run_url(evidence)
+    evidence_url = run_url(evidence) if stable else publication
     if stable:
         require(qualification is not None, "stable requires protected native evidence")
         candidate = json.loads((qualification / "candidate.json").read_bytes())
@@ -112,7 +112,6 @@ def build_record(readback_bytes, readback_sha256, assets, qualification=None):
         evidence_kind = "OpenNebulaNativeQualification/v1"
     else:
         require(qualification is None, "candidate records describe an intended target")
-        require(evidence_url == publication, "candidate evidence must match publication run")
         require(metadata["appVersion"] == tag, "candidate appVersion differs")
         evidence_bytes = (assets / "SHA256SUMS").read_bytes()
         require(sha256(evidence_bytes) == evidence["sha256"], "checksum asset hash differs")

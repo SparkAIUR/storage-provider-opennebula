@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import io
 import json
 import subprocess
@@ -9,8 +10,15 @@ import unittest
 from pathlib import Path
 
 import test_upgrade_evidence as fixtures
-from release_compatibility import build_record, sha256, store_record
+from release_compatibility import build_record, store_record
 from upgrade_evidence import TARGETS
+
+
+RUNS_URL = "https://github.com/SparkAIUR/storage-provider-opennebula/actions/runs"
+
+
+def raw_sha256(data):
+    return hashlib.sha256(data).hexdigest()
 
 
 class ReleaseCompatibilityTest(unittest.TestCase):
@@ -37,7 +45,6 @@ class ReleaseCompatibilityTest(unittest.TestCase):
             "sourceTree": "c" * 40,
             "imageDigest": "sha256:" + "a" * 64,
             "publication": {"runId": 111, "runAttempt": 1},
-            "evidence": {"runId": 111, "runAttempt": 1},
         }
 
     def write_chart(self, version, app_version):
@@ -47,7 +54,7 @@ class ReleaseCompatibilityTest(unittest.TestCase):
             member = tarfile.TarInfo("opennebula-csi/Chart.yaml")
             member.size = len(metadata)
             archive.addfile(member, io.BytesIO(metadata.encode()))
-        self.readback["chartSHA256"] = sha256(path.read_bytes())
+        self.readback["chartSHA256"] = raw_sha256(path.read_bytes())
 
     def candidate_assets(self):
         self.write_chart("0.6.0-rc.4", "v0.6.0-rc.4")
@@ -58,11 +65,11 @@ class ReleaseCompatibilityTest(unittest.TestCase):
         }.items():
             (self.assets / name).write_text(value + "\n")
         sums = "".join(
-            f"{sha256(p.read_bytes())}  _candidate/{p.name}\n"
+            f"{raw_sha256(p.read_bytes())}  _candidate/{p.name}\n"
             for p in sorted(self.assets.iterdir())
         )
         (self.assets / "SHA256SUMS").write_text(sums)
-        self.readback["evidence"]["sha256"] = sha256(sums.encode())
+        self.readback["evidence"] = {"sha256": raw_sha256(sums.encode())}
 
     def stable_assets(self):
         fixtures.EvidenceTest.setUp(self)
@@ -72,10 +79,10 @@ class ReleaseCompatibilityTest(unittest.TestCase):
         )
         self.readback["csiTag"] = "v0.6.0"
         self.readback["exclusions"].pop()
-        self.readback["evidence"]["runId"] = 222
+        self.readback["evidence"] = {"runId": 222, "runAttempt": 3}
         self.write_chart("0.6.0", "v0.6.0-rc.4")
         (self.qualification / "candidate.json").write_text(json.dumps(self.candidate))
-        candidate_sha = sha256(json.dumps(
+        candidate_sha = raw_sha256(json.dumps(
             self.candidate, sort_keys=True, separators=(",", ":")
         ).encode())
         self.receipt = {
@@ -126,37 +133,57 @@ class ReleaseCompatibilityTest(unittest.TestCase):
         self.write_receipt()
 
     def write_receipt(self):
-        data = json.dumps(self.receipt).encode()
+        data = (json.dumps(self.receipt) + "\n").encode()
         (self.qualification / "native.json").write_bytes(data)
-        self.readback["evidence"]["sha256"] = sha256(data)
+        self.readback["evidence"]["sha256"] = raw_sha256(data)
+
+    def readback_bytes(self):
+        return (json.dumps(self.readback) + "\n").encode()
 
     def record(self, qualification=None):
-        data = json.dumps(self.readback).encode()
-        return build_record(data, sha256(data), self.assets, qualification)
+        data = self.readback_bytes()
+        return build_record(data, raw_sha256(data), self.assets, qualification)
 
-    def test_candidate_cli_and_immutable_retry(self):
-        self.candidate_assets()
-        data = json.dumps(self.readback).encode()
+    def run_cli(self, *modes, qualification=None):
+        data = self.readback_bytes()
         readback = self.root / "readback.json"
         readback.write_bytes(data)
         options = [
-            "--readback", str(readback), "--approved-readback-sha256", sha256(data),
+            "--readback", str(readback), "--approved-readback-sha256", raw_sha256(data),
             "--release-assets", str(self.assets), "--record-dir", str(self.records),
         ]
-        for mode in ("author", "author", "verify"):
+        if qualification is not None:
+            options.extend(("--qualification", str(qualification)))
+        for mode in modes:
             subprocess.run(
                 [sys.executable, str(Path(__file__).with_name("release_compatibility.py")), mode, *options],
                 check=True,
                 capture_output=True,
             )
+        return data
+
+    def assert_hash_bindings(self, record, chart, readback, evidence):
+        self.assertEqual(record["chart"]["sha256"], raw_sha256(chart.read_bytes()))
+        self.assertEqual(record["publication"]["readbackSHA256"], raw_sha256(readback))
+        self.assertEqual(record["evidence"]["sha256"], raw_sha256(evidence.read_bytes()))
+
+    def test_candidate_cli_and_immutable_retry(self):
+        self.candidate_assets()
+        data = self.run_cli("author", "author", "verify")
         path = self.records / "release-compatibility-7.4.0-csi.0.6.0-rc.4.json"
         original = path.read_bytes()
-        self.assertEqual(json.loads(original)["status"], "target-only")
+        record = json.loads(original)
+        self.assertEqual(record["status"], "target-only")
+        publication_url = f"{RUNS_URL}/111/attempts/1"
+        self.assertEqual(record["publication"]["url"], publication_url)
+        self.assertEqual(record["evidence"]["url"], publication_url)
+        self.assert_hash_bindings(
+            record, self.assets / "opennebula-csi-0.6.0-rc.4.tgz", data, self.assets / "SHA256SUMS",
+        )
 
         self.readback["publication"]["runAttempt"] = 2
-        self.readback["evidence"]["runAttempt"] = 2
         with self.assertRaisesRegex(ValueError, "approved readback hash differs"):
-            build_record(json.dumps(self.readback).encode(), sha256(data), self.assets)
+            build_record(self.readback_bytes(), raw_sha256(data), self.assets)
         with self.assertRaisesRegex(ValueError, "immutable record differs"):
             store_record(self.records, self.record(), verify=False)
         self.assertEqual(path.read_bytes(), original)
@@ -174,10 +201,17 @@ class ReleaseCompatibilityTest(unittest.TestCase):
         self.stable_assets()
         with self.assertRaisesRegex(ValueError, "requires protected native evidence"):
             self.record()
-        record = self.record(self.qualification)
+        data = self.run_cli("author", "verify", qualification=self.qualification)
+        path = self.records / "release-compatibility-7.4.0-csi.0.6.0.json"
+        record = json.loads(path.read_bytes())
         self.assertEqual(record["discoveryRef"], "7.4.0-csi.0.6.0")
         self.assertEqual(record["status"], "native-verified")
         self.assertEqual(record["chart"]["appVersion"], "v0.6.0-rc.4")
+        self.assertEqual(record["publication"]["url"], f"{RUNS_URL}/111/attempts/1")
+        self.assertEqual(record["evidence"]["url"], f"{RUNS_URL}/222/attempts/3")
+        self.assert_hash_bindings(
+            record, self.assets / "opennebula-csi-0.6.0.tgz", data, self.qualification / "native.json",
+        )
         self.assertNotIn("OFFLINE FIXTURE", json.dumps(record))
         self.assertNotIn("fixture:NOT-NATIVE", json.dumps(record))
 
