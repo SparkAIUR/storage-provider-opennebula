@@ -72,6 +72,7 @@ type nodeAttachmentProtocol struct {
 	alterDirectVM       func(string) string
 	alterOriginalPoolVM func(string) string
 	alterDatastorePool  func(string) string
+	datastoreHTTPStatus int
 	poolVMFields        map[int]string
 	directImageFields   string
 	imageTemplateFields string
@@ -345,6 +346,10 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 					ok, body, code = 0, "VM not found", 0x400
 				}
 			case "one.datastorepool.info":
+				if state.datastoreHTTPStatus != 0 {
+					w.WriteHeader(state.datastoreHTTPStatus)
+					return
+				}
 				body = `<DATASTORE_POOL><DATASTORE><ID>100</ID><NAME>images</NAME><TYPE>IMAGE</TYPE><DS_MAD>fs</DS_MAD><TM_MAD>ssh</TM_MAD><STATE>0</STATE><TOTAL_MB>20000</TOTAL_MB><FREE_MB>10000</FREE_MB></DATASTORE><DATASTORE><ID>200</ID><NAME>system</NAME><TYPE>SYSTEM</TYPE><TM_MAD>ssh</TM_MAD><STATE>0</STATE></DATASTORE></DATASTORE_POOL>`
 				if state.ceph {
 					const rbdTemplate = `<TEMPLATE><DISK_TYPE>RBD</DISK_TYPE><COMPATIBLE_SYS_DS>200</COMPATIBLE_SYS_DS><POOL_NAME>fixture</POOL_NAME><CEPH_HOST>mon.example.invalid</CEPH_HOST><CEPH_USER>csi</CEPH_USER><CEPH_SECRET>fixture</CEPH_SECRET><BRIDGE_LIST>bridge.example.invalid</BRIDGE_LIST></TEMPLATE>`
@@ -557,16 +562,23 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 			"retirement-reply-lost", "retirement-not-committed", "reconciled", "terminating",
 			"held-va", "held-receipt", "held-pv", "held-claim", "held-source", "held-vm", "held-disk", "held-generation", "held-quarantine", "held-successor", "held-demand", "held-unknown-release",
 			"sticky", "sticky-release-reply-lost", "waiting-same-uid", "waiting-attached", "waiting-running", "waiting-terminating", "waiting-mounted", "waiting-multiple",
-			"maintenance", "maintenance-custody-changed", "overlap", "overlap-on-wire", "overlap-before-dispatch", "overlap-before-terminating",
+			"maintenance", "maintenance-custody-changed", "maintenance-release-replaced", "maintenance-release-replaced-on-wire",
+			"overlap", "overlap-on-wire", "overlap-before-dispatch", "overlap-before-terminating",
 			"overlap-before-third", "overlap-third", "overlap-history-changed", "overlap-release-changed",
 		} {
 			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				const volume = "volume-test"
 				var successorOnDetach atomic.Pointer[func()]
+				var changeReleaseOnRead atomic.Pointer[func()]
 				provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
-					if method == "one.vm.detach" {
+					switch method {
+					case "one.vm.detach":
 						if hook := successorOnDetach.Swap(nil); hook != nil {
+							(*hook)()
+						}
+					case "one.vm.info":
+						if hook := changeReleaseOnRead.Swap(nil); hook != nil {
 							(*hook)()
 						}
 					}
@@ -794,8 +806,9 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 				unpublish := &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: "node-new"}
 				if maintenance {
 					d := controller.driver
-					d.PluginConfig.OverrideVal(config.MaintenanceReleaseMinSecondsVar, 0)
-					d.PluginConfig.OverrideVal(config.MaintenanceReleaseMaxSecondsVar, 0)
+					const releaseDelay = 45
+					d.PluginConfig.OverrideVal(config.MaintenanceReleaseMinSecondsVar, releaseDelay)
+					d.PluginConfig.OverrideVal(config.MaintenanceReleaseMaxSecondsVar, releaseDelay)
 					d.maintenanceMode = NewMaintenanceModeManager(d, "default")
 					cms := kube.CoreV1().ConfigMaps("default")
 					cm, err := cms.Create(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: hotplugStateConfigMapName},
@@ -829,20 +842,76 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 					cm.Data[maintenanceModeKey] = "false"
 					_, err = cms.Update(ctx, cm, metav1.UpdateOptions{})
 					require.NoError(t, err)
+					var interruptScheduling atomic.Bool
+					interruptScheduling.Store(true)
+					kube.PrependReactor("patch", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+						if action.(ktesting.PatchAction).GetName() == hotplugStateConfigMapName && interruptScheduling.Swap(false) {
+							return true, nil, fmt.Errorf("maintenance ready update unavailable")
+						}
+						return false, nil, nil
+					})
+					require.Error(t, d.maintenanceMode.Reconcile(ctx))
+					require.False(t, d.maintenanceMode.Active())
+					unscheduled, ok := d.stickyAttachments.Get(volume)
+					require.True(t, ok)
+					require.Equal(t, hold, unscheduled)
+					controller.expireStickyDetach(ctx, hold)
+					require.Nil(t, readHistory().PendingPublishMove.Detach)
+					expectMutations(before, 1, 1)
 					require.NoError(t, d.maintenanceMode.Reconcile(ctx))
 					release, ok := d.stickyAttachments.Get(volume)
 					require.True(t, ok)
 					require.Equal(t, maintenanceReleaseReason, release.Reason)
+					require.Equal(t, releaseDelay, release.GraceSeconds)
+					require.Equal(t, releaseDelay*time.Second, release.ExpiresAt.Sub(release.StartedAt))
+					controller.expireStickyDetach(ctx, release)
+					require.Nil(t, readHistory().PendingPublishMove.Detach)
+					expectMutations(before, 1, 1)
+					release.StartedAt = release.StartedAt.Add(-2 * releaseDelay * time.Second)
+					release.ExpiresAt = release.ExpiresAt.Add(-2 * releaseDelay * time.Second)
 					if mode == "maintenance-custody-changed" {
 						release.PVCUID = "different-claim"
-						require.NoError(t, d.stickyAttachments.Update(release))
+					}
+					require.NoError(t, d.stickyAttachments.Update(release))
+					replacementSchedule := release
+					replacementSchedule.StartedAt = time.Now().UTC()
+					replacementSchedule.ExpiresAt = replacementSchedule.StartedAt.Add(releaseDelay * time.Second)
+					changeRelease := func() {
+						require.NoError(t, d.stickyAttachments.Update(replacementSchedule))
+					}
+					switch mode {
+					case "maintenance-release-replaced":
+						changeReleaseOnRead.Store(&changeRelease)
+					case "maintenance-release-replaced-on-wire":
+						successorOnDetach.Store(&changeRelease)
 					}
 					controller.expireStickyDetach(ctx, release)
 					released := readHistory()
-					if mode == "maintenance-custody-changed" {
+					switch mode {
+					case "maintenance-custody-changed", "maintenance-release-replaced", "maintenance-release-replaced-on-wire":
 						require.NotNil(t, released.PendingPublishMove)
-						require.Nil(t, released.PendingPublishMove.Detach)
-						expectMutations(before, 1, 1)
+						var mutations []string
+						var attempts int
+						if mode == "maintenance-release-replaced-on-wire" {
+							require.Nil(t, successorOnDetach.Load())
+							require.NotNil(t, released.PendingPublishMove.Detach)
+							require.Equal(t, publishMoveDigest(release), released.PendingPublishMove.Detach.MaintenanceRelease)
+							mutations, attempts = append(before, "detach:42"), 2
+						} else {
+							require.Nil(t, changeReleaseOnRead.Load())
+							require.Nil(t, released.PendingPublishMove.Detach)
+							mutations, attempts = before, 1
+						}
+						if mode != "maintenance-custody-changed" {
+							stillHeld, ok := d.stickyAttachments.Get(volume)
+							require.True(t, ok)
+							require.Equal(t, replacementSchedule, stillHeld)
+						}
+						csiClient = reviewControllerClient(t, restart())
+						reply, err := csiClient.ControllerUnpublishVolume(ctx, unpublish)
+						require.Error(t, err)
+						require.Nil(t, reply)
+						expectMutations(mutations, 1, attempts)
 						return
 					}
 					require.Nil(t, released.PendingPublishMove)
@@ -3651,6 +3720,59 @@ func TestAttachmentInventorySharesDatastorePoolPerPass(t *testing.T) {
 		{VolumeHandle: "other-volume", ImageID: 8, NodeName: "node-new", NodeID: 42, DiskID: -1, Backend: "local"},
 	}, attachments)
 	require.EqualValues(t, 4, datastoreReads.Load())
+
+	for _, tc := range []struct {
+		name         string
+		firstStatus  int
+		secondStatus int
+		conflict     bool
+		wantReads    int32
+		laterBackend string
+	}{
+		{name: "transient", firstStatus: http.StatusServiceUnavailable, wantReads: 2, laterBackend: "local"},
+		{name: "persistent", firstStatus: http.StatusServiceUnavailable, secondStatus: http.StatusServiceUnavailable, wantReads: 2},
+		{name: "permission", firstStatus: http.StatusForbidden, secondStatus: http.StatusForbidden, wantReads: 1},
+		{name: "conflict", conflict: true, wantReads: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reads atomic.Int32
+			var wire *nodeAttachmentProtocol
+			provider, protocol := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+				if method != "one.datastorepool.info" {
+					return
+				}
+				read := reads.Add(1)
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				wire.datastoreHTTPStatus = tc.secondStatus
+				if read == 1 {
+					wire.datastoreHTTPStatus = tc.firstStatus
+				}
+			})
+			wire = protocol
+			wire.mu.Lock()
+			wire.extraDiskByVM = map[int]string{42: `<DISK><IMAGE_ID>8</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdc</TARGET><SERIAL>onecsi-8</SERIAL></DISK>
+<DISK><IMAGE_ID>9</IMAGE_ID><DISK_ID>3</DISK_ID><TARGET>vdd</TARGET><SERIAL>onecsi-9</SERIAL></DISK>`}
+			wire.imageInfoByID = map[int]string{
+				8: "<IMAGE><ID>8</ID><NAME>other-volume</NAME><DATASTORE_ID>100</DATASTORE_ID></IMAGE>",
+				9: "<IMAGE><ID>9</ID><NAME>third-volume</NAME><DATASTORE_ID>100</DATASTORE_ID></IMAGE>",
+			}
+			if tc.conflict {
+				wire.alterDatastorePool = func(body string) string {
+					return strings.Replace(body, "<NAME>images</NAME>", "<NAME>images</NAME><NAME>contradiction</NAME>", 1)
+				}
+			}
+			wire.mu.Unlock()
+			attachments, _, err := provider.ListCurrentAttachments(ctx)
+			require.NoError(t, err)
+			require.ElementsMatch(t, []opennebula.ObservedAttachment{
+				{VolumeHandle: "volume-test", ImageID: 7, NodeName: "node-old", NodeID: 41, DiskID: 2},
+				{VolumeHandle: "other-volume", ImageID: 8, NodeName: "node-new", NodeID: 42, DiskID: 2, Backend: tc.laterBackend},
+				{VolumeHandle: "third-volume", ImageID: 9, NodeName: "node-new", NodeID: 42, DiskID: 3, Backend: tc.laterBackend},
+			}, attachments)
+			require.Equal(t, tc.wantReads, reads.Load())
+		})
+	}
 }
 
 func TestProviderDetachPreservesParentCancellationDuringPollAndRetry(t *testing.T) {

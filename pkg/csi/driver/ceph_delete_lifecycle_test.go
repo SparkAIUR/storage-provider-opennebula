@@ -432,6 +432,95 @@ func TestControllerDeleteVolumeRefreshesPinnedAdmission(t *testing.T) {
 	}
 }
 
+func TestControllerDeleteVolumeRejectsLatePVRebind(t *testing.T) {
+	for _, phase := range []string{"marker", "send", "lost-reply"} {
+		for _, reference := range []string{"handle", "image", "serial"} {
+			t.Run(phase+"/"+reference, func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+				pv.ResourceVersion = "1"
+				pv.Status.Phase = corev1.VolumeReleased
+				pv.Finalizers = []string{"external-provisioner.volume.kubernetes.io/finalizer"}
+				if phase != "marker" {
+					pv.Annotations[annotationDeleteVolumeIdentity] = fmt.Sprintf(
+						`{"version":1,"pvUID":%q,"driver":%q,"handle":%q,"imageID":7}`, pv.UID, DefaultDriverName, volume)
+				}
+				driver := newStickyTestDriver(t, pv, pvc)
+				kube := driver.kubeRuntime.client.(*fake.Clientset)
+				successor := pv.DeepCopy()
+				successor.Name, successor.UID = "successor-pv", "successor-pv-uid"
+				successor.Status.Phase = corev1.VolumeBound
+				successor.Spec.ClaimRef = &corev1.ObjectReference{Namespace: pvc.Namespace, Name: "successor-claim", UID: "successor-claim-uid"}
+				delete(successor.Annotations, annotationDeleteVolumeIdentity)
+				successor.Spec.CSI.VolumeAttributes = map[string]string{}
+				switch reference {
+				case "image":
+					successor.Spec.CSI.VolumeHandle = "static-image-alias"
+					successor.Spec.CSI.VolumeAttributes[publishContextOpenNebulaImageID] = "7"
+				case "serial":
+					successor.Spec.CSI.VolumeHandle = "static-serial-alias"
+					successor.Spec.CSI.VolumeAttributes[publishContextDeviceSerial] = "ONECSI-7"
+				}
+				var inject, inspected, inserted atomic.Bool
+				kube.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+					if action.(ktesting.GetAction).GetName() == hostArtifactStateConfigMapName &&
+						inspected.Load() && inject.Swap(false) {
+						if err := kube.Tracker().Create(corev1.SchemeGroupVersion.WithResource("persistentvolumes"), successor, ""); err != nil {
+							return true, nil, err
+						}
+						inserted.Store(true)
+					}
+					return false, nil, nil
+				})
+				provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+					if method == "one.vmpool.infoextended" && inject.Load() {
+						inspected.Store(true)
+					}
+				})
+				wire.mu.Lock()
+				wire.allowImageDelete, wire.loseDeleteReply = true, phase == "lost-reply"
+				delete(wire.disks, 41)
+				wire.mu.Unlock()
+				client := reviewControllerClient(t, NewControllerServer(driver, provider, nil))
+				request := &csi.DeleteVolumeRequest{VolumeId: volume}
+				if phase == "lost-reply" {
+					reply, err := client.DeleteVolume(ctx, request)
+					require.Error(t, err)
+					require.Nil(t, reply)
+					wire.mu.Lock()
+					missing := wire.missingImage
+					wire.mu.Unlock()
+					require.True(t, missing)
+					restarted := newStickyTestDriver(t)
+					restarted.kubeRuntime.client = kube
+					client = reviewControllerClient(t, NewControllerServer(restarted, provider, nil))
+				}
+				inject.Store(true)
+				reply, err := client.DeleteVolume(ctx, request)
+				require.Equal(t, codes.FailedPrecondition, status.Code(err), "%v", err)
+				require.Nil(t, reply)
+				require.True(t, inserted.Load())
+				held, err := kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+				require.NoError(t, err)
+				require.Equal(t, pv.Finalizers, held.Finalizers)
+				require.Equal(t, pv.Annotations[annotationDeleteVolumeIdentity], held.Annotations[annotationDeleteVolumeIdentity])
+				current, err := kube.CoreV1().PersistentVolumes().Get(ctx, successor.Name, metav1.GetOptions{})
+				require.NoError(t, err)
+				require.Equal(t, successor.Spec.ClaimRef, current.Spec.ClaimRef)
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				if phase == "lost-reply" {
+					require.Equal(t, []string{"image-delete:7"}, wire.mutations)
+				} else {
+					require.Empty(t, wire.mutations)
+					require.False(t, wire.missingImage)
+				}
+			})
+		}
+	}
+}
+
 func TestDeleteVolumeRechecksLiveImageWithExistingPVIdentity(t *testing.T) {
 	ctx := context.Background()
 	const volume = "volume-test"

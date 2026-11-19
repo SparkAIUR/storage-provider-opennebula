@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
@@ -28,6 +29,10 @@ type volumeDeletionIdentity struct {
 }
 
 func (s *ControllerServer) ownedDeletionPV(ctx context.Context, volume string) (*corev1.PersistentVolume, error) {
+	return s.ownedDeletionPVForImage(ctx, volume, -1)
+}
+
+func (s *ControllerServer) ownedDeletionPVForImage(ctx context.Context, volume string, imageID int) (*corev1.PersistentVolume, error) {
 	runtime := s.driver.kubeRuntime
 	if runtime == nil || !runtime.enabled {
 		return nil, nil
@@ -39,7 +44,14 @@ func (s *ControllerServer) ownedDeletionPV(ctx context.Context, volume string) (
 	var owned *corev1.PersistentVolume
 	for i := range pvs.Items {
 		pv := &pvs.Items[i]
-		if csi := pv.Spec.CSI; csi == nil || csi.Driver != s.driver.name || csi.VolumeHandle != volume {
+		csi := pv.Spec.CSI
+		if csi == nil || csi.Driver != s.driver.name {
+			continue
+		}
+		if csi.VolumeHandle != volume {
+			if imageID >= 0 && pvReferencesDeletionImage(pv, imageID) {
+				return nil, fmt.Errorf("provider image has a conflicting owned PV")
+			}
 			continue
 		}
 		if owned != nil || pv.UID == "" {
@@ -48,6 +60,20 @@ func (s *ControllerServer) ownedDeletionPV(ctx context.Context, volume string) (
 		owned = pv
 	}
 	return owned, nil
+}
+
+func pvReferencesDeletionImage(pv *corev1.PersistentVolume, imageID int) bool {
+	attributes := pv.Spec.CSI.VolumeAttributes
+	declared, err := strconv.Atoi(strings.TrimSpace(attributes[publishContextOpenNebulaImageID]))
+	if (err == nil && declared == imageID) ||
+		opennebula.DeviceSerialMatchesImage(strings.TrimSpace(attributes[publishContextDeviceSerial]), imageID) {
+		return true
+	}
+	raw, present := pv.Annotations[annotationDeleteVolumeIdentity]
+	var record volumeDeletionIdentity
+	return present && decodeCephRetentionProtection(raw, &record) == nil &&
+		record.Version == 1 && record.PVUID == pv.UID && record.Driver == pv.Spec.CSI.Driver &&
+		record.Handle == pv.Spec.CSI.VolumeHandle && record.ImageID != nil && *record.ImageID == imageID
 }
 
 func (s *ControllerServer) prepareVolumeDeletion(ctx context.Context, volume string) (context.Context, error) {
@@ -193,20 +219,34 @@ func (s *ControllerServer) verifyPVDeletion(ctx context.Context, pv *corev1.Pers
 	if (pv != nil && imageID < 0) || (history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != imageID) {
 		return fmt.Errorf("provider image identity is unverified for deletion")
 	}
-	current, err := s.ownedDeletionPV(ctx, volume)
-	if err != nil {
-		return err
-	}
-	if (pv == nil) != (current == nil) {
-		return fmt.Errorf("PV deletion identity changed during admission")
-	}
-	if current != nil {
-		currentRaw, currentMarked := current.Annotations[annotationDeleteVolumeIdentity]
-		if current.Name != pv.Name || current.UID != pv.UID || current.ResourceVersion != expectedVersion ||
-			!apiequality.Semantic.DeepEqual(current.Spec.ClaimRef, pv.Spec.ClaimRef) || currentMarked != marked || currentRaw != raw {
+	checkPV := func() error {
+		current, err := s.ownedDeletionPVForImage(ctx, volume, imageID)
+		if err != nil {
+			return err
+		}
+		if (pv == nil) != (current == nil) {
 			return fmt.Errorf("PV deletion identity changed during admission")
 		}
-		if err := s.verifyPVImageAssertions(ctx, current, imageID, history, imageAbsent, admittedBackend); err != nil {
+		if current == nil {
+			return nil
+		}
+		currentRaw, currentMarked := current.Annotations[annotationDeleteVolumeIdentity]
+		if current.Name != pv.Name || current.UID != pv.UID || current.ResourceVersion != expectedVersion ||
+			!apiequality.Semantic.DeepEqual(current.Spec.CSI, pv.Spec.CSI) ||
+			!apiequality.Semantic.DeepEqual(current.Spec.ClaimRef, pv.Spec.ClaimRef) ||
+			current.Annotations[annotationBackend] != pv.Annotations[annotationBackend] ||
+			current.Status.Phase != pv.Status.Phase || !current.DeletionTimestamp.Equal(pv.DeletionTimestamp) ||
+			current.Spec.PersistentVolumeReclaimPolicy != pv.Spec.PersistentVolumeReclaimPolicy ||
+			currentMarked != marked || currentRaw != raw {
+			return fmt.Errorf("PV deletion identity changed during admission")
+		}
+		return nil
+	}
+	if err := checkPV(); err != nil {
+		return err
+	}
+	if pv != nil {
+		if err := s.verifyPVImageAssertions(ctx, pv, imageID, history, imageAbsent, admittedBackend); err != nil {
 			return err
 		}
 	}
@@ -225,5 +265,11 @@ func (s *ControllerServer) verifyPVDeletion(ctx context.Context, pv *corev1.Pers
 	} else if pv != nil {
 		return fmt.Errorf("volume history manager is unavailable")
 	}
-	return s.verifyVolumeDeletionProtection(ctx, volume, imageID, history.LastSuccessfulOpenNebulaVMID, pv != nil)
+	if err := s.verifyVolumeDeletionProtection(ctx, volume, imageID, history.LastSuccessfulOpenNebulaVMID, pv != nil); err != nil {
+		return err
+	}
+	if err := checkPV(); err != nil {
+		return err
+	}
+	return ctx.Err()
 }

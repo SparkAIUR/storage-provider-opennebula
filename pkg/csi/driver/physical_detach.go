@@ -238,7 +238,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		if va := attachments[publishOldName]; va.uid != "" && va.deleting && (publishDispatch || va.uid == publishRelease.VAUID) {
 			publishOld = va
 		}
-		if publishDispatch && publishOld.uid == "" && (identity.stickyRelease == nil || !identity.stickyRelease.maintenanceHold()) {
+		if publishDispatch && publishOld.uid == "" && (identity.stickyRelease == nil || identity.stickyRelease.Reason != maintenanceReleaseReason) {
 			return attachmentEvidenceUnavailable("pending Publish destination detach custody is unverified", nil)
 		}
 	}

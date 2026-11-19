@@ -3,10 +3,15 @@ package opennebula
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"strconv"
 	"strings"
 
+	gocaerrors "github.com/OpenNebula/one/src/oca/go/src/goca/errors"
 	datastoreSchema "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/datastore"
 )
 
@@ -31,6 +36,27 @@ func (p *PersistentDiskVolumeProvider) readDatastoreAuthorityPool(ctx context.Co
 		return nil, err
 	}
 	return pool.Rows, nil
+}
+
+func transientDatastorePoolRead(err error) bool {
+	var clientErr *gocaerrors.ClientError
+	if !errors.As(err, &clientErr) {
+		return false
+	}
+	switch clientErr.Code {
+	case gocaerrors.ClientRespHTTP:
+		if response := clientErr.GetHTTPResponse(); response != nil {
+			switch response.StatusCode {
+			case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+				return true
+			}
+		}
+	case gocaerrors.ClientReqHTTP:
+		var networkErr net.Error
+		return errors.Is(clientErr.Cause(), io.EOF) ||
+			(errors.As(clientErr.Cause(), &networkErr) && networkErr.Timeout())
+	}
+	return false
 }
 
 func selectDatastoreAuthority(rows []datastoreAuthorityXML, datastoreID int) (datastoreSchema.Datastore, error) {

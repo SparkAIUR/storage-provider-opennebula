@@ -120,8 +120,12 @@ func (state StickyAttachmentState) matchesExpiredPublishMoveGrace(volume, node s
 
 func (m *StickyAttachmentManager) recheckReleasedPublishMoveGrace(ctx context.Context, volume, node string, binding *VolumeRuntimeContext, expected StickyAttachmentState) error {
 	deny := attachmentEvidenceUnavailable("pending Publish destination detach custody is unverified", nil)
-	if m == nil || m.runtime == nil || !m.runtime.enabled || !expected.maintenanceHold() || !expected.LastKnownNodeReady ||
-		!expected.matchesExpiredPublishMoveGrace(volume, node, binding) || expected.DatastoreID != binding.DatastoreID {
+	if m == nil || m.runtime == nil || !m.runtime.enabled || expected.Reason != maintenanceReleaseReason || !expected.LastKnownNodeReady ||
+		!expected.matchesExpiredPublishMoveGrace(volume, node, binding) || expected.DatastoreID != binding.DatastoreID ||
+		expected.GraceSeconds < 0 || expected.ExpiresAt.Sub(expected.StartedAt) != time.Duration(expected.GraceSeconds)*time.Second {
+		return deny
+	}
+	if !m.publishMoveMaintenanceInactive(ctx) {
 		return deny
 	}
 	cm, err := m.runtime.GetConfigMap(ctx, m.namespace, stickyAttachmentStateConfigMapName)
@@ -132,6 +136,15 @@ func (m *StickyAttachmentManager) recheckReleasedPublishMoveGrace(ctx context.Co
 	return ctx.Err()
 }
 
+func (m *StickyAttachmentManager) publishMoveMaintenanceInactive(ctx context.Context) bool {
+	cm, err := m.runtime.GetConfigMap(ctx, m.namespace, hotplugStateConfigMapName)
+	if err != nil {
+		return errors.IsNotFound(err)
+	}
+	active, _ := maintenanceModeActive(cm.Data)
+	return !active
+}
+
 func (m *StickyAttachmentManager) clearReleasedPublishMoveGrace(ctx context.Context, volume, node string, binding *VolumeRuntimeContext, maintenanceRelease string) error {
 	deny := attachmentEvidenceUnavailable("pending Publish destination detach grace is unverified", nil)
 	if m == nil || m.runtime == nil || !m.runtime.enabled {
@@ -139,6 +152,9 @@ func (m *StickyAttachmentManager) clearReleasedPublishMoveGrace(ctx context.Cont
 			return deny
 		}
 		return nil
+	}
+	if maintenanceRelease != "" && !m.publishMoveMaintenanceInactive(ctx) {
+		return deny
 	}
 	matches := func(state StickyAttachmentState) bool {
 		releasedHold := (state.Reason == "stateful_restart" && binding.RestartMode == restartOptimizationAnnotationValue) ||

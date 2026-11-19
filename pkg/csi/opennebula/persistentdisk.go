@@ -26,7 +26,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/OpenNebula/one/src/oca/go/src/goca"
@@ -2870,9 +2869,9 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 			})
 		}
 	}
-	loadDatastorePool := sync.OnceValues(func() ([]datastoreAuthorityXML, error) {
-		return p.readDatastoreAuthorityPool(ctx)
-	})
+	var datastorePool []datastoreAuthorityXML
+	var datastoreErr error
+	poolReads := 0
 	imageCache := map[int]struct {
 		name    string
 		backend string
@@ -2900,10 +2899,14 @@ func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Contex
 			}
 			imageMeta.name = imageInfo.Name
 			if imageInfo.DatastoreID != nil {
-				pool, backendErr := loadDatastorePool()
+				if poolReads == 0 || (poolReads == 1 && transientDatastorePoolRead(datastoreErr) && ctx.Err() == nil) {
+					poolReads++
+					datastorePool, datastoreErr = p.readDatastoreAuthorityPool(ctx)
+				}
+				backendErr := datastoreErr
 				if backendErr == nil {
 					var datastore Datastore
-					datastore, backendErr = attachmentDatastoreFromPool(pool, *imageInfo.DatastoreID)
+					datastore, backendErr = attachmentDatastoreFromPool(datastorePool, *imageInfo.DatastoreID)
 					imageMeta.backend = datastore.Backend
 				}
 				if backendErr != nil {

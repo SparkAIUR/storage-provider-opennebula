@@ -166,21 +166,18 @@ func (s *ControllerServer) preparePublishMoveDetach(ctx context.Context, volume,
 	binding := admission.binding
 	proof := &publishMoveDetach{VAName: name, VAUID: identity.attachments[name].uid,
 		Marker: binding.PVAnnotations[annotationPublishMoveReceipt], Grant: publishMoveGrantSnapshot(binding)}
-	if proof.VAUID == "" {
-		release := identity.stickyRelease
-		if release == nil || !release.maintenanceHold() {
-			return nil, nil, deny
-		}
-		if err := s.driver.stickyAttachments.recheckReleasedPublishMoveGrace(ctx, volume, node, binding, *release); err != nil {
-			return nil, nil, err
-		}
-		proof.MaintenanceRelease = publishMoveDigest(*release)
-	}
 	if err := s.recheckPublishMoveOldVA(ctx, move, binding.PVName, name, identity.attachments[name]); err != nil {
 		return nil, nil, err
 	}
 	if err := s.recheckDetachVolumeAttachments(ctx, binding.PVName, "", identity.attachments); err != nil {
 		return nil, nil, err
+	}
+	if proof.VAUID == "" {
+		release := identity.stickyRelease
+		if err := s.driver.stickyAttachments.recheckReleasedPublishMoveGrace(ctx, volume, node, binding, *release); err != nil {
+			return nil, nil, err
+		}
+		proof.MaintenanceRelease = publishMoveDigest(*release)
 	}
 	if s.driver.maintenanceMode != nil && s.driver.maintenanceMode.Active() {
 		return nil, nil, deny
