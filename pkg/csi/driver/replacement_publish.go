@@ -174,6 +174,9 @@ func (s *ControllerServer) replacementPublishHistory(ctx context.Context, req *c
 	if err != nil {
 		return history, false, attachmentEvidenceUnavailable("publish attachment history is unverified", err)
 	}
+	if replacementPublishReadOnlyMany(req) && history.PendingReplacementAttach != nil {
+		return history, false, attachmentEvidenceUnavailable("read-only publish is blocked by replacement attachment history", nil)
+	}
 	retired, err := s.retireCompletedReplacement(ctx, history)
 	if err != nil {
 		return history, false, err
@@ -263,6 +266,98 @@ func (s *ControllerServer) checkReplacementSuccessor(ctx context.Context, attemp
 		return err
 	}
 	return s.checkReplacementVAOrigin(ctx, attempt, pv.Name, name, va)
+}
+
+func replacementPublishReadOnlyMany(req *csi.ControllerPublishVolumeRequest) bool {
+	return req.GetVolumeCapability().GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
+}
+
+func (s *ControllerServer) verifyFreshReplacementReader(ctx context.Context, history VolumeHistoryRecord, volume, nodeName string, imageID, vmID int, admitted KubernetesNodeIdentity) error {
+	deny := func(err error) error {
+		return attachmentEvidenceUnavailable("read-only replacement release is unverified", err)
+	}
+	if !cephHistoryHasObservedAuthority(history) || history.LastSuccessfulImageID != imageID ||
+		history.LastSuccessfulNodeName != nodeName || history.LastSuccessfulNodeUID == "" ||
+		history.LastSuccessfulNodeUID == admitted.UID || history.LastSuccessfulOpenNebulaVMID <= 0 {
+		return deny(nil)
+	}
+	pv, err := s.ownedDeletionPV(ctx, volume)
+	if err != nil || pv == nil || pv.Name != history.PVName || pv.DeletionTimestamp != nil ||
+		pv.Status.Phase != corev1.VolumeBound || !slices.Equal(pv.Spec.AccessModes, []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany}) {
+		return deny(err)
+	}
+	pvc, reused, err := s.driver.kubeRuntime.attachmentClaim(ctx, pv)
+	if err != nil || reused || pvc == nil || pvc.Namespace != history.PVCNamespace || pvc.Name != history.PVCName ||
+		pvc.Status.Phase != corev1.ClaimBound || pvc.DeletionTimestamp != nil || !slices.Equal(pv.Spec.AccessModes, pvc.Spec.AccessModes) {
+		return deny(err)
+	}
+	client := s.driver.kubeRuntime.client.CoreV1()
+	node, err := client.Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil || node == nil || string(node.UID) != admitted.UID || node.DeletionTimestamp != nil ||
+		node.CreationTimestamp.IsZero() || nodeReportsVolumeInUse(node, s.driver.name, volume) ||
+		(!history.LastSuccessfulPublishTime.IsZero() && !history.LastSuccessfulPublishTime.Before(node.CreationTimestamp.Time)) ||
+		(!history.LastSuccessfulStageTime.IsZero() && !history.LastSuccessfulStageTime.Before(node.CreationTimestamp.Time)) {
+		return deny(err)
+	}
+	if ready, _ := nodeReadyConditionStatus(node); ready != corev1.ConditionTrue {
+		return deny(nil)
+	}
+	attachments, err := s.detachVolumeAttachments(ctx, pv.Name, "")
+	name := csiVolumeAttachmentName(volume, s.driver.name, nodeName)
+	va := attachments[name]
+	if err != nil || len(attachments) != 1 || va.node != nodeName || va.attacher != s.driver.name ||
+		va.uid == "" || va.deleting || va.attached || !va.created.After(node.CreationTimestamp.Time) ||
+		validateAttachmentImageAssertions(va.metadata, imageID) != nil ||
+		validateMarkedReplacementMetadata(va, pv, "", fmt.Sprintf("onecsi-%d", imageID)) != nil {
+		return deny(err)
+	}
+	waiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, node, false)
+	if err != nil {
+		return err
+	}
+	verifier, ok := s.volumeProvider.(opennebula.ReplacementDestinationAbsenceVerifier)
+	if !ok {
+		return deny(nil)
+	}
+	if err := verifier.VerifyReplacementDestinationAbsent(ctx, volume, nodeName, imageID, vmID, 0); err != nil {
+		return deny(err)
+	}
+	if originalVM := history.LastSuccessfulOpenNebulaVMID; originalVM != vmID {
+		inspector, ok := s.volumeProvider.(opennebula.ReplacementAttachInspector)
+		if !ok {
+			return deny(nil)
+		}
+		if _, err := inspector.InspectReplacementRelease(ctx, imageID, originalVM, ""); err != nil {
+			return deny(err)
+		}
+	}
+	runtimeCtx := &VolumeRuntimeContext{PVName: pv.Name, PVAnnotations: pv.Annotations, Backend: "ceph", AccessModes: pv.Spec.AccessModes,
+		PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVCUID: pvc.UID, PVCAnnotations: pvc.Annotations, verifiedClaimBinding: true}
+	if control := resolvedRecoveryControlState(volume, runtimeCtx, VolumeRecoveryControlState{}); control.Invalid || control.Active() {
+		return deny(nil)
+	}
+	target := opennebula.HostArtifactAttachmentTarget{NodeName: nodeName, VMID: vmID, ImageID: imageID, DiskID: -1}
+	if err := s.attachmentProtectionChecks(ctx, volume, nil, target); err != nil {
+		return err
+	}
+	currentHistory, err := s.readAttachmentHistory(ctx, volume)
+	if err != nil || currentHistory.PendingReplacementAttach != nil || replacementHistoryGeneration(currentHistory) != replacementHistoryGeneration(history) {
+		return deny(err)
+	}
+	currentWaiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, node, false)
+	if err != nil || !sameWaitingConsumers(waiting, currentWaiting) {
+		return deny(err)
+	}
+	if err := s.recheckAttachmentReleaseNode(ctx, node, volume); err != nil {
+		return err
+	}
+	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
+		return err
+	}
+	if err := s.recheckReplacementVolumeAttachment(ctx, pv.Name, name, va); err != nil {
+		return err
+	}
+	return s.recheckAttachmentBinding(ctx, pv, pvc, false)
 }
 
 func replacementPublishCanWrite(req *csi.ControllerPublishVolumeRequest) bool {

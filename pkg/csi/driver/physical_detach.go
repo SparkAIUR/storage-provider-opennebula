@@ -736,7 +736,7 @@ func (s *ControllerServer) checkDetachAbsenceTarget(ctx context.Context, volume,
 		if history.LastSuccessfulNodeName == node && history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != vmID {
 			return attachmentEvidenceUnavailable("detach absence VM differs from history", nil)
 		}
-		if err := s.checkDetachAbsencePVImage(ctx, volume, imageID, history); err != nil {
+		if err := s.checkDetachAbsencePVImage(ctx, volume, imageID, history, false); err != nil {
 			return err
 		}
 		retired, err := s.detachAbsenceNodeRetired(ctx, node, history, nodeUID)
@@ -761,13 +761,13 @@ func (s *ControllerServer) checkDetachAbsenceTarget(ctx context.Context, volume,
 	return status.FromContextError(ctx.Err()).Err()
 }
 
-func (s *ControllerServer) checkDetachAbsencePVImage(ctx context.Context, volume string, imageID int, history VolumeHistoryRecord) error {
+func (s *ControllerServer) checkDetachAbsencePVImage(ctx context.Context, volume string, imageID int, history VolumeHistoryRecord, imageAbsent bool) error {
 	pv, err := s.ownedDeletionPV(ctx, volume)
 	if err != nil {
 		return attachmentEvidenceUnavailable("cannot verify detach absence PV identity", err)
 	}
-	if pv != nil && pvDeclaresCephImage(pv, history) {
-		return validatePVImageAssertions(pv.Spec.CSI.VolumeAttributes, imageID)
+	if pv != nil {
+		return s.verifyPVImageAssertions(ctx, pv, imageID, history, imageAbsent)
 	}
 	return nil
 }

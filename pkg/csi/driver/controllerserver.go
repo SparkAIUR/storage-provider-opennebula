@@ -836,12 +836,14 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, lookupErr
 	}
 	volumeID := lookup.ImageID
-	checkPublishPV, err := s.publishPVImageCheck(ctx, req.VolumeId, volumeID, runtimeCtx, imageHistory)
+	pvAdmission, err := s.publishPVImageCheck(ctx, req.VolumeId, volumeID, runtimeCtx, imageHistory)
 	if err != nil {
 		return nil, err
 	}
-	if checkPublishPV != nil {
-		ctx = context.WithValue(ctx, publishPVImageCheckKey{}, checkPublishPV)
+	if pvAdmission.check != nil {
+		runtimeCtx = pvAdmission.binding
+		pvAdmission.sizeBytes = lookup.SizeBytes
+		ctx = context.WithValue(ctx, publishPVImageCheckKey{}, pvAdmission)
 	}
 
 	nodeID, err := s.volumeProvider.NodeExists(ctx, req.NodeId)
@@ -913,9 +915,11 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			deviceDiscoveryTimeout := s.nodeDeviceDiscoveryTimeout("disk", lookup.SizeBytes, 0)
 			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
 			s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
-			return &csi.ControllerPublishVolumeResponse{
-				PublishContext: s.publishContextForRecoveryAdoption(ctx, req.VolumeId, observation, req.GetVolumeContext(), recoveryControl, deviceDiscoveryTimeout),
-			}, nil
+			publishContext := s.publishContextForRecoveryAdoption(ctx, req.VolumeId, observation, req.GetVolumeContext(), recoveryControl, deviceDiscoveryTimeout)
+			if err := recheckPublishPVImage(ctx); err != nil {
+				return nil, err
+			}
+			return &csi.ControllerPublishVolumeResponse{PublishContext: publishContext}, nil
 		}
 	}
 	if recoveryControl.ManualActive() {
@@ -996,6 +1000,13 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		history, replacement, err := s.replacementPublishHistory(queueCtx, req, runtimeCtx, publishNode)
 		if err != nil {
 			return err
+		}
+		freshReader := replacement && replacementPublishReadOnlyMany(req)
+		if freshReader {
+			if err := s.verifyFreshReplacementReader(queueCtx, history, req.VolumeId, req.NodeId, volumeID, nodeID, publishNode); err != nil {
+				return err
+			}
+			replacement = false
 		}
 		if attempt := history.PendingReplacementAttach; attempt != nil && !attempt.prepared() {
 			if attempt.ImageID != volumeID || attempt.VMID != nodeID {
@@ -1087,6 +1098,14 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "sizeBytes", sizeBytes, "hotplugTimeout", hotplugTimeout, "deviceDiscoveryTimeout", deviceDiscoveryTimeout)
 		attachStarted := time.Now()
 		attachCtx := s.authorizeHostArtifactAttach(s.publishMutationContext(queueCtx, req, nodeID, volumeID, publishNode, true), req)
+		if freshReader {
+			attachCtx = opennebula.WithAttachAuthorization(attachCtx, func(ctx context.Context, target *opennebula.HostArtifactAttachmentTarget) error {
+				if err := s.checkHostArtifactAttachTarget(ctx, req, target); err != nil {
+					return err
+				}
+				return s.verifyFreshReplacementReader(ctx, history, req.VolumeId, req.NodeId, volumeID, nodeID, publishNode)
+			})
+		}
 		var attempt *replacementAttachAttempt
 		var admission *replacementAttachAdmission
 		var dispatch *opennebula.ReplacementAttachDispatch
@@ -1101,8 +1120,10 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 				if err := s.checkPublishedAttachmentNode(ctx, req.VolumeId, req.NodeId, publishNode, true); err != nil {
 					return err
 				}
-				_, err := s.verifyReplacementAttempt(ctx, req, *attempt, false)
-				return err
+				if _, err := s.verifyReplacementAttempt(ctx, req, *attempt, false); err != nil {
+					return err
+				}
+				return recheckPublishPVImage(ctx)
 			})
 		}
 		err = s.volumeProvider.AttachVolume(attachCtx, req.VolumeId, req.NodeId, immutableVolume, params)
@@ -1208,6 +1229,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 	if response == nil {
 		return nil, status.Error(codes.Aborted, "publish completion requires capacity verification; retry the request")
+	}
+	if err := recheckPublishPVImage(ctx); err != nil {
+		return nil, err
 	}
 	s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
 	s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
@@ -1512,7 +1536,7 @@ func (s *ControllerServer) confirmMissingUnpublish(ctx context.Context, volume, 
 	if err := verifier.VerifyVolumeAbsent(ctx, volume, history.LastSuccessfulImageID, vmIDs...); err != nil {
 		return attachmentEvidenceUnavailable("missing volume ownership is unverified", err)
 	}
-	if err := s.checkDetachAbsencePVImage(ctx, volume, history.LastSuccessfulImageID, history); err != nil {
+	if err := s.checkDetachAbsencePVImage(ctx, volume, history.LastSuccessfulImageID, history, true); err != nil {
 		return err
 	}
 	_, err = s.detachAbsenceNodeRetired(ctx, node, history, "")
@@ -2049,7 +2073,13 @@ func (s *ControllerServer) publishContextForVolume(ctx context.Context, volumeID
 	}
 
 	if kubeEnabled {
-		if runtimeCtx, runtimeErr := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeID); runtimeErr == nil {
+		var runtimeCtx *VolumeRuntimeContext
+		if admission, ok := ctx.Value(publishPVImageCheckKey{}).(publishPVAdmission); ok {
+			runtimeCtx = admission.binding
+		} else {
+			runtimeCtx, _ = s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeID)
+		}
+		if runtimeCtx != nil {
 			if runtimeCtx.verifiedClaimBinding {
 				publishContext[paramPVCNamespace] = runtimeCtx.PVCNamespace
 				publishContext[paramPVCName] = runtimeCtx.PVCName
@@ -2067,11 +2097,17 @@ func (s *ControllerServer) publishContextForVolume(ctx context.Context, volumeID
 		}
 	}
 
-	sizeBytes, err := s.volumeProvider.ResolveVolumeSizeBytes(ctx, volumeID)
-	if err != nil {
-		klog.V(2).InfoS("Skipping dynamic hotplug timeout in publish context after size resolution failure",
-			"method", "publishContextForVolume", "volumeID", volumeID, "err", err)
-		return publishContext
+	var sizeBytes int64
+	if admission, ok := ctx.Value(publishPVImageCheckKey{}).(publishPVAdmission); ok && admission.sizeBytes > 0 {
+		sizeBytes = admission.sizeBytes
+	} else {
+		var err error
+		sizeBytes, err = s.volumeProvider.ResolveVolumeSizeBytes(ctx, volumeID)
+		if err != nil {
+			klog.V(2).InfoS("Skipping dynamic hotplug timeout in publish context after size resolution failure",
+				"method", "publishContextForVolume", "volumeID", volumeID, "err", err)
+			return publishContext
+		}
 	}
 
 	hotplugTimeout := s.volumeProvider.ComputeHotplugTimeout(sizeBytes)

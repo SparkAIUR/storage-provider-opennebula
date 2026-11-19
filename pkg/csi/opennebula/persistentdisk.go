@@ -175,7 +175,7 @@ func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume 
 			return p.confirmVolumeDeletion(ctx, volume, expectedID, vmID, admission.verify)
 		}
 		if admission.verify != nil {
-			if err := admission.verify(ctx, -1); err != nil {
+			if err := admission.verify(ctx, -1, false); err != nil {
 				return err
 			}
 		}
@@ -200,7 +200,7 @@ func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume 
 		}
 	}
 	if admission.verify != nil {
-		if err := admission.verify(ctx, volumeID); err != nil {
+		if err := admission.verify(ctx, volumeID, false); err != nil {
 			return err
 		}
 	}
@@ -213,12 +213,12 @@ func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume 
 	return p.confirmVolumeDeletion(ctx, volume, volumeID, vmID, admission.verify)
 }
 
-func (p *PersistentDiskVolumeProvider) confirmVolumeDeletion(ctx context.Context, volume string, imageID, vmID int, verify func(context.Context, int) error) error {
+func (p *PersistentDiskVolumeProvider) confirmVolumeDeletion(ctx context.Context, volume string, imageID, vmID int, verify func(context.Context, int, bool) error) error {
 	if err := p.VerifyVolumeAbsent(ctx, volume, imageID, vmID); err != nil {
 		return err
 	}
 	if verify != nil {
-		return verify(ctx, imageID)
+		return verify(ctx, imageID, true)
 	}
 	return ctx.Err()
 }
@@ -1740,10 +1740,10 @@ type volumeDeletionAuthorization struct{}
 
 type deletionAdmission struct {
 	prepare func(context.Context, int) error
-	verify  func(context.Context, int) error
+	verify  func(context.Context, int, bool) error
 }
 
-func WithVolumeDeletionAuthorization(ctx context.Context, prepare, verify func(context.Context, int) error) context.Context {
+func WithVolumeDeletionAuthorization(ctx context.Context, prepare func(context.Context, int) error, verify func(context.Context, int, bool) error) context.Context {
 	return context.WithValue(ctx, volumeDeletionAuthorization{}, deletionAdmission{prepare: prepare, verify: verify})
 }
 

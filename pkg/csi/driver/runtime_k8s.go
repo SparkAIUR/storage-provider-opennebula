@@ -90,6 +90,8 @@ type PlacementReport struct {
 type VolumeRuntimeContext struct {
 	PVName               string
 	pvUID                types.UID
+	pvClaimRef           *corev1.ObjectReference
+	pvPhase              corev1.PersistentVolumePhase
 	PVCNamespace         string
 	PVCName              string
 	PVCUID               types.UID
@@ -505,54 +507,59 @@ func (r *KubeRuntime) ResolveVolumeRuntimeContext(ctx context.Context, volumeHan
 			continue
 		}
 
-		runtimeCtx := &VolumeRuntimeContext{
-			PVName:        pv.Name,
-			pvUID:         pv.UID,
-			PVAnnotations: cloneStringMap(pv.Annotations),
-			AccessModes:   append([]corev1.PersistentVolumeAccessMode(nil), pv.Spec.AccessModes...),
-		}
-		runtimeCtx.Backend = strings.TrimSpace(pv.Annotations[annotationBackend])
-		runtimeCtx.backendAttribute = pv.Spec.CSI.VolumeAttributes[annotationBackend]
-		runtimeCtx.RestartMode = strings.TrimSpace(runtimeCtx.PVAnnotations[annotationRestartOpt])
-		if rawGrace := strings.TrimSpace(runtimeCtx.PVAnnotations[annotationDetachGrace]); rawGrace != "" {
-			if parsed, convErr := strconv.Atoi(rawGrace); convErr == nil {
-				runtimeCtx.DetachGraceHint = parsed
-			}
-		}
-		if rawDatastoreID := strings.TrimSpace(runtimeCtx.PVAnnotations[annotationDatastoreID]); rawDatastoreID != "" {
-			if parsed, convErr := strconv.Atoi(rawDatastoreID); convErr == nil {
-				runtimeCtx.DatastoreID = parsed
-			}
-		}
+		return r.volumeRuntimeContext(ctx, pv), nil
+	}
 
-		if pv.Spec.ClaimRef != nil {
-			runtimeCtx.PVCNamespace = pv.Spec.ClaimRef.Namespace
-			runtimeCtx.PVCName = pv.Spec.ClaimRef.Name
-			pvc, pvcErr := r.client.CoreV1().PersistentVolumeClaims(runtimeCtx.PVCNamespace).Get(ctx, runtimeCtx.PVCName, metav1.GetOptions{})
-			if pvcErr == nil && pv.Spec.ClaimRef.UID != "" && pvc.UID != pv.Spec.ClaimRef.UID {
-				runtimeCtx.PVCNamespace = ""
-				runtimeCtx.PVCName = ""
-			} else if pvcErr == nil {
-				runtimeCtx.PVCUID = pv.Spec.ClaimRef.UID
-				runtimeCtx.verifiedClaimBinding = runtimeCtx.PVCUID != "" && pvc.Spec.VolumeName == pv.Name
-				runtimeCtx.PVCAnnotations = cloneStringMap(pvc.Annotations)
-				if runtimeCtx.RestartMode == "" {
-					runtimeCtx.RestartMode = strings.TrimSpace(runtimeCtx.PVCAnnotations[annotationRestartOpt])
-				}
-				if runtimeCtx.DetachGraceHint == 0 {
-					if rawGrace := strings.TrimSpace(runtimeCtx.PVCAnnotations[annotationDetachGrace]); rawGrace != "" {
-						if parsed, convErr := strconv.Atoi(rawGrace); convErr == nil {
-							runtimeCtx.DetachGraceHint = parsed
-						}
+	return nil, fmt.Errorf("persistent volume for handle %s not found", volumeHandle)
+}
+
+func (r *KubeRuntime) volumeRuntimeContext(ctx context.Context, pv *corev1.PersistentVolume) *VolumeRuntimeContext {
+	runtimeCtx := &VolumeRuntimeContext{
+		PVName:        pv.Name,
+		pvUID:         pv.UID,
+		pvClaimRef:    pv.Spec.ClaimRef.DeepCopy(),
+		pvPhase:       pv.Status.Phase,
+		PVAnnotations: cloneStringMap(pv.Annotations),
+		AccessModes:   append([]corev1.PersistentVolumeAccessMode(nil), pv.Spec.AccessModes...),
+	}
+	runtimeCtx.Backend = strings.TrimSpace(pv.Annotations[annotationBackend])
+	runtimeCtx.backendAttribute = pv.Spec.CSI.VolumeAttributes[annotationBackend]
+	runtimeCtx.RestartMode = strings.TrimSpace(runtimeCtx.PVAnnotations[annotationRestartOpt])
+	if rawGrace := strings.TrimSpace(runtimeCtx.PVAnnotations[annotationDetachGrace]); rawGrace != "" {
+		if parsed, convErr := strconv.Atoi(rawGrace); convErr == nil {
+			runtimeCtx.DetachGraceHint = parsed
+		}
+	}
+	if rawDatastoreID := strings.TrimSpace(runtimeCtx.PVAnnotations[annotationDatastoreID]); rawDatastoreID != "" {
+		if parsed, convErr := strconv.Atoi(rawDatastoreID); convErr == nil {
+			runtimeCtx.DatastoreID = parsed
+		}
+	}
+
+	if pv.Spec.ClaimRef != nil {
+		runtimeCtx.PVCNamespace = pv.Spec.ClaimRef.Namespace
+		runtimeCtx.PVCName = pv.Spec.ClaimRef.Name
+		pvc, pvcErr := r.client.CoreV1().PersistentVolumeClaims(runtimeCtx.PVCNamespace).Get(ctx, runtimeCtx.PVCName, metav1.GetOptions{})
+		if pvcErr == nil && pv.Spec.ClaimRef.UID != "" && pvc.UID != pv.Spec.ClaimRef.UID {
+			runtimeCtx.PVCNamespace = ""
+			runtimeCtx.PVCName = ""
+		} else if pvcErr == nil {
+			runtimeCtx.PVCUID = pv.Spec.ClaimRef.UID
+			runtimeCtx.verifiedClaimBinding = runtimeCtx.PVCUID != "" && pvc.Spec.VolumeName == pv.Name
+			runtimeCtx.PVCAnnotations = cloneStringMap(pvc.Annotations)
+			if runtimeCtx.RestartMode == "" {
+				runtimeCtx.RestartMode = strings.TrimSpace(runtimeCtx.PVCAnnotations[annotationRestartOpt])
+			}
+			if runtimeCtx.DetachGraceHint == 0 {
+				if rawGrace := strings.TrimSpace(runtimeCtx.PVCAnnotations[annotationDetachGrace]); rawGrace != "" {
+					if parsed, convErr := strconv.Atoi(rawGrace); convErr == nil {
+						runtimeCtx.DetachGraceHint = parsed
 					}
 				}
 			}
 		}
-
-		return runtimeCtx, nil
 	}
-
-	return nil, fmt.Errorf("persistent volume for handle %s not found", volumeHandle)
+	return runtimeCtx
 }
 
 func (r *KubeRuntime) PodUIDExists(ctx context.Context, uid string) (bool, error) {

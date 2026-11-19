@@ -4318,7 +4318,8 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 			"distinct-vm-orphan-remote-replaced-wire-retired", "distinct-vm-orphan-remote-terminating-wire-retired",
 			"distinct-vm-orphan-static-retired-accepted", "distinct-vm-orphan-static-same-name-retired-accepted",
 			"distinct-vm-orphan-static-waiting-retired-accepted", "distinct-vm-orphan-static-same-name-reused-pv-waiting-retired-accepted",
-			"distinct-vm-orphan-static-same-node-waiting-retired-accepted",
+			"distinct-vm-orphan-static-same-node-waiting-retired-accepted", "distinct-vm-orphan-static-same-node-rescheduled-waiting-retired-accepted",
+			"distinct-vm-orphan-static-released-waiting-retired-accepted",
 			"distinct-vm-orphan-rebound-wire-retired", "distinct-vm-orphan-rebound-lost-wire-retired",
 			"distinct-vm-orphan-rebound-unbound-wire-retired",
 			"prepared-abandoned-waiting-remote-retired-publish", "prepared-abandoned-waiting-remote-retired-reconcile-distinct-vm",
@@ -6179,6 +6180,36 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 								_, err = retry.ControllerUnpublishVolume(ctx, cancelRequest)
 								require.Error(t, err)
 								setCurrentObserve(false)
+								rescheduled := strings.Contains(mode, "-rescheduled-")
+								released := strings.Contains(mode, "-released-waiting-")
+								if rescheduled {
+									_, err = nodes.Create(ctx, remoteNode, metav1.CreateOptions{})
+									require.NoError(t, err)
+									wire.mu.Lock()
+									wire.vmNames[43] = remoteNode.Name
+									wire.mu.Unlock()
+									nextVA := remoteVA.DeepCopy()
+									nextVA.Spec.Source.PersistentVolumeName = &currentPV.Name
+									nextVA.CreationTimestamp = latePod.CreationTimestamp
+									_, err = vas.Create(ctx, nextVA, metav1.CreateOptions{})
+									require.NoError(t, err)
+									nextPod := remotePod.DeepCopy()
+									nextPod.Spec.Volumes[0].PersistentVolumeClaim.ClaimName = currentPVC.Name
+									_, err = pods.Create(ctx, nextPod, metav1.CreateOptions{})
+									require.NoError(t, err)
+									_, err = retry.ControllerUnpublishVolume(ctx, cancelRequest)
+									require.NoError(t, err)
+									stillHeld()
+									require.NoError(t, vas.Delete(ctx, nextVA.Name, metav1.DeleteOptions{}))
+									require.NoError(t, pods.Delete(ctx, nextPod.Name, metav1.DeleteOptions{}))
+								}
+								if released {
+									require.NoError(t, claims.Delete(ctx, currentPVC.Name, metav1.DeleteOptions{}))
+									releasedPV := currentPV.DeepCopy()
+									releasedPV.Status.Phase = corev1.VolumeReleased
+									_, err = pvs.Update(ctx, releasedPV, metav1.UpdateOptions{})
+									require.NoError(t, err)
+								}
 								kube.ClearActions()
 								_, err = retry.ControllerUnpublishVolume(ctx, cancelRequest)
 								require.NoError(t, err)
@@ -6188,19 +6219,21 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 								stillHeld()
 								require.NoError(t, vas.Delete(ctx, canceled.Name, metav1.DeleteOptions{}))
 
-								_, err = vas.Create(ctx, waitingVA, metav1.CreateOptions{})
-								require.NoError(t, err)
-								destination.Status.VolumesInUse = []corev1.UniqueVolumeName{corev1.UniqueVolumeName("kubernetes.io/csi/" + driver.name + "^" + volume)}
-								_, err = nodes.UpdateStatus(ctx, destination, metav1.UpdateOptions{})
-								require.NoError(t, err)
-								waiter.Status.StartTime = nil
-								_, err = pods.Create(ctx, waiter, metav1.CreateOptions{})
-								require.NoError(t, err)
-								stillHeld()
-								started := waiter.CreationTimestamp
-								waiter.Status.StartTime = &started
-								_, err = pods.UpdateStatus(ctx, waiter, metav1.UpdateOptions{})
-								require.NoError(t, err)
+								if !released {
+									_, err = vas.Create(ctx, waitingVA, metav1.CreateOptions{})
+									require.NoError(t, err)
+									destination.Status.VolumesInUse = []corev1.UniqueVolumeName{corev1.UniqueVolumeName("kubernetes.io/csi/" + driver.name + "^" + volume)}
+									_, err = nodes.UpdateStatus(ctx, destination, metav1.UpdateOptions{})
+									require.NoError(t, err)
+									waiter.Status.StartTime = nil
+									_, err = pods.Create(ctx, waiter, metav1.CreateOptions{})
+									require.NoError(t, err)
+									stillHeld()
+									started := waiter.CreationTimestamp
+									waiter.Status.StartTime = &started
+									_, err = pods.UpdateStatus(ctx, waiter, metav1.UpdateOptions{})
+									require.NoError(t, err)
+								}
 							}
 							kube.ClearActions()
 							reconcileDriver(fresh)
@@ -6220,7 +6253,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							require.Equal(t, []string{"attach:42:false", "detach:42"}, wire.mutations)
 							wire.expectedAttachNonce, wire.loseAttachReply = nil, false
 							wire.mu.Unlock()
-							if waitingRebind && !sameNodeRebound {
+							if waitingRebind && !sameNodeRebound && !strings.Contains(mode, "-released-waiting-") {
 								published, err := retry.ControllerPublishVolume(ctx, newPublishReq(volume, remoteNode.Name))
 								require.NoError(t, err)
 								require.Equal(t, "7", published.PublishContext[publishContextOpenNebulaImageID])
@@ -7891,5 +7924,179 @@ func TestProviderDetachWaitsForAcceptedOwnershipConvergence(t *testing.T) {
 				require.False(t, accepted)
 			}
 		})
+	}
+}
+
+func TestControllerPublishLegacyCephImageAssertions(t *testing.T) {
+	for _, mode := range []string{"absent", "matching", "wrong-image", "blank-image", "wrong-serial", "local"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			const volume = "volume-test"
+			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			delete(pv.Annotations, annotationBackend)
+			pv.Status.Phase, pvc.Status.Phase = corev1.VolumeBound, corev1.ClaimBound
+			switch mode {
+			case "matching":
+				pv.Spec.CSI.VolumeAttributes = map[string]string{publishContextOpenNebulaImageID: "7", publishContextDeviceSerial: "onecsi-7"}
+			case "wrong-image", "local":
+				pv.Spec.CSI.VolumeAttributes = map[string]string{publishContextOpenNebulaImageID: "8"}
+			case "blank-image":
+				pv.Spec.CSI.VolumeAttributes = map[string]string{publishContextOpenNebulaImageID: ""}
+			case "wrong-serial":
+				pv.Spec.CSI.VolumeAttributes = map[string]string{publishContextDeviceSerial: "onecsi-8"}
+			}
+			node := newReadyNode("node-old", true)
+			driver := newStickyTestDriver(t, pv, pvc, node)
+			provider, wire := nodeAttachmentProvider(t)
+			wire.mu.Lock()
+			wire.ceph, wire.version, wire.marker = mode != "local", "7.4.0", 128*1024*1024
+			delete(wire.disks, 41)
+			wire.mu.Unlock()
+			server := NewControllerServer(driver, provider, nil)
+			reply, err := reviewControllerClient(t, server).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
+			history, readErr := server.readAttachmentHistory(ctx, volume)
+			require.NoError(t, readErr)
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			switch mode {
+			case "absent", "matching", "local":
+				require.NoError(t, err)
+				require.Equal(t, "7", reply.GetPublishContext()[publishContextOpenNebulaImageID])
+				require.NotEmpty(t, wire.mutations)
+				require.Equal(t, "attach:41:false", wire.mutations[0])
+			default:
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.Nil(t, reply)
+				require.Empty(t, wire.mutations)
+				require.Zero(t, history)
+			}
+		})
+	}
+}
+
+func TestControllerPublishPinsAdmittedClaim(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, retained := range []bool{false, true} {
+			t.Run(fmt.Sprintf("queued=%t/retained=%t", queued, retained), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+				pv.Status.Phase, pvc.Status.Phase = corev1.VolumeBound, corev1.ClaimBound
+				node := newReadyNode("node-old", true)
+				driver := newStickyTestDriver(t, pv, pvc, node)
+				kube := driver.kubeRuntime.client.CoreV1()
+				claim := pvc.DeepCopy()
+				claim.Name, claim.UID = "rebound-pvc", "rebound-uid"
+				var changed atomic.Bool
+				provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+					if method != "one.vm.info" || !changed.CompareAndSwap(false, true) {
+						return
+					}
+					_, err := kube.PersistentVolumeClaims(claim.Namespace).Create(ctx, claim, metav1.CreateOptions{})
+					require.NoError(t, err)
+					rebound := pv.DeepCopy()
+					rebound.Spec.ClaimRef.Name, rebound.Spec.ClaimRef.UID = claim.Name, claim.UID
+					_, err = kube.PersistentVolumes().Update(ctx, rebound, metav1.UpdateOptions{})
+					require.NoError(t, err)
+				})
+				wire.mu.Lock()
+				wire.ceph, wire.version = true, "7.4.0"
+				if !retained {
+					delete(wire.disks, 41)
+				}
+				wire.mu.Unlock()
+				server := NewControllerServer(driver, provider, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+				}
+				client := reviewControllerClient(t, server)
+				request := newPublishReq(volume, node.Name)
+				reply, err := client.ControllerPublishVolume(ctx, request)
+				require.True(t, changed.Load())
+				require.Error(t, err)
+				require.Nil(t, reply)
+				history, err := server.readAttachmentHistory(ctx, volume)
+				require.NoError(t, err)
+				require.Zero(t, history)
+				wire.mu.Lock()
+				require.Empty(t, wire.mutations)
+				wire.mu.Unlock()
+
+				consumer := activePodForPVC("rebound-consumer", claim.Name, node.Name)
+				consumer.UID = "rebound-consumer"
+				_, err = kube.Pods(claim.Namespace).Create(ctx, consumer, metav1.CreateOptions{})
+				require.NoError(t, err)
+				reply, err = client.ControllerPublishVolume(ctx, request)
+				require.NoError(t, err)
+				require.Equal(t, claim.Name, reply.GetPublishContext()[paramPVCName])
+				history, err = server.readAttachmentHistory(ctx, volume)
+				require.NoError(t, err)
+				require.Equal(t, claim.Name, history.PVCName)
+			})
+		}
+	}
+}
+
+func TestControllerPublishFreshCephReplacementReader(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, mode := range []string{"retired", "old-attachment", "in-use", "pending"} {
+			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany}, map[string]string{annotationBackend: "ceph"})
+				pv.Status.Phase, pvc.Status.Phase = corev1.VolumeBound, corev1.ClaimBound
+				pvc.Spec.AccessModes = pv.Spec.AccessModes
+				node := newReadyNode("node-old", true)
+				node.UID = "replacement-reader-node"
+				node.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Minute))
+				va := replacementPublishVA(pv, node)
+				va.Name = csiVolumeAttachmentName(volume, pv.Spec.CSI.Driver, node.Name)
+				if mode == "old-attachment" {
+					va.CreationTimestamp = metav1.NewTime(node.CreationTimestamp.Add(-time.Minute))
+				}
+				if mode == "in-use" {
+					node.Status.VolumesInUse = []corev1.UniqueVolumeName{corev1.UniqueVolumeName("kubernetes.io/csi/" + pv.Spec.CSI.Driver + "^" + volume)}
+				}
+				driver := newStickyTestDriver(t, pv, pvc, node, va)
+				_, err := driver.volumeHistory.Upsert(ctx, volume, func(state *VolumeHistoryRecord) {
+					state.PVName, state.PVCNamespace, state.PVCName = pv.Name, pvc.Namespace, pvc.Name
+					state.Backend = "ceph"
+					state.LastSuccessfulNodeName, state.LastSuccessfulNodeUID = node.Name, "retired-node"
+					state.LastSuccessfulImageID, state.LastSuccessfulOpenNebulaVMID = 7, 41
+					state.LastSuccessfulPublishTime = node.CreationTimestamp.Add(-time.Minute)
+					if mode == "pending" {
+						state.PendingReplacementAttach = &replacementAttachAttempt{Version: 2, Phase: replacementAttachArmed}
+					}
+				})
+				require.NoError(t, err)
+				provider, wire := nodeAttachmentProvider(t)
+				wire.mu.Lock()
+				wire.ceph, wire.version, wire.readOnlyAttach, wire.marker = true, "7.4.0", true, 128*1024*1024
+				delete(wire.disks, 41)
+				wire.mu.Unlock()
+				server := NewControllerServer(driver, provider, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+				}
+				request := newPublishReq(volume, node.Name)
+				request.VolumeCapability.AccessMode.Mode = csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
+				request.Readonly = true
+				reply, err := reviewControllerClient(t, server).ControllerPublishVolume(ctx, request)
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				if mode == "retired" {
+					require.NoError(t, err)
+					require.Equal(t, "7", reply.GetPublishContext()[publishContextOpenNebulaImageID])
+					require.Equal(t, []string{"attach:41:true"}, wire.mutations)
+					require.NotContains(t, wire.attachFields, "CSI_ATTACH_ATTEMPT")
+				} else {
+					require.Error(t, err)
+					require.Nil(t, reply)
+					require.Empty(t, wire.mutations)
+				}
+			})
+		}
 	}
 }

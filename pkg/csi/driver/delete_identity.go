@@ -101,14 +101,14 @@ func (s *ControllerServer) prepareVolumeDeletion(ctx context.Context, volume str
 	}
 	var stage func(context.Context, int) error
 	var expectedVersion string
-	verify := func(ctx context.Context, actualImageID int) error {
-		return s.verifyPVDeletion(ctx, pv, volume, actualImageID, history, expectedVersion, raw, marked)
+	verify := func(ctx context.Context, actualImageID int, imageAbsent bool) error {
+		return s.verifyPVDeletion(ctx, pv, volume, actualImageID, history, expectedVersion, raw, marked, imageAbsent)
 	}
 	if pv != nil {
 		expectedVersion = pv.ResourceVersion
 		if !marked && history.LastSuccessfulImageID <= 0 {
 			stage = func(ctx context.Context, actualImageID int) error {
-				if err := verify(ctx, actualImageID); err != nil {
+				if err := verify(ctx, actualImageID, false); err != nil {
 					return err
 				}
 				var err error
@@ -117,7 +117,7 @@ func (s *ControllerServer) prepareVolumeDeletion(ctx context.Context, volume str
 					return err
 				}
 				marked = true
-				return verify(ctx, actualImageID)
+				return verify(ctx, actualImageID, false)
 			}
 		}
 	}
@@ -175,7 +175,7 @@ func (s *ControllerServer) markPVDeletion(ctx context.Context, pv *corev1.Persis
 	return updated.ResourceVersion, raw, nil
 }
 
-func (s *ControllerServer) verifyPVDeletion(ctx context.Context, pv *corev1.PersistentVolume, volume string, imageID int, history VolumeHistoryRecord, expectedVersion, raw string, marked bool) error {
+func (s *ControllerServer) verifyPVDeletion(ctx context.Context, pv *corev1.PersistentVolume, volume string, imageID int, history VolumeHistoryRecord, expectedVersion, raw string, marked, imageAbsent bool) error {
 	if (pv != nil && imageID < 0) || (history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != imageID) {
 		return fmt.Errorf("provider image identity is unverified for deletion")
 	}
@@ -192,10 +192,8 @@ func (s *ControllerServer) verifyPVDeletion(ctx context.Context, pv *corev1.Pers
 			!apiequality.Semantic.DeepEqual(current.Spec.ClaimRef, pv.Spec.ClaimRef) || currentMarked != marked || currentRaw != raw {
 			return fmt.Errorf("PV deletion identity changed during admission")
 		}
-		if pvDeclaresCephImage(current, history) {
-			if err := validatePVImageAssertions(current.Spec.CSI.VolumeAttributes, imageID); err != nil {
-				return err
-			}
+		if err := s.verifyPVImageAssertions(ctx, current, imageID, history, imageAbsent); err != nil {
+			return err
 		}
 	}
 	if manager := s.driver.volumeHistory; manager != nil && manager.runtime != nil && manager.runtime.enabled {

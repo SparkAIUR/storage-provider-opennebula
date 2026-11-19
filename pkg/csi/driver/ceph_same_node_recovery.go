@@ -493,8 +493,33 @@ func isCephBackend(backend string) bool {
 	return strings.EqualFold(strings.TrimSpace(backend), "ceph")
 }
 
-func pvDeclaresCephImage(pv *corev1.PersistentVolume, history VolumeHistoryRecord) bool {
-	return isCephBackend(pv.Annotations[annotationBackend]) || isCephBackend(pv.Spec.CSI.VolumeAttributes[annotationBackend]) || isCephBackend(history.Backend)
+func (s *ControllerServer) verifyPVImageAssertions(ctx context.Context, pv *corev1.PersistentVolume, imageID int, history VolumeHistoryRecord, imageAbsent bool) error {
+	attributes := pv.Spec.CSI.VolumeAttributes
+	_, hasImage := attributes[publishContextOpenNebulaImageID]
+	_, hasSerial := attributes[publishContextDeviceSerial]
+	if !hasImage && !hasSerial {
+		return nil
+	}
+	backend, err := persistentVolumeBackend(pv)
+	if errors.Is(err, errAttachmentBackendUndeclared) {
+		switch {
+		case history.LastSuccessfulImageID == imageID && volumeHistoryHasObservedSuccess(history) && history.Backend != "":
+			backend, err = verifiedAttachmentBackend(history.Backend, "")
+		case imageAbsent:
+			return validatePVImageAssertions(attributes, imageID)
+		default:
+			datastore, lookupErr := s.inspectVolumeDatastore(ctx, pv.Spec.CSI.VolumeHandle, imageID)
+			backend, err = datastore.Backend, lookupErr
+		}
+	}
+	if err != nil || (history.LastSuccessfulImageID == imageID && volumeHistoryHasObservedSuccess(history) &&
+		history.Backend != "" && !strings.EqualFold(history.Backend, backend)) {
+		return attachmentEvidenceUnavailable("PV image backend is unverified", err)
+	}
+	if isCephBackend(backend) {
+		return validatePVImageAssertions(attributes, imageID)
+	}
+	return nil
 }
 
 func validatePVImageAssertions(attributes map[string]string, imageID int) error {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -13,7 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
+
 	"k8s.io/klog/v2"
 )
 
@@ -550,52 +551,66 @@ func (s *ControllerServer) publishNodeIdentity(ctx context.Context, nodeName str
 
 type publishPVImageCheckKey struct{}
 
-func (s *ControllerServer) publishPVImageCheck(ctx context.Context, volumeID string, imageID int, binding *VolumeRuntimeContext, history VolumeHistoryRecord) (func(context.Context) error, error) {
+type publishPVAdmission struct {
+	binding   *VolumeRuntimeContext
+	check     func(context.Context) error
+	sizeBytes int64
+}
+
+func (s *ControllerServer) publishPVImageCheck(ctx context.Context, volumeID string, imageID int, binding *VolumeRuntimeContext, history VolumeHistoryRecord) (publishPVAdmission, error) {
 	runtime := s.driver.kubeRuntime
 	if runtime == nil || !runtime.enabled {
-		return nil, nil
+		return publishPVAdmission{}, nil
+	}
+	if binding == nil {
+		pv, err := s.ownedDeletionPV(ctx, volumeID)
+		if err != nil {
+			return publishPVAdmission{}, attachmentEvidenceUnavailable("Publish PV identity is unreadable", err)
+		}
+		if pv != nil {
+			binding = runtime.volumeRuntimeContext(ctx, pv)
+		}
 	}
 	check := func(ctx context.Context) error {
-		volumes := runtime.client.CoreV1().PersistentVolumes()
-		name, uid := "", types.UID("")
-		if binding != nil {
-			name, uid = binding.PVName, binding.pvUID
-		} else {
+		if binding == nil {
 			pv, err := s.ownedDeletionPV(ctx, volumeID)
-			if err != nil {
-				return attachmentEvidenceUnavailable("Publish PV identity is unreadable", err)
+			if err != nil || pv != nil {
+				return attachmentEvidenceUnavailable("Publish PV identity changed or is unreadable", err)
 			}
-			if pv == nil {
-				return nil
-			}
-			name, uid = pv.Name, pv.UID
+			return ctx.Err()
 		}
-		pv, err := volumes.Get(ctx, name, metav1.GetOptions{})
-		if err != nil || pv == nil || pv.UID != uid || pv.Spec.CSI == nil || pv.Spec.CSI.Driver != s.driver.name || pv.Spec.CSI.VolumeHandle != volumeID {
-			return attachmentEvidenceUnavailable("Publish PV identity is unverified", err)
+		volumes := runtime.client.CoreV1().PersistentVolumes()
+		matches := func(pv *corev1.PersistentVolume) bool {
+			return pv != nil && pv.UID == binding.pvUID && pv.Spec.CSI != nil && pv.Spec.CSI.Driver == s.driver.name &&
+				pv.Spec.CSI.VolumeHandle == volumeID && pv.Status.Phase == binding.pvPhase && reflect.DeepEqual(binding.pvClaimRef, pv.Spec.ClaimRef)
 		}
-		if pvDeclaresCephImage(pv, history) {
-			if pv.UID == "" {
-				return attachmentEvidenceUnavailable("Ceph Publish PV UID is unverified", nil)
-			}
-			if err := validatePVImageAssertions(pv.Spec.CSI.VolumeAttributes, imageID); err != nil {
-				return err
-			}
-			if pv.Status.Phase == corev1.VolumeBound {
-				pvc, replaced, err := runtime.attachmentClaim(ctx, pv)
-				if err != nil || pvc == nil || replaced {
-					return attachmentEvidenceUnavailable("Ceph Publish claim identity is unverified", err)
-				}
+		pv, err := volumes.Get(ctx, binding.PVName, metav1.GetOptions{})
+		if err != nil || !matches(pv) {
+			return attachmentEvidenceUnavailable("Publish PV or claim identity changed", err)
+		}
+		if err := s.verifyPVImageAssertions(ctx, pv, imageID, history, false); err != nil {
+			return err
+		}
+		if pv.Status.Phase == corev1.VolumeBound || binding.verifiedClaimBinding {
+			pvc, replaced, err := runtime.attachmentClaim(ctx, pv)
+			if err != nil || pvc == nil || replaced || !binding.verifiedClaimBinding || pvc.UID != binding.PVCUID ||
+				pvc.Name != binding.PVCName || pvc.Namespace != binding.PVCNamespace ||
+				pv.DeletionTimestamp != nil || pvc.DeletionTimestamp != nil {
+				return attachmentEvidenceUnavailable("Publish claim identity is unverified", err)
 			}
 		}
-		return nil
+		current, err := volumes.Get(ctx, binding.PVName, metav1.GetOptions{})
+		if err != nil || !matches(current) || !reflect.DeepEqual(current.Spec.CSI.VolumeAttributes, pv.Spec.CSI.VolumeAttributes) {
+			return attachmentEvidenceUnavailable("Publish PV or claim identity changed", err)
+		}
+		return ctx.Err()
 	}
-	return check, check(ctx)
+	return publishPVAdmission{binding: binding, check: check}, check(ctx)
 }
 
 func recheckPublishPVImage(ctx context.Context) error {
-	if check, ok := ctx.Value(publishPVImageCheckKey{}).(func(context.Context) error); ok {
-		return check(ctx)
+	if admission, ok := ctx.Value(publishPVImageCheckKey{}).(publishPVAdmission); ok {
+		return admission.check(ctx)
 	}
 	return nil
 }
@@ -719,7 +734,13 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 		if err := state.checkAttachmentNode(observation); err != nil {
 			return err
 		}
-		if s.publishHistoryBindingVerified(ctx, volumeID, observation.imageID, runtimeCtx) {
+		verified := false
+		if admission, ok := ctx.Value(publishPVImageCheckKey{}).(publishPVAdmission); ok {
+			verified = admission.binding != nil && admission.binding.verifiedClaimBinding
+		} else {
+			verified = s.publishHistoryBindingVerified(ctx, volumeID, observation.imageID, runtimeCtx)
+		}
+		if verified {
 			state.PVName, state.PVCNamespace, state.PVCName = runtimeCtx.PVName, runtimeCtx.PVCNamespace, runtimeCtx.PVCName
 		} else {
 			state.PVName = firstNonEmpty(state.PVName, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVName }), strings.TrimSpace(sourceContext[paramPVName]))

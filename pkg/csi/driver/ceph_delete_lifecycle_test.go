@@ -614,11 +614,15 @@ func TestMissingImageRejectsMalformedOrUnpinnedOwnedHistory(t *testing.T) {
 }
 
 func TestControllerDeleteCephPVImageAssertions(t *testing.T) {
-	for _, mode := range []string{"absent", "matching", "wrong-image", "blank-image", "wrong-serial", "marked-conflict", "late-conflict"} {
+	for _, mode := range []string{"absent", "matching", "wrong-image", "blank-image", "wrong-serial", "marked-conflict", "late-conflict", "legacy-absent", "legacy-matching", "legacy-wrong-image", "legacy-blank-image", "legacy-marked-conflict"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			const volume = "volume-test"
 			pv, _ := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+			if strings.HasPrefix(mode, "legacy-") {
+				delete(pv.Annotations, annotationBackend)
+				mode = strings.TrimPrefix(mode, "legacy-")
+			}
 			pv.ResourceVersion = "1"
 			pv.Status.Phase = corev1.VolumeReleased
 			pv.Finalizers = []string{"external-provisioner.volume.kubernetes.io/finalizer"}
