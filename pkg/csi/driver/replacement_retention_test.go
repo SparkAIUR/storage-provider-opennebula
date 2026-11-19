@@ -447,6 +447,23 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 							reused := pvc.DeepCopy()
 							reused.UID, reused.DeletionTimestamp = "reused-destination-claim", nil
 							reused.CreationTimestamp = metav1.Now()
+							pending := reused.DeepCopy()
+							pending.Status.Phase = corev1.ClaimPending
+							_, err = pvcs.Create(ctx, pending, metav1.CreateOptions{})
+							require.NoError(t, err)
+							denyDestination()
+							pending.Spec.VolumeName = ""
+							_, err = pvcs.Update(ctx, pending, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							acknowledgeDestination()
+							mountedPending := waiting.DeepCopy()
+							mountedPending.Status.Phase = corev1.PodRunning
+							mountedPending.CreationTimestamp = metav1.NewTime(pending.CreationTimestamp.Add(time.Second))
+							_, err = pods.Create(ctx, mountedPending, metav1.CreateOptions{})
+							require.NoError(t, err)
+							denyDestination()
+							require.NoError(t, pods.Delete(ctx, mountedPending.Name, metav1.DeleteOptions{}))
+							require.NoError(t, pvcs.Delete(ctx, pending.Name, metav1.DeleteOptions{}))
 							other, _ := newLocalPVAndPVC("separate-destination-handle", pv.Spec.AccessModes, nil)
 							other.Status.Phase = corev1.VolumeBound
 							other.Spec.ClaimRef = &corev1.ObjectReference{Namespace: reused.Namespace, Name: reused.Name, UID: pvc.UID}

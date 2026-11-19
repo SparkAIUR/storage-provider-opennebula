@@ -51,10 +51,10 @@ func (p *cancelableCapacityAttachProvider) AttachVolume(ctx context.Context, vol
 	return p.PersistentDiskVolumeProvider.AttachVolume(ctx, volume, node, immutable, params)
 }
 
-func reviewControllerClient(t *testing.T, controller *ControllerServer) csi.ControllerClient {
+func reviewControllerClient(t *testing.T, controller *ControllerServer, options ...grpc.ServerOption) csi.ControllerClient {
 	t.Helper()
 	listener := bufconn.Listen(1024 * 1024)
-	server := grpc.NewServer()
+	server := grpc.NewServer(options...)
 	csi.RegisterControllerServer(server, controller)
 	go func() {
 		if err := server.Serve(listener); err != nil {

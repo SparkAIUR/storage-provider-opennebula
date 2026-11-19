@@ -50,7 +50,7 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 		return unavailable(nil)
 	}
 	if replaced {
-		if err := runtime.verifyReleasedClaimNameReuse(ctx, pv, pvc); err != nil {
+		if err := runtime.verifyReleasedClaimNameReuse(ctx, pv, pvc, true); err != nil {
 			return err
 		}
 	}
@@ -137,7 +137,7 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 		return err
 	}
 	if replaced {
-		if err := runtime.verifyReleasedClaimNameReuse(ctx, pv, pvc); err != nil {
+		if err := runtime.verifyReleasedClaimNameReuse(ctx, pv, pvc, true); err != nil {
 			return err
 		}
 	}

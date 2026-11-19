@@ -360,15 +360,16 @@ func (r *AttachmentReconciler) reconcileReleasedReplacementAttempts(ctx context.
 			continue
 		}
 		pv := pvs[volume]
+		successor := slices.ContainsFunc(vas[volume], func(va storagev1.VolumeAttachment) bool {
+			return va.Spec.NodeName == attempt.Node && va.DeletionTimestamp == nil && string(va.UID) != attempt.VAUID
+		})
 		if (attempt.prepared() || attempt.detachAccepted()) && attempt.matchesHistory(history) && attempt.Driver == s.driver.name &&
 			pv != nil && attempt.PVUID == string(pv.UID) && len(disks[volume]) == 0 &&
-			(attempt.detachAccepted() || len(vas[volume]) == 0) && !unresolved[volume] && !r.skipDiskAttachmentReconcile(ctx, volume, pv) {
+			(attempt.detachAccepted() || len(vas[volume]) == 0 || successor) && !unresolved[volume] && !r.skipDiskAttachmentReconcile(ctx, volume, pv) {
 			key := volume + "@" + attempt.Node + "@" + string(pv.UID) + "@" + attempt.ID
 			currentOrphans[key] = struct{}{}
 			if r.due(r.orphanSeen, key, now, r.orphanGrace) {
-				r.settleReleasedReplacement(ctx, history, *attempt, pv.UID, slices.ContainsFunc(vas[volume], func(va storagev1.VolumeAttachment) bool {
-					return va.Spec.NodeName == attempt.Node && va.DeletionTimestamp == nil
-				}))
+				r.settleReleasedReplacement(ctx, history, *attempt, pv.UID, successor)
 			}
 		}
 	}
@@ -383,8 +384,8 @@ func (r *AttachmentReconciler) settleReleasedReplacement(ctx context.Context, hi
 	identity := physicalDetachIdentity{pvUID: pvUID, nodeUID: types.UID(attempt.ReplacementUID), imageID: attempt.ImageID, vmID: attempt.VMID,
 		diskID: -1, background: true, cephSingleWriter: true, replacement: &attempt}
 	var err error
-	if attempt.acceptedOrphan() && successor {
-		err = s.retireAcceptedOrphanForPublish(ctx, history, attempt)
+	if successor && (attempt.acceptedOrphan() || attempt.prepared()) {
+		err = s.retireReplacementForSuccessor(ctx, history, attempt)
 	} else if attempt.detachAccepted() {
 		err = s.completeVerifiedReplacementDetach(ctx, attempt.VolumeID, attempt.Node, &identity, detachReadback)
 	} else if err = s.checkPhysicalDetachAuthority(ctx, attempt.VolumeID, attempt.Node, &identity, detachReadback); err == nil {

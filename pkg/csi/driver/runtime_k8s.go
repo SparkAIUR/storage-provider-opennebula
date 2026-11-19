@@ -443,11 +443,21 @@ func (r *KubeRuntime) attachmentClaim(ctx context.Context, pv *corev1.Persistent
 	return pvc, false, nil
 }
 
-func (r *KubeRuntime) verifyReleasedClaimNameReuse(ctx context.Context, original *corev1.PersistentVolume, reused *corev1.PersistentVolumeClaim) error {
+func (r *KubeRuntime) verifyReleasedClaimNameReuse(ctx context.Context, original *corev1.PersistentVolume, reused *corev1.PersistentVolumeClaim, readback bool) error {
 	if original.Status.Phase != corev1.VolumeReleased {
 		return attachmentEvidenceUnavailable("reused claim name has no verified independent binding", nil)
 	}
+	if readback && pendingReplacementClaim(original, reused) {
+		return ctx.Err()
+	}
 	return r.verifyIndependentClaimBinding(ctx, original, reused)
+}
+
+func pendingReplacementClaim(original *corev1.PersistentVolume, reused *corev1.PersistentVolumeClaim) bool {
+	claim := original.Spec.ClaimRef
+	return claim != nil && claim.UID != "" && reused.UID != "" && reused.UID != claim.UID &&
+		reused.Name == claim.Name && reused.Namespace == claim.Namespace &&
+		reused.Status.Phase == corev1.ClaimPending && reused.Spec.VolumeName != original.Name
 }
 
 func (r *KubeRuntime) verifyIndependentClaimBinding(ctx context.Context, original *corev1.PersistentVolume, reused *corev1.PersistentVolumeClaim) error {

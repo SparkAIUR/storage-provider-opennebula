@@ -237,7 +237,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			}
 		}
 		if replacement {
-			if err := runtime.verifyReleasedClaimNameReuse(ctx, pv, pvc); err != nil {
+			if err := runtime.verifyReleasedClaimNameReuse(ctx, pv, pvc, readback); err != nil {
 				return err
 			}
 		}
@@ -392,7 +392,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	}
 	if replacementDetach {
 		if replacement {
-			if err := runtime.verifyReleasedClaimNameReuse(ctx, pv, pvc); err != nil {
+			if err := runtime.verifyReleasedClaimNameReuse(ctx, pv, pvc, readback); err != nil {
 				return err
 			}
 		}
@@ -459,7 +459,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		}
 	}
 	if canceledSuccessor {
-		if err := s.checkOrphanSuccessor(ctx, *attempt, pv, localVAName, localVA); err != nil {
+		if err := s.checkReplacementSuccessor(ctx, *attempt, pv, localVAName, localVA); err != nil {
 			return err
 		}
 	} else if replacementDetach {
@@ -750,6 +750,9 @@ func (s *ControllerServer) finishVerifiedReplacementAbsence(ctx context.Context,
 	if attempt.detached() {
 		return true, nil
 	}
+	if len(identity.attachments) != 0 {
+		return true, s.checkReplacementAttemptReadback(ctx, *attempt)
+	}
 	return true, s.retireVerifiedReplacement(ctx, *attempt)
 }
 
@@ -797,7 +800,7 @@ func (s *ControllerServer) checkAcceptedDetachIdentity(ctx context.Context, volu
 			if pvc.Spec.VolumeName != pv.Name {
 				return unavailable(nil)
 			}
-		} else if pvc.Status.Phase != corev1.ClaimPending || pvc.Spec.VolumeName != "" {
+		} else if !pendingReplacementClaim(pv, pvc) {
 			if err := runtime.verifyIndependentClaimBinding(ctx, pv, pvc); err != nil {
 				return err
 			}
@@ -845,7 +848,7 @@ func (s *ControllerServer) checkAcceptedDetachIdentity(ctx context.Context, volu
 					return unavailable(err)
 				}
 			}
-			return s.checkOrphanSuccessor(ctx, *attempt, pv, name, va)
+			return s.checkReplacementSuccessor(ctx, *attempt, pv, name, va)
 		}
 	}
 	if !reflect.DeepEqual(source, currentSource) {

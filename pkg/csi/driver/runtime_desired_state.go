@@ -78,7 +78,7 @@ func podReferencesClaim(pod *corev1.Pod, claimName string, pvc *corev1.Persisten
 }
 
 func podMayUseAttachmentClaim(pod *corev1.Pod, claim *corev1.ObjectReference, pvc *corev1.PersistentVolumeClaim, replacement bool) (bool, error) {
-	if !replacement {
+	if !replacement || pvc.Status.Phase == corev1.ClaimPending {
 		return podReferencesClaim(pod, claim.Name, pvc)
 	}
 	owner := metav1.GetControllerOfNoCopy(pvc)

@@ -1078,12 +1078,14 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		attachStarted := time.Now()
 		attachCtx := s.authorizeHostArtifactAttach(s.publishMutationContext(queueCtx, req, nodeID, volumeID, publishNode, true), req)
 		var attempt *replacementAttachAttempt
+		var admission *replacementAttachAdmission
 		var dispatch *opennebula.ReplacementAttachDispatch
 		if replacement {
-			attempt, err = s.beginReplacementAttach(queueCtx, req, history, volumeID, nodeID, publishNode)
+			admission, err = s.beginReplacementAttach(queueCtx, req, history, volumeID, nodeID, publishNode)
 			if err != nil {
 				return err
 			}
+			attempt = &admission.armed
 			attachCtx, dispatch = opennebula.WithReplacementAttachAttempt(attachCtx, attempt.ID)
 			attachCtx = opennebula.WithPublishMutationAuthorization(attachCtx, req.VolumeId, req.NodeId, nodeID, volumeID, func(ctx context.Context) error {
 				if err := s.checkPublishedAttachmentNode(ctx, req.VolumeId, req.NodeId, publishNode, true); err != nil {
@@ -1095,7 +1097,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		}
 		err = s.volumeProvider.AttachVolume(attachCtx, req.VolumeId, req.NodeId, immutableVolume, params)
 		if err != nil && attempt != nil && dispatch.DefinitelyIdle() {
-			s.retireIdleReplacementAttach(queueCtx, *attempt)
+			s.restoreUnsentReplacement(queueCtx, admission.prepared, *attempt)
 		}
 		if ctxErr := queueCtx.Err(); ctxErr != nil {
 			return ctxErr

@@ -170,12 +170,21 @@ func (s *ControllerServer) replacementPublishHistory(ctx context.Context, req *c
 	if err != nil {
 		return history, false, err
 	}
-	if attempt := history.PendingReplacementAttach; attempt != nil && attempt.acceptedOrphan() &&
+	if attempt := history.PendingReplacementAttach; attempt != nil && (attempt.acceptedOrphan() || attempt.prepared()) &&
 		attempt.Node == req.NodeId && attempt.ReplacementUID == node.UID && replacementPublishCanWrite(req) {
-		if err := s.retireAcceptedOrphanForPublish(ctx, history, *attempt); err != nil {
-			return history, false, err
+		gone := true
+		if attempt.prepared() {
+			gone, err = s.replacementVAGone(ctx, attempt.VAName, attempt.VAUID)
+			if err != nil {
+				return history, false, err
+			}
 		}
-		retired = true
+		if gone {
+			if err := s.retireReplacementForSuccessor(ctx, history, *attempt); err != nil {
+				return history, false, err
+			}
+			retired = true
+		}
 	}
 	if retired {
 		history, err = s.readAttachmentHistory(ctx, req.VolumeId)
@@ -196,19 +205,22 @@ func (attempt replacementAttachAttempt) acceptedOrphan() bool {
 	return attempt.detachAccepted() && attempt.DetachAcceptance.VAName == "" && attempt.DetachAcceptance.VAUID == ""
 }
 
-func (s *ControllerServer) retireAcceptedOrphanForPublish(ctx context.Context, history VolumeHistoryRecord, attempt replacementAttachAttempt) error {
-	if !attempt.acceptedOrphan() || !attempt.matchesHistory(history) || attempt.Driver != s.driver.name {
-		return attachmentEvidenceUnavailable("accepted orphan detach is unverified", nil)
+func (s *ControllerServer) retireReplacementForSuccessor(ctx context.Context, history VolumeHistoryRecord, attempt replacementAttachAttempt) error {
+	if (!attempt.acceptedOrphan() && !attempt.prepared()) || !attempt.matchesHistory(history) || attempt.Driver != s.driver.name {
+		return attachmentEvidenceUnavailable("replacement successor scope is unverified", nil)
 	}
 	if _, err := s.inspectReplacementDisk(ctx, attempt, false); err != nil {
 		return err
 	}
-	diskID, _ := strconv.Atoi(attempt.DetachAcceptance.DiskID)
+	diskID := -1
+	if attempt.acceptedOrphan() {
+		diskID, _ = strconv.Atoi(attempt.DetachAcceptance.DiskID)
+	}
 	proveVA := func(name string, va detachAttachmentAuthority, pv *corev1.PersistentVolume, _ *corev1.PersistentVolumeClaim) error {
 		if va.deleting {
-			return attachmentEvidenceUnavailable("accepted orphan detach successor is unverified", nil)
+			return attachmentEvidenceUnavailable("replacement successor is unverified", nil)
 		}
-		return s.checkOrphanSuccessor(ctx, attempt, pv, name, va)
+		return s.checkReplacementSuccessor(ctx, attempt, pv, name, va)
 	}
 	if _, err := s.verifyReplacementBinding(ctx, history, attempt, diskID, proveVA); err != nil {
 		return err
@@ -216,13 +228,13 @@ func (s *ControllerServer) retireAcceptedOrphanForPublish(ctx context.Context, h
 	return s.retireVerifiedReplacement(ctx, attempt)
 }
 
-func (s *ControllerServer) checkOrphanSuccessor(ctx context.Context, attempt replacementAttachAttempt, pv *corev1.PersistentVolume, name string, va detachAttachmentAuthority) error {
+func (s *ControllerServer) checkReplacementSuccessor(ctx context.Context, attempt replacementAttachAttempt, pv *corev1.PersistentVolume, name string, va detachAttachmentAuthority) error {
 	if name != attempt.VAName || name != csiVolumeAttachmentName(attempt.VolumeID, attempt.Driver, attempt.Node) ||
 		va.node != attempt.Node || va.attacher != attempt.Driver || va.uid == "" || string(va.uid) == attempt.VAUID || va.attached {
-		return attachmentEvidenceUnavailable("orphan detach successor is unverified", nil)
+		return attachmentEvidenceUnavailable("replacement successor is unverified", nil)
 	}
 	if err := validateAttachmentImageAssertions(va.metadata, attempt.ImageID); err != nil {
-		return attachmentEvidenceUnavailable("orphan detach successor image is unverified", err)
+		return attachmentEvidenceUnavailable("replacement successor image is unverified", err)
 	}
 	if err := validateMarkedReplacementMetadata(va, pv, "", fmt.Sprintf("onecsi-%d", attempt.ImageID)); err != nil {
 		return err
@@ -307,7 +319,7 @@ func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, history
 		return unavailable()
 	}
 	requireStarted := false
-	if attempt.acceptedOrphan() {
+	if attempt.acceptedOrphan() || (attempt.prepared() && proveVA != nil) {
 		requireStarted = nodeReportsVolumeInUse(current, s.driver.name, attempt.VolumeID)
 		if requireStarted != nodeReportsVolumeInUse(node, s.driver.name, attempt.VolumeID) {
 			return unavailable()
@@ -499,13 +511,20 @@ func (s *ControllerServer) inspectReplacementDisk(ctx context.Context, attempt r
 	return disk, nil
 }
 
-func (s *ControllerServer) retireIdleReplacementAttach(ctx context.Context, attempt replacementAttachAttempt) {
+func (s *ControllerServer) restoreUnsentReplacement(ctx context.Context, prepared, armed replacementAttachAttempt) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
 	if err := retryOnConflict(retry.DefaultRetry, func() error {
-		return s.retireReplacementAttach(ctx, attempt)
+		_, err := s.driver.volumeHistory.updateHistory(ctx, armed.VolumeID, true, func(current *VolumeHistoryRecord) error {
+			if current.PendingReplacementAttach == nil || *current.PendingReplacementAttach != armed || !armed.matchesHistory(*current) {
+				return fmt.Errorf("replacement Ceph attach dispatch state changed")
+			}
+			current.PendingReplacementAttach = &prepared
+			return nil
+		})
+		return err
 	}); err != nil {
-		klog.V(2).InfoS("Could not retire idle replacement Ceph attach", "volumeID", attempt.VolumeID, "err", err)
+		klog.V(2).InfoS("Could not restore unsent replacement Ceph preparation", "volumeID", armed.VolumeID, "err", err)
 	}
 }
 
@@ -520,7 +539,11 @@ func (s *ControllerServer) retireReplacementAttach(ctx context.Context, attempt 
 	return err
 }
 
-func (s *ControllerServer) beginReplacementAttach(ctx context.Context, req *csi.ControllerPublishVolumeRequest, history VolumeHistoryRecord, imageID, vmID int, node KubernetesNodeIdentity) (*replacementAttachAttempt, error) {
+type replacementAttachAdmission struct {
+	prepared, armed replacementAttachAttempt
+}
+
+func (s *ControllerServer) beginReplacementAttach(ctx context.Context, req *csi.ControllerPublishVolumeRequest, history VolumeHistoryRecord, imageID, vmID int, node KubernetesNodeIdentity) (*replacementAttachAdmission, error) {
 	inspector, ok := s.volumeProvider.(opennebula.ReplacementAttachInspector)
 	if !ok {
 		return nil, attachmentEvidenceUnavailable("replacement Ceph attach inspection is unavailable", nil)
@@ -573,12 +596,10 @@ func (s *ControllerServer) beginReplacementAttach(ctx context.Context, req *csi.
 			return nil
 		})
 		if err != nil {
-			s.retireIdleReplacementAttach(ctx, attempt)
 			return nil, attachmentEvidenceUnavailable("replacement Ceph attach admission could not be persisted", err)
 		}
 	}
 	if err := s.checkReplacementAttemptReadback(ctx, attempt); err != nil {
-		s.retireIdleReplacementAttach(ctx, attempt)
 		return nil, err
 	}
 	armed := attempt
@@ -596,14 +617,14 @@ func (s *ControllerServer) beginReplacementAttach(ctx context.Context, req *csi.
 		return nil
 	})
 	if err != nil {
-		s.retireIdleReplacementAttach(ctx, armed)
+		s.restoreUnsentReplacement(ctx, attempt, armed)
 		return nil, attachmentEvidenceUnavailable("replacement Ceph dispatch authorization is unverified", err)
 	}
 	if err := s.checkReplacementAttemptReadback(ctx, armed); err != nil {
-		s.retireIdleReplacementAttach(ctx, armed)
+		s.restoreUnsentReplacement(ctx, attempt, armed)
 		return nil, err
 	}
-	return &armed, nil
+	return &replacementAttachAdmission{prepared: attempt, armed: armed}, nil
 }
 
 func (s *ControllerServer) checkReplacementAttemptReadback(ctx context.Context, attempt replacementAttachAttempt) error {
