@@ -550,6 +550,333 @@ func TestProviderRequestedVMCapacityWithMultipleAttachments(t *testing.T) {
 	}
 }
 
+func TestControllerRetiresDetachedPublishMove(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, mode := range []string{
+			"consumed", "reserved", "detach-reply-lost", "acceptance-reply-lost", "acceptance-not-committed",
+			"retirement-reply-lost", "retirement-not-committed", "reconciled", "terminating",
+			"held-va", "held-receipt", "held-pv", "held-claim", "held-source", "held-vm", "held-disk", "held-generation", "held-quarantine", "held-successor", "held-demand", "held-unknown-release",
+		} {
+			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				provider, wire := nodeAttachmentProvider(t)
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+				pv.ResourceVersion = "1"
+				pv.Status.Phase, pvc.Status.Phase = corev1.VolumeBound, corev1.ClaimBound
+				pvc.Spec.AccessModes = pv.Spec.AccessModes
+				grant := time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano)
+				pv.Annotations[annotationAllowCrossNodeUntil] = grant
+				pod := activePodForPVC("move-consumer", pvc.Name, "node-new")
+				pod.UID = "move-consumer-uid"
+				driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true), newReadyNode("node-new", true), pod)
+				kube := driver.kubeRuntime.client.(*fake.Clientset)
+				prior, err := driver.volumeHistory.Upsert(ctx, volume, func(history *VolumeHistoryRecord) {
+					history.Backend, history.LastSuccessfulNodeName = "local", "node-old"
+					history.LastSuccessfulPublishTime = time.Now().UTC().Add(-time.Minute)
+				})
+				require.NoError(t, err)
+				setReplacementHistoryVersion(t, driver)
+				now := time.Now().UTC()
+				require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
+					VolumeID: volume, NodeID: "node-old", Backend: "local", StartedAt: now, ExpiresAt: now.Add(time.Minute), GraceSeconds: 60,
+				}))
+				var renewedGrant, interruptedGrant, interruptedHistory atomic.Bool
+				kube.PrependReactor("update", "persistentvolumes", func(action ktesting.Action) (bool, kruntime.Object, error) {
+					updated := action.(ktesting.UpdateAction).GetObject().(*corev1.PersistentVolume)
+					if updated.Annotations[annotationAllowCrossNodeUntil] != "" {
+						return false, nil, nil
+					}
+					gvr := corev1.SchemeGroupVersion.WithResource("persistentvolumes")
+					if mode == "consumed" && renewedGrant.CompareAndSwap(false, true) {
+						tracked, err := kube.Tracker().Get(gvr, "", updated.Name)
+						require.NoError(t, err)
+						current := tracked.(*corev1.PersistentVolume).DeepCopy()
+						current.ResourceVersion = "2"
+						current.Annotations[annotationAllowCrossNodeUntil] = time.Now().UTC().Add(2 * time.Minute).Format(time.RFC3339Nano)
+						require.NoError(t, kube.Tracker().Update(gvr, current, ""))
+						return true, nil, apierrors.NewConflict(corev1.Resource("persistentvolumes"), updated.Name, errors.New("grant renewed"))
+					}
+					if !interruptedGrant.CompareAndSwap(false, true) {
+						return false, nil, nil
+					}
+					if mode != "reserved" {
+						require.NoError(t, kube.Tracker().Update(gvr, updated, ""))
+					}
+					return true, nil, context.DeadlineExceeded
+				})
+				kube.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+					cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
+					if cm.Name != volumeHistoryStateConfigMapName {
+						return false, nil, nil
+					}
+					var proposed VolumeHistoryRecord
+					require.NoError(t, json.Unmarshal([]byte(cm.Data[volume]), &proposed))
+					accept := proposed.PendingPublishMove != nil && proposed.PendingPublishMove.Detach != nil
+					retire := proposed.PendingPublishMove == nil && proposed.LastPublishMoveReceipt != "" && proposed.LastSuccessfulNodeName == "node-old"
+					if (accept && strings.HasPrefix(mode, "acceptance-") || retire && strings.HasPrefix(mode, "retirement-")) &&
+						interruptedHistory.CompareAndSwap(false, true) {
+						if !strings.HasSuffix(mode, "-not-committed") {
+							require.NoError(t, kube.Tracker().Update(corev1.SchemeGroupVersion.WithResource("configmaps"), cm, cm.Namespace))
+						}
+						return true, nil, context.DeadlineExceeded
+					}
+					return false, nil, nil
+				})
+				start := func(d *Driver) *ControllerServer {
+					controller := NewControllerServer(d, provider, nil)
+					if queued {
+						d.hotplugQueue = NewHotplugQueueManager(nil, "default", d.metrics, 5*time.Second, time.Second)
+						d.hotplugQueue.Configure(true, 0, 0, 0, controller.validateHotplugQueueRequest)
+					}
+					return controller
+				}
+				restart := func() *ControllerServer {
+					d := newStickyTestDriver(t)
+					d.kubeRuntime.client = kube
+					require.NoError(t, d.volumeHistory.LoadFromConfigMap(ctx))
+					require.NoError(t, d.stickyAttachments.LoadFromConfigMap(ctx))
+					return start(d)
+				}
+				csiClient := reviewControllerClient(t, start(driver))
+				response, err := csiClient.ControllerPublishVolume(ctx, newPublishReq(volume, "node-new"))
+				require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+				require.Nil(t, response)
+				if mode == "consumed" {
+					require.True(t, renewedGrant.Load())
+					require.False(t, interruptedGrant.Load())
+					csiClient = reviewControllerClient(t, restart())
+					response, err = csiClient.ControllerPublishVolume(ctx, newPublishReq(volume, "node-new"))
+					require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+					require.Nil(t, response)
+				}
+				require.True(t, interruptedGrant.Load())
+				pvs := kube.CoreV1().PersistentVolumes()
+				heldPV, err := pvs.Get(ctx, pv.Name, metav1.GetOptions{})
+				require.NoError(t, err)
+				marker := heldPV.Annotations[annotationPublishMoveReceipt]
+				require.NotEmpty(t, marker)
+				if mode == "reserved" {
+					require.Equal(t, grant, heldPV.Annotations[annotationAllowCrossNodeUntil])
+				} else {
+					require.NotContains(t, heldPV.Annotations, annotationAllowCrossNodeUntil)
+				}
+				pods := kube.CoreV1().Pods(pod.Namespace)
+				if mode == "terminating" {
+					stopping := pod.DeepCopy()
+					stamp := metav1.Now()
+					stopping.DeletionTimestamp = &stamp
+					_, err := pods.Update(ctx, stopping, metav1.UpdateOptions{})
+					require.NoError(t, err)
+				} else {
+					require.NoError(t, pods.Delete(ctx, pod.Name, metav1.DeleteOptions{}))
+				}
+				stamp := metav1.Now()
+				va := &storagev1.VolumeAttachment{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: csiVolumeAttachmentName(volume, driver.name, "node-new"), UID: "abandoned-va",
+						ResourceVersion: "1", DeletionTimestamp: &stamp, Finalizers: []string{"external-attacher/" + driver.name},
+					},
+					Spec: storagev1.VolumeAttachmentSpec{Attacher: driver.name, NodeName: "node-new",
+						Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name}},
+					Status: storagev1.VolumeAttachmentStatus{Attached: true, AttachmentMetadata: map[string]string{
+						"volumeName": "vdb", publishContextOpenNebulaImageID: "7", publishContextDeviceSerial: "onecsi-7",
+					}},
+				}
+				vas := kube.StorageV1().VolumeAttachments()
+				_, err = vas.Create(ctx, va, metav1.CreateOptions{})
+				require.NoError(t, err)
+				wire.mu.Lock()
+				before := append([]string(nil), wire.mutations...)
+				wire.loseDetachReply = mode == "detach-reply-lost"
+				wire.mu.Unlock()
+				expectMutations := func(expected []string, attaches, detaches int) {
+					t.Helper()
+					wire.mu.Lock()
+					defer wire.mu.Unlock()
+					require.Equal(t, expected, wire.mutations)
+					require.Equal(t, attaches, wire.attachAttempts)
+					require.Equal(t, detaches, wire.detachAttempts)
+				}
+				expectMutations(before, 1, 1)
+				controller := restart()
+				readHistory := func() VolumeHistoryRecord {
+					t.Helper()
+					history, err := controller.readAttachmentHistory(ctx, volume)
+					require.NoError(t, err)
+					require.Equal(t, "node-old", history.LastSuccessfulNodeName)
+					require.Equal(t, prior.LastSuccessfulPublishTime, history.LastSuccessfulPublishTime)
+					return history
+				}
+				require.NotNil(t, readHistory().PendingPublishMove)
+				csiClient = reviewControllerClient(t, controller)
+				unpublish := &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: "node-new"}
+				reply, err := csiClient.ControllerUnpublishVolume(ctx, unpublish)
+				if mode == "terminating" {
+					require.Error(t, err)
+					require.Nil(t, reply)
+					require.Nil(t, readHistory().PendingPublishMove.Detach)
+					expectMutations(before, 1, 1)
+					return
+				}
+				detached := append(before, "detach:42")
+				expectMutations(detached, 1, 2)
+				switch mode {
+				case "detach-reply-lost", "acceptance-not-committed":
+					require.Error(t, err)
+					require.Nil(t, reply)
+					controller = restart()
+					csiClient = reviewControllerClient(t, controller)
+					_, err := csiClient.ControllerUnpublishVolume(ctx, unpublish)
+					require.Error(t, err)
+					require.NoError(t, vas.Delete(ctx, va.Name, metav1.DeleteOptions{}))
+					_, err = csiClient.ControllerPublishVolume(ctx, newPublishReq(volume, "node-old"))
+					require.Equal(t, codes.Unavailable, status.Code(err))
+					require.Nil(t, readHistory().PendingPublishMove.Detach)
+					expectMutations(detached, 1, 2)
+					return
+				case "acceptance-reply-lost":
+					require.Error(t, err)
+					require.Nil(t, reply)
+					require.True(t, interruptedHistory.Load())
+				default:
+					require.NoError(t, err)
+					require.NotNil(t, reply)
+				}
+				require.NotNil(t, readHistory().PendingPublishMove.Detach)
+				controller = restart()
+				csiClient = reviewControllerClient(t, controller)
+				switch mode {
+				case "held-va":
+					changed := va.DeepCopy()
+					changed.UID = "different-va"
+					_, err := vas.Update(ctx, changed, metav1.UpdateOptions{})
+					require.NoError(t, err)
+				case "held-receipt", "held-pv":
+					changed := heldPV.DeepCopy()
+					if mode == "held-receipt" {
+						changed.Annotations[annotationPublishMoveReceipt] = strings.Repeat("a", 64)
+					} else {
+						changed.UID = "replacement-pv"
+					}
+					_, err := pvs.Update(ctx, changed, metav1.UpdateOptions{})
+					require.NoError(t, err)
+				case "held-claim":
+					changed := pvc.DeepCopy()
+					changed.UID = "replacement-claim"
+					_, err := kube.CoreV1().PersistentVolumeClaims(pvc.Namespace).Update(ctx, changed, metav1.UpdateOptions{})
+					require.NoError(t, err)
+				case "held-source":
+					changed := newReadyNode("node-old", true)
+					changed.UID = "replacement-node"
+					_, err := kube.CoreV1().Nodes().Update(ctx, changed, metav1.UpdateOptions{})
+					require.NoError(t, err)
+				case "held-vm", "held-disk", "held-unknown-release":
+					wire.mu.Lock()
+					switch mode {
+					case "held-vm":
+						wire.vmNames = map[int]string{42: "retired-vm", 43: "node-new"}
+					case "held-disk":
+						wire.diskSlot, wire.disks[42] = "3", 256
+					case "held-unknown-release":
+						wire.failMethod = "one.vm.info"
+					}
+					wire.mu.Unlock()
+				case "held-generation":
+					_, err := controller.driver.volumeHistory.Upsert(ctx, volume, func(history *VolumeHistoryRecord) {
+						history.LastSuccessfulStageTime = time.Now().UTC()
+					})
+					require.NoError(t, err)
+				case "held-quarantine":
+					_, active, err := controller.driver.volumeQuarantine.MarkFailure(ctx, VolumeQuarantineState{
+						VolumeID: volume, Classification: "fixture-uncertain", Reason: "release unconfirmed", RequestedNode: "node-new",
+					}, 1, time.Minute)
+					require.NoError(t, err)
+					require.True(t, active)
+				case "held-successor":
+					successor := va.DeepCopy()
+					successor.Name, successor.UID = "successor-va", "successor-uid"
+					successor.Spec.NodeName, successor.DeletionTimestamp = "node-old", nil
+					_, err := vas.Create(ctx, successor, metav1.CreateOptions{})
+					require.NoError(t, err)
+				case "held-demand":
+					_, err := pods.Create(ctx, pod, metav1.CreateOptions{})
+					require.NoError(t, err)
+				}
+				reply, err = csiClient.ControllerUnpublishVolume(ctx, unpublish)
+				if strings.HasPrefix(mode, "held-") {
+					require.Error(t, err)
+					require.Nil(t, reply)
+					require.NotNil(t, readHistory().PendingPublishMove)
+					expectMutations(detached, 1, 2)
+					return
+				}
+				require.NoError(t, err)
+				require.NotNil(t, reply)
+				_, err = csiClient.ControllerPublishVolume(ctx, newPublishReq(volume, "node-old"))
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.NotNil(t, readHistory().PendingPublishMove)
+				expectMutations(detached, 1, 2)
+				require.NoError(t, vas.Delete(ctx, va.Name, metav1.DeleteOptions{}))
+				controller = restart()
+				csiClient = reviewControllerClient(t, controller)
+				if mode == "reconciled" {
+					require.NoError(t, NewAttachmentReconciler(controller).ReconcileOnce(ctx))
+				} else {
+					_, err = csiClient.ControllerPublishVolume(ctx, newPublishReq(volume, "node-old"))
+					require.Equal(t, codes.Unavailable, status.Code(err))
+					if strings.HasPrefix(mode, "retirement-") {
+						require.True(t, interruptedHistory.Load())
+					}
+					if mode == "retirement-not-committed" {
+						require.NotNil(t, readHistory().PendingPublishMove)
+						controller = restart()
+						csiClient = reviewControllerClient(t, controller)
+						_, err = csiClient.ControllerPublishVolume(ctx, newPublishReq(volume, "node-old"))
+						require.Equal(t, codes.Unavailable, status.Code(err))
+					}
+				}
+				retired := readHistory()
+				require.Nil(t, retired.PendingPublishMove)
+				require.Equal(t, marker, retired.LastPublishMoveReceipt)
+				require.Equal(t, "node-new", retired.LastSafeDetachNodeName)
+				finalPV, err := pvs.Get(ctx, pv.Name, metav1.GetOptions{})
+				require.NoError(t, err)
+				require.Equal(t, marker, finalPV.Annotations[annotationPublishMoveReceipt])
+				require.Equal(t, heldPV.Annotations[annotationAllowCrossNodeUntil], finalPV.Annotations[annotationAllowCrossNodeUntil])
+				expectMutations(detached, 1, 2)
+				nextNode, nextVM := "node-old", 41
+				if mode == "reserved" {
+					nextNode, nextVM = "node-new", 42
+					nextVA := va.DeepCopy()
+					nextVA.UID, nextVA.DeletionTimestamp, nextVA.Status = "successor-va", nil, storagev1.VolumeAttachmentStatus{}
+					_, err := vas.Create(ctx, nextVA, metav1.CreateOptions{})
+					require.NoError(t, err)
+				}
+				successor := activePodForPVC("successor", pvc.Name, nextNode)
+				successor.UID = "successor-uid"
+				_, err = pods.Create(ctx, successor, metav1.CreateOptions{})
+				require.NoError(t, err)
+				controller = restart()
+				csiClient = reviewControllerClient(t, controller)
+				response, err = csiClient.ControllerPublishVolume(ctx, newPublishReq(volume, nextNode))
+				require.NoError(t, err)
+				require.Equal(t, "vdb", response.GetPublishContext()["volumeName"])
+				_, err = csiClient.ControllerUnpublishVolume(ctx, unpublish)
+				if nextNode != unpublish.NodeId {
+					require.NoError(t, err)
+				}
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				require.Equal(t, 2, wire.attachAttempts)
+				require.Equal(t, 2, wire.detachAttempts)
+				require.Len(t, wire.disks, 1)
+				require.Contains(t, wire.disks, nextVM)
+			})
+		}
+	}
+}
+
 func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 	for _, queued := range []bool{false, true} {
 		for _, mode := range []string{"shared=true", "shared=false", "conflict", "renewed", "renewed-after-expiry", "renewed-without-demand", "renewed-write-unknown", "renewed-reply-lost", "renewed-history-fails", "renewed-receipt-mismatch", "renewed-receipt-deleted", "renewed-receipt-expired", "renewed-binding-replaced", "renewed-committed-no-demand", "renewed-grant-replaced", "renewed-other-node-readback", "renewed-stage-history-changed", "renewed-destination-changed", "replaced", "claim-replaced", "replaced-after-grant", "revoked-after-attach", "revoked-on-conflict", "malformed", "expired", "history-write-fails", "pending-write-fails", "pending-write-lost", "grant-write-fails", "lost-grant-reply", "competing-history"} {
@@ -569,7 +896,11 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 				pv.ResourceVersion = "1"
 				deadline := time.Now().UTC().Add(time.Minute)
 				if postExpiry {
-					deadline = time.Now().UTC().Add(3 * time.Second)
+					window := 3 * time.Second
+					if queued && mode == "renewed-destination-changed" {
+						window = 6 * time.Second
+					}
+					deadline = time.Now().UTC().Add(window)
 				}
 				pv.Annotations[annotationAllowCrossNodeUntil] = deadline.Format(time.RFC3339Nano)
 				consumer := activePodForPVC("move-consumer", pvc.Name, "node-new")
@@ -579,6 +910,15 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 					require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{VolumeID: "volume-test", NodeID: "node-old", Backend: "local", StartedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Minute), GraceSeconds: 60}))
 				}
 				kube := driver.kubeRuntime.client.(*fake.Clientset)
+				var failSourceRead atomic.Bool
+				if mode == "renewed-reply-lost" {
+					kube.PrependReactor("get", "nodes", func(action ktesting.Action) (bool, kruntime.Object, error) {
+						if action.(ktesting.GetAction).GetName() == "node-old" && failSourceRead.CompareAndSwap(true, false) {
+							return true, nil, errors.New("source Node read unavailable")
+						}
+						return false, nil, nil
+					})
+				}
 				var injected, interruptedHistory atomic.Bool
 				var renewedWrites atomic.Int32
 				if replayRenewal && mode != "renewed-history-fails" {
@@ -750,7 +1090,7 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 					require.Equal(t, before.LastSuccessfulPublishTime, after.LastSuccessfulPublishTime)
 					require.Equal(t, before.LastSuccessfulNodeName, after.LastSuccessfulNodeName)
 					if postExpiry {
-						require.NotNil(t, after.PendingPublishMove)
+						require.NotNil(t, after.PendingPublishMove, "initial Publish: %v", err)
 						require.True(t, after.PendingPublishMove.Expires.Equal(deadline))
 					}
 				} else {
@@ -835,6 +1175,21 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 						receipt = committed.Annotations[annotationPublishMoveReceipt]
 						require.NotEmpty(t, receipt)
 						require.NotEqual(t, current.Annotations[annotationPublishMoveReceipt], receipt)
+						if mode == "renewed-reply-lost" {
+							sticky, hasSticky := restart.driver.stickyAttachments.Get(req.VolumeId)
+							require.True(t, hasSticky)
+							failSourceRead.Store(true)
+							reply, err := reviewControllerClient(t, restart).ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: req.VolumeId, NodeId: "node-old"})
+							require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+							require.Nil(t, reply)
+							require.False(t, failSourceRead.Load())
+							unchanged, err := restart.readAttachmentHistory(ctx, req.VolumeId)
+							require.NoError(t, err)
+							require.Equal(t, failed, unchanged)
+							currentSticky, ok := restart.driver.stickyAttachments.Get(req.VolumeId)
+							require.True(t, ok)
+							require.Equal(t, sticky, currentSticky)
+						}
 						if mode == "renewed-reply-lost" || furtherRenewal || mode == "renewed-stage-history-changed" {
 							detachReadback = readback("node-old", failed.LastSafeDetachTime)
 						}

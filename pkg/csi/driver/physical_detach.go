@@ -45,6 +45,7 @@ type physicalDetachIdentity struct {
 	backend               string
 	attachments           map[string]detachAttachmentAuthority
 	replacement           *replacementAttachAttempt
+	publishMove           *pendingPublishMove
 	replacementDisk       opennebula.VolumeDiskRecord
 	replacementRetired    bool
 	remoteNodeUID         types.UID
@@ -180,6 +181,17 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		attempt = identity.replacement
 	}
 	replacementDetach := attempt != nil
+	if !readback {
+		move := history.PendingPublishMove
+		if move != nil && move.Destination.Name != nodeName {
+			move = nil
+		}
+		if (move != nil && (replacementDetach || move.Detach != nil)) ||
+			(identity.attachments != nil && !samePendingPublishMove(identity.publishMove, move)) {
+			return attachmentEvidenceUnavailable("pending Publish destination detach changed or is awaiting readback", nil)
+		}
+		identity.publishMove = move
+	}
 	if identity.replacement != nil && (!replacementDetach || *identity.replacement != *attempt) {
 		return attachmentEvidenceUnavailable("replacement detach attempt changed", nil)
 	}
@@ -1083,6 +1095,8 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 	if err := s.resolvePhysicalDetachIdentity(ctx, volume, node, &identity); err != nil {
 		return false, err
 	}
+	var move *pendingPublishMove
+	var detach *publishMoveDetach
 	authorize := func(ctx context.Context, imageID, vmID, diskID int) error {
 		if imageID != identity.imageID || vmID != identity.vmID || (identity.diskID >= 0 && diskID != identity.diskID) {
 			return status.Error(codes.Unavailable, "provider attachment identity changed before detach")
@@ -1096,6 +1110,11 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 			return err
 		}
 		if err := s.checkPublishMoveAdmission(ctx, volume); err != nil {
+			return err
+		}
+		var err error
+		move, detach, err = s.preparePublishMoveDetach(ctx, volume, node, attempt)
+		if err != nil {
 			return err
 		}
 		if err := attempt.placementGrant.checkExpiry(); err != nil {
@@ -1126,6 +1145,13 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 			func(ctx context.Context, vmName string, imageID, vmID, diskID int) error {
 				return s.recordReplacementDetachAcceptance(ctx, volume, node, vmName, imageID, vmID, diskID, &identity)
 			})
+	} else if identity.publishMove != nil {
+		providerCtx = opennebula.WithDetachAcceptance(providerCtx, func(ctx context.Context, imageID, vmID, diskID int) error {
+			if move == nil || detach == nil || move.Image != imageID || move.Destination.VM != vmID || move.Slot != diskID {
+				return attachmentEvidenceUnavailable("pending Publish destination detach acceptance is unverified", nil)
+			}
+			return s.recordPublishMoveDetach(ctx, volume, move, detach)
+		})
 	}
 	accepted, err := provider.DetachVolumeWithAuthority(providerCtx, volume, node, identity.vmID, identity.backend, verifyOwner, authorize)
 	if parentErr := ctx.Err(); parentErr != nil {
@@ -1133,6 +1159,14 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 	}
 	if err != nil {
 		return false, err
+	}
+	if identity.publishMove != nil {
+		if !accepted || move == nil || detach == nil {
+			return false, attachmentEvidenceUnavailable("pending Publish destination detach outcome is unverified", nil)
+		}
+		updated := *move
+		updated.Detach = detach
+		return true, s.settlePublishMoveDetach(ctx, volume, &updated, false)
 	}
 	retiredRequired := false
 	if identity.ceph || isCephBackend(identity.backend) || identity.background {

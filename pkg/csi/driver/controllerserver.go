@@ -852,6 +852,12 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.NotFound, "node not found")
 	}
 	if imageHistory.PendingPublishMove != nil || (runtimeCtx != nil && runtimeCtx.PVAnnotations[annotationPublishMoveReceipt] != "") {
+		if move := imageHistory.PendingPublishMove; move != nil && move.Detach != nil {
+			if err := s.retryPublishMoveDetach(ctx, req.VolumeId, move, true); err != nil {
+				return nil, err
+			}
+			return nil, attachmentEvidenceUnavailable("Publish move retired; retry publication", nil)
+		}
 		completed, handled, err := s.resumePublishMove(ctx, req, volumeID, publishNode, pvAdmission)
 		if err != nil {
 			return nil, err
@@ -1314,6 +1320,12 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return nil, attachmentEvidenceUnavailable("volume lookup is unknown", err)
 	}
 	history := s.currentVolumeHistory(req.VolumeId)
+	if move := history.PendingPublishMove; move != nil && move.Detach != nil && move.Destination.Name == req.NodeId {
+		if err := s.retryPublishMoveDetach(ctx, req.VolumeId, move, false); err != nil {
+			return nil, err
+		}
+		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
 	if errors.Is(err, opennebula.ErrVolumeNotFound) {
 		if err := s.confirmMissingUnpublish(ctx, req.VolumeId, req.NodeId, history); err != nil {
 			return nil, err
@@ -1485,7 +1497,9 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		}
 		s.clearHotplugGuardState(queueCtx, req.NodeId)
 		if !accepted {
-			s.recordSafeDetachReadback(queueCtx, req.VolumeId, req.NodeId, volumeID, nodeID)
+			if _, err := s.recordSafeDetachReadback(queueCtx, req.VolumeId, req.NodeId, volumeID, nodeID); err != nil {
+				return err
+			}
 			klog.V(1).InfoS("Volume already absent from node", "volumeID", volumeID, "nodeID", nodeID)
 			return nil
 		}
@@ -1635,7 +1649,9 @@ func (s *ControllerServer) confirmUnpublishAbsence(ctx context.Context, req *csi
 	if err := s.checkDetachAbsenceTarget(ctx, req.VolumeId, req.NodeId, imageID, vmID, "", retiredRequired); err != nil {
 		return nil, err
 	}
-	s.recordSafeDetachReadback(ctx, req.VolumeId, req.NodeId, imageID, vmID)
+	if _, err := s.recordSafeDetachReadback(ctx, req.VolumeId, req.NodeId, imageID, vmID); err != nil {
+		return nil, err
+	}
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
@@ -2450,7 +2466,9 @@ func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *cs
 			decision.Evidence.OpenNebulaImageID != imageID || decision.Evidence.OpenNebulaNodeID != vmID {
 			return true, nil, status.Error(codes.Unavailable, "attachment absence is unverified")
 		}
-		s.recordSafeDetachReadback(ctx, req.VolumeId, req.NodeId, imageID, vmID)
+		if _, err := s.recordSafeDetachReadback(ctx, req.VolumeId, req.NodeId, imageID, vmID); err != nil {
+			return true, nil, err
+		}
 		return true, &csi.ControllerUnpublishVolumeResponse{}, nil
 	case VolumeReconcileReject, VolumeReconcileStale:
 		return true, nil, decision.Err()
@@ -3076,12 +3094,15 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 		if err := s.checkPublishMoveAdmission(ctx, req.VolumeId); err != nil {
 			return true, nil, err
 		}
-		if !moving {
+		held, err := s.recordSafeDetachReadback(ctx, req.VolumeId, state.NodeID, volumeID, oldNodeID)
+		if err != nil {
+			return true, nil, err
+		}
+		if !moving && !held {
 			if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
 				return true, nil, status.Errorf(codes.Internal, "failed to clear sticky attachment state: %v", err)
 			}
 		}
-		s.recordSafeDetachReadback(ctx, req.VolumeId, state.NodeID, volumeID, oldNodeID)
 		s.driver.metrics.RecordStickyDetach("already_absent", state.Reason)
 		s.driver.metrics.RecordStickyDetachResidency("already_absent", time.Since(state.StartedAt))
 		s.recordPVCEventFromStickyState(ctx, state, eventReasonDetachGraceCancelled, fmt.Sprintf("confirmed volume %s is already absent from node %s", req.VolumeId, state.NodeID))
@@ -3110,7 +3131,9 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 	if accepted {
 		s.recordSafeDetach(ctx, req.VolumeId, state.NodeID)
 	} else {
-		s.recordSafeDetachReadback(ctx, req.VolumeId, state.NodeID, volumeID, oldNodeID)
+		if _, err := s.recordSafeDetachReadback(ctx, req.VolumeId, state.NodeID, volumeID, oldNodeID); err != nil {
+			return true, nil, err
+		}
 	}
 	if !moving {
 		if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
@@ -3163,6 +3186,13 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 		if volumeErr != nil || nodeErr != nil || volumeID < 0 || nodeID <= 0 {
 			return attachmentEvidenceUnavailable("attachment identity is unknown", errors.Join(volumeErr, nodeErr))
 		}
+		history, err := s.readAttachmentHistory(queueCtx, confirmed.VolumeID)
+		if err != nil {
+			return attachmentEvidenceUnavailable("detach history is unreadable", err)
+		}
+		if move := history.PendingPublishMove; move != nil && move.Detach != nil && move.Destination.Name == confirmed.NodeID {
+			return s.settlePublishMoveDetach(queueCtx, confirmed.VolumeID, move, true)
+		}
 		if _, attachedErr := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID); attachedErr != nil {
 			if !errors.Is(attachedErr, opennebula.ErrAttachmentNotFound) {
 				return attachmentEvidenceUnavailable("attachment is unknown", attachedErr)
@@ -3170,8 +3200,8 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 			if err := s.verifyDetachAbsenceTarget(queueCtx, confirmed.VolumeID, confirmed.NodeID, volumeID, nodeID, ""); err != nil {
 				return err
 			}
-			if s.recordSafeDetachReadback(queueCtx, confirmed.VolumeID, confirmed.NodeID, volumeID, nodeID) {
-				return nil
+			if held, err := s.recordSafeDetachReadback(queueCtx, confirmed.VolumeID, confirmed.NodeID, volumeID, nodeID); held || err != nil {
+				return err
 			}
 			if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
 				klog.V(2).InfoS("Failed to clear already-absent sticky attachment state", "volumeID", confirmed.VolumeID, "err", err)
@@ -3209,12 +3239,15 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 			klog.V(2).InfoS("Failed to detach sticky attachment after grace expiry", "volumeID", confirmed.VolumeID, "nodeID", confirmed.NodeID, "err", err)
 			return err
 		}
-		s.clearHotplugGuardState(queueCtx, confirmed.NodeID)
 		if accepted {
+			if move := history.PendingPublishMove; move != nil && move.Destination.Name == confirmed.NodeID {
+				return nil
+			}
 			s.recordSafeDetach(queueCtx, confirmed.VolumeID, confirmed.NodeID)
-		} else if s.recordSafeDetachReadback(queueCtx, confirmed.VolumeID, confirmed.NodeID, volumeID, nodeID) {
-			return nil
+		} else if held, err := s.recordSafeDetachReadback(queueCtx, confirmed.VolumeID, confirmed.NodeID, volumeID, nodeID); held || err != nil {
+			return err
 		}
+		s.clearHotplugGuardState(queueCtx, confirmed.NodeID)
 		if s.driver.volumeQuarantine != nil {
 			_ = s.driver.volumeQuarantine.Clear(queueCtx, confirmed.VolumeID)
 		}

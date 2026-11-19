@@ -33,6 +33,7 @@ type pendingPublishMove struct {
 	Target, Serial                     string
 	Renewal                            *publishMoveRenewal `json:"renewal,omitempty"`
 	SourceReadback                     string              `json:"sourceReadback,omitempty"`
+	Detach                             *publishMoveDetach  `json:"detach,omitempty"`
 }
 
 type publishMoveGrant struct {
@@ -64,6 +65,7 @@ func (move pendingPublishMove) receipt() string {
 func (move pendingPublishMove) receiptFor(grant publishMoveGrant) string {
 	move.Grant, move.Expires, move.Renewal = grant.Digest, grant.Expires, nil
 	move.SourceReadback = ""
+	move.Detach = nil
 	return publishMoveDigest(move)
 }
 
@@ -71,6 +73,11 @@ func (move pendingPublishMove) matchesHistory(history VolumeHistoryRecord) bool 
 	generation := publishMoveGeneration(history)
 	return generation == move.Prior || (history.LastSafeDetachNodeName == move.Source.Name &&
 		!history.LastSafeDetachTime.IsZero() && generation == move.SourceReadback)
+}
+
+func (move pendingPublishMove) ownsMarker(marker string) bool {
+	return marker != "" && (marker == move.Reservation || marker == move.receipt() ||
+		(move.Renewal != nil && move.Renewal.Previous != nil && marker == move.receiptFor(*move.Renewal.Previous)))
 }
 
 type publishMoveSourceKey struct{}
@@ -149,9 +156,14 @@ func (s *ControllerServer) reservePublishMove(ctx context.Context, req *csi.Cont
 	binding := admission.binding
 	pvs := s.driver.kubeRuntime.client.CoreV1().PersistentVolumes()
 	pv, err := pvs.Get(ctx, binding.PVName, metav1.GetOptions{})
-	if err != nil || pv.ResourceVersion == "" || !publishPVMatches(pv, binding, s.driver.name, req.VolumeId) ||
-		strings.HasPrefix(pv.Annotations[annotationPublishMoveReceipt], publishMoveReservationPrefix) {
+	if err != nil || pv.ResourceVersion == "" || !publishPVMatches(pv, binding, s.driver.name, req.VolumeId) {
 		return nil, deny
+	}
+	if marker := pv.Annotations[annotationPublishMoveReceipt]; strings.HasPrefix(marker, publishMoveReservationPrefix) {
+		history, err := s.readAttachmentHistory(ctx, req.VolumeId)
+		if err != nil || history.PendingPublishMove != nil || history.LastPublishMoveReceipt != marker {
+			return nil, deny
+		}
 	}
 	if err := recheckPublishPVImage(ctx); err != nil {
 		return nil, err
@@ -365,6 +377,9 @@ func (s *ControllerServer) resumePublishMove(ctx context.Context, req *csi.Contr
 			}
 		}
 		return nil, false, nil
+	}
+	if move.Detach != nil {
+		return nil, true, attachmentEvidenceUnavailable("pending Publish destination is retiring", nil)
 	}
 	deny := attachmentEvidenceUnavailable("pending Publish move authority is unverified", nil)
 	binding := admission.binding

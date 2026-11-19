@@ -997,23 +997,33 @@ func (s *ControllerServer) recordSafeDetach(ctx context.Context, volumeID, nodeI
 	s.recordSafeDetachReadback(ctx, volumeID, nodeID, 0, 0)
 }
 
-func (s *ControllerServer) recordSafeDetachReadback(ctx context.Context, volumeID, nodeID string, imageID, vmID int) bool {
+func (s *ControllerServer) recordSafeDetachReadback(ctx context.Context, volumeID, nodeID string, imageID, vmID int) (bool, error) {
 	if s == nil || s.driver == nil || s.driver.volumeHistory == nil || strings.TrimSpace(volumeID) == "" {
-		return false
+		return false, nil
 	}
 	nodeID = strings.TrimSpace(nodeID)
 	sourceReadback := false
-	_, err := s.driver.volumeHistory.Upsert(ctx, volumeID, func(state *VolumeHistoryRecord) {
+	_, err := s.driver.volumeHistory.upsert(ctx, volumeID, func(state *VolumeHistoryRecord) error {
 		sourceReadback = false
 		move := state.PendingPublishMove
-		if imageID > 0 && vmID > 0 && move != nil && state.PendingReplacementAttach == nil &&
-			move.Image == imageID && move.Source.Name == nodeID && move.Source.VM == vmID && move.matchesHistory(*state) {
-			node, err := s.publishNodeIdentity(ctx, nodeID)
-			sourceReadback = err == nil && node.Exists && node.UID != "" && node.UID == move.Source.UID
+		if move != nil && move.Destination.Name == nodeID {
+			return attachmentEvidenceUnavailable("pending Publish destination requires verified detach completion", nil)
+		}
+		if move != nil && move.Source.Name == nodeID {
+			if move.Image != imageID || move.Source.VM != vmID || !move.matchesHistory(*state) {
+				return attachmentEvidenceUnavailable("pending Publish source detach is unverified", nil)
+			}
+			if err := s.verifyPublishMoveRelease(ctx, volumeID, imageID, move.Source); err != nil {
+				return err
+			}
+			if _, err := s.checkPublishMoveScope(ctx, volumeID, move, *state); err != nil {
+				return err
+			}
+			sourceReadback = true
 		}
 		now := time.Now().UTC()
 		if !now.After(state.LastSafeDetachTime) {
-			return
+			return nil
 		}
 		state.LastSafeDetachNodeName = nodeID
 		state.LastSafeDetachTime = now
@@ -1022,11 +1032,12 @@ func (s *ControllerServer) recordSafeDetachReadback(ctx context.Context, volumeI
 			updated.SourceReadback = publishMoveGeneration(*state)
 			state.PendingPublishMove = &updated
 		}
+		return nil
 	})
 	if err == nil {
 		s.driver.metrics.RecordVolumeHistory("safe_detach", "persisted")
 	}
-	return err == nil && sourceReadback
+	return sourceReadback, err
 }
 
 func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volumeID string, publishContext map[string]string, identity *LocalDiskIdentity) {

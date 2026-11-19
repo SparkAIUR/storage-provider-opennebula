@@ -330,7 +330,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 		r.recordPVCEventForPV(ctx, pv, eventReasonStuckAttachmentRepublish, fmt.Sprintf("requested deletion of stale VolumeAttachment %s for volume %s to trigger republish", va.Name, volumeHandle))
 	}
 
-	r.reconcileReleasedReplacementAttempts(ctx, pvByHandle, attachmentsByVolume, vaByVolume, unresolvedVolume, currentOrphans, now)
+	r.reconcileReleasedAttachments(ctx, pvByHandle, attachmentsByVolume, vaByVolume, unresolvedVolume, currentOrphans, now)
 	r.prune(r.orphanSeen, currentOrphans)
 	r.prune(r.staleVASeen, currentStaleVAs)
 	r.prune(r.divergentSeen, currentDivergent)
@@ -338,7 +338,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 	return nil
 }
 
-func (r *AttachmentReconciler) reconcileReleasedReplacementAttempts(ctx context.Context, pvs map[string]*corev1.PersistentVolume, disks map[string][]opennebula.ObservedAttachment, vas map[string][]storagev1.VolumeAttachment, unresolved map[string]bool, currentOrphans map[string]struct{}, now time.Time) {
+func (r *AttachmentReconciler) reconcileReleasedAttachments(ctx context.Context, pvs map[string]*corev1.PersistentVolume, disks map[string][]opennebula.ObservedAttachment, vas map[string][]storagev1.VolumeAttachment, unresolved map[string]bool, currentOrphans map[string]struct{}, now time.Time) {
 	s := r.server
 	manager := s.driver.volumeHistory
 	if manager == nil {
@@ -350,7 +350,15 @@ func (r *AttachmentReconciler) reconcileReleasedReplacementAttempts(ctx context.
 	}
 	for volume, raw := range cm.Data {
 		history, err := decodeAttachmentHistory(raw, volume)
-		if err != nil || history.PendingReplacementAttach == nil {
+		if err != nil {
+			continue
+		}
+		if move := history.PendingPublishMove; move != nil && move.Detach != nil && history.PendingReplacementAttach == nil &&
+			pvs[volume] != nil && !unresolved[volume] && len(disks[volume]) == 0 && len(vas[volume]) == 0 {
+			_ = s.retryPublishMoveDetach(ctx, volume, move, true)
+			continue
+		}
+		if history.PendingReplacementAttach == nil {
 			continue
 		}
 		attempt := history.PendingReplacementAttach
@@ -760,6 +768,9 @@ func (r *AttachmentReconciler) deleteStaleVolumeAttachment(ctx context.Context, 
 		return err
 	}
 	if history.PendingReplacementAttach != nil {
+		return errAttachmentSkipped
+	}
+	if move := history.PendingPublishMove; move != nil && move.Destination.Name == va.Spec.NodeName {
 		return errAttachmentSkipped
 	}
 	imageID, _, err := r.server.volumeProvider.VolumeExists(ctx, volume)

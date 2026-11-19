@@ -1211,6 +1211,12 @@ func (p *PersistentDiskVolumeProvider) DetachVolume(ctx context.Context, volume,
 	return err
 }
 
+type detachAcceptanceKey struct{}
+
+func WithDetachAcceptance(ctx context.Context, record func(context.Context, int, int, int) error) context.Context {
+	return context.WithValue(ctx, detachAcceptanceKey{}, record)
+}
+
 func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Context, volume, node string, expectedVMID int, expectedBackend string, verifyOwner DetachOwnerCheck, authorize DetachAuthorization) (bool, error) {
 	nodeID, vmName, _, err := resolveNodeVM(ctx, p.ctrl, node)
 	if err != nil || nodeID < 0 {
@@ -1239,6 +1245,7 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 	hotplugTimeout := p.ComputeHotplugTimeout(sizeBytes)
 
 	readback, replacement := ctx.Value(replacementDetachReadbackKey{}).(replacementDetachReadback)
+	recordAcceptance, _ := ctx.Value(detachAcceptanceKey{}).(func(context.Context, int, int, int) error)
 	accepted := false
 	var authorityErr error
 	deny := func(err error) error {
@@ -1296,6 +1303,13 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 				return deny(detachEvidenceError(ctx, "detach success reply is unverified", nil))
 			}
 			if err := readback.recordAccepted(ctx, vmName, volumeID, nodeID, diskID); err != nil {
+				return deny(err)
+			}
+		} else if recordAcceptance != nil {
+			if reply == nil || reply.BodyInt() != nodeID {
+				return deny(detachEvidenceError(ctx, "detach success reply is unverified", nil))
+			}
+			if err := recordAcceptance(ctx, volumeID, nodeID, diskID); err != nil {
 				return deny(err)
 			}
 		}
