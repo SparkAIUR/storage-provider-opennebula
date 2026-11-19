@@ -47,6 +47,7 @@ See the [feature-gate reference](helm/opennebula-csi/README.md#feature-gates) fo
   `ghcr.io/sparkaiur/opennebula-csi:<tag>`
   `docker.io/nudevco/opennebula-csi:<tag>`
 - Release versions and changes: [CHANGELOG.md](CHANGELOG.md).
+- Exact OpenNebula patch claims and release records: [release compatibility policy](docs/release-compatibility.md).
 - Validation and rollout evidence: [node expansion](docs/node-expansion.md) and [CephFS recovery](docs/cephfs-recovery.md).
 - Historical Helm repo: `https://sparkaiur.github.io/storage-provider-opennebula/charts/`. For current publication channels, see the [upgrade runbook](docs/opennebula-74-upgrade.md).
 - Chart name: `opennebula-csi`

@@ -2,6 +2,10 @@
 
 Current source target is OpenNebula 7.4.0, with no direct OpenNebula host actions. This integration grants no native acceptance or feature waiver; affected persistent growth/reattach and the 24-hour observation remain open.
 
+## Unreleased release compatibility records
+
+- Add [exact OpenNebula patch records](docs/release-compatibility.md) that bind candidate intent or native-verified stable scope to approved release readback and immutable artifacts.
+
 ## Unreleased test reliability
 
 - Synchronize node expansion deadline injection with the actual RPC command context. Preserve deadline status and mutation assertions without relying on parent-to-child cancellation scheduling. Production behavior and native qualification gates are unchanged.
