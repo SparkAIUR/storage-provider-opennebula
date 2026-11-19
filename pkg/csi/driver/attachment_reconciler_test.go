@@ -98,6 +98,44 @@ type staleAttachmentTestProvider struct {
 	*MockOpenNebulaVolumeProviderTestify
 }
 
+func TestAttachmentReconcilerReportsPersistentMultipleAttachmentsInMetrics(t *testing.T) {
+	ctx := context.Background()
+	const volume = "vol-multi"
+	pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+	pv.Status.Phase, pvc.Status.Phase = corev1.VolumeBound, corev1.ClaimBound
+	first, second := newReadyNode("node-a", true), newReadyNode("node-b", true)
+	first.UID, second.UID = "node-a-uid", "node-b-uid"
+	driver := newAttachmentTestDriver(pv, pvc, first, second)
+	provider := &MockOpenNebulaVolumeProviderTestify{}
+	provider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{
+		{VolumeHandle: volume, ImageID: 1, NodeID: 101, DiskID: 2, Backend: "ceph"},
+		{VolumeHandle: volume, ImageID: 1, NodeID: 102, DiskID: 2, Backend: "ceph"},
+	}, opennebula.VMNameInventory{"node-a": {101}, "node-b": {102}}, nil).Twice()
+	reconciler := NewAttachmentReconciler(NewControllerServer(driver, provider, nil))
+	require.NoError(t, reconciler.ReconcileOnce(ctx))
+	require.NoError(t, reconciler.ReconcileOnce(ctx))
+	provider.AssertExpectations(t)
+	events, err := driver.kubeRuntime.client.CoreV1().Events(pvc.Namespace).List(ctx, metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Empty(t, events.Items)
+	metrics, err := driver.metrics.registry.Gather()
+	require.NoError(t, err)
+	var warnings float64
+	for _, family := range metrics {
+		if family.GetName() == "opennebula_csi_attachment_reconciler_total" {
+			require.Len(t, family.GetMetric(), 1)
+			metric := family.GetMetric()[0]
+			labels := make(map[string]string)
+			for _, label := range metric.GetLabel() {
+				labels[label.GetName()] = label.GetValue()
+			}
+			require.Equal(t, map[string]string{"check": "multi_attach", "action": "warn", "outcome": "observed"}, labels)
+			warnings = metric.GetCounter().GetValue()
+		}
+	}
+	require.Equal(t, float64(2), warnings)
+}
+
 func (p staleAttachmentTestProvider) InspectVolumeDatastore(ctx context.Context, volume string, imageID int) (opennebula.Datastore, error) {
 	args := p.Called(ctx, volume, imageID)
 	return args.Get(0).(opennebula.Datastore), args.Error(1)

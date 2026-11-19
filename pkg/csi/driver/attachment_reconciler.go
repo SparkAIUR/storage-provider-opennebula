@@ -237,7 +237,6 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 		if singleWriter && len(observed) > 1 {
 			currentMultiAttach[volumeHandle] = struct{}{}
 			r.server.driver.metrics.RecordAttachmentReconciler("multi_attach", "warn", "observed")
-			r.recordPVCEventForPV(ctx, pv, eventReasonStuckAttachmentMultiple, fmt.Sprintf("detected multiple attachments for single-writer volume %s", volumeHandle))
 			if cephSingleWriter {
 				continue
 			}

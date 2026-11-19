@@ -185,14 +185,21 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 			return err
 		}
 	}
+	if source != nil {
+		if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, sourceTarget, pv, pvc, replaced); err != nil {
+			return err
+		}
+	}
+	if waitingSource {
+		if err := s.attachmentProtectionChecks(ctx, volume, runtimeCtx, target); err != nil {
+			return err
+		}
+	}
 	finalWaiting, err := s.replacementDestinationConsumers(ctx, pv, pvc, replaced, liveBinding, current, inUse)
 	if err != nil || !sameWaitingConsumers(waiting, finalWaiting) {
 		return unavailable(err)
 	}
 	if source != nil {
-		if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, sourceTarget, pv, pvc, replaced); err != nil {
-			return err
-		}
 		var currentWaiting waitingConsumers
 		if waitingSource {
 			currentWaiting, err = s.replacementWaitingConsumers(ctx, pv, pvc, source, sourceInUse)
@@ -227,12 +234,6 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 	}
 	if waitingSource {
 		if err := s.recheckReplacementVolumeAttachment(ctx, pv.Name, destinationName, attachment); err != nil {
-			return err
-		}
-		if err := s.attachmentProtectionChecks(ctx, volume, runtimeCtx, sourceTarget); err != nil {
-			return err
-		}
-		if err := s.attachmentProtectionChecks(ctx, volume, runtimeCtx, target); err != nil {
 			return err
 		}
 	}

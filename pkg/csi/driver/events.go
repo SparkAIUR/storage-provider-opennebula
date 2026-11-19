@@ -43,7 +43,6 @@ const (
 	eventReasonVolumeRepairRequired         = "VolumeRepairRequired"
 	eventReasonHostArtifactQuarantined      = "HostArtifactQuarantined"
 	eventReasonStuckAttachmentDetached      = "StuckAttachmentDetached"
-	eventReasonStuckAttachmentMultiple      = "MultipleDiskAttachments"
 	eventReasonStuckAttachmentRepublish     = "StuckAttachmentRepublishRequested"
 	eventReasonLocalImmediateBindingWarning = "LocalImmediateBindingWarning"
 	eventReasonPreflightFailed              = "PreflightFailed"

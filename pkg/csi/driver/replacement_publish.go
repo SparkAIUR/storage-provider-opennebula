@@ -101,6 +101,10 @@ func (attempt replacementAttachAttempt) detached() bool {
 	return attempt.Version == 2 && attempt.Phase == replacementAttachDetached
 }
 
+func (attempt replacementAttachAttempt) hasDetachReceipt() bool {
+	return attempt.detached() || (attempt.detachAccepted() && attempt.DetachAcceptance.VAUID != "")
+}
+
 func (attempt replacementAttachAttempt) matchesHistory(history VolumeHistoryRecord) bool {
 	originalVM := attempt.VMID
 	if attempt.OriginalVMID != 0 || attempt.OriginalVMName != "" {

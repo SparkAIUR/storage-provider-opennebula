@@ -4242,6 +4242,8 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 			"prepared-abandoned-paired-forward", "prepared-abandoned-paired-forward-distinct-vm",
 			"prepared-abandoned-paired-reverse", "prepared-abandoned-paired-reverse-distinct-vm",
 			"prepared-abandoned-retired-pinned", "prepared-abandoned-retired-pinned-distinct-vm",
+			"distinct-vm-abandoned-replay-retired-completed", "distinct-vm-abandoned-replay-retired-accepted",
+			"same-vm-abandoned-replay-wire-retired", "distinct-vm-abandoned-replay-wire-retired",
 			"prepared-abandoned-waiting-remote-retired-publish", "prepared-abandoned-waiting-remote-retired-reconcile-distinct-vm",
 			"prepared-abandoned-retired-without-va", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
 			"distinct-vm-inflight", "same-vm-abandoned-replay",
@@ -4327,6 +4329,9 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				}
 				wireObserve := strings.HasSuffix(mode, "-wire-observe")
 				wireNodeChange := strings.HasSuffix(mode, "-wire-node-change")
+				wireRetired := strings.HasSuffix(mode, "-wire-retired")
+				retiredAccepted := strings.HasSuffix(mode, "-retired-accepted")
+				retiredCompleted := strings.HasSuffix(mode, "-retired-completed")
 				wireClaimGone := strings.HasSuffix(mode, "-wire-claim-gone")
 				wireClaimChanged := strings.HasSuffix(mode, "-wire-claim-changed")
 				wireClaimRebound := strings.HasSuffix(mode, "-wire-claim-reuse")
@@ -4355,9 +4360,15 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				remoteVA.Name, remoteVA.UID = "csi-d0f14d64d3d3a6b04c9005c10e373303290c14d77fcf8125d47bc2d3b8aae477", "orphan-remote-destination"
 				var replacement *corev1.Node
 				provider, protocol := nodeAttachmentProvider(t, func(method string, _ context.Context) {
-					if method == "one.vm.detach" && (wireObserve || wireNodeChange || claimTurnover || wireClaimChanged || wireClaimConflict || orphanRepublish) && postDetachChange.CompareAndSwap(false, true) {
-						if wireObserve {
+					if method == "one.vm.detach" && (wireObserve || wireNodeChange || wireRetired || retiredAccepted || claimTurnover || wireClaimChanged || wireClaimConflict || orphanRepublish) && postDetachChange.CompareAndSwap(false, true) {
+						if wireObserve || retiredAccepted {
 							setObserve(true)
+						}
+						if wireRetired {
+							require.NoError(t, nodes.Delete(ctx, node.Name, metav1.DeleteOptions{}))
+							wire.mu.Lock()
+							wire.omitVMID, wire.missingVMID = wire.attachAttemptVM, wire.attachAttemptVM
+							wire.mu.Unlock()
 						}
 						if wireNodeChange {
 							current, err := nodes.Get(ctx, node.Name, metav1.GetOptions{})
@@ -5199,6 +5210,34 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							delete(held.Annotations, annotationRecoveryMode)
 							_, err = pvs.Update(ctx, held, metav1.UpdateOptions{})
 							require.NoError(t, err)
+							lastProtectionRead := int32(4)
+							if paired && !reverse {
+								lastProtectionRead = 5
+							}
+							var protectionReads atomic.Int32
+							kube.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+								if action.(ktesting.GetAction).GetName() == hostArtifactStateConfigMapName && protectionReads.Add(1) == lastProtectionRead {
+									if retiredPinned {
+										reappeared := replacement.DeepCopy()
+										reappeared.UID = "recreated-during-protection-refresh"
+										require.NoError(t, kube.Tracker().Create(corev1.SchemeGroupVersion.WithResource("nodes"), reappeared, ""))
+									} else {
+										changed := deleting.DeepCopy()
+										changed.UID = "changed-during-protection-refresh"
+										require.NoError(t, kube.Tracker().Update(storagev1.SchemeGroupVersion.WithResource("volumeattachments"), changed, ""))
+									}
+								}
+								return false, nil, nil
+							})
+							_, err = restarted.ControllerUnpublishVolume(ctx, request)
+							require.Error(t, err, "release identity changed during the final protection read")
+							require.GreaterOrEqual(t, protectionReads.Load(), lastProtectionRead)
+							if retiredPinned {
+								require.NoError(t, nodes.Delete(ctx, node.Name, metav1.DeleteOptions{}))
+							} else {
+								_, err = vas.Update(ctx, deleting, metav1.UpdateOptions{})
+								require.NoError(t, err)
+							}
 							var acknowledged atomic.Bool
 							lost := reviewControllerClient(t, NewControllerServer(fresh, provider, nil), grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 								reply, err := handler(ctx, req)
@@ -5799,6 +5838,96 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					unpublish := func(client csi.ControllerClient) error {
 						_, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
 						return err
+					}
+					if retiredAccepted || retiredCompleted || wireRetired {
+						server := NewControllerServer(driver, provider, nil)
+						first := restarted
+						var replyLost atomic.Bool
+						if retiredCompleted {
+							first = reviewControllerClient(t, server, grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+								reply, err := handler(ctx, req)
+								if err == nil {
+									replyLost.Store(true)
+									return nil, status.Error(codes.Unavailable, "completed detach response lost")
+								}
+								return reply, err
+							}))
+						}
+						require.Error(t, unpublish(first))
+						require.Equal(t, retiredCompleted, replyLost.Load())
+						receipt, err := server.readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.NotNil(t, receipt.PendingReplacementAttach)
+						require.Equal(t, retiredCompleted, receipt.PendingReplacementAttach.detached())
+						require.True(t, receipt.PendingReplacementAttach.hasDetachReceipt())
+						if retiredCompleted {
+							require.False(t, receipt.LastSafeDetachTime.IsZero())
+						}
+						if retiredAccepted {
+							setObserve(false)
+						}
+						if !wireRetired {
+							require.NoError(t, nodes.Delete(ctx, node.Name, metav1.DeleteOptions{}))
+							wire.mu.Lock()
+							wire.omitVMID, wire.missingVMID = vmID, vmID
+							wire.mu.Unlock()
+						}
+						fresh := newStickyTestDriver(t)
+						fresh.kubeRuntime.client = kube
+						restarted = makeClient(fresh)
+						wrong := replayVA.DeepCopy()
+						wrong.UID = "different-receipt-uid"
+						_, err = vas.Update(ctx, wrong, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						require.Error(t, unpublish(restarted))
+						_, err = vas.Update(ctx, replayVA, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						recreated := replacement.DeepCopy()
+						recreated.UID = "recreated-source-node"
+						_, err = nodes.Create(ctx, recreated, metav1.CreateOptions{})
+						require.NoError(t, err)
+						require.Error(t, unpublish(restarted))
+						require.NoError(t, nodes.Delete(ctx, node.Name, metav1.DeleteOptions{}))
+						wire.mu.Lock()
+						wire.failMethod = "one.vm.info"
+						wire.mu.Unlock()
+						require.Error(t, unpublish(restarted))
+						wire.mu.Lock()
+						wire.failMethod = ""
+						wire.disks[43] = 128
+						wire.mu.Unlock()
+						require.Error(t, unpublish(restarted))
+						wire.mu.Lock()
+						delete(wire.disks, 43)
+						wire.mu.Unlock()
+						current, err := server.readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.Equal(t, receipt, current)
+						if retiredAccepted {
+							reconcileDriver(fresh)
+							observed, err := server.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.NotNil(t, observed.PendingReplacementAttach)
+							require.True(t, observed.PendingReplacementAttach.detached())
+						}
+						require.NoError(t, unpublish(restarted))
+						require.NoError(t, unpublish(restarted))
+						current, err = server.readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.NotNil(t, current.PendingReplacementAttach)
+						require.True(t, current.PendingReplacementAttach.detached())
+						require.Equal(t, string(replayVA.UID), current.PendingReplacementAttach.DetachCompletion.VAUID)
+						require.Equal(t, receipt.LastSafeDetachTime, current.LastSafeDetachTime)
+						require.NoError(t, vas.Delete(ctx, replayVA.Name, metav1.DeleteOptions{}))
+						reconcileDriver(fresh)
+						current, err = server.readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.Nil(t, current.PendingReplacementAttach)
+						wire.mu.Lock()
+						defer wire.mu.Unlock()
+						require.Equal(t, 1, wire.detachAttempts)
+						require.Equal(t, []string{fmt.Sprintf("attach:%d:false", vmID), fmt.Sprintf("detach:%d", vmID)}, wire.mutations)
+						return
 					}
 					if orphan {
 						reconcile()
