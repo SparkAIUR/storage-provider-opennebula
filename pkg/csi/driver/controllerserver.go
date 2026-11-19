@@ -1320,7 +1320,8 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return nil, attachmentEvidenceUnavailable("volume lookup is unknown", err)
 	}
 	history := s.currentVolumeHistory(req.VolumeId)
-	if move := history.PendingPublishMove; move != nil && move.Detach != nil && move.Destination.Name == req.NodeId {
+	pendingDestination := history.publishMoveDestination(req.NodeId)
+	if move := pendingDestination; move != nil && move.Detach != nil {
 		if err := s.retryPublishMoveDetach(ctx, req.VolumeId, move, false); err != nil {
 			return nil, err
 		}
@@ -1370,7 +1371,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		(recoveryRuntimeCtx != nil && (isCephBackend(recoveryRuntimeCtx.Backend) || isCephBackend(recoveryRuntimeCtx.backendAttribute)))
 	backend, backendErr := recoveryRuntimeCtx.verifiedAttachmentBackend()
 	var providerBackendErr error
-	if !ceph && backendErr == nil && runtimeContextEligibleForMaintenance(recoveryRuntimeCtx, req.VolumeId) {
+	if pendingDestination == nil && !ceph && backendErr == nil && runtimeContextEligibleForMaintenance(recoveryRuntimeCtx, req.VolumeId) {
 		desired, reason, desiredErr := s.driver.kubeRuntime.VolumeDesiredOnNode(ctx, req.VolumeId, req.NodeId)
 		sameNode := desiredErr == nil && desired
 		maintenance := s.driver.maintenanceMode != nil && s.driver.maintenanceMode.Active()
@@ -1407,6 +1408,9 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	if recoveryControl.ManualActive() {
 		message := recoveryControl.QueueBlockMessage(req.VolumeId, req.NodeId, "detach")
 		s.recordPVCEventFromRuntimeContext(ctx, recoveryRuntimeCtx, eventReasonRecoveryModeActive, message)
+		if pendingDestination != nil {
+			return nil, status.Error(codes.Unavailable, message)
+		}
 		s.recordSafeDetach(ctx, req.VolumeId, req.NodeId)
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
@@ -1452,11 +1456,31 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		release := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
 		defer release()
 
-		if handled, _, freshErr := s.precheckUnpublishHotplug(queueCtx, req, ceph, volumeID, nodeID); handled {
+		var current VolumeHistoryRecord
+		if runtime := s.driver.kubeRuntime; runtime != nil && runtime.enabled {
+			var err error
+			current, err = s.readAttachmentHistory(queueCtx, req.VolumeId)
+			if err != nil {
+				return attachmentEvidenceUnavailable("detach history is unreadable", err)
+			}
+		}
+		move := current.publishMoveDestination(req.NodeId)
+		if move != nil && move.Detach != nil {
+			return s.settlePublishMoveDetach(queueCtx, req.VolumeId, move, false)
+		}
+		if handled, _, freshErr := s.precheckUnpublishHotplug(queueCtx, req, ceph, volumeID, nodeID, move != nil); handled {
 			return freshErr
 		}
 
 		runtimeCtx, stickyState, stickyEligible, stickyReason := s.shouldDelayDetach(queueCtx, req)
+		if move != nil {
+			if grace, ok := s.driver.stickyAttachments.Get(req.VolumeId); ok && grace.NodeID == req.NodeId {
+				if grace.ExpiresAt.After(time.Now()) {
+					return attachmentEvidenceUnavailable("pending Publish destination detach grace is active", nil)
+				}
+				stickyEligible, stickyReason = false, ""
+			}
+		}
 		if !ceph && backend == "local" && stickyEligible {
 			if currentBackend, err := runtimeCtx.verifiedAttachmentBackend(); err != nil || currentBackend != backend {
 				return attachmentEvidenceUnavailable("detach grace backend is unverified", err)
@@ -1464,12 +1488,37 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 			if err := s.verifyProviderAttachmentBackend(queueCtx, req.VolumeId, req.NodeId, volumeID, nodeID, backend); err != nil {
 				return err
 			}
-			if err := s.startDetachGrace(queueCtx, runtimeCtx, stickyState); err != nil {
+			if move != nil {
+				node, err := s.publishMoveNode(queueCtx, req.NodeId)
+				if err != nil || node != move.Destination || move.Image != volumeID || node.VM != nodeID {
+					return attachmentEvidenceUnavailable("pending Publish destination identity changed", nil)
+				}
+				admission, err := s.checkPublishMoveScope(queueCtx, req.VolumeId, move, current)
+				if err != nil {
+					return err
+				}
+				if stickyState.PVCUID != admission.binding.PVCUID || admission.binding.RestartMode != restartOptimizationAnnotationValue {
+					return attachmentEvidenceUnavailable("pending Publish destination detach grace binding changed", nil)
+				}
+				if _, err := s.publishMoveDeletingVA(queueCtx, req.VolumeId, move, admission.binding, nil); err != nil {
+					return err
+				}
+				if err := admission.check(queueCtx, admission.binding); err != nil {
+					return err
+				}
+			}
+			if err := s.startDetachGrace(queueCtx, runtimeCtx, stickyState, move == nil); err != nil {
+				if move != nil {
+					return attachmentEvidenceUnavailable("pending Publish destination detach grace is unverified", err)
+				}
 				klog.V(2).InfoS("Sticky detach grace start failed, falling back to immediate detach",
 					"method", "ControllerUnpublishVolume", "volumeID", req.VolumeId, "nodeID", req.NodeId, "err", err)
 				s.recordPVCWarningFromRuntimeContext(queueCtx, runtimeCtx, eventReasonDetachGraceBypassed, fmt.Sprintf("failed to persist detach grace for volume %s: %v", req.VolumeId, err))
 				s.driver.metrics.RecordStickyDetach("bypassed", "persist_failed")
 			} else {
+				if move != nil {
+					return attachmentEvidenceUnavailable("pending Publish destination detach grace is active", nil)
+				}
 				return nil
 			}
 		} else if stickyReason != "" {
@@ -2439,7 +2488,7 @@ func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.
 	}
 }
 
-func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, ceph bool, imageID, vmID int) (bool, *csi.ControllerUnpublishVolumeResponse, error) {
+func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, ceph bool, imageID, vmID int, pendingDestination bool) (bool, *csi.ControllerUnpublishVolumeResponse, error) {
 	if s == nil || req == nil {
 		return false, nil, nil
 	}
@@ -2474,7 +2523,7 @@ func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *cs
 		return true, nil, decision.Err()
 	case VolumeReconcilePause:
 		backend, backendErr := decision.Evidence.RuntimeCtx.verifiedAttachmentBackend()
-		if !ceph && backendErr == nil && !isCephBackend(backend) &&
+		if !pendingDestination && !ceph && backendErr == nil && !isCephBackend(backend) &&
 			decision.Evidence.RuntimeCtx.Backend != "" && detachPauseCanReturnSuccess(decision.Reason) &&
 			!isCephBackend(decision.Evidence.History.Backend) &&
 			!isCephBackend(s.currentVolumeHistory(req.VolumeId).Backend) {
@@ -3004,7 +3053,7 @@ func (s *ControllerServer) shouldDelayDetach(ctx context.Context, req *csi.Contr
 	return runtimeCtx, state, true, ""
 }
 
-func (s *ControllerServer) startDetachGrace(ctx context.Context, runtimeCtx *VolumeRuntimeContext, state StickyAttachmentState) error {
+func (s *ControllerServer) startDetachGrace(ctx context.Context, runtimeCtx *VolumeRuntimeContext, state StickyAttachmentState, annotate bool) error {
 	if s == nil || s.driver == nil || s.driver.stickyAttachments == nil {
 		return fmt.Errorf("sticky attachment manager is not configured")
 	}
@@ -3013,7 +3062,9 @@ func (s *ControllerServer) startDetachGrace(ctx context.Context, runtimeCtx *Vol
 	}
 	s.driver.metrics.RecordStickyDetach("started", state.Reason)
 	s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonDetachGraceStarted, fmt.Sprintf("delaying detach for volume %s on node %s for %ds to allow same-node restart reuse", state.VolumeID, state.NodeID, state.GraceSeconds))
-	s.annotateRestartOptimization(ctx, runtimeCtx, state.NodeID, state.GraceSeconds)
+	if annotate {
+		s.annotateRestartOptimization(ctx, runtimeCtx, state.NodeID, state.GraceSeconds)
+	}
 	return nil
 }
 
@@ -3172,7 +3223,7 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 		defer volumeRelease()
 
 		confirmed, ok := s.driver.stickyAttachments.Get(current.VolumeID)
-		if !ok || confirmed.ExpiresAt.After(time.Now()) {
+		if !ok || confirmed.NodeID != current.NodeID || confirmed.ExpiresAt.After(time.Now()) {
 			return nil
 		}
 
@@ -3190,7 +3241,8 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 		if err != nil {
 			return attachmentEvidenceUnavailable("detach history is unreadable", err)
 		}
-		if move := history.PendingPublishMove; move != nil && move.Detach != nil && move.Destination.Name == confirmed.NodeID {
+		move := history.publishMoveDestination(confirmed.NodeID)
+		if move != nil && move.Detach != nil {
 			return s.settlePublishMoveDetach(queueCtx, confirmed.VolumeID, move, true)
 		}
 		if _, attachedErr := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID); attachedErr != nil {
@@ -3216,6 +3268,9 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 			return nil
 		}
 		if desired, reason, desiredErr := s.driver.kubeRuntime.VolumeDesiredOnNode(queueCtx, confirmed.VolumeID, confirmed.NodeID); desiredErr == nil && desired {
+			if move != nil {
+				return attachmentEvidenceUnavailable("pending Publish destination still has demand", nil)
+			}
 			if err := s.driver.stickyAttachments.Clear(confirmed.VolumeID); err != nil {
 				klog.V(2).InfoS("Failed to clear sticky attachment state after same-node desired validation", "volumeID", confirmed.VolumeID, "err", err)
 				return err
@@ -3240,7 +3295,7 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 			return err
 		}
 		if accepted {
-			if move := history.PendingPublishMove; move != nil && move.Destination.Name == confirmed.NodeID {
+			if move != nil {
 				return nil
 			}
 			s.recordSafeDetach(queueCtx, confirmed.VolumeID, confirmed.NodeID)
@@ -3274,6 +3329,12 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 func (s *ControllerServer) deferStickyDetach(ctx context.Context, state StickyAttachmentState, reason string, delay time.Duration) {
 	if s == nil || s.driver == nil || s.driver.stickyAttachments == nil {
 		return
+	}
+	if runtime := s.driver.kubeRuntime; runtime != nil && runtime.enabled && s.driver.volumeHistory != nil {
+		history, err := s.readAttachmentHistory(ctx, state.VolumeID)
+		if err != nil || history.publishMoveDestination(state.NodeID) != nil {
+			return
+		}
 	}
 	if delay <= 0 {
 		delay = time.Minute

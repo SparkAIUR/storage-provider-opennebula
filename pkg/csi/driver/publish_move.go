@@ -125,6 +125,13 @@ func samePendingPublishMove(a, b *pendingPublishMove) bool {
 	return reflect.DeepEqual(a, b)
 }
 
+func (history VolumeHistoryRecord) publishMoveDestination(node string) *pendingPublishMove {
+	if move := history.PendingPublishMove; move != nil && move.Destination.Name == node {
+		return move
+	}
+	return nil
+}
+
 func publishMoveBinding(binding *VolumeRuntimeContext, driver, volume string) string {
 	if binding == nil || !binding.verifiedClaimBinding || binding.pvUID == "" || binding.PVCUID == "" || binding.pvDeleting || binding.pvcDeleting {
 		return ""

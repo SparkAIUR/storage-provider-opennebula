@@ -317,6 +317,77 @@ func TestControllerLegacyDetachBoundaries(t *testing.T) {
 	}
 }
 
+func TestOrdinaryDetachReadbackSurvivesHistoryWriteTimeout(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, mode := range []string{"unpublish", "expiry", "unreadable"} {
+			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
+				ctx := context.Background()
+				const volume, node = "volume-test", "node-old"
+				provider, wire := nodeAttachmentProvider(t)
+				wire.mu.Lock()
+				delete(wire.disks, 41)
+				wire.mu.Unlock()
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+				driver := newStickyTestDriver(t, pv, pvc, newReadyNode(node, true))
+				initial, err := driver.volumeHistory.Upsert(ctx, volume, func(history *VolumeHistoryRecord) {
+					history.Backend, history.LastSuccessfulNodeName = "local", node
+					history.LastSuccessfulImageID, history.LastSuccessfulOpenNebulaVMID = 7, 41
+					history.LastSuccessfulPublishTime = time.Now().UTC().Add(-time.Minute)
+				})
+				require.NoError(t, err)
+				kube := driver.kubeRuntime.client.(*fake.Clientset)
+				var attempted atomic.Bool
+				kube.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+					cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
+					if cm.Name == volumeHistoryStateConfigMapName {
+						attempted.Store(true)
+						return true, nil, context.DeadlineExceeded
+					}
+					return false, nil, nil
+				})
+				if mode == "unreadable" {
+					kube.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+						if attempted.Load() && action.(ktesting.GetAction).GetName() == volumeHistoryStateConfigMapName {
+							return true, nil, context.DeadlineExceeded
+						}
+						return false, nil, nil
+					})
+				}
+				controller := NewControllerServer(driver, provider, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, controller.validateHotplugQueueRequest)
+				}
+				if mode == "expiry" {
+					grace := StickyAttachmentState{VolumeID: volume, NodeID: node, Backend: "local",
+						StartedAt: time.Now().Add(-2 * time.Minute), ExpiresAt: time.Now().Add(-time.Minute), GraceSeconds: 60}
+					require.NoError(t, driver.stickyAttachments.StartGrace(grace))
+					controller.expireStickyDetach(ctx, grace)
+					_, held := driver.stickyAttachments.Get(volume)
+					require.False(t, held)
+				} else {
+					reply, err := reviewControllerClient(t, controller).ControllerUnpublishVolume(ctx,
+						&csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node})
+					if mode == "unreadable" {
+						require.Error(t, err)
+						require.Nil(t, reply)
+					} else {
+						require.NoError(t, err)
+						require.NotNil(t, reply)
+					}
+				}
+				require.True(t, attempted.Swap(false))
+				stored, err := controller.readAttachmentHistory(ctx, volume)
+				require.NoError(t, err)
+				require.Equal(t, initial, stored)
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				require.Empty(t, wire.mutations)
+			})
+		}
+	}
+}
+
 func TestStickyExpiryDoesNotQuarantineDetachAuthorityDenial(t *testing.T) {
 	ctx := context.Background()
 	pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)

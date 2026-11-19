@@ -994,7 +994,9 @@ func (s *ControllerServer) publishHistoryBindingVerified(ctx context.Context, vo
 }
 
 func (s *ControllerServer) recordSafeDetach(ctx context.Context, volumeID, nodeID string) {
-	s.recordSafeDetachReadback(ctx, volumeID, nodeID, 0, 0)
+	if _, err := s.recordSafeDetachReadback(ctx, volumeID, nodeID, 0, 0); err != nil {
+		klog.V(3).InfoS("Safe detach history was not recorded", "volumeID", volumeID, "nodeID", nodeID)
+	}
 }
 
 func (s *ControllerServer) recordSafeDetachReadback(ctx context.Context, volumeID, nodeID string, imageID, vmID int) (bool, error) {
@@ -1003,8 +1005,10 @@ func (s *ControllerServer) recordSafeDetachReadback(ctx context.Context, volumeI
 	}
 	nodeID = strings.TrimSpace(nodeID)
 	sourceReadback := false
+	ordinaryWrite := false
 	_, err := s.driver.volumeHistory.upsert(ctx, volumeID, func(state *VolumeHistoryRecord) error {
 		sourceReadback = false
+		ordinaryWrite = false
 		move := state.PendingPublishMove
 		if move != nil && move.Destination.Name == nodeID {
 			return attachmentEvidenceUnavailable("pending Publish destination requires verified detach completion", nil)
@@ -1021,6 +1025,7 @@ func (s *ControllerServer) recordSafeDetachReadback(ctx context.Context, volumeI
 			}
 			sourceReadback = true
 		}
+		ordinaryWrite = !sourceReadback
 		now := time.Now().UTC()
 		if !now.After(state.LastSafeDetachTime) {
 			return nil
@@ -1036,6 +1041,13 @@ func (s *ControllerServer) recordSafeDetachReadback(ctx context.Context, volumeI
 	})
 	if err == nil {
 		s.driver.metrics.RecordVolumeHistory("safe_detach", "persisted")
+	} else if ordinaryWrite {
+		history, readErr := s.readAttachmentHistory(ctx, volumeID)
+		if move := history.PendingPublishMove; readErr == nil && history.PendingReplacementAttach == nil &&
+			(move == nil || (move.Source.Name != nodeID && move.Destination.Name != nodeID)) {
+			klog.V(3).InfoS("Safe detach history was not recorded", "volumeID", volumeID, "nodeID", nodeID)
+			return false, nil
+		}
 	}
 	return sourceReadback, err
 }

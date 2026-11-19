@@ -556,6 +556,7 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 			"consumed", "reserved", "detach-reply-lost", "acceptance-reply-lost", "acceptance-not-committed",
 			"retirement-reply-lost", "retirement-not-committed", "reconciled", "terminating",
 			"held-va", "held-receipt", "held-pv", "held-claim", "held-source", "held-vm", "held-disk", "held-generation", "held-quarantine", "held-successor", "held-demand", "held-unknown-release",
+			"sticky", "sticky-release-reply-lost", "waiting-same-uid", "waiting-attached", "waiting-running", "waiting-terminating", "waiting-mounted", "waiting-multiple",
 		} {
 			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
@@ -567,9 +568,16 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 				pvc.Spec.AccessModes = pv.Spec.AccessModes
 				grant := time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano)
 				pv.Annotations[annotationAllowCrossNodeUntil] = grant
+				sticky := strings.HasPrefix(mode, "sticky")
+				if sticky {
+					pv.Annotations[annotationRestartOpt] = restartOptimizationAnnotationValue
+				}
 				pod := activePodForPVC("move-consumer", pvc.Name, "node-new")
 				pod.UID = "move-consumer-uid"
-				driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true), newReadyNode("node-new", true), pod)
+				oldNode, newNode := newReadyNode("node-old", true), newReadyNode("node-new", true)
+				oldNode.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
+				newNode.CreationTimestamp = oldNode.CreationTimestamp
+				driver := newStickyTestDriver(t, pv, pvc, oldNode, newNode, pod)
 				kube := driver.kubeRuntime.client.(*fake.Clientset)
 				prior, err := driver.volumeHistory.Upsert(ctx, volume, func(history *VolumeHistoryRecord) {
 					history.Backend, history.LastSuccessfulNodeName = "local", "node-old"
@@ -581,7 +589,7 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 				require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
 					VolumeID: volume, NodeID: "node-old", Backend: "local", StartedAt: now, ExpiresAt: now.Add(time.Minute), GraceSeconds: 60,
 				}))
-				var renewedGrant, interruptedGrant, interruptedHistory atomic.Bool
+				var renewedGrant, interruptedGrant, interruptedHistory, interruptedGrace atomic.Bool
 				kube.PrependReactor("update", "persistentvolumes", func(action ktesting.Action) (bool, kruntime.Object, error) {
 					updated := action.(ktesting.UpdateAction).GetObject().(*corev1.PersistentVolume)
 					if updated.Annotations[annotationAllowCrossNodeUntil] != "" {
@@ -607,6 +615,11 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 				})
 				kube.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
 					cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
+					if mode == "sticky-release-reply-lost" && cm.Name == stickyAttachmentStateConfigMapName &&
+						cm.Data[volume] == "" && interruptedGrace.CompareAndSwap(false, true) {
+						require.NoError(t, kube.Tracker().Update(corev1.SchemeGroupVersion.WithResource("configmaps"), cm, cm.Namespace))
+						return true, nil, context.DeadlineExceeded
+					}
 					if cm.Name != volumeHistoryStateConfigMapName {
 						return false, nil, nil
 					}
@@ -712,6 +725,34 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 				csiClient = reviewControllerClient(t, controller)
 				unpublish := &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: "node-new"}
 				reply, err := csiClient.ControllerUnpublishVolume(ctx, unpublish)
+				if sticky {
+					require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+					require.Nil(t, reply)
+					grace, ok := controller.driver.stickyAttachments.Get(volume)
+					require.True(t, ok)
+					require.Equal(t, "node-new", grace.NodeID)
+					require.Equal(t, 90*time.Second, grace.ExpiresAt.Sub(grace.StartedAt))
+					require.Nil(t, readHistory().PendingPublishMove.Detach)
+					controller = restart()
+					csiClient = reviewControllerClient(t, controller)
+					reply, err = csiClient.ControllerUnpublishVolume(ctx, unpublish)
+					require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+					require.Nil(t, reply)
+					stillHeld, ok := controller.driver.stickyAttachments.Get(volume)
+					require.True(t, ok)
+					require.Equal(t, grace, stillHeld)
+					heldVA, readErr := vas.Get(ctx, va.Name, metav1.GetOptions{})
+					require.NoError(t, readErr)
+					require.Equal(t, va.UID, heldVA.UID)
+					require.Equal(t, va.Finalizers, heldVA.Finalizers)
+					expectMutations(before, 1, 1)
+					elapsed := time.Since(grace.ExpiresAt) - time.Second
+					grace.StartedAt, grace.ExpiresAt = grace.StartedAt.Add(elapsed), grace.ExpiresAt.Add(elapsed)
+					require.NoError(t, controller.driver.stickyAttachments.Update(grace))
+					controller.expireStickyDetach(ctx, grace)
+					require.NotNil(t, readHistory().PendingPublishMove.Detach)
+					reply, err = csiClient.ControllerUnpublishVolume(ctx, unpublish)
+				}
 				if mode == "terminating" {
 					require.Error(t, err)
 					require.Nil(t, reply)
@@ -818,18 +859,69 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 				require.NotNil(t, readHistory().PendingPublishMove)
 				expectMutations(detached, 1, 2)
 				require.NoError(t, vas.Delete(ctx, va.Name, metav1.DeleteOptions{}))
+				nextNode, nextVM := "node-old", 41
+				if mode == "reserved" || mode == "waiting-same-uid" {
+					nextNode, nextVM = "node-new", 42
+				}
+				successor := activePodForPVC("successor", pvc.Name, nextNode)
+				successor.UID = "successor-uid"
+				waiting := mode == "reserved" || sticky || mode == "reconciled" || strings.HasPrefix(mode, "waiting-")
+				if waiting {
+					nextVA := va.DeepCopy()
+					nextVA.Name, nextVA.Spec.NodeName = csiVolumeAttachmentName(volume, driver.name, nextNode), nextNode
+					nextVA.UID, nextVA.DeletionTimestamp, nextVA.Status = "successor-va", nil, storagev1.VolumeAttachmentStatus{}
+					nextVA.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Second))
+					successor.CreationTimestamp = nextVA.CreationTimestamp
+					successor.Status.Phase = corev1.PodPending
+					switch mode {
+					case "waiting-same-uid":
+						nextVA.UID = va.UID
+					case "waiting-attached":
+						nextVA.Status.Attached = true
+					case "waiting-running":
+						successor.Status.Phase = corev1.PodRunning
+					case "waiting-terminating":
+						successor.DeletionTimestamp = &stamp
+					case "waiting-mounted":
+						oldNode.Status.VolumesInUse = []corev1.UniqueVolumeName{corev1.UniqueVolumeName("kubernetes.io/csi/" + driver.name + "^" + volume)}
+						_, err := kube.CoreV1().Nodes().Update(ctx, oldNode, metav1.UpdateOptions{})
+						require.NoError(t, err)
+					}
+					_, err = vas.Create(ctx, nextVA, metav1.CreateOptions{})
+					require.NoError(t, err)
+					if mode == "waiting-multiple" {
+						additional := nextVA.DeepCopy()
+						additional.Name = va.Name
+						additional.UID = "extra-uid"
+						additional.Spec.NodeName = "node-new"
+						_, err = vas.Create(ctx, additional, metav1.CreateOptions{})
+						require.NoError(t, err)
+					}
+					_, err = pods.Create(ctx, successor, metav1.CreateOptions{})
+					require.NoError(t, err)
+				}
 				controller = restart()
 				csiClient = reviewControllerClient(t, controller)
+				if waiting {
+					reply, err = csiClient.ControllerUnpublishVolume(ctx, unpublish)
+					require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+					require.Nil(t, reply)
+					require.NotNil(t, readHistory().PendingPublishMove)
+					expectMutations(detached, 1, 2)
+				}
 				if mode == "reconciled" {
 					require.NoError(t, NewAttachmentReconciler(controller).ReconcileOnce(ctx))
 				} else {
-					_, err = csiClient.ControllerPublishVolume(ctx, newPublishReq(volume, "node-old"))
+					_, err = csiClient.ControllerPublishVolume(ctx, newPublishReq(volume, nextNode))
 					require.Equal(t, codes.Unavailable, status.Code(err))
 					if strings.HasPrefix(mode, "retirement-") {
 						require.True(t, interruptedHistory.Load())
 					}
-					if mode == "retirement-not-committed" {
+					if mode == "retirement-not-committed" || mode == "sticky-release-reply-lost" {
 						require.NotNil(t, readHistory().PendingPublishMove)
+						if sticky {
+							require.True(t, interruptedGrace.Load())
+						}
 						controller = restart()
 						csiClient = reviewControllerClient(t, controller)
 						_, err = csiClient.ControllerPublishVolume(ctx, newPublishReq(volume, "node-old"))
@@ -837,7 +929,16 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 					}
 				}
 				retired := readHistory()
+				if strings.HasPrefix(mode, "waiting-") {
+					require.NotNil(t, retired.PendingPublishMove)
+					expectMutations(detached, 1, 2)
+					return
+				}
 				require.Nil(t, retired.PendingPublishMove)
+				if sticky {
+					_, held := controller.driver.stickyAttachments.Get(volume)
+					require.False(t, held)
+				}
 				require.Equal(t, marker, retired.LastPublishMoveReceipt)
 				require.Equal(t, "node-new", retired.LastSafeDetachNodeName)
 				finalPV, err := pvs.Get(ctx, pv.Name, metav1.GetOptions{})
@@ -845,18 +946,10 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 				require.Equal(t, marker, finalPV.Annotations[annotationPublishMoveReceipt])
 				require.Equal(t, heldPV.Annotations[annotationAllowCrossNodeUntil], finalPV.Annotations[annotationAllowCrossNodeUntil])
 				expectMutations(detached, 1, 2)
-				nextNode, nextVM := "node-old", 41
-				if mode == "reserved" {
-					nextNode, nextVM = "node-new", 42
-					nextVA := va.DeepCopy()
-					nextVA.UID, nextVA.DeletionTimestamp, nextVA.Status = "successor-va", nil, storagev1.VolumeAttachmentStatus{}
-					_, err := vas.Create(ctx, nextVA, metav1.CreateOptions{})
+				if !waiting {
+					_, err = pods.Create(ctx, successor, metav1.CreateOptions{})
 					require.NoError(t, err)
 				}
-				successor := activePodForPVC("successor", pvc.Name, nextNode)
-				successor.UID = "successor-uid"
-				_, err = pods.Create(ctx, successor, metav1.CreateOptions{})
-				require.NoError(t, err)
 				controller = restart()
 				csiClient = reviewControllerClient(t, controller)
 				response, err = csiClient.ControllerPublishVolume(ctx, newPublishReq(volume, nextNode))

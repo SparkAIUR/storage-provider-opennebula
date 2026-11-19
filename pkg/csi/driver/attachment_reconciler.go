@@ -354,7 +354,7 @@ func (r *AttachmentReconciler) reconcileReleasedAttachments(ctx context.Context,
 			continue
 		}
 		if move := history.PendingPublishMove; move != nil && move.Detach != nil && history.PendingReplacementAttach == nil &&
-			pvs[volume] != nil && !unresolved[volume] && len(disks[volume]) == 0 && len(vas[volume]) == 0 {
+			pvs[volume] != nil && !unresolved[volume] && len(disks[volume]) == 0 && len(vas[volume]) <= 1 {
 			_ = s.retryPublishMoveDetach(ctx, volume, move, true)
 			continue
 		}

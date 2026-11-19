@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -105,6 +106,58 @@ func (m *StickyAttachmentManager) Clear(volumeID string) error {
 	delete(m.entries, volumeID)
 	m.mu.Unlock()
 	return m.deleteEntry(context.Background(), volumeID)
+}
+
+func (m *StickyAttachmentManager) clearReleasedPublishMoveGrace(ctx context.Context, volume, node string, binding *VolumeRuntimeContext) error {
+	if m == nil || m.runtime == nil || !m.runtime.enabled || binding.RestartMode != restartOptimizationAnnotationValue {
+		return nil
+	}
+	deny := attachmentEvidenceUnavailable("pending Publish destination detach grace is unverified", nil)
+	matches := func(state StickyAttachmentState) bool {
+		return state.VolumeID == volume && state.NodeID == node && state.Backend == "local" &&
+			state.Reason == "stateful_restart" && state.PVCUID == binding.PVCUID &&
+			state.PVCName == binding.PVCName && state.PVCNamespace == binding.PVCNamespace &&
+			!state.StartedAt.IsZero() && state.ExpiresAt.After(state.StartedAt) && !state.ExpiresAt.After(time.Now())
+	}
+	read := func() (*corev1.ConfigMap, string, error) {
+		cm, err := m.runtime.GetConfigMap(ctx, m.namespace, stickyAttachmentStateConfigMapName)
+		if errors.IsNotFound(err) {
+			return nil, "", nil
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		raw, present := cm.Data[volume]
+		if present && raw == "" {
+			return nil, "", deny
+		}
+		return cm, raw, nil
+	}
+	cm, raw, err := read()
+	if err != nil {
+		return deny
+	}
+	var released StickyAttachmentState
+	if raw != "" {
+		if err := unmarshalAuthorityJSON(raw, &released); err != nil || released.VolumeID != volume {
+			return deny
+		}
+		if released.NodeID != node {
+			return nil
+		}
+		if !matches(released) || m.runtime.deleteConfigMapKeyIfCurrent(ctx, cm, volume, raw) != nil {
+			return deny
+		}
+		if _, remaining, err := read(); err != nil || remaining != "" {
+			return deny
+		}
+	}
+	m.mu.Lock()
+	if cached := m.entries[volume]; matches(cached) && (raw == "" || cached == released) {
+		delete(m.entries, volume)
+	}
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *StickyAttachmentManager) Update(state StickyAttachmentState) error {

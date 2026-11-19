@@ -3,11 +3,13 @@ package driver
 import (
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -196,12 +198,59 @@ func (s *ControllerServer) recordPublishMoveDetach(ctx context.Context, volume s
 	return nil
 }
 
+func (s *ControllerServer) publishMoveWaitingNode(ctx context.Context, volume string, move *pendingPublishMove, successor detachAttachmentAuthority) (*corev1.Node, int, error) {
+	deny := attachmentEvidenceUnavailable("Publish successor Node is unverified", nil)
+	node, err := s.driver.kubeRuntime.client.CoreV1().Nodes().Get(ctx, successor.node, metav1.GetOptions{})
+	ready, _ := nodeReadyConditionStatus(node)
+	if err != nil || node == nil || node.Name != successor.node || node.UID == "" || node.DeletionTimestamp != nil ||
+		ready != corev1.ConditionTrue || node.CreationTimestamp.IsZero() || !successor.created.After(node.CreationTimestamp.Time) ||
+		successor.created.After(time.Now()) || nodeReportsVolumeInUse(node, s.driver.name, volume) {
+		return nil, 0, deny
+	}
+	switch node.Name {
+	case move.Source.Name:
+		if string(node.UID) == move.Source.UID {
+			return node, move.Source.VM, nil
+		}
+	case move.Destination.Name:
+		if string(node.UID) == move.Destination.UID {
+			return node, move.Destination.VM, nil
+		}
+	default:
+		target, err := s.publishMoveNode(ctx, node.Name)
+		if err == nil && target.UID == string(node.UID) && target.UID != move.Source.UID && target.UID != move.Destination.UID &&
+			target.VM != move.Source.VM && target.VM != move.Destination.VM {
+			if err := s.verifyPublishMoveRelease(ctx, volume, move.Image, target); err != nil {
+				return nil, 0, err
+			}
+			return node, target.VM, nil
+		}
+	}
+	return nil, 0, deny
+}
+
+func (s *ControllerServer) recheckPublishMoveSuccessor(ctx context.Context, pvName, oldName, name string, successor detachAttachmentAuthority) error {
+	vas := s.driver.kubeRuntime.client.StorageV1().VolumeAttachments()
+	if name != oldName {
+		if _, err := vas.Get(ctx, oldName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			return attachmentEvidenceUnavailable("old Publish VolumeAttachment has not retired", err)
+		}
+	}
+	va, err := vas.Get(ctx, name, metav1.GetOptions{})
+	if err != nil || va == nil || va.Name != name || va.Spec.Source.PersistentVolumeName == nil ||
+		*va.Spec.Source.PersistentVolumeName != pvName || va.Spec.Source.InlineVolumeSpec != nil ||
+		!reflect.DeepEqual(successor, detachAttachmentSnapshot(va)) {
+		return attachmentEvidenceUnavailable("Publish successor VolumeAttachment is unverified", err)
+	}
+	return ctx.Err()
+}
+
 func (s *ControllerServer) settlePublishMoveDetach(ctx context.Context, volume string, move *pendingPublishMove, requireRetired bool) error {
 	deny := attachmentEvidenceUnavailable("pending Publish destination release is unverified", nil)
 	if move.Detach == nil {
 		return deny
 	}
-	verify := func(history VolumeHistoryRecord) (bool, error) {
+	verify := func(history VolumeHistoryRecord, retiring bool) (bool, error) {
 		if !samePendingPublishMove(history.PendingPublishMove, move) {
 			return false, deny
 		}
@@ -230,21 +279,40 @@ func (s *ControllerServer) settlePublishMoveDetach(ctx context.Context, volume s
 			return false, deny
 		}
 		identity := physicalDetachIdentity{pvUID: binding.pvUID, nodeUID: types.UID(move.Destination.UID),
-			imageID: move.Image, vmID: move.Destination.VM, diskID: move.Slot, backend: "local"}
-		if err := s.checkPhysicalDetachAuthority(ctx, volume, move.Destination.Name, &identity, detachReadback); err != nil {
+			imageID: move.Image, vmID: move.Destination.VM, diskID: move.Slot, backend: "local", publishMove: move}
+		check := detachReadback
+		if requireRetired {
+			check = detachPublishMoveRetirement
+		}
+		if err := s.checkPhysicalDetachAuthority(ctx, volume, move.Destination.Name, &identity, check); err != nil {
 			return false, err
+		}
+		finish := func(gone bool) (bool, error) {
+			if gone && retiring {
+				if err := s.driver.stickyAttachments.clearReleasedPublishMoveGrace(ctx, volume, move.Destination.Name, binding); err != nil {
+					return false, err
+				}
+			}
+			return gone, admission.check(ctx, binding)
+		}
+		if requireRetired {
+			for _, va := range identity.attachments {
+				if !va.deleting {
+					return finish(true)
+				}
+			}
 		}
 		va, err := s.publishMoveDeletingVA(ctx, volume, move, binding, move.Detach)
 		if err != nil {
 			return false, err
 		}
-		return va == nil, admission.check(ctx, binding)
+		return finish(va == nil)
 	}
 	history, err := s.readAttachmentHistory(ctx, volume)
 	if err != nil {
 		return deny
 	}
-	gone, err := verify(history)
+	gone, err := verify(history, false)
 	if err != nil {
 		return err
 	}
@@ -255,7 +323,7 @@ func (s *ControllerServer) settlePublishMoveDetach(ctx context.Context, volume s
 		return nil
 	}
 	_, err = s.driver.volumeHistory.updateHistory(ctx, volume, true, func(history *VolumeHistoryRecord) error {
-		gone, err := verify(*history)
+		gone, err := verify(*history, true)
 		if err != nil || !gone {
 			return deny
 		}
