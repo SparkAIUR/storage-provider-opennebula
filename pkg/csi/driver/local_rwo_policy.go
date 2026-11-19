@@ -902,7 +902,7 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 	}
 	_, err := s.driver.volumeHistory.updateHistory(ctx, volumeID, observation.replacementAttempt != nil, func(state *VolumeHistoryRecord) error {
 		if !samePendingPublishMove(state.PendingPublishMove, move) ||
-			(move != nil && publishMoveGeneration(*state) != move.Prior) {
+			(move != nil && !move.matchesHistory(*state)) {
 			return attachmentEvidenceUnavailable("Publish move history changed", nil)
 		}
 		if err := verify(); err != nil {
@@ -994,16 +994,39 @@ func (s *ControllerServer) publishHistoryBindingVerified(ctx context.Context, vo
 }
 
 func (s *ControllerServer) recordSafeDetach(ctx context.Context, volumeID, nodeID string) {
+	s.recordSafeDetachReadback(ctx, volumeID, nodeID, 0, 0)
+}
+
+func (s *ControllerServer) recordSafeDetachReadback(ctx context.Context, volumeID, nodeID string, imageID, vmID int) bool {
 	if s == nil || s.driver == nil || s.driver.volumeHistory == nil || strings.TrimSpace(volumeID) == "" {
-		return
+		return false
 	}
+	nodeID = strings.TrimSpace(nodeID)
+	sourceReadback := false
 	_, err := s.driver.volumeHistory.Upsert(ctx, volumeID, func(state *VolumeHistoryRecord) {
-		state.LastSafeDetachNodeName = strings.TrimSpace(nodeID)
-		state.LastSafeDetachTime = time.Now().UTC()
+		sourceReadback = false
+		move := state.PendingPublishMove
+		if imageID > 0 && vmID > 0 && move != nil && state.PendingReplacementAttach == nil &&
+			move.Image == imageID && move.Source.Name == nodeID && move.Source.VM == vmID && move.matchesHistory(*state) {
+			node, err := s.publishNodeIdentity(ctx, nodeID)
+			sourceReadback = err == nil && node.Exists && node.UID != "" && node.UID == move.Source.UID
+		}
+		now := time.Now().UTC()
+		if !now.After(state.LastSafeDetachTime) {
+			return
+		}
+		state.LastSafeDetachNodeName = nodeID
+		state.LastSafeDetachTime = now
+		if sourceReadback {
+			updated := *move
+			updated.SourceReadback = publishMoveGeneration(*state)
+			state.PendingPublishMove = &updated
+		}
 	})
 	if err == nil {
 		s.driver.metrics.RecordVolumeHistory("safe_detach", "persisted")
 	}
+	return err == nil && sourceReadback
 }
 
 func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volumeID string, publishContext map[string]string, identity *LocalDiskIdentity) {

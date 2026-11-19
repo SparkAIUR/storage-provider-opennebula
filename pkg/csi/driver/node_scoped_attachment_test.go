@@ -552,13 +552,14 @@ func TestProviderRequestedVMCapacityWithMultipleAttachments(t *testing.T) {
 
 func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"shared=true", "shared=false", "conflict", "renewed", "renewed-after-expiry", "renewed-without-demand", "renewed-write-unknown", "renewed-reply-lost", "renewed-history-fails", "renewed-receipt-mismatch", "renewed-receipt-deleted", "renewed-receipt-expired", "renewed-binding-replaced", "renewed-committed-no-demand", "renewed-grant-replaced", "replaced", "claim-replaced", "replaced-after-grant", "revoked-after-attach", "revoked-on-conflict", "malformed", "expired", "history-write-fails", "pending-write-fails", "pending-write-lost", "grant-write-fails", "lost-grant-reply", "competing-history"} {
+		for _, mode := range []string{"shared=true", "shared=false", "conflict", "renewed", "renewed-after-expiry", "renewed-without-demand", "renewed-write-unknown", "renewed-reply-lost", "renewed-history-fails", "renewed-receipt-mismatch", "renewed-receipt-deleted", "renewed-receipt-expired", "renewed-binding-replaced", "renewed-committed-no-demand", "renewed-grant-replaced", "renewed-other-node-readback", "renewed-stage-history-changed", "renewed-destination-changed", "replaced", "claim-replaced", "replaced-after-grant", "revoked-after-attach", "revoked-on-conflict", "malformed", "expired", "history-write-fails", "pending-write-fails", "pending-write-lost", "grant-write-fails", "lost-grant-reply", "competing-history"} {
 			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				shared := mode == "shared=true"
 				postExpiry := strings.HasPrefix(mode, "renewed-")
 				replayRenewal := postExpiry && mode != "renewed-after-expiry" && mode != "renewed-without-demand" && mode != "renewed-write-unknown"
-				replaySucceeds := mode == "renewed-reply-lost" || mode == "renewed-history-fails"
+				furtherRenewal := mode == "renewed-receipt-expired"
+				replaySucceeds := mode == "renewed-reply-lost" || mode == "renewed-history-fails" || furtherRenewal
 				provider, state := nodeAttachmentProvider(t)
 				accessMode := corev1.ReadWriteOnce
 				if shared {
@@ -588,7 +589,7 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 					require.NoError(t, err)
 				}
 				renewedDeadline := time.Now().UTC().Add(2 * time.Minute)
-				if mode == "renewed-receipt-expired" {
+				if furtherRenewal {
 					renewedDeadline = deadline.Add(3 * time.Second)
 				}
 				renewed := renewedDeadline.Format(time.RFC3339Nano)
@@ -640,8 +641,13 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 								return true, nil, context.DeadlineExceeded
 							}
 							if replayRenewal {
-								renewedWrites.Add(1)
-								pending.ResourceVersion = "3"
+								attempt := renewedWrites.Add(1)
+								if furtherRenewal && attempt == 2 {
+									return true, nil, context.DeadlineExceeded
+								}
+								version, err := strconv.Atoi(pending.ResourceVersion)
+								require.NoError(t, err)
+								pending.ResourceVersion = strconv.Itoa(version + 1)
 								require.NoError(t, kube.Tracker().Update(corev1.SchemeGroupVersion.WithResource("persistentvolumes"), pending, ""))
 								if mode == "renewed-history-fails" {
 									return true, pending, nil
@@ -792,6 +798,23 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 					mutations := append([]string(nil), state.mutations...)
 					state.mu.Unlock()
 					restart := restartController()
+					readback := func(node string, previous time.Time) time.Time {
+						t.Helper()
+						reply, err := reviewControllerClient(t, restart).ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: req.VolumeId, NodeId: node})
+						require.NoError(t, err)
+						require.NotNil(t, reply)
+						history, err := restart.readAttachmentHistory(ctx, req.VolumeId)
+						require.NoError(t, err)
+						require.Equal(t, node, history.LastSafeDetachNodeName)
+						require.True(t, history.LastSafeDetachTime.After(previous))
+						return history.LastSafeDetachTime
+					}
+					var detachReadback time.Time
+					if mode == "renewed-history-fails" {
+						pending, err := restart.readAttachmentHistory(ctx, req.VolumeId)
+						require.NoError(t, err)
+						detachReadback = readback("node-old", pending.LastSafeDetachTime)
+					}
 					retried, err := reviewControllerClient(t, restart).ControllerPublishVolume(ctx, req)
 					var receipt string
 					if replayRenewal {
@@ -812,6 +835,9 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 						receipt = committed.Annotations[annotationPublishMoveReceipt]
 						require.NotEmpty(t, receipt)
 						require.NotEqual(t, current.Annotations[annotationPublishMoveReceipt], receipt)
+						if mode == "renewed-reply-lost" || furtherRenewal || mode == "renewed-stage-history-changed" {
+							detachReadback = readback("node-old", failed.LastSafeDetachTime)
+						}
 						switch mode {
 						case "renewed-receipt-mismatch":
 							committed.Annotations[annotationPublishMoveReceipt] = strings.Repeat("a", 64)
@@ -827,6 +853,22 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 							committed.Annotations[annotationAllowCrossNodeUntil] = time.Now().UTC().Add(3 * time.Minute).Format(time.RFC3339Nano)
 						case "renewed-committed-no-demand":
 							require.NoError(t, kube.CoreV1().Pods(consumer.Namespace).Delete(ctx, consumer.Name, metav1.DeleteOptions{}))
+						case "renewed-other-node-readback":
+							_, err := kube.CoreV1().Nodes().Create(ctx, newReadyNode("node-other", true), metav1.CreateOptions{})
+							require.NoError(t, err)
+							state.mu.Lock()
+							state.vmNames = map[int]string{43: "node-other"}
+							state.mu.Unlock()
+							detachReadback = readback("node-other", failed.LastSafeDetachTime)
+						case "renewed-stage-history-changed":
+							_, err := restart.driver.volumeHistory.Upsert(ctx, req.VolumeId, func(history *VolumeHistoryRecord) {
+								history.LastSuccessfulStageTime = time.Now().UTC()
+							})
+							require.NoError(t, err)
+						case "renewed-destination-changed":
+							state.mu.Lock()
+							state.diskSlot = "3"
+							state.mu.Unlock()
 						}
 						switch mode {
 						case "renewed-receipt-mismatch", "renewed-receipt-deleted", "renewed-binding-replaced", "renewed-grant-replaced":
@@ -835,6 +877,58 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 						restart = restartController()
 						retried, err = reviewControllerClient(t, restart).ControllerPublishVolume(ctx, req)
 						require.EqualValues(t, 1, renewedWrites.Load())
+						if furtherRenewal {
+							require.Equal(t, codes.Unavailable, status.Code(err))
+							require.Nil(t, retried)
+							publishWithGrant := func(raw, marker string) {
+								t.Helper()
+								actual, err := pvs.Get(ctx, pv.Name, metav1.GetOptions{})
+								require.NoError(t, err)
+								if raw == "" {
+									delete(actual.Annotations, annotationAllowCrossNodeUntil)
+								} else {
+									actual.Annotations[annotationAllowCrossNodeUntil] = raw
+								}
+								actual.Annotations[annotationPublishMoveReceipt] = marker
+								version, err := strconv.Atoi(actual.ResourceVersion)
+								require.NoError(t, err)
+								actual.ResourceVersion = strconv.Itoa(version + 1)
+								require.NoError(t, kube.Tracker().Update(corev1.SchemeGroupVersion.WithResource("persistentvolumes"), actual, ""))
+								restart = restartController()
+								retried, err = reviewControllerClient(t, restart).ControllerPublishVolume(ctx, req)
+								require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+								require.Nil(t, retried)
+								pending, err := restart.readAttachmentHistory(ctx, req.VolumeId)
+								require.NoError(t, err)
+								require.Equal(t, before.LastSuccessfulNodeName, pending.LastSuccessfulNodeName)
+								require.Equal(t, before.LastSuccessfulPublishTime, pending.LastSuccessfulPublishTime)
+								require.NotNil(t, pending.PendingPublishMove)
+							}
+							fresh := time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano)
+							publishWithGrant(renewed, receipt)
+							publishWithGrant(fresh, strings.Repeat("b", 64))
+							require.EqualValues(t, 1, renewedWrites.Load())
+							publishWithGrant(fresh, receipt)
+							require.EqualValues(t, 2, renewedWrites.Load())
+							uncommitted, readErr := pvs.Get(ctx, pv.Name, metav1.GetOptions{})
+							require.NoError(t, readErr)
+							require.Equal(t, fresh, uncommitted.Annotations[annotationAllowCrossNodeUntil])
+							require.Equal(t, receipt, uncommitted.Annotations[annotationPublishMoveReceipt])
+							publishWithGrant("", receipt)
+							require.EqualValues(t, 2, renewedWrites.Load())
+							publishWithGrant(time.Now().UTC().Add(2*time.Minute).Format(time.RFC3339Nano), receipt)
+							require.EqualValues(t, 3, renewedWrites.Load())
+							settled, readErr := pvs.Get(ctx, pv.Name, metav1.GetOptions{})
+							require.NoError(t, readErr)
+							require.NotContains(t, settled.Annotations, annotationAllowCrossNodeUntil)
+							require.NotEmpty(t, settled.Annotations[annotationPublishMoveReceipt])
+							require.NotEqual(t, receipt, settled.Annotations[annotationPublishMoveReceipt])
+							receipt = settled.Annotations[annotationPublishMoveReceipt]
+							restart = restartController()
+							retried, err = reviewControllerClient(t, restart).ControllerPublishVolume(ctx, req)
+							require.NoError(t, err)
+							require.EqualValues(t, 3, renewedWrites.Load())
+						}
 					}
 					if postExpiry {
 						state.mu.Lock()
@@ -843,6 +937,9 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 					}
 					history, historyErr := restart.readAttachmentHistory(ctx, req.VolumeId)
 					require.NoError(t, historyErr)
+					if !detachReadback.IsZero() {
+						require.True(t, history.LastSafeDetachTime.Equal(detachReadback))
+					}
 					if complete {
 						require.NoError(t, err)
 						require.Equal(t, "vdb", retried.GetPublishContext()["volumeName"])

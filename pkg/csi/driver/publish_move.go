@@ -31,7 +31,8 @@ type pendingPublishMove struct {
 	Source, Destination                publishMoveNode
 	Image, Slot                        int
 	Target, Serial                     string
-	Renewal                            *publishMoveGrant `json:"renewal,omitempty"`
+	Renewal                            *publishMoveRenewal `json:"renewal,omitempty"`
+	SourceReadback                     string              `json:"sourceReadback,omitempty"`
 }
 
 type publishMoveGrant struct {
@@ -39,17 +40,37 @@ type publishMoveGrant struct {
 	Expires time.Time
 }
 
+func (grant publishMoveGrant) valid() bool {
+	digest, err := hex.DecodeString(grant.Digest)
+	return err == nil && len(digest) == sha256.Size && !grant.Expires.IsZero()
+}
+
+type publishMoveRenewal struct {
+	publishMoveGrant
+	Previous *publishMoveGrant `json:"previous,omitempty"`
+}
+
 func (move pendingPublishMove) authorizedGrant() publishMoveGrant {
 	if move.Renewal != nil {
-		return *move.Renewal
+		return move.Renewal.publishMoveGrant
 	}
 	return publishMoveGrant{Digest: move.Grant, Expires: move.Expires}
 }
 
 func (move pendingPublishMove) receipt() string {
-	grant := move.authorizedGrant()
+	return move.receiptFor(move.authorizedGrant())
+}
+
+func (move pendingPublishMove) receiptFor(grant publishMoveGrant) string {
 	move.Grant, move.Expires, move.Renewal = grant.Digest, grant.Expires, nil
+	move.SourceReadback = ""
 	return publishMoveDigest(move)
+}
+
+func (move pendingPublishMove) matchesHistory(history VolumeHistoryRecord) bool {
+	generation := publishMoveGeneration(history)
+	return generation == move.Prior || (history.LastSafeDetachNodeName == move.Source.Name &&
+		!history.LastSafeDetachTime.IsZero() && generation == move.SourceReadback)
 }
 
 type publishMoveSourceKey struct{}
@@ -232,7 +253,7 @@ func (s *ControllerServer) verifyPublishMove(ctx context.Context, req *csi.Contr
 	}
 	history, err := s.readAttachmentHistory(ctx, req.VolumeId)
 	if err != nil || history.PendingReplacementAttach != nil || !samePendingPublishMove(history.PendingPublishMove, move) ||
-		publishMoveGeneration(history) != move.Prior {
+		!move.matchesHistory(history) {
 		return deny
 	}
 	if renewed {
@@ -282,6 +303,10 @@ func (s *ControllerServer) consumePublishMove(ctx context.Context, req *csi.Cont
 	binding := admission.binding
 	pvs := s.driver.kubeRuntime.client.CoreV1().PersistentVolumes()
 	grant, token := move.authorizedGrant(), move.receipt()
+	predecessor := move.Reservation
+	if move.Renewal != nil && move.Renewal.Previous != nil {
+		predecessor = move.receiptFor(*move.Renewal.Previous)
+	}
 	consumed := *binding
 	consumed.PVAnnotations = cloneStringMap(binding.PVAnnotations)
 	delete(consumed.PVAnnotations, annotationAllowCrossNodeUntil)
@@ -294,7 +319,7 @@ func (s *ControllerServer) consumePublishMove(ctx context.Context, req *csi.Cont
 		if _, present := pv.Annotations[annotationAllowCrossNodeUntil]; !present && publishPVMatches(pv, &consumed, s.driver.name, req.VolumeId) {
 			return nil
 		}
-		if pv.ResourceVersion == "" || pv.Annotations[annotationPublishMoveReceipt] != move.Reservation || !publishPVMatches(pv, binding, s.driver.name, req.VolumeId) ||
+		if pv.ResourceVersion == "" || pv.Annotations[annotationPublishMoveReceipt] != predecessor || !publishPVMatches(pv, binding, s.driver.name, req.VolumeId) ||
 			publishMoveDigest(pv.Annotations[annotationAllowCrossNodeUntil]) != grant.Digest {
 			return deny
 		}
@@ -351,9 +376,12 @@ func (s *ControllerServer) resumePublishMove(ctx context.Context, req *csi.Contr
 	receipt := binding.PVAnnotations[annotationPublishMoveReceipt]
 	grant := move.authorizedGrant()
 	renewal := move.Renewal
+	var previous *publishMoveGrant
 	if renewal != nil {
-		digest, err := hex.DecodeString(renewal.Digest)
-		if err != nil || len(digest) != sha256.Size || renewal.Digest == move.Grant || renewal.Expires.IsZero() {
+		previous = renewal.Previous
+		if !grant.valid() || grant.Digest == move.Grant ||
+			(previous != nil && (!previous.valid() || previous.Digest == grant.Digest ||
+				(previous.Digest == move.Grant && !previous.Expires.Equal(move.Expires)))) {
 			return nil, true, deny
 		}
 	}
@@ -366,20 +394,30 @@ func (s *ControllerServer) resumePublishMove(ctx context.Context, req *csi.Contr
 		policyBinding.PVAnnotations[annotationAllowCrossNodeUntil] = grant.Expires.Format(time.RFC3339Nano)
 	} else {
 		deadline, valid := crossNodeOverrideDeadline(binding)
-		if receipt != move.Reservation || !valid || !deadline.After(time.Now()) {
+		now := time.Now()
+		if !valid || !deadline.After(now) {
 			return nil, true, deny
 		}
 		digest := publishMoveDigest(raw)
+		switch {
+		case receipt == move.Reservation && previous == nil:
+		case receipt == move.receipt() && grant.valid() && !grant.Expires.After(now):
+			consumed := grant
+			previous = &consumed
+		case previous != nil && receipt == move.receiptFor(*previous) && !previous.Expires.After(now):
+		default:
+			return nil, true, deny
+		}
 		if digest == grant.Digest {
 			if !deadline.Equal(grant.Expires) {
 				return nil, true, deny
 			}
 		} else {
-			if digest == move.Grant {
+			if digest == move.Grant || (previous != nil && digest == previous.Digest) {
 				return nil, true, deny
 			}
 			grant = publishMoveGrant{Digest: digest, Expires: deadline}
-			renewal = &grant
+			renewal = &publishMoveRenewal{publishMoveGrant: grant, Previous: previous}
 		}
 	}
 	placement, err := s.localRWOProtectionProjection(ctx, req.VolumeId, req.NodeId, &policyBinding, false, false)
@@ -410,7 +448,7 @@ func (s *ControllerServer) resumePublishMove(ctx context.Context, req *csi.Contr
 	return completed, true, s.recheckPublishTarget(completed.withAdmission(ctx), req, disk, node)
 }
 
-func (s *ControllerServer) finishPublishMove(ctx context.Context, req *csi.ControllerPublishVolumeRequest, disk successfulAttachmentObservation, node KubernetesNodeIdentity, admission publishPVAdmission, move *pendingPublishMove, renewal *publishMoveGrant, publishContext map[string]string) (*diskPublishCompletion, error) {
+func (s *ControllerServer) finishPublishMove(ctx context.Context, req *csi.ControllerPublishVolumeRequest, disk successfulAttachmentObservation, node KubernetesNodeIdentity, admission publishPVAdmission, move *pendingPublishMove, renewal *publishMoveRenewal, publishContext map[string]string) (*diskPublishCompletion, error) {
 	grantBinding := *admission.binding
 	if renewal != nil {
 		if _, present := grantBinding.PVAnnotations[annotationAllowCrossNodeUntil]; !present {
@@ -429,12 +467,12 @@ func (s *ControllerServer) finishPublishMove(ctx context.Context, req *csi.Contr
 		}
 		return s.recheckPublishTarget(ctx, req, disk, node)
 	}
-	if renewal != nil && (move.Renewal == nil || *move.Renewal != *renewal) {
+	if !reflect.DeepEqual(move.Renewal, renewal) {
 		updated := *move
 		updated.Renewal = renewal
 		deny := attachmentEvidenceUnavailable("Publish move renewal could not be persisted", nil)
 		if _, err := s.driver.volumeHistory.upsert(ctx, req.VolumeId, func(current *VolumeHistoryRecord) error {
-			if !samePendingPublishMove(current.PendingPublishMove, move) || publishMoveGeneration(*current) != move.Prior {
+			if !samePendingPublishMove(current.PendingPublishMove, move) || !move.matchesHistory(*current) {
 				return deny
 			}
 			if err := verify(ctx); err != nil {
