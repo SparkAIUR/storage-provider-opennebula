@@ -111,7 +111,7 @@ func (s *ControllerServer) prepareVolumeDeletion(ctx context.Context, volume str
 		needsImageMarker := !marked && imageID <= 0
 		_, hasImage := pv.Spec.CSI.VolumeAttributes[publishContextOpenNebulaImageID]
 		_, hasSerial := pv.Spec.CSI.VolumeAttributes[publishContextDeviceSerial]
-		if needsImageMarker || (admittedBackend == "" && (marked || history.Backend == "") && (hasImage || hasSerial)) {
+		if needsImageMarker || (admittedBackend == "" && (marked || observedHistoryBackendForImage(history, imageID) == "") && (hasImage || hasSerial)) {
 			stage = func(ctx context.Context, actualImageID int) error {
 				if err := verify(ctx, actualImageID, false); err != nil {
 					return err

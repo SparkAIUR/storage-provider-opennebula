@@ -557,7 +557,7 @@ type publishPVImageCheckKey struct{}
 
 type publishPVAdmission struct {
 	binding *VolumeRuntimeContext
-	check   func(context.Context) error
+	check   func(context.Context, *VolumeRuntimeContext) error
 }
 
 func samePublishAnnotations(admitted, current map[string]string) bool {
@@ -589,7 +589,7 @@ func (s *ControllerServer) publishPVImageCheck(ctx context.Context, volumeID str
 			binding = runtime.volumeRuntimeContext(ctx, pv)
 		}
 	}
-	check := func(ctx context.Context) error {
+	check := func(ctx context.Context, binding *VolumeRuntimeContext) error {
 		if binding == nil {
 			pv, err := s.ownedDeletionPV(ctx, volumeID)
 			if err != nil || pv != nil {
@@ -620,7 +620,7 @@ func (s *ControllerServer) publishPVImageCheck(ctx context.Context, volumeID str
 		}
 		return ctx.Err()
 	}
-	return publishPVAdmission{binding: binding, check: check}, check(ctx)
+	return publishPVAdmission{binding: binding, check: check}, check(ctx, binding)
 }
 
 func publishPVMatches(pv *corev1.PersistentVolume, binding *VolumeRuntimeContext, driver, volumeID string) bool {
@@ -635,7 +635,7 @@ type publishProtectionCheckKey struct{}
 
 func recheckPublishPVImage(ctx context.Context) error {
 	if admission, ok := ctx.Value(publishPVImageCheckKey{}).(publishPVAdmission); ok {
-		if err := admission.check(ctx); err != nil {
+		if err := admission.check(ctx, admission.binding); err != nil {
 			return err
 		}
 	}
@@ -744,7 +744,7 @@ func (s *ControllerServer) observePublishedDisk(ctx context.Context, volumeID, r
 		imageID: imageID, vmID: vmID, diskID: -1, serial: firstNonEmpty(adoptedSerial, fmt.Sprintf("onecsi-%d", imageID)),
 		adopted: adoptedSerial != "",
 	}
-	if observation.target == "" || imageID <= 0 || vmID <= 0 {
+	if (!observation.adopted && observation.target == "") || imageID <= 0 || vmID <= 0 {
 		return observation, attachmentEvidenceUnavailable("publish attachment identity is incomplete", nil)
 	}
 
@@ -770,7 +770,7 @@ func (s *ControllerServer) observePublishedDisk(ctx context.Context, volumeID, r
 		if adoptedSerial != "" && len(metadata.ConflictingOwnerVMIDs()) != 0 {
 			return observation, attachmentEvidenceUnavailable("publish adoption has conflicting attachment owners", nil)
 		}
-		if adoptedSerial == "" && !metadata.AttachedToRequestedNode {
+		if !metadata.AttachedToRequestedNode {
 			return observation, attachmentEvidenceUnavailable("publish attachment target changed", nil)
 		}
 		disks = metadata.DiskRecords
@@ -798,8 +798,11 @@ func (s *ControllerServer) observePublishedDisk(ctx context.Context, volumeID, r
 			return observation, attachmentEvidenceUnavailable("publish disk slot or target is ambiguous or invalid", nil)
 		}
 		seen = true
-		if serial := strings.TrimSpace(disk.Serial); serial != "" && !strings.EqualFold(serial, observation.serial) {
+		if serial := strings.TrimSpace(disk.Serial); (observation.adopted || serial != "") && !strings.EqualFold(serial, observation.serial) {
 			return observation, attachmentEvidenceUnavailable("publish disk serial conflicts with the verified target", nil)
+		}
+		if observation.adopted && observation.target == "" {
+			observation.target = strings.TrimSpace(disk.Target)
 		}
 		if strings.TrimSpace(disk.Target) == observation.target {
 			observation.diskID = disk.DiskID
@@ -1019,6 +1022,7 @@ func (ns *NodeServer) recordWrongDeviceIdentityRepairState(ctx context.Context, 
 		LastKnownTarget:       localDiskAssertedDiskTarget(expected),
 		LastKnownDeviceSerial: firstNonEmpty(localDiskObservedDeviceSerial(expected), localDiskAssertedDeviceSerial(expected)),
 		EvidenceSource:        "node_stage_identity_check",
+		LastObservedAt:        wrongDeviceObservedAt(observed),
 		LastHealthyIdentity:   expected,
 		LastObservedIdentity:  observed,
 	}

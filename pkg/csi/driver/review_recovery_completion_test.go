@@ -80,8 +80,8 @@ func TestReviewNodeStageProviderCompletionAfterConcurrentWrongIdentity(t *testin
 				key := localDeviceReportKey(report.Node, report.VolumeID)
 				client := driver.kubeRuntime.client.(*fake.Clientset)
 				if scenario == "marker-write-failed" {
-					client.PrependReactor("patch", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
-						if action.(ktesting.PatchAction).GetName() == volumeRepairStateConfigMapName {
+					client.PrependReactor("create", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+						if action.(ktesting.CreateAction).GetObject().(*corev1.ConfigMap).Name == volumeRepairStateConfigMapName {
 							return true, nil, errors.New("repair marker API unavailable")
 						}
 						return false, nil, nil

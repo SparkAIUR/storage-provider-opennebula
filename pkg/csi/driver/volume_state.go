@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
@@ -691,6 +693,9 @@ func (m *VolumeRepairStateManager) Mark(ctx context.Context, state VolumeRepairS
 	state.EvidenceSource = strings.TrimSpace(state.EvidenceSource)
 	normalizeLocalDiskIdentity(state.LastObservedIdentity)
 	normalizeLocalDiskIdentity(state.LastHealthyIdentity)
+	if state.Classification == repairClassificationWrongDeviceIdentity && !state.LastObservedAt.IsZero() {
+		return m.persistWrongDeviceObservation(ctx, state)
+	}
 	now := time.Now().UTC()
 	state.LastObservedAt = now
 
@@ -712,6 +717,108 @@ func (m *VolumeRepairStateManager) Mark(ctx context.Context, state VolumeRepairS
 	m.entries[state.VolumeID] = state
 	m.mu.Unlock()
 	return state, nil
+}
+
+func wrongDeviceObservedAt(observed *LocalDiskIdentity) time.Time {
+	if observed != nil && !observed.ObservedAt.IsZero() {
+		return observed.ObservedAt
+	}
+	return time.Now().UTC()
+}
+
+func sameLocalDiskEvidence(first, second *LocalDiskIdentity) bool {
+	if first == nil || second == nil {
+		return first == second
+	}
+	a, b := *first, *second
+	a.ObservedAt, b.ObservedAt = time.Time{}, time.Time{}
+	return reflect.DeepEqual(a, b)
+}
+
+func (m *VolumeRepairStateManager) persistWrongDeviceObservation(ctx context.Context, observed VolumeRepairState) (VolumeRepairState, error) {
+	merge := func(previous VolumeRepairState) (VolumeRepairState, bool) {
+		current := observed
+		if previous.Classification == repairClassificationWrongDeviceIdentity {
+			sameNode := previous.RequestedNode == observed.RequestedNode && previous.LastKnownNodeName == observed.LastKnownNodeName
+			if !observed.LastObservedAt.After(previous.LastObservedAt) ||
+				(sameNode && sameLocalDiskEvidence(previous.LastHealthyIdentity, observed.LastHealthyIdentity) &&
+					sameLocalDiskEvidence(previous.LastObservedIdentity, observed.LastObservedIdentity)) {
+				return previous, false
+			}
+			if sameNode {
+				current.FirstObservedAt = previous.FirstObservedAt
+				current.FailureCount = previous.FailureCount + 1
+				current.RecoveryToken = previous.RecoveryToken
+				return current, true
+			}
+		}
+		current.FirstObservedAt = observed.LastObservedAt
+		current.FailureCount = 1
+		return current, true
+	}
+	if m.runtime == nil || !m.runtime.enabled {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		current, _ := merge(m.entries[observed.VolumeID])
+		m.entries[observed.VolumeID] = current
+		return current, nil
+	}
+
+	client := m.runtime.client.CoreV1().ConfigMaps(m.namespace)
+	var current VolumeRepairState
+	err := retryOnConflict(retry.DefaultRetry, func() error {
+		cm, err := client.Get(ctx, volumeRepairStateConfigMapName, metav1.GetOptions{})
+		missing := errors.IsNotFound(err)
+		if err != nil && !missing {
+			return err
+		}
+		var previous VolumeRepairState
+		if !missing {
+			if raw, present := cm.Data[observed.VolumeID]; present {
+				if err := decodeCephRetentionProtection(raw, &previous); err != nil {
+					return err
+				}
+				if previous.VolumeID != observed.VolumeID {
+					return fmt.Errorf("wrong-device repair record identity changed")
+				}
+			}
+		}
+		var accepted bool
+		current, accepted = merge(previous)
+		if !accepted {
+			return nil
+		}
+		payload, err := json.Marshal(current)
+		if err != nil {
+			return err
+		}
+		data := map[string]string{current.VolumeID: string(payload)}
+		if missing {
+			_, err := client.Create(ctx, &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: volumeRepairStateConfigMapName, Namespace: m.namespace},
+				Data:       data,
+			}, metav1.CreateOptions{})
+			if errors.IsAlreadyExists(err) {
+				return errors.NewConflict(corev1.Resource("configmaps"), volumeRepairStateConfigMapName, err)
+			}
+			return err
+		}
+		patch, err := json.Marshal(map[string]any{"metadata": map[string]string{"resourceVersion": cm.ResourceVersion}, "data": data})
+		if err != nil {
+			return err
+		}
+		_, err = client.Patch(ctx, cm.Name, types.MergePatchType, patch, metav1.PatchOptions{})
+		return err
+	})
+	if err != nil {
+		return current, err
+	}
+	m.mu.Lock()
+	if !m.entries[current.VolumeID].LastObservedAt.After(current.LastObservedAt) {
+		m.entries[current.VolumeID] = current
+	}
+	m.mu.Unlock()
+	return current, nil
 }
 
 func (m *VolumeRepairStateManager) Clear(ctx context.Context, volumeID string) error {

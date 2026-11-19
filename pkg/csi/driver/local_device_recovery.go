@@ -268,17 +268,19 @@ func (ns *NodeServer) recordWrongDeviceIdentityReport(ctx context.Context, sessi
 	if volumeID == "" || node == "" {
 		return
 	}
-	now := time.Now().UTC()
+	observedAt := wrongDeviceObservedAt(observed)
 	key := localDeviceReportKey(node, volumeID)
 	namespace := namespaceFromServiceAccount()
 	err := updateLocalDeviceReportIf(ctx, ns.Driver.kubeRuntime, namespace, key, func(report *LocalDeviceMissingReport) bool {
 		if report.VolumeID != "" && (report.VolumeID != volumeID || report.Node != node) {
 			return false
 		}
-		if localDeviceFailureClass(*report) == localDeviceFailureClassWrongIdentity {
+		if localDeviceFailureClass(*report) == localDeviceFailureClassWrongIdentity &&
+			(!observedAt.After(report.LastObservedAt) || (sameLocalDiskEvidence(report.ExpectedIdentity, session.Identity) &&
+				sameLocalDiskEvidence(report.ObservedIdentity, observed))) {
 			return false
 		}
-		if !report.recordFailureObservation(now) {
+		if !report.recordFailureObservation(observedAt) {
 			return true
 		}
 		report.Node = node
@@ -286,9 +288,9 @@ func (ns *NodeServer) recordWrongDeviceIdentityReport(ctx context.Context, sessi
 		report.VolumeName = strings.TrimSpace(session.VolumeName)
 		report.FailureClass = localDeviceFailureClassWrongIdentity
 		report.ResolvedBy = ""
-		report.ExpectedTarget = firstNonEmpty(report.ExpectedTarget, strings.TrimSpace(localDiskAssertedDiskTarget(session.Identity)))
+		report.ExpectedTarget = firstNonEmpty(strings.TrimSpace(localDiskAssertedDiskTarget(session.Identity)), report.ExpectedTarget)
 		report.DevicePath = strings.TrimSpace(session.DevicePath)
-		report.DeviceSerial = firstNonEmpty(report.DeviceSerial, strings.TrimSpace(session.DeviceSerial))
+		report.DeviceSerial = firstNonEmpty(strings.TrimSpace(session.DeviceSerial), localDiskAssertedDeviceSerial(session.Identity), report.DeviceSerial)
 		report.OpenNebulaImageID = strings.TrimSpace(session.OpenNebulaImageID)
 		report.FsType = strings.TrimSpace(session.FSType)
 		report.PVCNamespace = strings.TrimSpace(session.PVCNamespace)

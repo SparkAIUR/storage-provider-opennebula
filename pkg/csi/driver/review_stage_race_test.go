@@ -304,8 +304,8 @@ func TestReviewNodeStageWrongIdentityPreservesConcurrentRecovery(t *testing.T) {
 				}
 				client := driver.kubeRuntime.client.(*fake.Clientset)
 				markerWrites := 0
-				client.PrependReactor("patch", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
-					if action.(ktesting.PatchAction).GetName() == volumeRepairStateConfigMapName {
+				client.PrependReactor("create", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+					if action.(ktesting.CreateAction).GetObject().(*corev1.ConfigMap).Name == volumeRepairStateConfigMapName {
 						markerWrites++
 						if markerFails {
 							return true, nil, errors.New("repair marker API unavailable")

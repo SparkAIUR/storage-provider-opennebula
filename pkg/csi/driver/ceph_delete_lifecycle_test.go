@@ -615,7 +615,7 @@ func TestMissingImageRejectsMalformedOrUnpinnedOwnedHistory(t *testing.T) {
 }
 
 func TestControllerDeleteCephPVImageAssertions(t *testing.T) {
-	for _, mode := range []string{"absent", "matching", "wrong-image", "blank-image", "wrong-serial", "marked-conflict", "late-conflict", "legacy-absent", "legacy-matching", "legacy-wrong-image", "legacy-blank-image", "legacy-marked-conflict", "false-local", "false-cephfs", "legacy-local-unknown", "legacy-local-history", "legacy-local-history-pin", "legacy-local-live-marker", "legacy-local-old-marker", "legacy-local-invalid-backend", "legacy-local-contradictory-backend"} {
+	for _, mode := range []string{"absent", "matching", "wrong-image", "blank-image", "wrong-serial", "marked-conflict", "late-conflict", "legacy-absent", "legacy-matching", "legacy-wrong-image", "legacy-blank-image", "legacy-marked-conflict", "false-local", "false-cephfs", "legacy-local-unknown", "legacy-local-history", "legacy-local-history-pin", "legacy-local-bootstrap", "legacy-local-live-marker", "legacy-local-old-marker", "legacy-local-invalid-backend", "legacy-local-contradictory-backend"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			const volume = "volume-test"
@@ -638,7 +638,7 @@ func TestControllerDeleteCephPVImageAssertions(t *testing.T) {
 				attrs[publishContextOpenNebulaImageID] = "8"
 			case "blank-image":
 				attrs[publishContextOpenNebulaImageID] = ""
-			case "wrong-serial", "marked-conflict", "false-local", "false-cephfs", "local-unknown", "local-history", "local-history-pin", "local-live-marker", "local-old-marker", "local-invalid-backend", "local-contradictory-backend":
+			case "wrong-serial", "marked-conflict", "false-local", "false-cephfs", "local-unknown", "local-history", "local-history-pin", "local-bootstrap", "local-live-marker", "local-old-marker", "local-invalid-backend", "local-contradictory-backend":
 				attrs[publishContextDeviceSerial] = "onecsi-8"
 			}
 			switch mode {
@@ -655,10 +655,15 @@ func TestControllerDeleteCephPVImageAssertions(t *testing.T) {
 			}
 			pv.Spec.CSI.VolumeAttributes = attrs
 			driver := newStickyTestDriver(t, pv)
-			if mode == "local-history" || mode == "local-history-pin" {
+			if mode == "local-history" || mode == "local-history-pin" || mode == "local-bootstrap" {
 				_, err := driver.volumeHistory.Upsert(ctx, volume, func(state *VolumeHistoryRecord) {
-					if mode == "local-history" {
+					switch mode {
+					case "local-history":
 						state.Backend = "local"
+					case "local-bootstrap":
+						state.Backend = "local"
+						state.Bootstrapped = true
+						state.EvidenceSource = volumeHistoryEvidenceSourceBootstrap
 					}
 					state.LastSuccessfulImageID = 7
 					state.LastSuccessfulPublishTime = time.Now()
@@ -679,7 +684,7 @@ func TestControllerDeleteCephPVImageAssertions(t *testing.T) {
 			wire.mu.Lock()
 			wire.ceph, wire.allowImageDelete = !strings.HasPrefix(mode, "local-"), true
 			delete(wire.disks, 41)
-			lostReply := mode == "local-unknown" || mode == "local-history-pin" || mode == "local-live-marker"
+			lostReply := mode == "local-unknown" || mode == "local-history-pin" || mode == "local-bootstrap" || mode == "local-live-marker"
 			wire.loseDeleteReply = lostReply
 			wire.missingImage = mode == "local-old-marker"
 			wire.mu.Unlock()
@@ -710,7 +715,7 @@ func TestControllerDeleteCephPVImageAssertions(t *testing.T) {
 			wire.mu.Lock()
 			defer wire.mu.Unlock()
 			switch mode {
-			case "absent", "matching", "local-unknown", "local-history", "local-history-pin", "local-live-marker":
+			case "absent", "matching", "local-unknown", "local-history", "local-history-pin", "local-bootstrap", "local-live-marker":
 				require.NoError(t, err)
 				require.NotNil(t, reply)
 				require.Equal(t, []string{"image-delete:7"}, wire.mutations)

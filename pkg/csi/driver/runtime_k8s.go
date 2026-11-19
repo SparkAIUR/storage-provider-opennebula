@@ -307,16 +307,21 @@ func (r *KubeRuntime) annotatePublishedPV(ctx context.Context, binding *VolumeRu
 	return err
 }
 
-func (r *KubeRuntime) consumePublishGrant(ctx context.Context, binding *VolumeRuntimeContext, driver, volume string) (bool, error) {
+func (r *KubeRuntime) consumePublishGrant(ctx context.Context, binding *VolumeRuntimeContext, driver, volume string) (*VolumeRuntimeContext, bool, error) {
 	pvs := r.client.CoreV1().PersistentVolumes()
+	admittedGrant := binding.PVAnnotations[annotationAllowCrossNodeUntil]
+	current := *binding
+	current.PVAnnotations = cloneStringMap(binding.PVAnnotations)
 	consumed := false
 	err := retryOnConflict(retry.DefaultRetry, func() error {
 		pv, err := pvs.Get(ctx, binding.PVName, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
-		if !publishPVMatches(pv, binding, driver, volume) {
-			return nil
+		grant := pv.Annotations[annotationAllowCrossNodeUntil]
+		current.PVAnnotations[annotationAllowCrossNodeUntil] = grant
+		if !publishPVMatches(pv, &current, driver, volume) {
+			return attachmentEvidenceUnavailable("Publish PV authority changed during grant consumption", nil)
 		}
 		pvc, reused, err := r.attachmentClaim(ctx, pv)
 		if err != nil {
@@ -324,14 +329,20 @@ func (r *KubeRuntime) consumePublishGrant(ctx context.Context, binding *VolumeRu
 		}
 		if reused || pvc == nil || pvc.UID != binding.PVCUID || pvc.Status.Phase != binding.pvcPhase ||
 			pvc.DeletionTimestamp != nil || !samePublishAnnotations(binding.PVCAnnotations, pvc.Annotations) {
+			return attachmentEvidenceUnavailable("Publish claim authority changed during grant consumption", nil)
+		}
+		if grant != admittedGrant {
 			return nil
 		}
 		delete(pv.Annotations, annotationAllowCrossNodeUntil)
 		_, err = pvs.Update(ctx, pv, metav1.UpdateOptions{})
-		consumed = err == nil
+		if err == nil {
+			consumed = true
+			delete(current.PVAnnotations, annotationAllowCrossNodeUntil)
+		}
 		return err
 	})
-	return consumed, err
+	return &current, consumed, err
 }
 
 func (r *KubeRuntime) GetNodeLabel(ctx context.Context, nodeName, labelKey string) (string, error) {

@@ -572,3 +572,71 @@ func TestNodeDeviceReportPreservesOutOfOrderObservations(t *testing.T) {
 		})
 	}
 }
+
+func TestWrongDeviceObservationOrdering(t *testing.T) {
+	ctx := context.Background()
+	const volume = "vol-wrong-identity"
+	driver := newLocalDeviceRecoveryTestDriver(t)
+	driver.nodeID = "node-a"
+	ns := &NodeServer{Driver: driver}
+	staleDriver := newLocalDeviceRecoveryTestDriver(t)
+	staleDriver.nodeID = driver.nodeID
+	staleDriver.kubeRuntime = driver.kubeRuntime
+	staleDriver.volumeRepairState = NewVolumeRepairStateManager(driver.kubeRuntime, "default")
+	staleNode := &NodeServer{Driver: staleDriver}
+
+	at := time.Now().UTC().Add(-time.Minute)
+	record := func(node *NodeServer, observedAt time.Time, target, serial, wrongSerial string) {
+		session := localDiskSession{
+			VolumeID: volume, VolumeName: target, DevicePath: "/dev/" + target, DeviceSerial: serial,
+			Identity: &LocalDiskIdentity{AssertedByController: &LocalDiskControllerAssertion{DiskTarget: target, DeviceSerial: serial}},
+		}
+		observed := &LocalDiskIdentity{
+			ObservedAt: observedAt,
+			ObservedFromDevice: &LocalDiskObservedIdentity{Block: &LocalDiskObservedBlockIdentity{
+				DevicePath: session.DevicePath, DeviceSerial: wrongSerial,
+			}},
+		}
+		node.recordWrongDeviceIdentityRepairState(ctx, session, observed)
+		node.recordWrongDeviceIdentityReport(ctx, session, observed, errors.New("unexpected device "+wrongSerial))
+	}
+	read := func() (LocalDeviceMissingReport, VolumeRepairState) {
+		report, found := ns.currentLocalDeviceReport(ctx, volume)
+		require.True(t, found)
+		repair, found, err := staleDriver.volumeRepairState.GetCurrent(ctx, volume)
+		require.NoError(t, err)
+		require.True(t, found)
+		return report, repair
+	}
+	record(staleNode, at, "sdd", "onecsi-7", "onecsi-8")
+	require.NoError(t, updateLocalDeviceReport(ctx, driver.kubeRuntime, "default", localDeviceReportKey(driver.nodeID, volume), func(report *LocalDeviceMissingReport) {
+		report.RecoveryToken = "current-recovery"
+		report.ConfirmationState = localDeviceConfirmationStateInProgress
+	}))
+	record(ns, at.Add(2*time.Second), "sdf", "onecsi-9", "onecsi-10")
+	report, repair := read()
+	require.Equal(t, localDeviceFailureClassWrongIdentity, report.FailureClass)
+	require.Equal(t, repairClassificationWrongDeviceIdentity, repair.Classification)
+	require.Equal(t, "sdf", report.ExpectedTarget)
+	require.Equal(t, "sdf", repair.LastKnownTarget)
+	require.Equal(t, "onecsi-9", report.DeviceSerial)
+	require.Equal(t, "onecsi-9", repair.LastKnownDeviceSerial)
+	require.Equal(t, "onecsi-10", localDiskObservedDeviceSerial(report.ObservedIdentity))
+	require.Equal(t, report.ExpectedIdentity, repair.LastHealthyIdentity)
+	require.Equal(t, report.ObservedIdentity, repair.LastObservedIdentity)
+	require.Equal(t, "unexpected device onecsi-10", report.LastError)
+	require.Equal(t, at, report.FirstObservedAt)
+	require.Equal(t, at, repair.FirstObservedAt)
+	require.Equal(t, at.Add(2*time.Second), report.LastObservedAt)
+	require.Equal(t, report.LastObservedAt, repair.LastObservedAt)
+	require.Equal(t, 2, report.Attempts)
+	require.Equal(t, 2, repair.FailureCount)
+	require.Equal(t, "current-recovery", report.RecoveryToken)
+	require.Equal(t, localDeviceConfirmationStateInProgress, report.ConfirmationState)
+
+	record(staleNode, at.Add(time.Second), "sdg", "onecsi-11", "onecsi-12")
+	record(staleNode, at.Add(3*time.Second), "sdf", "onecsi-9", "onecsi-10")
+	unchangedReport, unchangedRepair := read()
+	require.Equal(t, report, unchangedReport)
+	require.Equal(t, repair, unchangedRepair)
+}

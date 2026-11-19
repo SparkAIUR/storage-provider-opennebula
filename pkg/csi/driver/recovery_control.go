@@ -414,6 +414,7 @@ func (s *ControllerServer) recordRecoveryModeExpiryWarning(ctx context.Context, 
 
 func (s *ControllerServer) publishContextForRecoveryAdoption(ctx context.Context, volumeID string, observation successfulAttachmentObservation, sourceContext map[string]string, control VolumeRecoveryControlState, deviceDiscoveryTimeout time.Duration) map[string]string {
 	publishContext := s.publishContextForVolume(ctx, volumeID, observation, deviceDiscoveryTimeout, sourceContext)
+	publishContext["volumeName"] = normalizedRecoveryDeviceName(control.ConfirmedVolumeName)
 	if strings.TrimSpace(control.Mode) != "" {
 		publishContext[publishContextRecoveryMode] = strings.TrimSpace(control.Mode)
 	}

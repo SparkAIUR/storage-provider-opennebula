@@ -550,7 +550,7 @@ func TestProviderRequestedVMCapacityWithMultipleAttachments(t *testing.T) {
 }
 
 func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
-	for _, mode := range []string{"shared=true", "shared=false", "conflict", "renewed", "replaced"} {
+	for _, mode := range []string{"shared=true", "shared=false", "conflict", "renewed", "replaced", "claim-replaced", "replaced-after-grant"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			shared := mode == "shared=true"
@@ -586,10 +586,17 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 						current.Annotations[annotationPlacementSummary] = "externally refreshed placement summary"
 					case "renewed":
 						current.Annotations[annotationAllowCrossNodeUntil] = renewed
-					case "replaced":
+					case "replaced", "replaced-after-grant":
 						current.UID = "replacement-pv"
+					case "claim-replaced":
+						replacement := pvc.DeepCopy()
+						replacement.UID = "replacement-pvc"
+						require.NoError(t, kube.Tracker().Update(corev1.SchemeGroupVersion.WithResource("persistentvolumeclaims"), replacement, replacement.Namespace))
 					}
 					require.NoError(t, kube.Tracker().Update(gvr, current, ""))
+					if mode == "replaced-after-grant" {
+						return true, pending, nil
+					}
 					return true, nil, apierrors.NewConflict(corev1.Resource("persistentvolumes"), current.Name, errors.New("concurrent PV update"))
 				})
 			}
@@ -603,9 +610,19 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 				req.VolumeCapability.AccessMode.Mode = csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
 				req.Readonly = true
 			}
-			response, err := client.ControllerPublishVolume(ctx, req)
+			before, err := controller.readAttachmentHistory(ctx, req.VolumeId)
 			require.NoError(t, err)
-			require.Equal(t, "vdb", response.GetPublishContext()["volumeName"])
+			response, err := client.ControllerPublishVolume(ctx, req)
+			if strings.Contains(mode, "replaced") {
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.Nil(t, response)
+				after, err := controller.readAttachmentHistory(ctx, req.VolumeId)
+				require.NoError(t, err)
+				require.Equal(t, before.LastSuccessfulPublishTime, after.LastSuccessfulPublishTime)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, "vdb", response.GetPublishContext()["volumeName"])
+			}
 			state.mu.Lock()
 			require.Equal(t, 256, state.disks[42])
 			if shared {
@@ -628,8 +645,10 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 				switch mode {
 				case "renewed":
 					require.Equal(t, renewed, current.Annotations[annotationAllowCrossNodeUntil])
-				case "replaced":
+				case "replaced", "replaced-after-grant":
 					require.Equal(t, types.UID("replacement-pv"), current.UID)
+					require.Equal(t, pv.Annotations[annotationAllowCrossNodeUntil], current.Annotations[annotationAllowCrossNodeUntil])
+				case "claim-replaced":
 					require.Equal(t, pv.Annotations[annotationAllowCrossNodeUntil], current.Annotations[annotationAllowCrossNodeUntil])
 				default:
 					require.NotContains(t, current.Annotations, annotationAllowCrossNodeUntil)
@@ -3987,7 +4006,7 @@ func TestCephSameVMFreshAttachReplacesUnobservedDiskSlot(t *testing.T) {
 			probe.failCensus.Store(true)
 			reply, err := client.ControllerPublishVolume(ctx, publish)
 			require.NoError(t, err)
-			require.EqualValues(t, 1, probe.failedCensus.Load())
+			require.EqualValues(t, 4, probe.failedCensus.Load(), "discovery, post-size, pre-history, and reply checks use direct slot evidence")
 			probe.failCensus.Store(false)
 			after, err := server.readAttachmentHistory(ctx, volume)
 			require.NoError(t, err)
@@ -8546,5 +8565,74 @@ func TestControllerPublishPlacementPatchRejectsChangedPV(t *testing.T) {
 				require.Equal(t, "2099-01-01T00:00:00Z", current.Annotations[annotationAllowCrossNodeUntil])
 			}
 		})
+	}
+}
+
+func TestControllerPublishManualAdoptionSeparatesDeviceNames(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, mode := range []string{"verified", "late-provider-target", "wrong-provider-serial", "wrong-guest-evidence"} {
+			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+					annotationRecoveryMode:          recoveryModeManual,
+					annotationRecoveryModeUntil:     time.Now().Add(time.Hour).Format(time.RFC3339),
+					annotationAdoptAttachedDevice:   "true",
+					annotationConfirmedDeviceSerial: "onecsi-7",
+					annotationConfirmedVolumeName:   "/dev/sdf",
+				})
+				pv.Status.Phase, pvc.Status.Phase = corev1.VolumeBound, corev1.ClaimBound
+				node := newReadyNode("node-old", true)
+				driver := newStickyTestDriver(t, pv, pvc, node, activePodForPVC("adopt-consumer", pvc.Name, node.Name))
+				if mode == "wrong-guest-evidence" {
+					now := time.Now().UTC()
+					require.NoError(t, updateLocalDeviceReport(ctx, driver.kubeRuntime, "default", localDeviceReportKey(node.Name, volume), func(report *LocalDeviceMissingReport) {
+						*report = LocalDeviceMissingReport{
+							Node: node.Name, VolumeID: volume, DevicePath: "/dev/sdg", DeviceSerial: "onecsi-7",
+							FailureClass: localDeviceFailureClassMountFailed, Attempts: 1, FirstObservedAt: now, LastObservedAt: now,
+						}
+					}))
+				}
+				provider, wire := nodeAttachmentProvider(t)
+				probe := &publishRestoreProbe{PersistentDiskVolumeProvider: provider}
+				switch mode {
+				case "late-provider-target":
+					probe.beforeSize = func() {
+						wire.mu.Lock()
+						defer wire.mu.Unlock()
+						wire.diskTarget = "vdc"
+					}
+				case "wrong-provider-serial":
+					wire.mu.Lock()
+					wire.attachedDisks[41] = map[string]string{"IMAGE_ID": "7", "SERIAL": "onecsi-8"}
+					wire.mu.Unlock()
+				}
+				server := NewControllerServer(driver, probe, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+				}
+				reply, err := reviewControllerClient(t, server).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
+				history, historyErr := server.readAttachmentHistory(ctx, volume)
+				require.NoError(t, historyErr)
+				if mode == "verified" {
+					require.NoError(t, err)
+					require.Equal(t, "sdf", reply.GetPublishContext()["volumeName"])
+					require.Equal(t, "true", reply.GetPublishContext()[publishContextRecoveryAdoptedDevice])
+					require.Equal(t, "vdb", history.LastSuccessfulTarget)
+					require.Equal(t, new(2), history.LastSuccessfulDiskID)
+					control, found := driver.volumeRecoveryControl.Get(volume)
+					require.True(t, found)
+					require.Equal(t, "sdf", control.AdoptedVolumeName)
+				} else {
+					require.Error(t, err)
+					require.Nil(t, reply)
+					require.True(t, history.LastSuccessfulPublishTime.IsZero())
+				}
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				require.Empty(t, wire.mutations)
+			})
+		}
 	}
 }

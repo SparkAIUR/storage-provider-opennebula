@@ -902,13 +902,13 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			return nil, status.Error(codes.FailedPrecondition, message)
 		}
 		if manualTarget != "" {
-			observation, err := s.verifyPublishedAttachment(ctx, req.VolumeId, req.NodeId, volumeID, nodeID, manualTarget, recoveryControl.ConfirmedDeviceSerial, publishNode, false)
+			observation, err := s.verifyPublishedAttachment(ctx, req.VolumeId, req.NodeId, volumeID, nodeID, "", recoveryControl.ConfirmedDeviceSerial, publishNode, false)
 			if err != nil {
 				return nil, err
 			}
 			deviceDiscoveryTimeout := s.nodeDeviceDiscoveryTimeout("disk", lookup.SizeBytes, 0)
 			publishContext := s.publishContextForRecoveryAdoption(ctx, req.VolumeId, observation, req.GetVolumeContext(), recoveryControl, deviceDiscoveryTimeout)
-			completed, err := s.completeDiskPublish(ctx, req, observation, publishNode, runtimeCtx, publishContext)
+			completed, err := s.completeDiskPublish(ctx, req, observation, publishNode, runtimeCtx, &protection, publishContext)
 			if err != nil {
 				return nil, err
 			}
@@ -921,11 +921,12 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonRecoveryAdoptionAccepted, fmt.Sprintf("accepted manual recovery adoption for volume %s on node %s using guest-visible device %s and serial %s", req.VolumeId, req.NodeId, manualTarget, recoveryControl.ConfirmedDeviceSerial))
 			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
 			s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
+			ctx = completed.withAdmission(ctx)
 			if err := s.recheckPublishTarget(ctx, req, observation, publishNode); err != nil {
 				return nil, err
 			}
-			if err := s.finishPublishMetadata(ctx, req, &protection); err != nil {
-				return nil, err
+			if completed.annotatePlacement {
+				s.finishPublishMetadata(req, completed.admission.binding)
 			}
 			return completed.response, nil
 		}
@@ -1025,7 +1026,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			if err != nil {
 				return err
 			}
-			completed, err = s.completeDiskPublish(queueCtx, req, observation, publishNode, runtimeCtx,
+			completed, err = s.completeDiskPublish(queueCtx, req, observation, publishNode, runtimeCtx, &protection,
 				s.publishContextForVolume(queueCtx, req.VolumeId, observation, 0, req.GetVolumeContext()))
 			return err
 		}
@@ -1046,7 +1047,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			if err != nil {
 				return err
 			}
-			completed, err = s.completeDiskPublish(queueCtx, req, observation, publishNode, runtimeCtx,
+			completed, err = s.completeDiskPublish(queueCtx, req, observation, publishNode, runtimeCtx, &protection,
 				s.publishContextForVolume(queueCtx, req.VolumeId, observation, 0, req.GetVolumeContext()))
 			if err != nil {
 				return err
@@ -1076,7 +1077,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 					return reuseErr
 				}
 				updateMetadata = true
-				completed, err = s.completeDiskPublish(queueCtx, req, *observed, publishNode, runtimeCtx,
+				completed, err = s.completeDiskPublish(queueCtx, req, *observed, publishNode, runtimeCtx, &protection,
 					s.publishContextForVolume(queueCtx, req.VolumeId, *observed, 0, req.GetVolumeContext()))
 				return err
 			}
@@ -1149,7 +1150,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			if err != nil {
 				return err
 			}
-			completed, err = s.completeDiskPublish(queueCtx, req, observation, publishNode, runtimeCtx,
+			completed, err = s.completeDiskPublish(queueCtx, req, observation, publishNode, runtimeCtx, &protection,
 				s.publishContextForVolume(queueCtx, req.VolumeId, observation, deviceDiscoveryTimeout, params))
 			return err
 		}
@@ -1169,7 +1170,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		if err != nil {
 			return err
 		}
-		completed, err = s.completeDiskPublish(queueCtx, req, observation, publishNode, runtimeCtx,
+		completed, err = s.completeDiskPublish(queueCtx, req, observation, publishNode, runtimeCtx, &protection,
 			s.publishContextForVolume(queueCtx, req.VolumeId, observation, deviceDiscoveryTimeout, req.GetVolumeContext()))
 		if err != nil {
 			return err
@@ -1222,15 +1223,14 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	if completed == nil {
 		return nil, status.Error(codes.Aborted, "publish completion requires capacity verification; retry the request")
 	}
+	ctx = completed.withAdmission(ctx)
 	if err := s.recheckPublishTarget(ctx, req, completed.observation, publishNode); err != nil {
 		return nil, err
 	}
 	s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
 	s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
-	if updateMetadata {
-		if err := s.finishPublishMetadata(ctx, req, &protection); err != nil {
-			return nil, err
-		}
+	if updateMetadata && completed.annotatePlacement {
+		s.finishPublishMetadata(req, completed.admission.binding)
 	}
 	return completed.response, nil
 }
@@ -2164,20 +2164,46 @@ func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node
 }
 
 type diskPublishCompletion struct {
-	observation successfulAttachmentObservation
-	response    *csi.ControllerPublishVolumeResponse
+	observation       successfulAttachmentObservation
+	response          *csi.ControllerPublishVolumeResponse
+	admission         publishPVAdmission
+	annotatePlacement bool
 }
 
-func (s *ControllerServer) completeDiskPublish(ctx context.Context, req *csi.ControllerPublishVolumeRequest, observation successfulAttachmentObservation, admittedNode KubernetesNodeIdentity, runtimeCtx *VolumeRuntimeContext, publishContext map[string]string) (*diskPublishCompletion, error) {
+func (completion *diskPublishCompletion) withAdmission(ctx context.Context) context.Context {
+	if completion.admission.check != nil {
+		return context.WithValue(ctx, publishPVImageCheckKey{}, completion.admission)
+	}
+	return ctx
+}
+
+func (s *ControllerServer) completeDiskPublish(ctx context.Context, req *csi.ControllerPublishVolumeRequest, observation successfulAttachmentObservation, admittedNode KubernetesNodeIdentity, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision, publishContext map[string]string) (*diskPublishCompletion, error) {
 	if err := s.recheckPublishTarget(ctx, req, observation, admittedNode); err != nil {
 		return nil, err
+	}
+	admission, _ := ctx.Value(publishPVImageCheckKey{}).(publishPVAdmission)
+	completed := &diskPublishCompletion{
+		observation: observation, response: &csi.ControllerPublishVolumeResponse{PublishContext: publishContext},
+		admission: admission, annotatePlacement: admission.binding != nil,
+	}
+	if protection.OverrideUsed && admission.binding != nil && admission.binding.verifiedClaimBinding {
+		binding, consumed, err := s.driver.kubeRuntime.consumePublishGrant(ctx, admission.binding, s.driver.name, req.VolumeId)
+		if err != nil {
+			return nil, attachmentEvidenceUnavailable("used Publish placement grant could not be consumed", err)
+		}
+		completed.admission.binding = binding
+		completed.annotatePlacement = consumed
+		ctx = completed.withAdmission(ctx)
+		if consumed {
+			s.recordPVCEventFromRuntimeContext(ctx, binding, eventReasonCrossNodeOverrideUsed, protection.Message)
+		}
 	}
 	if err := s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, observation, req.GetVolumeContext(), runtimeCtx, func() error {
 		return s.recheckPublishTarget(ctx, req, observation, admittedNode)
 	}); err != nil {
 		return nil, err
 	}
-	return &diskPublishCompletion{observation: observation, response: &csi.ControllerPublishVolumeResponse{PublishContext: publishContext}}, nil
+	return completed, nil
 }
 
 func (s *ControllerServer) recheckPublishTarget(ctx context.Context, req *csi.ControllerPublishVolumeRequest, observation successfulAttachmentObservation, admittedNode KubernetesNodeIdentity) error {
@@ -2269,11 +2295,11 @@ func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.
 		}
 		adopted := validation.Reason == queueReasonManualRecoveryAdopted
 		control := evidence.RecoveryControl
-		adoptedSerial := ""
+		providerTarget, adoptedSerial := target, ""
 		if adopted {
-			adoptedSerial = control.ConfirmedDeviceSerial
+			providerTarget, adoptedSerial = "", control.ConfirmedDeviceSerial
 		}
-		observation, err := s.verifyPublishedAttachment(ctx, req.VolumeId, req.NodeId, volumeID, nodeID, target, adoptedSerial, publishNode, false)
+		observation, err := s.verifyPublishedAttachment(ctx, req.VolumeId, req.NodeId, volumeID, nodeID, providerTarget, adoptedSerial, publishNode, false)
 		if err != nil {
 			return true, nil, err
 		}
@@ -2283,12 +2309,12 @@ func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.
 		} else {
 			publishContext = s.publishContextForVolume(ctx, req.VolumeId, observation, 0, req.GetVolumeContext())
 		}
-		response, err := s.completeDiskPublish(ctx, req, observation, publishNode, runtimeCtx, publishContext)
+		response, err := s.completeDiskPublish(ctx, req, observation, publishNode, runtimeCtx, protection, publishContext)
 		if err != nil {
 			return true, nil, err
 		}
 		if adopted && s.driver.volumeRecoveryControl != nil {
-			if _, err := s.driver.volumeRecoveryControl.MarkAdopted(ctx, req.VolumeId, req.NodeId, observation.serial, observation.target); err != nil {
+			if _, err := s.driver.volumeRecoveryControl.MarkAdopted(ctx, req.VolumeId, req.NodeId, observation.serial, normalizedRecoveryDeviceName(control.ConfirmedVolumeName)); err != nil {
 				klog.V(2).InfoS("Failed to persist queue-driven manual recovery adoption state", "volumeID", req.VolumeId, "nodeID", req.NodeId, "err", err)
 			}
 		}
@@ -3163,13 +3189,7 @@ func (s *ControllerServer) annotateRestartOptimization(ctx context.Context, runt
 	})
 }
 
-func (s *ControllerServer) finishPublishMetadata(ctx context.Context, req *csi.ControllerPublishVolumeRequest, protection *LocalRWOProtectionDecision) error {
-	admission, ok := ctx.Value(publishPVImageCheckKey{}).(publishPVAdmission)
-	if !ok || admission.binding == nil {
-		return nil
-	}
-	binding := admission.binding
-	consumeGrant := protection.OverrideUsed && binding.verifiedClaimBinding
+func (s *ControllerServer) finishPublishMetadata(req *csi.ControllerPublishVolumeRequest, binding *VolumeRuntimeContext) {
 	report := PlacementReport{
 		Backend:             binding.Backend,
 		DatastoreID:         binding.DatastoreID,
@@ -3179,22 +3199,7 @@ func (s *ControllerServer) finishPublishMetadata(ctx context.Context, req *csi.C
 		RestartOptimization: binding.RestartMode,
 		DetachGraceSeconds:  s.effectiveDetachGraceSeconds(binding),
 	}
-	if consumeGrant {
-		consumed, err := s.driver.kubeRuntime.consumePublishGrant(ctx, binding, s.driver.name, req.VolumeId)
-		if err != nil {
-			return attachmentEvidenceUnavailable("used Publish placement grant could not be consumed", err)
-		}
-		if !consumed {
-			return nil
-		}
-		s.recordPVCEventFromRuntimeContext(ctx, binding, eventReasonCrossNodeOverrideUsed, protection.Message)
-		updated := *binding
-		updated.PVAnnotations = cloneStringMap(binding.PVAnnotations)
-		delete(updated.PVAnnotations, annotationAllowCrossNodeUntil)
-		binding = &updated
-	}
 	s.driver.kubeRuntime.annotatePublishedPVAsync(binding, s.driver.name, req.VolumeId, report)
-	return nil
 }
 
 func (s *ControllerServer) recordPVCEventFromRuntimeContext(ctx context.Context, runtimeCtx *VolumeRuntimeContext, reason, message string) {
