@@ -70,6 +70,8 @@ type LocalDiskObservedIdentity struct {
 }
 
 type VolumeHistoryRecord struct {
+	PendingPublishMove           *pendingPublishMove       `json:"pendingPublishMove,omitempty"`
+	LastPublishMoveReceipt       string                    `json:"lastPublishMoveReceipt,omitempty"`
 	PendingReplacementAttach     *replacementAttachAttempt `json:"pendingReplacementAttach,omitempty"`
 	Version                      int                       `json:"version"`
 	VolumeID                     string                    `json:"volumeID"`

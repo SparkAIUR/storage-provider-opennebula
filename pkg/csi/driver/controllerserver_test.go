@@ -2293,7 +2293,8 @@ func TestControllerPublishVolumeAllowsOverrideForProtectedCrossNodeAttach(t *tes
 		annotationRestartOpt: restartOptimizationAnnotationValue,
 	})
 	pv.Annotations[annotationAllowCrossNodeUntil] = time.Now().UTC().Add(5 * time.Minute).Format(time.RFC3339)
-	driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
+	pv.ResourceVersion = "1"
+	driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true), newReadyNode("node-new", true))
 	require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
 		VolumeID:     "vol-move-override",
 		NodeID:       "node-old",
@@ -2312,9 +2313,10 @@ func TestControllerPublishVolumeAllowsOverrideForProtectedCrossNodeAttach(t *tes
 	mockProvider.On("NodeExists", mock.Anything, "node-old").Return(41, nil)
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 42).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Twice()
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdc", nil).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", opennebula.ErrAttachmentNotFound).Twice()
 	mockProvider.On("DetachVolume", mock.Anything, "vol-move-override", "node-old").Return(nil).Once()
 	mockProvider.On("AttachVolume", mock.Anything, "vol-move-override", "node-new", false, mock.Anything).Return(nil).Once()
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 42).Return("vdd", nil).Times(5)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 42).Return("vdd", nil).Times(6)
 
 	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
 	resp, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-move-override", "node-new"))

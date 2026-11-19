@@ -173,7 +173,7 @@ func TestControllerDeleteCephRetainedOwnershipLifecycle(t *testing.T) {
 }
 
 func TestControllerDeleteCephVerifiesMissingImageOwnership(t *testing.T) {
-	for _, mode := range []string{"retained-disk", "backed-disk-without-id", "backed-disk-conflicting-serial", "backed-disk-blank-id-conflicting-serial", "serial-reference", "unknown-ownership", "replacement-image", "hidden-handle", "confirmed-absent", "missing-vm-template", "contradictory-vm-name", "unrelated-observed-conflict", "owner-omitted", "owner-omitted-released", "owner-omitted-gone"} {
+	for _, mode := range []string{"retained-disk", "backed-disk-without-id", "backed-disk-conflicting-serial", "backed-disk-blank-id-conflicting-serial", "serial-reference", "mixed-case-conflicting-serial", "unknown-ownership", "replacement-image", "hidden-handle", "confirmed-absent", "missing-vm-template", "contradictory-vm-name", "unrelated-observed-conflict", "owner-omitted", "owner-omitted-released", "owner-omitted-gone"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			const volume = "volume-test"
@@ -205,6 +205,10 @@ func TestControllerDeleteCephVerifiesMissingImageOwnership(t *testing.T) {
 			case "serial-reference":
 				delete(wire.disks, 41)
 				wire.extraDiskBefore = "<DISK><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SERIAL>onecsi-7</SERIAL></DISK>"
+			case "mixed-case-conflicting-serial":
+				delete(wire.disks, 41)
+				wire.missingImage = false
+				wire.extraDiskBefore = "<DISK><IMAGE_ID>8</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SERIAL>ONECSI-7</SERIAL></DISK>"
 			case "unknown-ownership":
 				wire.failMethod = "one.vmpool.infoextended"
 			case "replacement-image":

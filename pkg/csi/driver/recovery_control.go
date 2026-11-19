@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -243,18 +244,53 @@ func (m *VolumeRecoveryControlManager) SyncFromRuntimeContext(ctx context.Contex
 	})
 }
 
-func (m *VolumeRecoveryControlManager) MarkAdopted(ctx context.Context, volumeID, node, serial, volumeName string) (VolumeRecoveryControlState, error) {
-	if m == nil || strings.TrimSpace(volumeID) == "" {
-		return VolumeRecoveryControlState{}, nil
+func (m *VolumeRecoveryControlManager) readAdoption(ctx context.Context, volume string) (VolumeRecoveryControlState, error) {
+	var adoption VolumeRecoveryControlState
+	cm, err := m.runtime.GetConfigMap(ctx, m.namespace, volumeRecoveryControlStateConfigMapName)
+	if err != nil {
+		return adoption, err
+	}
+	err = decodeCephRetentionProtection(cm.Data[volume], &adoption)
+	return adoption, err
+}
+
+func (s *ControllerServer) persistPublishAdoption(ctx context.Context, volume string, binding *VolumeRuntimeContext, disk successfulAttachmentObservation, metadata map[string]string) (func(context.Context) error, time.Time, error) {
+	manager := s.driver.volumeRecoveryControl
+	unverified := attachmentEvidenceUnavailable("Publish guest adoption evidence is unverified", nil)
+	if manager == nil || manager.runtime == nil || !manager.runtime.enabled ||
+		binding == nil || !binding.verifiedClaimBinding || binding.pvUID == "" || binding.PVCUID == "" ||
+		disk.vmID <= 0 || disk.nodeUID == "" || disk.diskID < 0 || disk.target == "" ||
+		disk.serial != fmt.Sprintf("onecsi-%d", disk.imageID) {
+		return nil, time.Time{}, unverified
+	}
+	control := resolvedRecoveryControlState(volume, binding, VolumeRecoveryControlState{})
+	guest := normalizedRecoveryDeviceName(control.ConfirmedVolumeName)
+	if !control.AdoptionRequested() || control.Invalid || guest == "" || guest != metadata["volumeName"] ||
+		control.Ticket != metadata[publishContextRecoveryTicket] || !strings.EqualFold(control.ConfirmedDeviceSerial, disk.serial) {
+		return nil, time.Time{}, unverified
 	}
 	now := time.Now().UTC()
-	return m.Upsert(ctx, volumeID, func(state *VolumeRecoveryControlState) {
-		state.Adopted = true
-		state.AdoptedNode = strings.TrimSpace(node)
-		state.AdoptedAt = &now
-		state.AdoptedDeviceSerial = strings.TrimSpace(serial)
-		state.AdoptedVolumeName = strings.TrimSpace(volumeName)
-	})
+	control.Adopted = true
+	control.AdoptedNode = disk.nodeName
+	control.AdoptedAt = &now
+	control.AdoptedVolumeName = guest
+	control.AdoptedDeviceSerial = disk.serial
+	if _, err := manager.Upsert(ctx, volume, func(state *VolumeRecoveryControlState) { *state = control }); err != nil {
+		return nil, time.Time{}, unverified
+	}
+	verify := func(ctx context.Context) error {
+		current, err := manager.readAdoption(ctx, volume)
+		current.LastObservedAt = control.LastObservedAt
+		if err != nil || !reflect.DeepEqual(current, control) {
+			return unverified
+		}
+		desired, _, err := manager.runtime.VolumeDesiredOnNode(ctx, volume, disk.nodeName)
+		if err != nil || !desired {
+			return unverified
+		}
+		return nil
+	}
+	return verify, now, verify(ctx)
 }
 
 func (m *VolumeRecoveryControlManager) verifyAdoptedGuestTarget(ctx context.Context, volume, node, pvName string, pvc *corev1.PersistentVolumeClaim, history VolumeHistoryRecord, metadata map[string]string) error {
@@ -273,13 +309,9 @@ func (m *VolumeRecoveryControlManager) verifyAdoptedGuestTarget(ctx context.Cont
 		metadata[publishContextOpenNebulaImageID] == "" || validateAttachmentImageAssertions(metadata, history.LastSuccessfulImageID) != nil {
 		return unverified
 	}
-	cm, err := m.runtime.GetConfigMap(ctx, m.namespace, volumeRecoveryControlStateConfigMapName)
+	adoption, err := m.readAdoption(ctx, volume)
 	if err != nil {
 		return attachmentEvidenceUnavailable("adopted guest device evidence is unreadable", err)
-	}
-	var adoption VolumeRecoveryControlState
-	if err := decodeCephRetentionProtection(cm.Data[volume], &adoption); err != nil {
-		return unverified
 	}
 	if adoption.VolumeID != volume || adoption.Version != stateObjectVersion || !adoption.Adopted || adoption.Invalid ||
 		adoption.AdoptedAt == nil || adoption.AdoptedAt.Before(history.LastSuccessfulPublishTime) ||

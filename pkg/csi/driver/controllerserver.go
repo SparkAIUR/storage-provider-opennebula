@@ -851,6 +851,17 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		klog.V(0).ErrorS(err, "Node does not exist", "method", "ControllerPublishVolume", "nodeID", req.NodeId)
 		return nil, status.Error(codes.NotFound, "node not found")
 	}
+	if imageHistory.PendingPublishMove != nil || (runtimeCtx != nil && runtimeCtx.PVAnnotations[annotationPublishMoveReceipt] != "") {
+		completed, handled, err := s.resumePublishMove(ctx, req, volumeID, publishNode, pvAdmission)
+		if err != nil {
+			return nil, err
+		}
+		if handled {
+			s.recordCrossNodeOverrideUsed(ctx, completed.admission.binding)
+			s.finishPublishMetadata(req, completed.admission.binding)
+			return completed.response, nil
+		}
+	}
 
 	protection, protectionErr := s.localRWOProtectionDecision(ctx, req.VolumeId, req.NodeId)
 	if protectionErr != nil {
@@ -912,11 +923,6 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			if err != nil {
 				return nil, err
 			}
-			if s.driver.volumeRecoveryControl != nil {
-				if _, markErr := s.driver.volumeRecoveryControl.MarkAdopted(ctx, req.VolumeId, req.NodeId, recoveryControl.ConfirmedDeviceSerial, manualTarget); markErr != nil {
-					klog.V(2).InfoS("Failed to persist manual recovery adoption state", "volumeID", req.VolumeId, "nodeID", req.NodeId, "err", markErr)
-				}
-			}
 			s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
 			s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonRecoveryAdoptionAccepted, fmt.Sprintf("accepted manual recovery adoption for volume %s on node %s using guest-visible device %s and serial %s", req.VolumeId, req.NodeId, manualTarget, recoveryControl.ConfirmedDeviceSerial))
 			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
@@ -924,9 +930,6 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			ctx = completed.withAdmission(ctx)
 			if err := s.recheckPublishTarget(ctx, req, observation, publishNode); err != nil {
 				return nil, err
-			}
-			if completed.consumedGrant {
-				s.recordCrossNodeOverrideUsed(ctx, completed.admission.binding, protection.Message)
 			}
 			if completed.annotatePlacement {
 				s.finishPublishMetadata(req, completed.admission.binding)
@@ -1013,6 +1016,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		if err != nil {
 			return err
 		}
+		if history.PendingPublishMove != nil {
+			return attachmentEvidenceUnavailable("a pending Publish move requires exact replay evidence", nil)
+		}
 		readerReleaseProven := replacement && immutableVolume
 		if readerReleaseProven {
 			if err := s.verifyReadOnlyPriorRelease(queueCtx, history, req.VolumeId, req.NodeId, volumeID, nodeID, publishNode); err != nil {
@@ -1034,6 +1040,12 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		}
 		target, err := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
 		if err == nil {
+			if protection.OverrideUsed {
+				if err := recheckPublishPVImage(queueCtx); err != nil {
+					return err
+				}
+				return attachmentEvidenceUnavailable("the protected attachment has no verified Publish move", nil)
+			}
 			if history.PendingReplacementAttach != nil {
 				return attachmentEvidenceUnavailable("prepared replacement Ceph attach requires settled provider absence", nil)
 			}
@@ -1062,6 +1074,18 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		}
 		if !errors.Is(err, opennebula.ErrAttachmentNotFound) {
 			return status.Errorf(codes.Unavailable, "attachment state is unknown: %v", err)
+		}
+		if protection.OverrideUsed {
+			source, err := s.publishMoveNode(queueCtx, protection.InferredRequiredNode)
+			generation := publishMoveGenerationBeforeRelease(history, req.VolumeId)
+			if err != nil || source.VM == nodeID || publishNode.UID == "" || !replacementPublishCanWrite(req) || replacement ||
+				publishMoveBinding(runtimeCtx, s.driver.name, req.VolumeId) == "" ||
+				generation != publishMoveGenerationBeforeRelease(protection.History, req.VolumeId) ||
+				(history.LastSuccessfulNodeName == source.Name && ((history.LastSuccessfulNodeUID != "" && history.LastSuccessfulNodeUID != source.UID) ||
+					(history.LastSuccessfulOpenNebulaVMID > 0 && history.LastSuccessfulOpenNebulaVMID != source.VM))) {
+				return attachmentEvidenceUnavailable("Publish move admission is unverified", nil)
+			}
+			queueCtx = context.WithValue(queueCtx, publishMoveSourceKey{}, publishMoveAdmission{source, generation})
 		}
 
 		if history.PendingReplacementAttach == nil {
@@ -1104,6 +1128,15 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		klog.V(3).InfoS("Attaching volume to node",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "sizeBytes", sizeBytes, "hotplugTimeout", hotplugTimeout, "deviceDiscoveryTimeout", deviceDiscoveryTimeout)
 		attachStarted := time.Now()
+		if protection.OverrideUsed {
+			admission, _ := queueCtx.Value(publishPVImageCheckKey{}).(publishPVAdmission)
+			binding, err := s.reservePublishMove(queueCtx, req, admission)
+			if err != nil {
+				return err
+			}
+			admission.binding = binding
+			queueCtx = context.WithValue(queueCtx, publishPVImageCheckKey{}, admission)
+		}
 		attachCtx := s.authorizeHostArtifactAttach(s.publishMutationContext(queueCtx, req, nodeID, volumeID, publishNode, true), req)
 		var attempt *replacementAttachAttempt
 		var admission *replacementAttachAdmission
@@ -1229,8 +1262,8 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	if err := s.recheckPublishTarget(ctx, req, completed.observation, publishNode); err != nil {
 		return nil, err
 	}
-	if completed.consumedGrant {
-		s.recordCrossNodeOverrideUsed(ctx, completed.admission.binding, protection.Message)
+	if completed.move != nil {
+		s.recordCrossNodeOverrideUsed(ctx, completed.admission.binding)
 	}
 	s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
 	s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
@@ -2173,10 +2206,13 @@ type diskPublishCompletion struct {
 	response          *csi.ControllerPublishVolumeResponse
 	admission         publishPVAdmission
 	annotatePlacement bool
-	consumedGrant     bool
+	move              *pendingPublishMove
 }
 
 func (completion *diskPublishCompletion) withAdmission(ctx context.Context) context.Context {
+	if completion.move != nil {
+		ctx = context.WithValue(ctx, publishMoveSourceKey{}, publishMoveAdmission{source: completion.move.Source})
+	}
 	if completion.admission.check != nil {
 		return context.WithValue(ctx, publishPVImageCheckKey{}, completion.admission)
 	}
@@ -2189,48 +2225,34 @@ func (s *ControllerServer) completeDiskPublish(ctx context.Context, req *csi.Con
 		observation: observation, response: &csi.ControllerPublishVolumeResponse{PublishContext: publishContext},
 		admission: admission, annotatePlacement: admission.binding != nil,
 	}
-	usesGrant := protection.OverrideUsed && admission.binding != nil && admission.binding.verifiedClaimBinding
-	if usesGrant {
-		binding, _, err := s.driver.kubeRuntime.checkPublishGrant(ctx, admission.binding, s.driver.name, req.VolumeId, nil)
+	verify := func() error { return s.recheckPublishTarget(ctx, req, observation, admittedNode) }
+	if protection.OverrideUsed {
+		move, err := s.startPublishMove(ctx, req, observation, admission.binding, protection, verify)
 		if err != nil {
 			return nil, err
 		}
-		completed.admission.binding = binding
-		ctx = completed.withAdmission(ctx)
+		return s.finishPublishMove(ctx, req, observation, admittedNode, admission, move, publishContext)
 	}
-	verify := func() error { return s.recheckPublishTarget(ctx, req, observation, admittedNode) }
-	if !usesGrant {
-		if err := verify(); err != nil {
-			return nil, err
-		}
-	}
-	if err := s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, observation, req.GetVolumeContext(), runtimeCtx, usesGrant, verify); err != nil {
+	if err := verify(); err != nil {
 		return nil, err
 	}
-	if usesGrant {
-		binding, consumed, err := s.driver.kubeRuntime.checkPublishGrant(ctx, admission.binding, s.driver.name, req.VolumeId, func(binding *VolumeRuntimeContext) error {
-			return recheckPublishPVImage(context.WithValue(ctx, publishPVImageCheckKey{}, publishPVAdmission{binding: binding, check: admission.check}))
-		})
+	var adoptedAt time.Time
+	if observation.adopted {
+		verifyAdoption, when, err := s.persistPublishAdoption(ctx, req.VolumeId, admission.binding, observation, publishContext)
 		if err != nil {
-			return nil, attachmentEvidenceUnavailable("used Publish placement grant could not be consumed", err)
+			return nil, err
 		}
-		completed.admission.binding = binding
-		completed.consumedGrant = consumed
-		completed.annotatePlacement = consumed
-		ctx = completed.withAdmission(ctx)
-		_, err = s.driver.volumeHistory.upsert(ctx, req.VolumeId, func(state *VolumeHistoryRecord) error {
-			if err := verify(); err != nil {
+		adoptedAt = when
+		completed.admission.check = func(ctx context.Context, binding *VolumeRuntimeContext) error {
+			if err := admission.check(ctx, binding); err != nil {
 				return err
 			}
-			if !state.matchesPublishedDisk(observation) || state.PendingReplacementAttach != nil {
-				return attachmentEvidenceUnavailable("verified Publish history changed during grant consumption", nil)
-			}
-			state.LastSuccessfulPublishTime = time.Now().UTC()
-			return nil
-		})
-		if err != nil {
-			return nil, attachmentEvidenceUnavailable("Publish completion could not be persisted", err)
+			return verifyAdoption(ctx)
 		}
+		ctx = completed.withAdmission(ctx)
+	}
+	if err := s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, observation, req.GetVolumeContext(), runtimeCtx, adoptedAt, nil, verify); err != nil {
+		return nil, err
 	}
 	return completed, nil
 }
@@ -2268,8 +2290,12 @@ func (s *ControllerServer) publishMutationContext(ctx context.Context, req *csi.
 		}
 		if newAttachment && s.driver.volumeHistory != nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
 			history, err := s.readAttachmentHistory(ctx, req.VolumeId)
-			if err != nil || history.PendingReplacementAttach != nil {
+			if err != nil || history.PendingReplacementAttach != nil || history.PendingPublishMove != nil {
 				return attachmentEvidenceUnavailable("ordinary publish replacement history is unverified", err)
+			}
+			if move, ok := ctx.Value(publishMoveSourceKey{}).(publishMoveAdmission); ok &&
+				publishMoveGenerationBeforeRelease(history, req.VolumeId) != move.generation {
+				return attachmentEvidenceUnavailable("Publish move history changed before provider dispatch", nil)
 			}
 		}
 		return recheckPublishPVImage(ctx)
@@ -2341,11 +2367,6 @@ func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.
 		response, err := s.completeDiskPublish(ctx, req, observation, publishNode, runtimeCtx, protection, publishContext)
 		if err != nil {
 			return true, nil, err
-		}
-		if adopted && s.driver.volumeRecoveryControl != nil {
-			if _, err := s.driver.volumeRecoveryControl.MarkAdopted(ctx, req.VolumeId, req.NodeId, observation.serial, normalizedRecoveryDeviceName(control.ConfirmedVolumeName)); err != nil {
-				klog.V(2).InfoS("Failed to persist queue-driven manual recovery adoption state", "volumeID", req.VolumeId, "nodeID", req.NodeId, "err", err)
-			}
 		}
 		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
 		return true, response, nil

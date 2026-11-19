@@ -1510,7 +1510,7 @@ func diskImageReference(disk shared.Disk, allowBlank bool) (int, bool, error) {
 		if !present && (hasDiskBacking(disk, serial) || (blank && !isImageLessDisk(disk))) {
 			return 0, false, fmt.Errorf("malformed VM disk image identity")
 		}
-		if suffix, ok := strings.CutPrefix(strings.TrimSpace(serial), "onecsi-"); ok {
+		if suffix, ok := csiDiskSerialSuffix(serial); ok {
 			serialID, parseErr := strconv.Atoi(suffix)
 			if parseErr == nil && serialID >= 0 && serialID != id {
 				return 0, false, &diskImageConflict{imageID: id, serialID: serialID}
@@ -1531,8 +1531,12 @@ func isImageLessDisk(disk shared.Disk) bool {
 	}
 }
 
+func csiDiskSerialSuffix(serial string) (string, bool) {
+	return strings.CutPrefix(strings.ToLower(strings.TrimSpace(serial)), "onecsi-")
+}
+
 func hasDiskBacking(disk shared.Disk, serial string) bool {
-	if strings.HasPrefix(strings.TrimSpace(serial), "onecsi-") {
+	if _, reserved := csiDiskSerialSuffix(serial); reserved {
 		return true
 	}
 	for _, key := range []shared.DiskKeys{"IMAGE", "IMAGE_UNAME", "IMAGE_UID", "SOURCE", "ORIGINAL_SOURCE"} {
@@ -1582,7 +1586,7 @@ func diskIdentifiesOtherImage(disk shared.Disk, imageID int) bool {
 		return false
 	}
 	for _, serial := range disk.GetPairs(string(shared.Serial)) {
-		suffix, isCSI := strings.CutPrefix(strings.ToLower(strings.TrimSpace(serial.Value)), "onecsi-")
+		suffix, isCSI := csiDiskSerialSuffix(serial.Value)
 		serialID, err := strconv.Atoi(suffix)
 		if isCSI && err == nil && serialID == imageID {
 			return false
@@ -1607,7 +1611,7 @@ func diskFieldsBelongToImage(disk shared.Disk, imageID int) bool {
 		return false
 	}
 	for _, serial := range disk.GetPairs(string(shared.Serial)) {
-		if suffix, ok := strings.CutPrefix(strings.ToLower(strings.TrimSpace(serial.Value)), "onecsi-"); ok {
+		if suffix, ok := csiDiskSerialSuffix(serial.Value); ok {
 			id, err := strconv.Atoi(suffix)
 			if err != nil || id != imageID {
 				return false

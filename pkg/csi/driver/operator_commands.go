@@ -1253,6 +1253,8 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 		historySnapshot = driver.volumeHistory.Snapshot()
 		for volume, history := range historySnapshot {
 			history.PendingReplacementAttach = nil
+			history.PendingPublishMove = nil
+			history.LastPublishMoveReceipt = ""
 			historySnapshot[volume] = history
 		}
 	}
@@ -1297,6 +1299,14 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 		}
 		decision, err := (&ControllerServer{driver: driver}).localRWOProtectionProjection(ctx, pv.Spec.CSI.VolumeHandle, "", runtimeCtx, false, false)
 		decision.History.PendingReplacementAttach = nil
+		decision.History.PendingPublishMove = nil
+		decision.History.LastPublishMoveReceipt = ""
+		if decision.RuntimeContext != nil {
+			delete(decision.RuntimeContext.PVAnnotations, annotationPublishMoveReceipt)
+			delete(decision.RuntimeContext.PVAnnotations, annotationAllowCrossNodeUntil)
+			delete(decision.RuntimeContext.PVCAnnotations, annotationPublishMoveReceipt)
+			delete(decision.RuntimeContext.PVCAnnotations, annotationAllowCrossNodeUntil)
+		}
 		if decision.History.VolumeID != "" {
 			historySnapshot[pv.Spec.CSI.VolumeHandle] = decision.History
 		}

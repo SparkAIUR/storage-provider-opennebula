@@ -252,6 +252,10 @@ func (r *KubeRuntime) annotatePublishedPVAsync(binding *VolumeRuntimeContext, dr
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := r.annotatePublishedPV(ctx, binding, driver, volume, report); err != nil {
+			if binding.PVAnnotations[annotationPublishMoveReceipt] != "" || binding.PVAnnotations[annotationAllowCrossNodeUntil] != "" {
+				klog.V(2).InfoS("Failed to annotate published PV", "pvName", binding.PVName)
+				return
+			}
 			klog.V(2).InfoS("Failed to annotate published PV", "pvName", binding.PVName, "err", err)
 		}
 	}()
@@ -305,54 +309,6 @@ func (r *KubeRuntime) annotatePublishedPV(ctx context.Context, binding *VolumeRu
 	}
 	_, err = pvs.Patch(ctx, pv.Name, types.JSONPatchType, payload, metav1.PatchOptions{})
 	return err
-}
-
-func (r *KubeRuntime) checkPublishGrant(ctx context.Context, binding *VolumeRuntimeContext, driver, volume string, authorizeConsumption func(*VolumeRuntimeContext) error) (*VolumeRuntimeContext, bool, error) {
-	pvs := r.client.CoreV1().PersistentVolumes()
-	admittedGrant := binding.PVAnnotations[annotationAllowCrossNodeUntil]
-	current := *binding
-	current.PVAnnotations = cloneStringMap(binding.PVAnnotations)
-	consumed := false
-	err := retryOnConflict(retry.DefaultRetry, func() error {
-		pv, err := pvs.Get(ctx, binding.PVName, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		grant := pv.Annotations[annotationAllowCrossNodeUntil]
-		current.PVAnnotations[annotationAllowCrossNodeUntil] = grant
-		if !publishPVMatches(pv, &current, driver, volume) {
-			return attachmentEvidenceUnavailable("Publish PV authority changed during grant consumption", nil)
-		}
-		pvc, reused, err := r.attachmentClaim(ctx, pv)
-		if err != nil {
-			return err
-		}
-		if reused || pvc == nil || pvc.UID != binding.PVCUID || pvc.Status.Phase != binding.pvcPhase ||
-			pvc.DeletionTimestamp != nil || !samePublishAnnotations(binding.PVCAnnotations, pvc.Annotations) {
-			return attachmentEvidenceUnavailable("Publish claim authority changed during grant consumption", nil)
-		}
-		deadline, valid := crossNodeOverrideDeadline(&current)
-		if !valid || !deadline.After(time.Now()) {
-			return attachmentEvidenceUnavailable("Publish placement grant was revoked, invalid or expired", nil)
-		}
-		if authorizeConsumption == nil {
-			return nil
-		}
-		if err := authorizeConsumption(&current); err != nil {
-			return err
-		}
-		if grant != admittedGrant {
-			return nil
-		}
-		delete(pv.Annotations, annotationAllowCrossNodeUntil)
-		_, err = pvs.Update(ctx, pv, metav1.UpdateOptions{})
-		if err == nil {
-			consumed = true
-			delete(current.PVAnnotations, annotationAllowCrossNodeUntil)
-		}
-		return err
-	})
-	return &current, consumed, err
 }
 
 func (r *KubeRuntime) GetNodeLabel(ctx context.Context, nodeName, labelKey string) (string, error) {

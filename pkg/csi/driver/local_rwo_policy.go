@@ -112,7 +112,7 @@ func (s *ControllerServer) localRWOProtectionProjection(ctx context.Context, vol
 	if localRWOHistoryRuntimeContextDegraded(runtimeCtx) {
 		history = s.refreshVolumeHistory(ctx, volumeID)
 	}
-	if !volumeHistoryHasObservedSuccess(history) {
+	if history.PendingPublishMove == nil && !volumeHistoryHasObservedSuccess(history) {
 		if persist {
 			history = s.bootstrapVolumeHistoryEvidence(ctx, volumeID, runtimeCtx, history)
 		} else if seed, ok := buildVolumeHistoryBootstrapEvidence(ctx, s.driver.kubeRuntime, volumeID, runtimeCtx); ok {
@@ -560,14 +560,17 @@ type publishPVAdmission struct {
 	check   func(context.Context, *VolumeRuntimeContext) error
 }
 
+var publishAuthorityAnnotations = []string{
+	annotationBackend, annotationDatastoreID, annotationDatastoreName, annotationSelectionPolicy,
+	annotationRecoveryMode, annotationRecoveryModeUntil, annotationRecoveryTicket, annotationAdoptAttachedDevice,
+	annotationConfirmedDeviceSerial, annotationConfirmedVolumeName, annotationRestartOpt, annotationDetachGrace,
+	annotationRequiredNode, annotationRequiredNodeUntil, annotationPreferredNode, annotationAllowCrossNodeUntil,
+	annotationLastAttachedNode, annotationLegacyLastAttachedNode, annotationLastNodePref, annotationPreferredLastNode,
+	annotationPublishMoveReceipt,
+}
+
 func samePublishAnnotations(admitted, current map[string]string) bool {
-	for _, key := range []string{
-		annotationBackend, annotationDatastoreID, annotationDatastoreName, annotationSelectionPolicy,
-		annotationRecoveryMode, annotationRecoveryModeUntil, annotationRecoveryTicket, annotationAdoptAttachedDevice,
-		annotationConfirmedDeviceSerial, annotationConfirmedVolumeName, annotationRestartOpt, annotationDetachGrace,
-		annotationRequiredNode, annotationRequiredNodeUntil, annotationPreferredNode, annotationAllowCrossNodeUntil,
-		annotationLastAttachedNode, annotationLegacyLastAttachedNode, annotationLastNodePref, annotationPreferredLastNode,
-	} {
+	for _, key := range publishAuthorityAnnotations {
 		if admitted[key] != current[key] {
 			return false
 		}
@@ -747,6 +750,7 @@ func (s *ControllerServer) publishProtectionCheck(ctx context.Context, volume, n
 }
 
 func (s *ControllerServer) observePublishedDisk(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target, adoptedSerial string) (successfulAttachmentObservation, error) {
+	_, moving := ctx.Value(publishMoveSourceKey{}).(publishMoveAdmission)
 	observation := successfulAttachmentObservation{
 		nodeName: strings.TrimSpace(requestedNode), target: strings.TrimSpace(target),
 		imageID: imageID, vmID: vmID, diskID: -1, serial: firstNonEmpty(adoptedSerial, fmt.Sprintf("onecsi-%d", imageID)),
@@ -775,8 +779,8 @@ func (s *ControllerServer) observePublishedDisk(ctx context.Context, volumeID, r
 		if err := metadata.VerifyOwnership(); err != nil {
 			return observation, attachmentEvidenceUnavailable("publish attachment ownership is unverified", err)
 		}
-		if adoptedSerial != "" && len(metadata.ConflictingOwnerVMIDs()) != 0 {
-			return observation, attachmentEvidenceUnavailable("publish adoption has conflicting attachment owners", nil)
+		if (adoptedSerial != "" || moving) && len(metadata.ConflictingOwnerVMIDs()) != 0 {
+			return observation, attachmentEvidenceUnavailable("publish has conflicting attachment owners", nil)
 		}
 		if !metadata.AttachedToRequestedNode {
 			return observation, attachmentEvidenceUnavailable("publish attachment target changed", nil)
@@ -872,15 +876,23 @@ func (state VolumeHistoryRecord) matchesPublishedDisk(observation successfulAtta
 		state.LastSuccessfulTarget == observation.target && state.LastSuccessfulDeviceSerial == observation.serial
 }
 
-func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID string, observation successfulAttachmentObservation, sourceContext map[string]string, runtimeCtx *VolumeRuntimeContext, beforeGrantConsumption bool, verify func() error) error {
+func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID string, observation successfulAttachmentObservation, sourceContext map[string]string, runtimeCtx *VolumeRuntimeContext, adoptionTime time.Time, move *pendingPublishMove, verify func() error) error {
+	strict := move != nil || !adoptionTime.IsZero() || observation.replacementAttempt != nil
 	if s == nil || s.driver == nil || s.driver.volumeHistory == nil || strings.TrimSpace(volumeID) == "" {
-		if beforeGrantConsumption {
-			return attachmentEvidenceUnavailable("Publish history is unavailable for grant consumption", nil)
+		if strict {
+			return attachmentEvidenceUnavailable("Publish history is unavailable", nil)
 		}
 		return nil
 	}
 	now := time.Now().UTC()
+	if !adoptionTime.IsZero() {
+		now = adoptionTime
+	}
 	_, err := s.driver.volumeHistory.updateHistory(ctx, volumeID, observation.replacementAttempt != nil, func(state *VolumeHistoryRecord) error {
+		if !samePendingPublishMove(state.PendingPublishMove, move) ||
+			(move != nil && publishMoveGeneration(*state) != move.Prior) {
+			return attachmentEvidenceUnavailable("Publish move history changed", nil)
+		}
 		if err := verify(); err != nil {
 			return err
 		}
@@ -918,9 +930,11 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 		state.BootstrappedFields = nil
 		state.PendingReplacementAttach = nil
 		state.observeSuccessfulAttachment(observation)
-		if !beforeGrantConsumption {
-			state.LastSuccessfulPublishTime = now
+		state.PendingPublishMove = nil
+		if move != nil {
+			state.LastPublishMoveReceipt = publishMoveDigest(move)
 		}
+		state.LastSuccessfulPublishTime = now
 		return nil
 	})
 	if errors.Is(err, errRetainedAttachmentNodeChanged) {
@@ -930,14 +944,15 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 	case codes.Unavailable, codes.FailedPrecondition:
 		return err
 	}
-	if beforeGrantConsumption || observation.replacementAttempt != nil {
+	if strict {
 		if err != nil {
-			return attachmentEvidenceUnavailable("verified Publish attachment could not be persisted", err)
+			return attachmentEvidenceUnavailable("verified Publish attachment could not be persisted", nil)
 		}
 		current, err := s.readAttachmentHistory(ctx, volumeID)
-		if err != nil || current.PendingReplacementAttach != nil || !current.matchesPublishedDisk(observation) ||
-			(!beforeGrantConsumption && !current.LastSuccessfulPublishTime.Equal(now)) {
-			return attachmentEvidenceUnavailable("verified Publish attachment readback failed", err)
+		if err != nil || current.PendingReplacementAttach != nil || current.PendingPublishMove != nil ||
+			(move != nil && current.LastPublishMoveReceipt != publishMoveDigest(move)) ||
+			!current.matchesPublishedDisk(observation) || !current.LastSuccessfulPublishTime.Equal(now) {
+			return attachmentEvidenceUnavailable("verified Publish attachment readback failed", nil)
 		}
 	}
 	if err == nil {
@@ -992,6 +1007,9 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 		observation.target = localDiskAssertedDiskTarget(identity)
 	}
 	_, err := ns.Driver.volumeHistory.upsert(ctx, volumeID, func(state *VolumeHistoryRecord) error {
+		if state.PendingPublishMove != nil {
+			return attachmentEvidenceUnavailable("Stage history is blocked by a pending Publish move", nil)
+		}
 		if err := state.checkAttachmentNode(observation); err != nil {
 			return err
 		}
@@ -1376,7 +1394,7 @@ func (s *ControllerServer) activeHostArtifactQuarantine(ctx context.Context, vol
 	return false, nil
 }
 
-func (s *ControllerServer) recordCrossNodeOverrideUsed(ctx context.Context, binding *VolumeRuntimeContext, message string) {
+func (s *ControllerServer) recordCrossNodeOverrideUsed(ctx context.Context, binding *VolumeRuntimeContext) {
 	s.driver.kubeRuntime.emitNamespacedEvent(ctx, binding.PVCNamespace, binding.PVCName, binding.PVCUID,
-		"PersistentVolumeClaim", corev1.EventTypeNormal, eventReasonCrossNodeOverrideUsed, message)
+		"PersistentVolumeClaim", corev1.EventTypeNormal, eventReasonCrossNodeOverrideUsed, "verified the protected cross-node attachment")
 }
