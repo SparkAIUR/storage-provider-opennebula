@@ -125,16 +125,19 @@ ownership and original VM settlement. Completion requires fresh provider absence
 and verified original VM release, along with the current Kubernetes scope and
 per-volume controls. The acceptance write preserves the exact reply across
 control changes and verified claim or attachment turnover while keeping the
-original detach scope. Settlement refreshes controls, then confirms the Pod,
-Node and attachment evidence again. These bounded observations do not fence
-provider or Kubernetes changes.
+original detach scope. It can record the reply while the original claim is
+absent and the PV still says Bound. Settlement retains its binding requirements.
+It refreshes protection, confirms Pod, Node and attachment evidence, and
+checks the binding and recovery annotations once more. These bounded
+observations do not fence provider or Kubernetes changes.
 
 When a detach was accepted without a source VolumeAttachment, reconciliation
 or a fresh Publish can retire that record after settlement for a successor with
 the same canonical attachment name and a new UID whose consumer is still
 waiting to mount. If that successor is deleting and unattached, Unpublish can
-acknowledge it after verifying release and settled absence. The accepted record
-remains until its normal retirement checks pass. Each new publication requires
+acknowledge it after verifying release and settled absence. Verified pre-mount
+demand can remain on the same node or on one verified replacement destination.
+The accepted record remains until its normal retirement checks pass. Each new publication requires
 its own attach authorization. An uncertain reply or a failed acceptance write
 leaves the attempt unresolved. Global local-disk maintenance does not govern
 these verified Ceph paths.

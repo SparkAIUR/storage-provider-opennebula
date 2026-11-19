@@ -7,7 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"maps"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -328,7 +328,7 @@ func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, history
 		return attempt, err
 	}
 	finalWaiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, current, requireStarted)
-	if err != nil || !maps.Equal(waiting, finalWaiting) {
+	if err != nil || !sameWaitingConsumers(waiting, finalWaiting) {
 		return unavailable()
 	}
 	if err := s.recheckAttachmentReleaseNode(ctx, current, attempt.VolumeID); err != nil {
@@ -337,15 +337,55 @@ func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, history
 	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
 		return attempt, err
 	}
-	return attempt, nil
+	return attempt, s.recheckAttachmentBinding(ctx, pv, pvc, false)
 }
 
-func (s *ControllerServer) replacementWaitingConsumers(ctx context.Context, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, node *corev1.Node, requireStarted bool) (map[types.UID]string, error) {
+type waitingConsumers map[types.UID]waitingConsumer
+
+type waitingConsumer struct {
+	name, namespace, node string
+	created, started      time.Time
+	claimVolumes          map[string]bool
+	readiness             map[corev1.PodConditionType]corev1.ConditionStatus
+	containers            [3]map[string]string
+}
+
+func observeWaitingConsumer(pod *corev1.Pod, claimName string) waitingConsumer {
+	evidence := waitingConsumer{name: pod.Name, namespace: pod.Namespace, node: pod.Spec.NodeName, created: pod.CreationTimestamp.Time}
+	if pod.Status.StartTime != nil {
+		evidence.started = pod.Status.StartTime.Time
+	}
+	evidence.claimVolumes = make(map[string]bool)
+	for _, volume := range pod.Spec.Volumes {
+		if podVolumeClaimName(pod, volume) == claimName {
+			evidence.claimVolumes[volume.Name] = volume.Ephemeral != nil
+		}
+	}
+	evidence.readiness = make(map[corev1.PodConditionType]corev1.ConditionStatus)
+	for _, condition := range pod.Status.Conditions {
+		if premountReadinessCondition(condition.Type) {
+			evidence.readiness[condition.Type] = condition.Status
+		}
+	}
+	for i, statuses := range [3][]corev1.ContainerStatus{pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses, pod.Status.EphemeralContainerStatuses} {
+		evidence.containers[i] = make(map[string]string, len(statuses))
+		for _, container := range statuses {
+			evidence.containers[i][container.Name] = container.State.Waiting.Reason
+		}
+	}
+	return evidence
+}
+
+func sameWaitingConsumers(previous, current waitingConsumers) bool {
+	return reflect.DeepEqual(previous, current)
+}
+
+func (s *ControllerServer) replacementWaitingConsumers(ctx context.Context, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, node *corev1.Node, requireStarted bool) (waitingConsumers, error) {
 	pods, err := s.driver.kubeRuntime.client.CoreV1().Pods(pv.Spec.ClaimRef.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, attachmentEvidenceUnavailable("replacement consumer state is unreadable", err)
 	}
-	consumers := make(map[types.UID]string)
+	consumers := make(waitingConsumers)
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		references, err := podReferencesClaim(pod, pv.Spec.ClaimRef.Name, pvc)
@@ -358,7 +398,7 @@ func (s *ControllerServer) replacementWaitingConsumers(ctx context.Context, pv *
 		if !replacementPodWaitingOnNode(pod, node) || (requireStarted && pod.Status.StartTime == nil) {
 			return nil, attachmentEvidenceUnavailable("replacement consumer may already be using the volume", nil)
 		}
-		consumers[pod.UID] = pod.ResourceVersion
+		consumers[pod.UID] = observeWaitingConsumer(pod, pv.Spec.ClaimRef.Name)
 	}
 	if len(consumers) > 1 && pv.Spec.AccessModes[0] == corev1.ReadWriteOncePod {
 		return nil, attachmentEvidenceUnavailable("replacement volume has multiple consumers", nil)
@@ -375,7 +415,7 @@ func replacementPodWaitingOnNode(pod *corev1.Pod, node *corev1.Node) bool {
 func replacementPodPendingBeforeMount(pod *corev1.Pod) bool {
 	if pod.Status.Phase != corev1.PodPending || pod.Status.PodIP != "" || len(pod.Status.PodIPs) != 0 ||
 		slices.ContainsFunc(pod.Status.Conditions, func(c corev1.PodCondition) bool {
-			return c.Status != corev1.ConditionFalse && (c.Type == corev1.PodReadyToStartContainers || c.Type == corev1.PodReady || c.Type == corev1.ContainersReady)
+			return c.Status != corev1.ConditionFalse && premountReadinessCondition(c.Type)
 		}) {
 		return false
 	}
@@ -390,6 +430,10 @@ func replacementPodPendingBeforeMount(pod *corev1.Pod) bool {
 	}) && premountContainerStatuses(pod.Status.EphemeralContainerStatuses, func(name string) bool {
 		return slices.ContainsFunc(pod.Spec.EphemeralContainers, func(c corev1.EphemeralContainer) bool { return c.Name == name })
 	})
+}
+
+func premountReadinessCondition(condition corev1.PodConditionType) bool {
+	return condition == corev1.PodReadyToStartContainers || condition == corev1.PodReady || condition == corev1.ContainersReady
 }
 
 func premountContainerStatuses(statuses []corev1.ContainerStatus, declared func(string) bool) bool {

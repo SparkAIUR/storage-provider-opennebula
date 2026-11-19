@@ -314,6 +314,9 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
 		return nil, err
 	}
+	if err := s.recheckAttachmentBinding(ctx, pv, pvc, false); err != nil {
+		return nil, err
+	}
 	return authority, nil
 }
 

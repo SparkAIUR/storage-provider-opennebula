@@ -3,7 +3,6 @@ package driver
 import (
 	"context"
 	"fmt"
-	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -158,7 +157,7 @@ func (s *ControllerServer) checkReplacedNodeStaleAttachment(ctx context.Context,
 		return true, err
 	}
 	finalWaiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, currentNode, false)
-	if err != nil || !maps.Equal(waiting, finalWaiting) {
+	if err != nil || !sameWaitingConsumers(waiting, finalWaiting) {
 		return deny(err)
 	}
 	if err := s.recheckAttachmentReleaseNode(ctx, currentNode, volume); err != nil {
@@ -173,5 +172,5 @@ func (s *ControllerServer) checkReplacedNodeStaleAttachment(ctx context.Context,
 		!reflect.DeepEqual(currentVA.DeletionTimestamp, va.DeletionTimestamp) {
 		return deny(err)
 	}
-	return true, nil
+	return true, s.recheckAttachmentBinding(ctx, pv, pvc, false)
 }

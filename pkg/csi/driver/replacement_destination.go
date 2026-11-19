@@ -3,7 +3,6 @@ package driver
 import (
 	"context"
 	"fmt"
-	"maps"
 	"slices"
 	"time"
 
@@ -12,7 +11,6 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Context, history VolumeHistoryRecord, attempt replacementAttachAttempt, nodeName string, imageID, vmID int) error {
@@ -132,7 +130,7 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 		return unavailable(err)
 	}
 	verifiedWaiting, err := s.replacementDestinationConsumers(ctx, claim, pvc, replaced, liveBinding, current, inUse)
-	if err != nil || !maps.Equal(waiting, verifiedWaiting) {
+	if err != nil || !sameWaitingConsumers(waiting, verifiedWaiting) {
 		return unavailable(err)
 	}
 	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, replaced); err != nil {
@@ -147,23 +145,26 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 		return err
 	}
 	finalWaiting, err := s.replacementDestinationConsumers(ctx, claim, pvc, replaced, liveBinding, current, inUse)
-	if err != nil || !maps.Equal(waiting, finalWaiting) {
+	if err != nil || !sameWaitingConsumers(waiting, finalWaiting) {
 		return unavailable(err)
 	}
 	if err := s.recheckAttachmentReleaseNode(ctx, current, volume); err != nil {
 		return err
 	}
-	return s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments)
+	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
+		return err
+	}
+	return s.recheckAttachmentBinding(ctx, pv, pvc, replaced)
 }
 
 func (s *ControllerServer) replacementDestinationConsumers(ctx context.Context, claim *corev1.ObjectReference, pvc *corev1.PersistentVolumeClaim,
 	replaced, liveBinding bool, node *corev1.Node, inUse bool,
-) (map[types.UID]string, error) {
+) (waitingConsumers, error) {
 	pods, err := s.driver.kubeRuntime.client.CoreV1().Pods(claim.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
-	waiting := make(map[types.UID]string)
+	waiting := make(waitingConsumers)
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		usesClaim, err := podMayUseAttachmentClaim(pod, claim, pvc, replaced)
@@ -177,7 +178,7 @@ func (s *ControllerServer) replacementDestinationConsumers(ctx context.Context, 
 			pod.CreationTimestamp.After(time.Now()) || (inUse && pod.Status.StartTime == nil) {
 			return nil, fmt.Errorf("destination consumer may already be using the volume")
 		}
-		waiting[pod.UID] = pod.ResourceVersion
+		waiting[pod.UID] = observeWaitingConsumer(pod, claim.Name)
 	}
 	if inUse && len(waiting) == 0 {
 		return nil, fmt.Errorf("destination node still reports the volume in use")

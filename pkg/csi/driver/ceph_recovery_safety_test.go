@@ -679,6 +679,7 @@ func TestControllerUnpublishCephEventUsesVerifiedClaimWithoutLateReads(t *testin
 			f := newCephRestartTestFixture(t, queued)
 			client := f.server.driver.kubeRuntime.client.(*fake.Clientset)
 			var finalPodRead atomic.Bool
+			var releaseRead atomic.Bool
 			var finalAuthorityRead atomic.Bool
 			var lateActions atomic.Int32
 			client.PrependReactor("*", "*", func(action ktesting.Action) (bool, kruntime.Object, error) {
@@ -689,6 +690,9 @@ func TestControllerUnpublishCephEventUsesVerifiedClaimWithoutLateReads(t *testin
 					finalPodRead.Store(true)
 				}
 				if action.Matches("list", "volumeattachments") && finalPodRead.Load() {
+					releaseRead.Store(true)
+				}
+				if action.Matches("get", "persistentvolumeclaims") && releaseRead.Load() {
 					finalAuthorityRead.Store(true)
 				}
 				return false, nil, nil
@@ -826,15 +830,15 @@ func TestControllerUnpublishCephRechecksDemandAfterProtectionReads(t *testing.T)
 
 func TestControllerUnpublishCephDeniesObserveDuringFinalRead(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, duringPods := range []bool{false, true} {
-			t.Run(fmt.Sprintf("queued=%t/pods=%t", queued, duringPods), func(t *testing.T) {
+		for _, podRead := range []int{0, 2, 3} {
+			t.Run(fmt.Sprintf("queued=%t/protection-reads=%d", queued, podRead), func(t *testing.T) {
 				f := newCephRestartTestFixture(t, queued)
 				client := f.server.driver.kubeRuntime.client.(*fake.Clientset)
 				var installed bool
 				var protectionReads int
 				f.provider.observe = func(context.Context) (*opennebula.SameNodeRetentionEvidence, error) {
 					if f.provider.inspections.Load() == 2 {
-						if duringPods {
+						if podRead != 0 {
 							client.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
 								if action.(ktesting.GetAction).GetName() == hostArtifactStateConfigMapName {
 									protectionReads++
@@ -842,7 +846,7 @@ func TestControllerUnpublishCephDeniesObserveDuringFinalRead(t *testing.T) {
 								return false, nil, nil
 							})
 							client.PrependReactor("list", "pods", func(ktesting.Action) (bool, kruntime.Object, error) {
-								if !installed && protectionReads >= 2 {
+								if !installed && protectionReads >= podRead {
 									observed := f.pvc.DeepCopy()
 									observed.Annotations[annotationRecoveryMode] = recoveryModeObserve
 									require.NoError(t, client.Tracker().Update(corev1.SchemeGroupVersion.WithResource("persistentvolumeclaims"), observed, f.pvc.Namespace))
@@ -860,7 +864,7 @@ func TestControllerUnpublishCephDeniesObserveDuringFinalRead(t *testing.T) {
 				require.Equal(t, codes.Unavailable, status.Code(err))
 				require.Nil(t, response)
 				require.EqualValues(t, 2, f.provider.inspections.Load())
-				if duringPods {
+				if podRead != 0 {
 					require.True(t, installed)
 					require.GreaterOrEqual(t, protectionReads, 3)
 				}
