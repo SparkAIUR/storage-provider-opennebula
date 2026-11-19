@@ -36,6 +36,22 @@ type publishMoveSourceKey struct{}
 type publishMoveAdmission struct {
 	source     publishMoveNode
 	generation string
+	err        error
+}
+
+func (s *ControllerServer) checkPublishMoveAdmission(ctx context.Context, volume string) error {
+	if move, ok := ctx.Value(publishMoveSourceKey{}).(publishMoveAdmission); ok {
+		if move.err != nil {
+			return move.err
+		}
+		history, err := s.readAttachmentHistory(ctx, volume)
+		if err != nil || history.PendingPublishMove != nil || history.PendingReplacementAttach != nil ||
+			publishMoveGenerationBeforeRelease(history, volume) != move.generation {
+			return attachmentEvidenceUnavailable("Publish move history changed before provider dispatch", nil)
+		}
+		return recheckPublishPVImage(ctx)
+	}
+	return nil
 }
 
 func publishMoveDigest(value any) string {
@@ -111,9 +127,44 @@ func (s *ControllerServer) reservePublishMove(ctx context.Context, req *csi.Cont
 		return nil, deny
 	}
 	if err := admission.check(ctx, &reserved); err != nil {
-		return nil, deny
+		return &reserved, deny
 	}
 	return &reserved, nil
+}
+
+func (s *ControllerServer) releaseUnsentPublishMove(ctx context.Context, req *csi.ControllerPublishVolumeRequest, original publishPVAdmission, reserved *VolumeRuntimeContext, node KubernetesNodeIdentity, vmID, imageID int) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	move, ok := ctx.Value(publishMoveSourceKey{}).(publishMoveAdmission)
+	if !ok || move.err != nil {
+		return
+	}
+	pvs := s.driver.kubeRuntime.client.CoreV1().PersistentVolumes()
+	pv, err := pvs.Get(ctx, reserved.PVName, metav1.GetOptions{})
+	if err != nil || pv.ResourceVersion == "" || !publishPVMatches(pv, reserved, s.driver.name, req.VolumeId) {
+		return
+	}
+	history, err := s.readAttachmentHistory(ctx, req.VolumeId)
+	if err != nil || history.PendingPublishMove != nil || history.PendingReplacementAttach != nil ||
+		publishMoveGenerationBeforeRelease(history, req.VolumeId) != move.generation {
+		return
+	}
+	destination, err := s.publishMoveNode(ctx, req.NodeId)
+	if err != nil || destination.UID != node.UID || destination.VM != vmID ||
+		s.verifyPublishMoveSource(ctx, req, move.source, imageID, reserved) != nil {
+		return
+	}
+	originalReceipt := original.binding.PVAnnotations[annotationPublishMoveReceipt]
+	original.binding = reserved
+	if err := recheckPublishPVImage(context.WithValue(ctx, publishPVImageCheckKey{}, original)); err != nil {
+		return
+	}
+	if originalReceipt == "" {
+		delete(pv.Annotations, annotationPublishMoveReceipt)
+	} else {
+		pv.Annotations[annotationPublishMoveReceipt] = originalReceipt
+	}
+	_, _ = pvs.Update(ctx, pv, metav1.UpdateOptions{})
 }
 
 func (s *ControllerServer) startPublishMove(ctx context.Context, req *csi.ControllerPublishVolumeRequest, disk successfulAttachmentObservation, binding *VolumeRuntimeContext, protection *LocalRWOProtectionDecision, verify func() error) (*pendingPublishMove, error) {
@@ -166,20 +217,20 @@ func (s *ControllerServer) verifyPublishMove(ctx context.Context, req *csi.Contr
 		publishMoveGeneration(history) != move.Prior {
 		return deny
 	}
-	return s.verifyPublishMoveSource(ctx, req, *move, binding)
+	return s.verifyPublishMoveSource(ctx, req, move.Source, move.Image, binding)
 }
 
-func (s *ControllerServer) verifyPublishMoveSource(ctx context.Context, req *csi.ControllerPublishVolumeRequest, move pendingPublishMove, binding *VolumeRuntimeContext) error {
+func (s *ControllerServer) verifyPublishMoveSource(ctx context.Context, req *csi.ControllerPublishVolumeRequest, original publishMoveNode, imageID int, binding *VolumeRuntimeContext) error {
 	deny := attachmentEvidenceUnavailable("Publish move source or demand is unverified", nil)
-	source, err := s.publishMoveNode(ctx, move.Source.Name)
-	if err != nil || source != move.Source {
+	source, err := s.publishMoveNode(ctx, original.Name)
+	if err != nil || source != original {
 		return deny
 	}
 	if inspector, ok := s.volumeProvider.(opennebula.ReplacementAttachInspector); ok {
-		if _, err := inspector.InspectReplacementRelease(ctx, move.Image, source.VM, ""); err != nil {
+		if _, err := inspector.InspectReplacementRelease(ctx, imageID, source.VM, ""); err != nil {
 			return deny
 		}
-	} else if _, err := s.volumeProvider.GetVolumeInNode(ctx, move.Image, source.VM); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
+	} else if _, err := s.volumeProvider.GetVolumeInNode(ctx, imageID, source.VM); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
 		return deny
 	}
 	desired, err := s.driver.kubeRuntime.DesiredNodeForVolume(ctx, req.VolumeId)
@@ -347,7 +398,20 @@ func (s *ControllerServer) finishPublishMove(ctx context.Context, req *csi.Contr
 	}
 	ctx = completed.withAdmission(ctx)
 	if err := s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, disk, req.GetVolumeContext(), binding, time.Time{}, move, func() error {
-		return verify(ctx)
+		if err := verify(ctx); err != nil {
+			return err
+		}
+		if state, held := s.driver.stickyAttachments.Get(req.VolumeId); held && state.NodeID == move.Source.Name {
+			if (state.PVCUID != "" && state.PVCUID != binding.PVCUID) ||
+				(state.PVCName != "" && state.PVCName != binding.PVCName) ||
+				(state.PVCNamespace != "" && state.PVCNamespace != binding.PVCNamespace) {
+				return attachmentEvidenceUnavailable("Publish move sticky attachment claim changed", nil)
+			}
+			if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
+				return attachmentEvidenceUnavailable("could not release the prior sticky attachment hold", nil)
+			}
+		}
+		return nil
 	}); err != nil {
 		return nil, err
 	}

@@ -714,6 +714,7 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 					restarted := newStickyTestDriver(t)
 					restarted.kubeRuntime.client = kube
 					require.NoError(t, restarted.volumeHistory.LoadFromConfigMap(ctx))
+					require.NoError(t, restarted.stickyAttachments.LoadFromConfigMap(ctx))
 					restart := NewControllerServer(restarted, probe, nil)
 					if queued {
 						restarted.hotplugQueue = NewHotplugQueueManager(nil, "default", restarted.metrics, 5*time.Second, time.Second)
@@ -752,8 +753,14 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 				}
 				state.mu.Unlock()
 				if !shared {
-					_, exists := driver.stickyAttachments.Get("volume-test")
-					require.False(t, exists)
+					stickyConfig, err := kube.CoreV1().ConfigMaps("default").Get(ctx, stickyAttachmentStateConfigMapName, metav1.GetOptions{})
+					require.NoError(t, err)
+					switch mode {
+					case "shared=false", "conflict", "history-write-fails", "pending-write-lost", "grant-write-fails", "lost-grant-reply", "renewed":
+						require.NotContains(t, stickyConfig.Data, "volume-test")
+					default:
+						require.Contains(t, stickyConfig.Data, "volume-test")
+					}
 					current, err := driver.kubeRuntime.client.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
 					require.NoError(t, err)
 					require.Equal(t, mode != "shared=false", injected.Load())
@@ -792,6 +799,142 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 					require.Equal(t, 1, usedEvents)
 				default:
 					require.Zero(t, usedEvents)
+				}
+			})
+		}
+	}
+}
+
+func TestPublishMoveReleasesOnlyKnownUnsentReservations(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, mode := range []string{"local-refusal", "typed-refusal", "lost-reservation", "lost-attach", "changed-grant"} {
+			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+				grant := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+				pv.ResourceVersion = "1"
+				pv.Annotations[annotationAllowCrossNodeUntil] = grant
+				driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true), newReadyNode("node-new", true),
+					activePodForPVC("move-consumer", pvc.Name, "node-new"))
+				require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
+					VolumeID: volume, NodeID: "node-old", Backend: "local", StartedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute),
+				}))
+				provider, wire := nodeAttachmentProvider(t)
+				wire.mu.Lock()
+				wire.disks[41], wire.marker = 128, 128*1024*1024
+				wire.rejectFirstAttach = mode == "typed-refusal"
+				wire.loseAttachReply = mode == "lost-attach"
+				wire.mu.Unlock()
+				kube := driver.kubeRuntime.client.(*fake.Clientset)
+				renewed := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+				if mode == "lost-reservation" {
+					var lost atomic.Bool
+					kube.PrependReactor("update", "persistentvolumes", func(action ktesting.Action) (bool, kruntime.Object, error) {
+						proposal := action.(ktesting.UpdateAction).GetObject().(*corev1.PersistentVolume)
+						if !strings.HasPrefix(proposal.Annotations[annotationPublishMoveReceipt], publishMoveReservationPrefix) ||
+							!lost.CompareAndSwap(false, true) {
+							return false, nil, nil
+						}
+						gvr := corev1.SchemeGroupVersion.WithResource("persistentvolumes")
+						require.NoError(t, kube.Tracker().Update(gvr, proposal, ""))
+						return true, nil, context.DeadlineExceeded
+					})
+				}
+				probe := &publishRestoreProbe{PersistentDiskVolumeProvider: provider}
+				var injected atomic.Bool
+				if mode == "local-refusal" || mode == "changed-grant" {
+					probe.whileAttaching = func() func() {
+						if !injected.CompareAndSwap(false, true) {
+							return func() {}
+						}
+						if mode == "changed-grant" {
+							gvr := corev1.SchemeGroupVersion.WithResource("persistentvolumes")
+							obj, err := kube.Tracker().Get(gvr, "", pv.Name)
+							require.NoError(t, err)
+							current := obj.(*corev1.PersistentVolume)
+							current.Annotations[annotationAllowCrossNodeUntil] = renewed
+							require.NoError(t, kube.Tracker().Update(gvr, current, ""))
+						}
+						wire.mu.Lock()
+						wire.failMethod = "one.datastorepool.info"
+						wire.mu.Unlock()
+						return func() {
+							wire.mu.Lock()
+							wire.failMethod = ""
+							wire.mu.Unlock()
+						}
+					}
+				}
+				server := NewControllerServer(driver, probe, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+				}
+
+				req := newPublishReq(volume, "node-new")
+				reply, err := reviewControllerClient(t, server).ControllerPublishVolume(ctx, req)
+				require.Error(t, err)
+				require.Nil(t, reply)
+				history, err := server.readAttachmentHistory(ctx, volume)
+				require.NoError(t, err)
+				require.True(t, history.LastSuccessfulPublishTime.IsZero())
+				require.Nil(t, history.PendingPublishMove)
+				current, err := kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+				require.NoError(t, err)
+				knownUnsent := mode == "local-refusal" || mode == "typed-refusal"
+				if mode == "changed-grant" {
+					require.Equal(t, renewed, current.Annotations[annotationAllowCrossNodeUntil])
+				} else {
+					require.Equal(t, grant, current.Annotations[annotationAllowCrossNodeUntil])
+				}
+				wire.mu.Lock()
+				firstAttempts := wire.attachAttempts
+				wire.mu.Unlock()
+				if mode == "typed-refusal" || mode == "lost-attach" {
+					require.Equal(t, 1, firstAttempts)
+				} else {
+					require.Zero(t, firstAttempts)
+				}
+
+				restarted := newStickyTestDriver(t)
+				restarted.kubeRuntime.client = kube
+				require.NoError(t, restarted.volumeHistory.LoadFromConfigMap(ctx))
+				require.NoError(t, restarted.stickyAttachments.LoadFromConfigMap(ctx))
+				server = NewControllerServer(restarted, probe, nil)
+				if queued {
+					restarted.hotplugQueue = NewHotplugQueueManager(nil, "default", restarted.metrics, 5*time.Second, time.Second)
+					restarted.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+				}
+				if knownUnsent {
+					require.NotContains(t, current.Annotations, annotationPublishMoveReceipt)
+					reply, err = reviewControllerClient(t, server).ControllerPublishVolume(ctx, req)
+					require.NoError(t, err)
+					require.NotNil(t, reply)
+					current, err = kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+					require.NoError(t, err)
+					require.NotContains(t, current.Annotations, annotationAllowCrossNodeUntil)
+				} else {
+					require.NotEmpty(t, current.Annotations[annotationPublishMoveReceipt])
+					current.Annotations[annotationAllowCrossNodeUntil] = renewed
+					_, err := kube.CoreV1().PersistentVolumes().Update(ctx, current, metav1.UpdateOptions{})
+					require.NoError(t, err)
+					reply, err = reviewControllerClient(t, server).ControllerPublishVolume(ctx, req)
+					require.Equal(t, codes.Unavailable, status.Code(err))
+					require.Nil(t, reply)
+				}
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				switch {
+				case knownUnsent:
+					require.Equal(t, firstAttempts+1, wire.attachAttempts)
+					require.Equal(t, []string{"detach:41", "attach:42:false"}, wire.mutations)
+				case mode == "lost-attach":
+					require.Equal(t, firstAttempts, wire.attachAttempts)
+					require.Equal(t, []string{"detach:41", "attach:42:false"}, wire.mutations)
+				default:
+					require.Equal(t, firstAttempts, wire.attachAttempts)
+					require.Equal(t, []string{"detach:41"}, wire.mutations)
 				}
 			})
 		}
@@ -3538,10 +3681,19 @@ func TestControllerPublishMoveClearsStaleAttachmentPinsWhenCensusFails(t *testin
 
 type publishRestoreProbe struct {
 	*opennebula.PersistentDiskVolumeProvider
-	restored      atomic.Bool
-	beforeRestore func()
-	beforeSize    func()
-	beforeLookup  func()
+	restored       atomic.Bool
+	beforeRestore  func()
+	beforeSize     func()
+	beforeLookup   func()
+	whileAttaching func() func()
+}
+
+func (p *publishRestoreProbe) AttachVolume(ctx context.Context, volume, node string, readOnly bool, params map[string]string) error {
+	if p.whileAttaching != nil {
+		done := p.whileAttaching()
+		defer done()
+	}
+	return p.PersistentDiskVolumeProvider.AttachVolume(ctx, volume, node, readOnly, params)
 }
 
 func (p *publishRestoreProbe) GetVolumeInNode(ctx context.Context, image, node int) (string, error) {
@@ -8745,7 +8897,7 @@ func TestControllerPublishPlacementPatchRejectsChangedPV(t *testing.T) {
 
 func TestControllerPublishManualAdoptionSeparatesDeviceNames(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"verified", "verified-ceph", "ceph-changed-disk", "ceph-changed-guest", "ceph-changed-image", "late-provider-target", "wrong-provider-serial", "wrong-guest-evidence", "adoption-write-fails", "adoption-write-lost", "adoption-stale-readback"} {
+		for _, mode := range []string{"verified", "verified-ceph", "ceph-mixed-case", "adoption-late-write", "adoption-late-new-intent", "ceph-changed-disk", "ceph-changed-guest", "ceph-changed-image", "late-provider-target", "wrong-provider-serial", "wrong-case-variant-serial", "wrong-guest-evidence", "adoption-write-fails", "adoption-write-lost", "adoption-stale-readback"} {
 			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				const volume = "volume-test"
@@ -8757,7 +8909,11 @@ func TestControllerPublishManualAdoptionSeparatesDeviceNames(t *testing.T) {
 					annotationConfirmedVolumeName:   "/dev/sdf",
 				})
 				pv.Status.Phase, pvc.Status.Phase = corev1.VolumeBound, corev1.ClaimBound
-				ceph := mode == "verified-ceph" || strings.HasPrefix(mode, "ceph-")
+				lateWrite := strings.HasPrefix(mode, "adoption-late-")
+				ceph := mode == "verified-ceph" || strings.HasPrefix(mode, "ceph-") || lateWrite
+				if mode == "ceph-mixed-case" {
+					pvc.Annotations[annotationConfirmedDeviceSerial] = "ONECSI-7"
+				}
 				if ceph {
 					pv.Annotations[annotationBackend], pvc.Annotations[annotationBackend] = "ceph", "ceph"
 					pv.Spec.Capacity = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("128Mi")}
@@ -8772,32 +8928,50 @@ func TestControllerPublishManualAdoptionSeparatesDeviceNames(t *testing.T) {
 				driver.nodeID = node.Name
 				driver.PluginConfig.OverrideVal(config.StuckAttachmentReconcilerEnabledVar, true)
 				var adoptionFault atomic.Bool
+				var delayed *corev1.ConfigMap
+				kube := driver.kubeRuntime.client.(*fake.Clientset)
+				if lateWrite {
+					_, err := kube.CoreV1().ConfigMaps("default").Create(ctx, &corev1.ConfigMap{
+						ObjectMeta: metav1.ObjectMeta{Name: volumeRecoveryControlStateConfigMapName, Namespace: "default", ResourceVersion: "1", UID: "recovery-cm"},
+					}, metav1.CreateOptions{})
+					require.NoError(t, err)
+				}
 				if strings.HasPrefix(mode, "adoption-") {
-					kube := driver.kubeRuntime.client.(*fake.Clientset)
-					kube.PrependReactor("patch", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
-						patch := action.(ktesting.PatchAction)
-						if patch.GetName() != volumeRecoveryControlStateConfigMapName {
+					kube.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+						proposal := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
+						if proposal.Name != volumeRecoveryControlStateConfigMapName {
 							return false, nil, nil
 						}
-						var payload struct{ Data map[string]string }
-						require.NoError(t, json.Unmarshal(patch.GetPatch(), &payload))
-						var proposed VolumeRecoveryControlState
-						require.NoError(t, json.Unmarshal([]byte(payload.Data[volume]), &proposed))
-						if !proposed.Adopted || !adoptionFault.CompareAndSwap(false, true) {
-							return false, nil, nil
-						}
+						var adoption VolumeRecoveryControlState
+						require.NoError(t, json.Unmarshal([]byte(proposal.Data[volume]), &adoption))
 						gvr := corev1.SchemeGroupVersion.WithResource("configmaps")
-						obj, err := kube.Tracker().Get(gvr, patch.GetNamespace(), patch.GetName())
+						obj, err := kube.Tracker().Get(gvr, proposal.Namespace, proposal.Name)
 						require.NoError(t, err)
 						cm := obj.(*corev1.ConfigMap)
-						switch mode {
-						case "adoption-stale-readback":
-							return true, cm, nil
-						case "adoption-write-lost":
-							cm.Data[volume] = payload.Data[volume]
-							require.NoError(t, kube.Tracker().Update(gvr, cm, cm.Namespace))
+						if lateWrite && (cm.ResourceVersion != proposal.ResourceVersion || cm.UID != proposal.UID) {
+							return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), cm.Name, errors.New("stale resource version"))
 						}
-						return true, nil, errors.New("adoption update unavailable")
+						if adoption.Adopted && adoptionFault.CompareAndSwap(false, true) {
+							switch {
+							case lateWrite:
+								delayed = proposal.DeepCopy()
+								return true, nil, context.DeadlineExceeded
+							case mode == "adoption-stale-readback":
+								return true, cm, nil
+							case mode == "adoption-write-lost":
+								require.NoError(t, kube.Tracker().Update(gvr, proposal, cm.Namespace))
+							}
+							return true, nil, errors.New("adoption update unavailable")
+						}
+						if lateWrite {
+							version, err := strconv.Atoi(cm.ResourceVersion)
+							require.NoError(t, err)
+							proposal = proposal.DeepCopy()
+							proposal.ResourceVersion = strconv.Itoa(version + 1)
+							require.NoError(t, kube.Tracker().Update(gvr, proposal, cm.Namespace))
+							return true, proposal, nil
+						}
+						return false, nil, nil
 					})
 				}
 				if mode == "wrong-guest-evidence" {
@@ -8824,9 +8998,13 @@ func TestControllerPublishManualAdoptionSeparatesDeviceNames(t *testing.T) {
 						defer wire.mu.Unlock()
 						wire.diskTarget = "vdc"
 					}
-				case "wrong-provider-serial":
+				case "wrong-provider-serial", "wrong-case-variant-serial":
+					serial := "onecsi-8"
+					if mode == "wrong-case-variant-serial" {
+						serial = "ONECSI-8"
+					}
 					wire.mu.Lock()
-					wire.attachedDisks[41] = map[string]string{"IMAGE_ID": "7", "SERIAL": "onecsi-8"}
+					wire.attachedDisks[41] = map[string]string{"IMAGE_ID": "7", "SERIAL": serial}
 					wire.mu.Unlock()
 				}
 				server := NewControllerServer(driver, probe, nil)
@@ -8836,38 +9014,66 @@ func TestControllerPublishManualAdoptionSeparatesDeviceNames(t *testing.T) {
 				}
 				client := reviewControllerClient(t, server)
 				publish := newPublishReq(volume, node.Name)
+				originalScope, err := driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volume)
+				require.NoError(t, err)
 				reply, err := client.ControllerPublishVolume(ctx, publish)
 				history, historyErr := server.readAttachmentHistory(ctx, volume)
 				require.NoError(t, historyErr)
+				guest := "sdf"
 				if strings.HasPrefix(mode, "adoption-") {
 					require.True(t, adoptionFault.Load())
 					require.Equal(t, codes.Unavailable, status.Code(err))
 					require.Nil(t, reply)
 					require.True(t, history.LastSuccessfulPublishTime.IsZero())
-					retried, err := client.ControllerPublishVolume(ctx, publish)
+					if mode == "adoption-late-new-intent" {
+						guest = "sdg"
+						current, err := kube.CoreV1().PersistentVolumeClaims(pvc.Namespace).Get(ctx, pvc.Name, metav1.GetOptions{})
+						require.NoError(t, err)
+						current.Annotations[annotationConfirmedVolumeName] = "/dev/sdg"
+						current.Annotations[annotationRecoveryTicket] = "new-ticket"
+						_, err = kube.CoreV1().PersistentVolumeClaims(pvc.Namespace).Update(ctx, current, metav1.UpdateOptions{})
+						require.NoError(t, err)
+					}
+					reply, err = client.ControllerPublishVolume(ctx, publish)
 					require.NoError(t, err)
-					require.Equal(t, "sdf", retried.PublishContext["volumeName"])
+					require.Equal(t, guest, reply.PublishContext["volumeName"])
 					durable, err := driver.volumeRecoveryControl.readAdoption(ctx, volume)
 					require.NoError(t, err)
 					require.True(t, durable.Adopted)
-					require.Equal(t, "sdf", durable.AdoptedVolumeName)
-					wire.mu.Lock()
-					defer wire.mu.Unlock()
-					require.Empty(t, wire.mutations)
-					return
+					require.Equal(t, guest, durable.AdoptedVolumeName)
+					if lateWrite {
+						require.NotNil(t, delayed)
+						_, err := kube.CoreV1().ConfigMaps("default").Update(ctx, delayed, metav1.UpdateOptions{})
+						require.True(t, apierrors.IsConflict(err))
+						_, err = server.recoveryControlState(ctx, volume, originalScope)
+						require.NoError(t, err)
+						preserved, err := driver.volumeRecoveryControl.readAdoption(ctx, volume)
+						require.NoError(t, err)
+						require.Equal(t, durable, preserved)
+						history, err = server.readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.Equal(t, *durable.AdoptedAt, history.LastSuccessfulPublishTime)
+					} else {
+						wire.mu.Lock()
+						defer wire.mu.Unlock()
+						require.Empty(t, wire.mutations)
+						return
+					}
 				}
 				if mode == "verified" || ceph {
 					require.NoError(t, err)
-					require.Equal(t, "sdf", reply.GetPublishContext()["volumeName"])
+					require.Equal(t, guest, reply.GetPublishContext()["volumeName"])
+					require.Equal(t, "onecsi-7", reply.GetPublishContext()[publishContextDeviceSerial])
 					require.Equal(t, "true", reply.GetPublishContext()[publishContextRecoveryAdoptedDevice])
 					require.Equal(t, "vdb", history.LastSuccessfulTarget)
 					require.Equal(t, new(2), history.LastSuccessfulDiskID)
 					control, found := driver.volumeRecoveryControl.Get(volume)
 					require.True(t, found)
-					require.Equal(t, "sdf", control.AdoptedVolumeName)
+					require.Equal(t, guest, control.AdoptedVolumeName)
+					require.Equal(t, "onecsi-7", control.AdoptedDeviceSerial)
 					if ceph {
 						diskPath := withTestDiskPath(t)
-						require.NoError(t, os.WriteFile(filepath.Join(diskPath, "sdf"), []byte("fixture"), 0o600))
+						require.NoError(t, os.WriteFile(filepath.Join(diskPath, guest), []byte("fixture"), 0o600))
 						stageMount := mount.NewFakeMounter(nil)
 						ns := NewNodeServer(driver, mount.NewSafeFormatAndMount(stageMount, reviewDeviceSerialFixture(t, func(string) string {
 							return "onecsi-7"
@@ -8891,6 +9097,9 @@ func TestControllerPublishManualAdoptionSeparatesDeviceNames(t *testing.T) {
 						current.Annotations[annotationRecoveryMode] = recoveryModeDisabled
 						_, err = core.PersistentVolumeClaims(pvc.Namespace).Update(ctx, current, metav1.UpdateOptions{})
 						require.NoError(t, err)
+						updatedControl, err := server.recoveryControlState(ctx, volume, nil)
+						require.NoError(t, err)
+						require.False(t, updatedControl.ManualActive())
 						metadata := cloneStringMap(reply.PublishContext)
 						switch mode {
 						case "ceph-changed-guest":
@@ -8910,7 +9119,7 @@ func TestControllerPublishManualAdoptionSeparatesDeviceNames(t *testing.T) {
 						}, metav1.CreateOptions{})
 						require.NoError(t, err)
 						released, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
-						if mode == "verified-ceph" {
+						if mode == "verified-ceph" || mode == "ceph-mixed-case" || lateWrite {
 							require.NoError(t, err)
 							require.NotNil(t, released)
 						} else {

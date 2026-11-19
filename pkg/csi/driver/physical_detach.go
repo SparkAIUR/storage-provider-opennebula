@@ -1057,6 +1057,9 @@ func (s *ControllerServer) detachVolumeWithAuthority(ctx context.Context, volume
 		if err := s.checkPhysicalDetachAuthority(ctx, volume, node, &attempt, detachDispatch); err != nil {
 			return err
 		}
+		if err := s.checkPublishMoveAdmission(ctx, volume); err != nil {
+			return err
+		}
 		identity = attempt
 		return nil
 	}

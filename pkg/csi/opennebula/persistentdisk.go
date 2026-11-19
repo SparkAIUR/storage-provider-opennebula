@@ -825,6 +825,9 @@ func (p *PersistentDiskVolumeProvider) AttachVolume(ctx context.Context, volume 
 		if attempt != "" {
 			return status.Error(codes.Unavailable, "replacement attach outcome is unverified")
 		}
+		if dispatch != nil {
+			return status.Error(codes.Unavailable, "attach outcome is unverified")
+		}
 		retryAttach = func(ctx context.Context) error {
 			var err error
 			report, err = p.inspectAttachmentEnvironment(ctx, volumeID, nodeID, vmName)

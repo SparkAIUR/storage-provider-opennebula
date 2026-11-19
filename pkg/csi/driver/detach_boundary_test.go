@@ -186,7 +186,12 @@ func TestControllerLegacyDetachBoundaries(t *testing.T) {
 			case "transfer":
 				response, err := client.ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-new"))
 				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				require.ErrorContains(t, err, "detach disk identity or completed capacity is unverified")
 				require.Nil(t, response)
+				current, err := driver.kubeRuntime.client.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+				require.NoError(t, err)
+				require.Equal(t, pv.Annotations[annotationAllowCrossNodeUntil], current.Annotations[annotationAllowCrossNodeUntil])
+				require.NotContains(t, current.Annotations, annotationPublishMoveReceipt)
 			case "expiry":
 				before, _ := driver.stickyAttachments.Get("volume-test")
 				controller.expireStickyDetach(ctx, before)

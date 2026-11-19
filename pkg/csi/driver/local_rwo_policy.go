@@ -753,11 +753,14 @@ func (s *ControllerServer) observePublishedDisk(ctx context.Context, volumeID, r
 	_, moving := ctx.Value(publishMoveSourceKey{}).(publishMoveAdmission)
 	observation := successfulAttachmentObservation{
 		nodeName: strings.TrimSpace(requestedNode), target: strings.TrimSpace(target),
-		imageID: imageID, vmID: vmID, diskID: -1, serial: firstNonEmpty(adoptedSerial, fmt.Sprintf("onecsi-%d", imageID)),
+		imageID: imageID, vmID: vmID, diskID: -1, serial: fmt.Sprintf("onecsi-%d", imageID),
 		adopted: adoptedSerial != "",
 	}
 	if (!observation.adopted && observation.target == "") || imageID <= 0 || vmID <= 0 {
 		return observation, attachmentEvidenceUnavailable("publish attachment identity is incomplete", nil)
+	}
+	if observation.adopted && !strings.EqualFold(adoptedSerial, observation.serial) {
+		return observation, attachmentEvidenceUnavailable("adoption serial differs from the verified image", nil)
 	}
 
 	var metadata *opennebula.VolumeAttachmentMetadata
@@ -895,6 +898,9 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 		}
 		if err := verify(); err != nil {
 			return err
+		}
+		if !adoptionTime.IsZero() && adoptionTime.Before(state.LastSuccessfulPublishTime) {
+			return attachmentEvidenceUnavailable("Publish adoption was superseded", nil)
 		}
 		if err := state.checkAttachmentNode(observation); err != nil {
 			return err

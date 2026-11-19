@@ -14,6 +14,7 @@ import (
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 )
 
@@ -177,71 +178,142 @@ func (m *VolumeRecoveryControlManager) Snapshot() map[string]VolumeRecoveryContr
 	return snapshot
 }
 
-func (m *VolumeRecoveryControlManager) Upsert(ctx context.Context, volumeID string, mutate func(*VolumeRecoveryControlState)) (VolumeRecoveryControlState, error) {
-	if m == nil || strings.TrimSpace(volumeID) == "" {
+func (m *VolumeRecoveryControlManager) updateEntry(ctx context.Context, volumeID string, change func(VolumeRecoveryControlState) (*VolumeRecoveryControlState, error)) (VolumeRecoveryControlState, error) {
+	volumeID = strings.TrimSpace(volumeID)
+	if m == nil || volumeID == "" {
 		return VolumeRecoveryControlState{}, nil
 	}
-	volumeID = strings.TrimSpace(volumeID)
-	m.mu.Lock()
-	state := m.entries[volumeID]
-	if strings.TrimSpace(state.VolumeID) == "" {
-		state.VolumeID = volumeID
+	apply := func(current VolumeRecoveryControlState) (*VolumeRecoveryControlState, error) {
+		next, err := change(current)
+		if err != nil || next == nil || reflect.DeepEqual(*next, current) {
+			return next, err
+		}
+		next.VolumeID, next.Version = volumeID, stateObjectVersion
+		next.LastObservedAt = time.Now().UTC()
+		return next, nil
 	}
-	state.Version = stateObjectVersion
-	mutate(&state)
-	state.VolumeID = volumeID
-	state.Version = stateObjectVersion
-	state.LastObservedAt = time.Now().UTC()
-	m.entries[volumeID] = state
-	m.mu.Unlock()
-	if err := m.persistEntry(ctx, state); err != nil {
-		return state, err
-	}
-	return state, nil
-}
-
-func (m *VolumeRecoveryControlManager) Clear(ctx context.Context, volumeID string) error {
-	if m == nil || strings.TrimSpace(volumeID) == "" {
-		return nil
-	}
-	volumeID = strings.TrimSpace(volumeID)
-	m.mu.Lock()
-	delete(m.entries, volumeID)
-	m.mu.Unlock()
 	if m.runtime == nil || !m.runtime.enabled {
-		return nil
-	}
-	return m.runtime.DeleteConfigMapKey(ctx, m.namespace, volumeRecoveryControlStateConfigMapName, volumeID)
-}
-
-func (m *VolumeRecoveryControlManager) SyncFromRuntimeContext(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext) (VolumeRecoveryControlState, error) {
-	if m == nil || strings.TrimSpace(volumeID) == "" {
-		return VolumeRecoveryControlState{}, nil
-	}
-	volumeID = strings.TrimSpace(volumeID)
-	existing, _ := m.Get(volumeID)
-	resolved := resolvedRecoveryControlState(volumeID, runtimeCtx, existing)
-	if !resolved.Active() && !resolved.Expired && !resolved.Invalid && !resolved.Adopted {
-		if err := m.Clear(ctx, volumeID); err != nil {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		next, err := apply(m.entries[volumeID])
+		if err != nil {
 			return VolumeRecoveryControlState{}, err
+		}
+		if next == nil {
+			delete(m.entries, volumeID)
+			return VolumeRecoveryControlState{}, nil
+		}
+		m.entries[volumeID] = *next
+		return *next, nil
+	}
+
+	maps := m.runtime.client.CoreV1().ConfigMaps(m.namespace)
+	cm, err := maps.Get(ctx, volumeRecoveryControlStateConfigMapName, metav1.GetOptions{})
+	missing := errors.IsNotFound(err)
+	if err != nil && !missing {
+		return VolumeRecoveryControlState{}, err
+	}
+	current := VolumeRecoveryControlState{}
+	if missing {
+		cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: volumeRecoveryControlStateConfigMapName, Namespace: m.namespace}}
+	} else if raw, exists := cm.Data[volumeID]; exists {
+		if err := decodeCephRetentionProtection(raw, &current); err != nil || current.VolumeID != volumeID {
+			return VolumeRecoveryControlState{}, attachmentEvidenceUnavailable("recovery control record is unverified", nil)
+		}
+	}
+	next, err := apply(current)
+	if err != nil {
+		return VolumeRecoveryControlState{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return VolumeRecoveryControlState{}, err
+	}
+	if next == nil {
+		if _, exists := cm.Data[volumeID]; exists {
+			delete(cm.Data, volumeID)
+			_, err = maps.Update(ctx, cm, metav1.UpdateOptions{})
+		}
+	} else if !reflect.DeepEqual(*next, current) {
+		payload, marshalErr := json.Marshal(next)
+		if marshalErr != nil {
+			return VolumeRecoveryControlState{}, marshalErr
+		}
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		cm.Data[volumeID] = string(payload)
+		if missing {
+			_, err = maps.Create(ctx, cm, metav1.CreateOptions{})
+		} else {
+			_, err = maps.Update(ctx, cm, metav1.UpdateOptions{})
+		}
+	}
+	if err != nil {
+		return VolumeRecoveryControlState{}, attachmentEvidenceUnavailable("recovery control write is unverified", err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cached := m.entries[volumeID]
+	if next == nil {
+		if !cached.LastObservedAt.After(current.LastObservedAt) {
+			delete(m.entries, volumeID)
 		}
 		return VolumeRecoveryControlState{}, nil
 	}
-	return m.Upsert(ctx, volumeID, func(current *VolumeRecoveryControlState) {
-		adopted := current.Adopted
-		adoptedNode := current.AdoptedNode
-		adoptedAt := current.AdoptedAt
-		adoptedSerial := current.AdoptedDeviceSerial
-		adoptedVolumeName := current.AdoptedVolumeName
-		expiryWarningEmittedAt := current.ExpiryWarningEmittedAt
-		*current = resolved
-		current.Adopted = adopted
-		current.AdoptedNode = adoptedNode
-		current.AdoptedAt = adoptedAt
-		current.AdoptedDeviceSerial = adoptedSerial
-		current.AdoptedVolumeName = adoptedVolumeName
-		current.ExpiryWarningEmittedAt = expiryWarningEmittedAt
+	if !cached.LastObservedAt.After(next.LastObservedAt) {
+		m.entries[volumeID] = *next
+	}
+	return *next, nil
+}
+
+func (m *VolumeRecoveryControlManager) Upsert(ctx context.Context, volumeID string, mutate func(*VolumeRecoveryControlState)) (VolumeRecoveryControlState, error) {
+	return m.updateEntry(ctx, volumeID, func(current VolumeRecoveryControlState) (*VolumeRecoveryControlState, error) {
+		mutate(&current)
+		return &current, nil
 	})
+}
+
+func (m *VolumeRecoveryControlManager) clearIfCurrent(ctx context.Context, volumeID string, expected VolumeRecoveryControlState) error {
+	_, err := m.updateEntry(ctx, volumeID, func(current VolumeRecoveryControlState) (*VolumeRecoveryControlState, error) {
+		if reflect.DeepEqual(current, expected) {
+			return nil, nil
+		}
+		return &current, nil
+	})
+	return err
+}
+
+func (m *VolumeRecoveryControlManager) SyncFromRuntimeContext(ctx context.Context, volumeID string, runtimeCtx *VolumeRuntimeContext) (VolumeRecoveryControlState, error) {
+	var resolved VolumeRecoveryControlState
+	_, err := m.updateEntry(ctx, volumeID, func(current VolumeRecoveryControlState) (*VolumeRecoveryControlState, error) {
+		resolved = resolvedRecoveryControlState(volumeID, runtimeCtx, current)
+		if current.Adopted {
+			return &current, nil
+		}
+		resolved.LastObservedAt = current.LastObservedAt
+		if reflect.DeepEqual(resolved, current) || (runtimeCtx == nil && current.VolumeID != "") {
+			return &current, nil
+		}
+		if runtimeCtx != nil && m.runtime != nil && m.runtime.enabled &&
+			(current.VolumeID != "" || resolved.Active() || resolved.Expired || resolved.Invalid) {
+			runtime := m.runtime
+			pv, err := runtime.client.CoreV1().PersistentVolumes().Get(ctx, runtimeCtx.PVName, metav1.GetOptions{})
+			if err != nil || !publishPVMatches(pv, runtimeCtx, firstNonEmpty(runtime.driverName, DefaultDriverName), volumeID) {
+				return nil, attachmentEvidenceUnavailable("recovery control volume changed before refresh", err)
+			}
+			binding := runtime.volumeRuntimeContext(ctx, pv)
+			if binding.PVCUID != runtimeCtx.PVCUID || binding.PVCName != runtimeCtx.PVCName ||
+				binding.PVCNamespace != runtimeCtx.PVCNamespace || binding.pvcDeleting != runtimeCtx.pvcDeleting ||
+				!samePublishAnnotations(runtimeCtx.PVCAnnotations, binding.PVCAnnotations) {
+				return nil, attachmentEvidenceUnavailable("recovery control claim changed before refresh", nil)
+			}
+		}
+		if !resolved.Active() && !resolved.Expired && !resolved.Invalid {
+			return nil, nil
+		}
+		return &resolved, nil
+	})
+	return resolved, err
 }
 
 func (m *VolumeRecoveryControlManager) readAdoption(ctx context.Context, volume string) (VolumeRecoveryControlState, error) {
@@ -254,7 +326,7 @@ func (m *VolumeRecoveryControlManager) readAdoption(ctx context.Context, volume 
 	return adoption, err
 }
 
-func (s *ControllerServer) persistPublishAdoption(ctx context.Context, volume string, binding *VolumeRuntimeContext, disk successfulAttachmentObservation, metadata map[string]string) (func(context.Context) error, time.Time, error) {
+func (s *ControllerServer) persistPublishAdoption(ctx context.Context, volume string, binding *VolumeRuntimeContext, disk successfulAttachmentObservation, metadata map[string]string, verifyPublish func() error) (func(context.Context) error, time.Time, error) {
 	manager := s.driver.volumeRecoveryControl
 	unverified := attachmentEvidenceUnavailable("Publish guest adoption evidence is unverified", nil)
 	if manager == nil || manager.runtime == nil || !manager.runtime.enabled ||
@@ -275,20 +347,40 @@ func (s *ControllerServer) persistPublishAdoption(ctx context.Context, volume st
 	control.AdoptedAt = &now
 	control.AdoptedVolumeName = guest
 	control.AdoptedDeviceSerial = disk.serial
-	if _, err := manager.Upsert(ctx, volume, func(state *VolumeRecoveryControlState) { *state = control }); err != nil {
-		return nil, time.Time{}, unverified
-	}
-	verify := func(ctx context.Context) error {
-		current, err := manager.readAdoption(ctx, volume)
-		current.LastObservedAt = control.LastObservedAt
-		if err != nil || !reflect.DeepEqual(current, control) {
-			return unverified
-		}
+	verifyDemand := func(ctx context.Context) error {
 		desired, _, err := manager.runtime.VolumeDesiredOnNode(ctx, volume, disk.nodeName)
 		if err != nil || !desired {
 			return unverified
 		}
 		return nil
+	}
+	if _, err := manager.updateEntry(ctx, volume, func(current VolumeRecoveryControlState) (*VolumeRecoveryControlState, error) {
+		if current.AdoptedAt != nil && !current.AdoptedAt.Before(now) {
+			return nil, unverified
+		}
+		if err := verifyDemand(ctx); err != nil {
+			return nil, err
+		}
+		if err := verifyPublish(); err != nil {
+			return nil, err
+		}
+		if current.Mode == control.Mode && reflect.DeepEqual(current.ExpiresAt, control.ExpiresAt) &&
+			current.Ticket == control.Ticket && current.PVName == control.PVName &&
+			current.PVCName == control.PVCName && current.PVCNamespace == control.PVCNamespace {
+			control.ExpiryWarningEmittedAt = current.ExpiryWarningEmittedAt
+		}
+		return &control, nil
+	}); err != nil {
+		return nil, time.Time{}, unverified
+	}
+	verify := func(ctx context.Context) error {
+		current, err := manager.readAdoption(ctx, volume)
+		current.LastObservedAt = control.LastObservedAt
+		current.ExpiryWarningEmittedAt = control.ExpiryWarningEmittedAt
+		if err != nil || !reflect.DeepEqual(current, control) {
+			return unverified
+		}
+		return verifyDemand(ctx)
 	}
 	return verify, now, verify(ctx)
 }
@@ -317,34 +409,25 @@ func (m *VolumeRecoveryControlManager) verifyAdoptedGuestTarget(ctx context.Cont
 		adoption.AdoptedAt == nil || adoption.AdoptedAt.Before(history.LastSuccessfulPublishTime) ||
 		adoption.AdoptedAt.Before(pvc.CreationTimestamp.Time) ||
 		adoption.PVName != pvName || adoption.PVCName != pvc.Name || adoption.PVCNamespace != pvc.Namespace ||
-		adoption.AdoptedNode != node || adoption.AdoptedVolumeName != guest || adoption.AdoptedDeviceSerial != history.LastSuccessfulDeviceSerial {
+		adoption.AdoptedNode != node || adoption.AdoptedVolumeName != guest || adoption.AdoptedDeviceSerial != history.LastSuccessfulDeviceSerial ||
+		adoption.Ticket != metadata[publishContextRecoveryTicket] {
 		return unverified
 	}
 	return nil
 }
 
-func (m *VolumeRecoveryControlManager) MarkExpiryWarningEmitted(ctx context.Context, volumeID string) error {
-	if m == nil || strings.TrimSpace(volumeID) == "" {
-		return nil
-	}
-	_, err := m.Upsert(ctx, volumeID, func(state *VolumeRecoveryControlState) {
-		now := time.Now().UTC()
-		state.ExpiryWarningEmittedAt = &now
+func (m *VolumeRecoveryControlManager) markExpiryWarningEmitted(ctx context.Context, expected VolumeRecoveryControlState) error {
+	_, err := m.updateEntry(ctx, expected.VolumeID, func(current VolumeRecoveryControlState) (*VolumeRecoveryControlState, error) {
+		if current.VolumeID == expected.VolumeID && current.PVName == expected.PVName &&
+			current.PVCName == expected.PVCName && current.PVCNamespace == expected.PVCNamespace &&
+			current.Mode == expected.Mode && current.Ticket == expected.Ticket && reflect.DeepEqual(current.ExpiresAt, expected.ExpiresAt) &&
+			current.ExpiryWarningEmittedAt == nil {
+			now := time.Now().UTC()
+			current.ExpiryWarningEmittedAt = &now
+		}
+		return &current, nil
 	})
 	return err
-}
-
-func (m *VolumeRecoveryControlManager) persistEntry(ctx context.Context, state VolumeRecoveryControlState) error {
-	if m == nil || m.runtime == nil || !m.runtime.enabled {
-		return nil
-	}
-	payload, err := json.Marshal(state)
-	if err != nil {
-		return fmt.Errorf("failed to marshal volume recovery control state: %w", err)
-	}
-	return m.runtime.UpsertConfigMapData(ctx, m.namespace, volumeRecoveryControlStateConfigMapName, map[string]string{
-		state.VolumeID: string(payload),
-	})
 }
 
 func resolvedRecoveryControlState(volumeID string, runtimeCtx *VolumeRuntimeContext, existing VolumeRecoveryControlState) VolumeRecoveryControlState {
@@ -476,7 +559,7 @@ func (s *ControllerServer) recordRecoveryModeExpiryWarning(ctx context.Context, 
 		return
 	}
 	s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonRecoveryModeExpired, state.Warning)
-	_ = s.driver.volumeRecoveryControl.MarkExpiryWarningEmitted(ctx, state.VolumeID)
+	_ = s.driver.volumeRecoveryControl.markExpiryWarningEmitted(ctx, state)
 }
 
 func (s *ControllerServer) publishContextForRecoveryAdoption(ctx context.Context, volumeID string, observation successfulAttachmentObservation, sourceContext map[string]string, control VolumeRecoveryControlState, deviceDiscoveryTimeout time.Duration) map[string]string {

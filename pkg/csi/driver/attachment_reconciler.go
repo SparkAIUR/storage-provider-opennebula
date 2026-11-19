@@ -468,9 +468,9 @@ func (r *AttachmentReconciler) cleanupStaleDriverState(ctx context.Context, pvBy
 		}
 	}
 	if r.server.driver.volumeRecoveryControl != nil {
-		for volumeID := range r.server.driver.volumeRecoveryControl.Snapshot() {
+		for volumeID, observed := range r.server.driver.volumeRecoveryControl.Snapshot() {
 			if pvByHandle[volumeID] == nil {
-				_ = r.server.driver.volumeRecoveryControl.Clear(ctx, volumeID)
+				_ = r.server.driver.volumeRecoveryControl.clearIfCurrent(ctx, volumeID, observed)
 			}
 		}
 	}

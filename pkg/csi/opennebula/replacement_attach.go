@@ -37,6 +37,10 @@ func WithReplacementAttachAttempt(ctx context.Context, attempt string) (context.
 	return context.WithValue(ctx, replacementAttachKey{}, dispatch), dispatch
 }
 
+func WithSingleAttachDispatch(ctx context.Context) (context.Context, *ReplacementAttachDispatch) {
+	return WithReplacementAttachAttempt(ctx, "")
+}
+
 func (d *ReplacementAttachDispatch) DefinitelyIdle() bool {
 	return d != nil && d.definitelyIdle
 }
