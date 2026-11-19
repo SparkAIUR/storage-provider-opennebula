@@ -40,7 +40,7 @@ func (s *ControllerServer) checkReplacedNodeStaleAttachment(ctx context.Context,
 	}
 	if history.PendingReplacementAttach != nil || vmID <= 0 || history.LastSuccessfulOpenNebulaVMID <= 0 ||
 		imageID <= 0 || history.LastSuccessfulImageID != imageID || history.LastSuccessfulDiskID == nil ||
-		history.LastSuccessfulTarget == "" || history.LastSuccessfulDeviceSerial != fmt.Sprintf("onecsi-%d", imageID) ||
+		history.LastSuccessfulTarget == "" || !opennebula.DeviceSerialMatchesImage(history.LastSuccessfulDeviceSerial, imageID) ||
 		node.UID == "" || node.DeletionTimestamp != nil || node.CreationTimestamp.IsZero() ||
 		!slices.ContainsFunc(node.Status.Conditions, func(c corev1.NodeCondition) bool {
 			return c.Type == corev1.NodeReady && c.Status == corev1.ConditionTrue

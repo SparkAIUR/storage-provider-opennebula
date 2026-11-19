@@ -8716,10 +8716,12 @@ func TestControllerPublishRefreshesProtectionAndTarget(t *testing.T) {
 				expiry := mode == "expiry-at-restore"
 				var expires time.Time
 				if expiry {
-					expires = time.Now().Add(2 * time.Second)
 					pv.Annotations[annotationBackend] = "local"
 					pvc.Annotations[annotationBackend] = "local"
-					pv.Annotations[annotationAllowCrossNodeUntil] = expires.Format(time.RFC3339Nano)
+					pv.Annotations[annotationAllowCrossNodeUntil] = time.Now().Add(2 * time.Second).Format(time.RFC3339Nano)
+					var err error
+					expires, err = time.Parse(time.RFC3339Nano, pv.Annotations[annotationAllowCrossNodeUntil])
+					require.NoError(t, err)
 				}
 				driver := newStickyTestDriver(t, pv, pvc, node)
 				if expiry {
@@ -8747,10 +8749,10 @@ func TestControllerPublishRefreshesProtectionAndTarget(t *testing.T) {
 				if expiry {
 					driver.kubeRuntime.client.(*fake.Clientset).PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
 						if action.(ktesting.GetAction).GetName() == volumeRepairStateConfigMapName && changed.Load() && timedProtectionRead.CompareAndSwap(false, true) {
-							require.True(t, time.Now().Before(expires))
-							expiration := time.NewTimer(time.Until(expires))
-							defer expiration.Stop()
-							<-expiration.C
+							require.True(t, time.Now().UTC().Before(expires))
+							for remaining := expires.Sub(time.Now().UTC()); remaining > 0; remaining = expires.Sub(time.Now().UTC()) {
+								time.Sleep(remaining)
+							}
 						}
 						return false, nil, nil
 					})
@@ -8826,6 +8828,7 @@ func TestControllerPublishRefreshesProtectionAndTarget(t *testing.T) {
 				if expiry {
 					require.True(t, timedProtectionRead.Load())
 					require.ErrorContains(t, publishErr, "Publish placement grant expired")
+					require.Equal(t, "retired-node", history.LastSuccessfulNodeName)
 				}
 				if mode == "quarantine-at-restore" {
 					_, active, err := server.activeVolumeQuarantine(ctx, volume)
@@ -8897,7 +8900,7 @@ func TestControllerPublishPlacementPatchRejectsChangedPV(t *testing.T) {
 
 func TestControllerPublishManualAdoptionSeparatesDeviceNames(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"verified", "verified-ceph", "ceph-mixed-case", "adoption-late-write", "adoption-late-new-intent", "ceph-changed-disk", "ceph-changed-guest", "ceph-changed-image", "late-provider-target", "wrong-provider-serial", "wrong-case-variant-serial", "wrong-guest-evidence", "adoption-write-fails", "adoption-write-lost", "adoption-stale-readback"} {
+		for _, mode := range []string{"verified", "verified-ceph", "ceph-mixed-case", "ceph-mixed-case-legacy", "adoption-late-write", "adoption-late-new-intent", "ceph-changed-disk", "ceph-changed-guest", "ceph-changed-image", "ceph-changed-serial", "late-provider-target", "wrong-provider-serial", "wrong-case-variant-serial", "wrong-guest-evidence", "adoption-write-fails", "adoption-write-lost", "adoption-stale-readback"} {
 			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				const volume = "volume-test"
@@ -8911,7 +8914,9 @@ func TestControllerPublishManualAdoptionSeparatesDeviceNames(t *testing.T) {
 				pv.Status.Phase, pvc.Status.Phase = corev1.VolumeBound, corev1.ClaimBound
 				lateWrite := strings.HasPrefix(mode, "adoption-late-")
 				ceph := mode == "verified-ceph" || strings.HasPrefix(mode, "ceph-") || lateWrite
-				if mode == "ceph-mixed-case" {
+				mixedCase := strings.HasPrefix(mode, "ceph-mixed-case")
+				legacySerial := mode == "ceph-mixed-case-legacy"
+				if mixedCase {
 					pvc.Annotations[annotationConfirmedDeviceSerial] = "ONECSI-7"
 				}
 				if ceph {
@@ -8988,6 +8993,9 @@ func TestControllerPublishManualAdoptionSeparatesDeviceNames(t *testing.T) {
 					wire.mu.Lock()
 					wire.ceph, wire.version = true, "7.4.0"
 					wire.disks[41], wire.marker = 128, 128*1024*1024
+					if mixedCase {
+						wire.attachedDisks[41] = map[string]string{"IMAGE_ID": "7", "SERIAL": "ONECSI-7"}
+					}
 					wire.mu.Unlock()
 				}
 				probe := &publishRestoreProbe{PersistentDiskVolumeProvider: provider}
@@ -9072,15 +9080,34 @@ func TestControllerPublishManualAdoptionSeparatesDeviceNames(t *testing.T) {
 					require.Equal(t, guest, control.AdoptedVolumeName)
 					require.Equal(t, "onecsi-7", control.AdoptedDeviceSerial)
 					if ceph {
+						metadata := cloneStringMap(reply.PublishContext)
+						guestSerial := "onecsi-7"
+						if mixedCase {
+							guestSerial = "oneCSI-7"
+						}
+						setLegacyHistorySerial := func() {
+							_, err := driver.volumeHistory.Upsert(ctx, volume, func(record *VolumeHistoryRecord) {
+								record.LastSuccessfulDeviceSerial = "OnEcSi-7"
+							})
+							require.NoError(t, err)
+						}
+						if legacySerial {
+							setLegacyHistorySerial()
+							_, err := driver.volumeRecoveryControl.Upsert(ctx, volume, func(record *VolumeRecoveryControlState) {
+								record.AdoptedDeviceSerial = "ONECSI-7"
+							})
+							require.NoError(t, err)
+							metadata[publishContextDeviceSerial] = "oNECSI-7"
+						}
 						diskPath := withTestDiskPath(t)
 						require.NoError(t, os.WriteFile(filepath.Join(diskPath, guest), []byte("fixture"), 0o600))
 						stageMount := mount.NewFakeMounter(nil)
 						ns := NewNodeServer(driver, mount.NewSafeFormatAndMount(stageMount, reviewDeviceSerialFixture(t, func(string) string {
-							return "onecsi-7"
+							return guestSerial
 						})))
 						ns.localDiskSessions = newLocalDiskSessionStore(t.TempDir())
 						staged, err := ns.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
-							VolumeId: volume, StagingTargetPath: t.TempDir(), VolumeCapability: publish.VolumeCapability, PublishContext: reply.PublishContext,
+							VolumeId: volume, StagingTargetPath: t.TempDir(), VolumeCapability: publish.VolumeCapability, PublishContext: metadata,
 						})
 						require.NoError(t, err)
 						require.NotNil(t, staged)
@@ -9090,6 +9117,12 @@ func TestControllerPublishManualAdoptionSeparatesDeviceNames(t *testing.T) {
 						require.Equal(t, "vdb", stageHistory.LastSuccessfulTarget)
 						require.Equal(t, new(2), stageHistory.LastSuccessfulDiskID)
 						require.Equal(t, "onecsi-7", stageHistory.LastSuccessfulDeviceSerial)
+						require.Equal(t, guestSerial, localDiskObservedDeviceSerial(stageHistory.LastHealthyIdentity))
+						if legacySerial {
+							setLegacyHistorySerial()
+							stageHistory, err = server.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+						}
 
 						core := driver.kubeRuntime.client.CoreV1()
 						current, err := core.PersistentVolumeClaims(pvc.Namespace).Get(ctx, pvc.Name, metav1.GetOptions{})
@@ -9100,12 +9133,13 @@ func TestControllerPublishManualAdoptionSeparatesDeviceNames(t *testing.T) {
 						updatedControl, err := server.recoveryControlState(ctx, volume, nil)
 						require.NoError(t, err)
 						require.False(t, updatedControl.ManualActive())
-						metadata := cloneStringMap(reply.PublishContext)
 						switch mode {
 						case "ceph-changed-guest":
 							metadata["volumeName"] = "sdg"
 						case "ceph-changed-image":
 							metadata[publishContextOpenNebulaImageID] = "8"
+						case "ceph-changed-serial":
+							metadata[publishContextDeviceSerial] = "ONECSI-8"
 						case "ceph-changed-disk":
 							wire.mu.Lock()
 							wire.diskSlot = "3"
@@ -9119,7 +9153,7 @@ func TestControllerPublishManualAdoptionSeparatesDeviceNames(t *testing.T) {
 						}, metav1.CreateOptions{})
 						require.NoError(t, err)
 						released, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
-						if mode == "verified-ceph" || mode == "ceph-mixed-case" || lateWrite {
+						if mode == "verified-ceph" || mixedCase || lateWrite {
 							require.NoError(t, err)
 							require.NotNil(t, released)
 						} else {

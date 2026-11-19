@@ -79,6 +79,12 @@ func retentionProtocolFixture(t *testing.T, modify func(*retentionProtocolCase))
 
 func TestSameNodeRetentionReadOnlyEvidence(t *testing.T) {
 	p, mutations := retentionProtocolFixture(t, func(c *retentionProtocolCase) {
+		c.serial = "OnEcSi-7"
+		c.beforeReply = func(method string) {
+			if method == "one.vm.info" {
+				c.serial = "ONECSI-7"
+			}
+		}
 		c.extraDisk = `<DISK><DISK_ID>0</DISK_ID><TYPE>CDROM</TYPE><IMAGE_ID/><SOURCE/></DISK>`
 		c.datastoreType, c.datastoreTemplateType = "0", "IMAGE_DS"
 		c.datastoreDiskType = "3"

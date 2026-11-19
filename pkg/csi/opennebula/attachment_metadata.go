@@ -11,6 +11,11 @@ import (
 	vm "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/vm"
 )
 
+func DeviceSerialMatchesImage(serial string, imageID int) bool {
+	expected := fmt.Sprintf("onecsi-%d", imageID)
+	return imageID >= 0 && len(serial) == len(expected) && strings.EqualFold(serial, expected)
+}
+
 // InspectSameNodeRetention does not repair or resize anything. It returns proof
 // only for one persistent Ceph disk whose current image, owner census, and fresh
 // VM observation agree. Kubernetes demand and object identity are caller gates.
@@ -102,7 +107,8 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 	}
 	target, targetErr := verifiedDiskTarget(info.Template.GetDisks(), *selected)
 	serial, serialErr := selected.Get(shared.Serial)
-	if targetErr != nil || serialErr != nil || diskID != record.DiskID || target != record.Target || serial != record.Serial {
+	if targetErr != nil || serialErr != nil || diskID != record.DiskID || target != record.Target ||
+		!DeviceSerialMatchesImage(serial, image.ID) || !DeviceSerialMatchesImage(record.Serial, image.ID) {
 		return deny("fresh disk identity differs from the owner census")
 	}
 	persistent, _ := selected.Get("PERSISTENT")
@@ -129,7 +135,7 @@ func (p *PersistentDiskVolumeProvider) InspectSameNodeRetention(ctx context.Cont
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &SameNodeRetentionEvidence{VolumeID: volume, ImageID: metadata.ImageID, NodeID: metadata.RequestedNodeID, DiskID: record.DiskID, Target: record.Target, DeviceSerial: record.Serial, SizeBytes: completedSize}, nil
+	return &SameNodeRetentionEvidence{VolumeID: volume, ImageID: metadata.ImageID, NodeID: metadata.RequestedNodeID, DiskID: record.DiskID, Target: record.Target, DeviceSerial: fmt.Sprintf("onecsi-%d", image.ID), SizeBytes: completedSize}, nil
 }
 
 func (p *PersistentDiskVolumeProvider) VerifyAttachmentBackend(ctx context.Context, volume, node string, imageID, vmID int, expected string) error {

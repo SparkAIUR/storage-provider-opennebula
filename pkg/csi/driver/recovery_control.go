@@ -338,7 +338,7 @@ func (s *ControllerServer) persistPublishAdoption(ctx context.Context, volume st
 	control := resolvedRecoveryControlState(volume, binding, VolumeRecoveryControlState{})
 	guest := normalizedRecoveryDeviceName(control.ConfirmedVolumeName)
 	if !control.AdoptionRequested() || control.Invalid || guest == "" || guest != metadata["volumeName"] ||
-		control.Ticket != metadata[publishContextRecoveryTicket] || !strings.EqualFold(control.ConfirmedDeviceSerial, disk.serial) {
+		control.Ticket != metadata[publishContextRecoveryTicket] || !opennebula.DeviceSerialMatchesImage(control.ConfirmedDeviceSerial, disk.imageID) {
 		return nil, time.Time{}, unverified
 	}
 	now := time.Now().UTC()
@@ -396,8 +396,8 @@ func (m *VolumeRecoveryControlManager) verifyAdoptedGuestTarget(ctx context.Cont
 		history.LastSuccessfulNodeName != node || history.LastSuccessfulNodeUID == "" ||
 		history.LastSuccessfulPublishTime.IsZero() || history.LastSuccessfulOpenNebulaVMID <= 0 ||
 		history.LastSuccessfulImageID <= 0 || history.LastSuccessfulDiskID == nil || history.LastSuccessfulTarget == "" ||
-		history.LastSuccessfulDeviceSerial != fmt.Sprintf("onecsi-%d", history.LastSuccessfulImageID) ||
-		metadata[publishContextDeviceSerial] != history.LastSuccessfulDeviceSerial ||
+		!opennebula.DeviceSerialMatchesImage(history.LastSuccessfulDeviceSerial, history.LastSuccessfulImageID) ||
+		!opennebula.DeviceSerialMatchesImage(metadata[publishContextDeviceSerial], history.LastSuccessfulImageID) ||
 		metadata[publishContextOpenNebulaImageID] == "" || validateAttachmentImageAssertions(metadata, history.LastSuccessfulImageID) != nil {
 		return unverified
 	}
@@ -409,7 +409,8 @@ func (m *VolumeRecoveryControlManager) verifyAdoptedGuestTarget(ctx context.Cont
 		adoption.AdoptedAt == nil || adoption.AdoptedAt.Before(history.LastSuccessfulPublishTime) ||
 		adoption.AdoptedAt.Before(pvc.CreationTimestamp.Time) ||
 		adoption.PVName != pvName || adoption.PVCName != pvc.Name || adoption.PVCNamespace != pvc.Namespace ||
-		adoption.AdoptedNode != node || adoption.AdoptedVolumeName != guest || adoption.AdoptedDeviceSerial != history.LastSuccessfulDeviceSerial ||
+		adoption.AdoptedNode != node || adoption.AdoptedVolumeName != guest ||
+		!opennebula.DeviceSerialMatchesImage(adoption.AdoptedDeviceSerial, history.LastSuccessfulImageID) ||
 		adoption.Ticket != metadata[publishContextRecoveryTicket] {
 		return unverified
 	}

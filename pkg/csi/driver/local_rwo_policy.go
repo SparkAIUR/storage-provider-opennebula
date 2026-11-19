@@ -514,7 +514,7 @@ func (state *VolumeHistoryRecord) observeSuccessfulAttachment(observation succes
 	imageChanged := observation.imageID > 0 && state.LastSuccessfulImageID > 0 && observation.imageID != state.LastSuccessfulImageID
 	diskChanged := (observation.diskID >= 0 && state.LastSuccessfulDiskID != nil && observation.diskID != *state.LastSuccessfulDiskID) ||
 		(observation.target != "" && state.LastSuccessfulTarget != "" && observation.target != state.LastSuccessfulTarget) ||
-		(observation.serial != "" && state.LastSuccessfulDeviceSerial != "" && observation.serial != state.LastSuccessfulDeviceSerial)
+		(observation.serial != "" && state.LastSuccessfulDeviceSerial != "" && !state.matchesDeviceSerial(observation.serial))
 	if nodeChanged || vmChanged {
 		state.LastSuccessfulNodeUID = ""
 	}
@@ -540,6 +540,12 @@ func (state *VolumeHistoryRecord) observeSuccessfulAttachment(observation succes
 	}
 	state.LastSuccessfulTarget = firstNonEmpty(observation.target, state.LastSuccessfulTarget)
 	state.LastSuccessfulDeviceSerial = firstNonEmpty(observation.serial, state.LastSuccessfulDeviceSerial)
+}
+
+func (state VolumeHistoryRecord) matchesDeviceSerial(serial string) bool {
+	return serial == state.LastSuccessfulDeviceSerial || (state.LastSuccessfulImageID > 0 &&
+		opennebula.DeviceSerialMatchesImage(serial, state.LastSuccessfulImageID) &&
+		opennebula.DeviceSerialMatchesImage(state.LastSuccessfulDeviceSerial, state.LastSuccessfulImageID))
 }
 
 func (s *ControllerServer) publishNodeIdentity(ctx context.Context, nodeName string) (KubernetesNodeIdentity, error) {
@@ -759,7 +765,7 @@ func (s *ControllerServer) observePublishedDisk(ctx context.Context, volumeID, r
 	if (!observation.adopted && observation.target == "") || imageID <= 0 || vmID <= 0 {
 		return observation, attachmentEvidenceUnavailable("publish attachment identity is incomplete", nil)
 	}
-	if observation.adopted && !strings.EqualFold(adoptedSerial, observation.serial) {
+	if observation.adopted && !opennebula.DeviceSerialMatchesImage(adoptedSerial, imageID) {
 		return observation, attachmentEvidenceUnavailable("adoption serial differs from the verified image", nil)
 	}
 
@@ -813,13 +819,16 @@ func (s *ControllerServer) observePublishedDisk(ctx context.Context, volumeID, r
 			return observation, attachmentEvidenceUnavailable("publish disk slot or target is ambiguous or invalid", nil)
 		}
 		seen = true
-		if serial := strings.TrimSpace(disk.Serial); (observation.adopted || serial != "") && !strings.EqualFold(serial, observation.serial) {
+		if serial := strings.TrimSpace(disk.Serial); (observation.adopted || serial != "") && !opennebula.DeviceSerialMatchesImage(serial, imageID) {
 			return observation, attachmentEvidenceUnavailable("publish disk serial conflicts with the verified target", nil)
 		}
 		if observation.adopted && observation.target == "" {
 			observation.target = strings.TrimSpace(disk.Target)
 		}
 		if strings.TrimSpace(disk.Target) == observation.target {
+			if opennebula.DeviceSerialMatchesImage(disk.Serial, imageID) {
+				disk.Serial = observation.serial
+			}
 			observation.diskID = disk.DiskID
 			observation.disk = disk
 		}
@@ -1013,6 +1022,7 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 		observation.target = localDiskAssertedDiskTarget(identity)
 	}
 	_, err := ns.Driver.volumeHistory.upsert(ctx, volumeID, func(state *VolumeHistoryRecord) error {
+		staged := observation
 		if state.PendingPublishMove != nil {
 			return attachmentEvidenceUnavailable("Stage history is blocked by a pending Publish move", nil)
 		}
@@ -1021,11 +1031,11 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 		}
 		targetDiffersFromPublishedDisk := state.LastSuccessfulDiskID != nil &&
 			state.LastSuccessfulNodeName == observation.nodeName && state.LastSuccessfulNodeUID == observation.nodeUID &&
-			observation.serial == state.LastSuccessfulDeviceSerial && observation.target != "" && observation.target != state.LastSuccessfulTarget
+			state.matchesDeviceSerial(observation.serial) && observation.target != "" && observation.target != state.LastSuccessfulTarget
 		if publishContext[publishContextRecoveryAdoptedDevice] != "" || targetDiffersFromPublishedDisk {
 			runtime := ns.Driver.kubeRuntime
 			if runtime == nil || !runtime.enabled || observation.nodeUID == "" || observation.nodeUID != state.LastSuccessfulNodeUID ||
-				localDiskObservedDeviceSerial(identity) != state.LastSuccessfulDeviceSerial {
+				!opennebula.DeviceSerialMatchesImage(localDiskObservedDeviceSerial(identity), state.LastSuccessfulImageID) {
 				return attachmentEvidenceUnavailable("adopted Stage attachment identity is unverified", nil)
 			}
 			pvc, err := runtime.client.CoreV1().PersistentVolumeClaims(publishContext[paramPVCNamespace]).Get(ctx, publishContext[paramPVCName], metav1.GetOptions{})
@@ -1035,7 +1045,8 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 			if err := ns.Driver.volumeRecoveryControl.verifyAdoptedGuestTarget(ctx, volumeID, observation.nodeName, publishContext[paramPVName], pvc, *state, publishContext); err != nil {
 				return err
 			}
-			observation.target = state.LastSuccessfulTarget
+			staged.target = state.LastSuccessfulTarget
+			staged.serial = fmt.Sprintf("onecsi-%d", state.LastSuccessfulImageID)
 		}
 		state.PVName = firstNonEmpty(state.PVName, strings.TrimSpace(publishContext[paramPVName]))
 		state.PVCNamespace = firstNonEmpty(state.PVCNamespace, strings.TrimSpace(publishContext[paramPVCNamespace]))
@@ -1047,7 +1058,7 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 		state.Bootstrapped = false
 		state.BootstrappedAt = time.Time{}
 		state.BootstrappedFields = nil
-		state.observeSuccessfulAttachment(observation)
+		state.observeSuccessfulAttachment(staged)
 		state.LastSuccessfulStageTime = time.Now().UTC()
 		if identity != nil {
 			state.LastHealthyIdentity = identity

@@ -1041,10 +1041,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		target, err := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
 		if err == nil {
 			if protection.OverrideUsed {
-				if err := recheckPublishPVImage(queueCtx); err != nil {
-					return err
-				}
-				return attachmentEvidenceUnavailable("the protected attachment has no verified Publish move", nil)
+				return rejectUnverifiedPublishMove(queueCtx)
 			}
 			if history.PendingReplacementAttach != nil {
 				return attachmentEvidenceUnavailable("prepared replacement Ceph attach requires settled provider absence", nil)
@@ -2336,6 +2333,13 @@ func (s *ControllerServer) restoreVolumeCapacity(ctx context.Context, volume str
 	}
 }
 
+func rejectUnverifiedPublishMove(ctx context.Context) error {
+	if err := recheckPublishPVImage(ctx); err != nil {
+		return err
+	}
+	return attachmentEvidenceUnavailable("the protected attachment has no verified Publish move", nil)
+}
+
 func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.ControllerPublishVolumeRequest, volumeID, nodeID int, publishNode KubernetesNodeIdentity, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision) (bool, *diskPublishCompletion, error) {
 	if s == nil || req == nil {
 		return false, nil, nil
@@ -2354,7 +2358,7 @@ func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.
 			return false, nil, nil
 		}
 		if protection != nil && protection.OverrideUsed {
-			return true, nil, attachmentEvidenceUnavailable("the protected attachment has no verified Publish move", nil)
+			return true, nil, rejectUnverifiedPublishMove(ctx)
 		}
 		if validation.Reason != queueReasonManualRecoveryAdopted {
 			if err := s.restoreRetainedVolumeCapacity(ctx, req, nodeID, volumeID, publishNode, false); err != nil {
@@ -3006,7 +3010,7 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 
 	if strings.TrimSpace(state.NodeID) == strings.TrimSpace(req.NodeId) {
 		if _, moving := ctx.Value(publishMoveSourceKey{}).(publishMoveAdmission); moving {
-			return true, nil, attachmentEvidenceUnavailable("the protected attachment has no verified Publish move", nil)
+			return true, nil, rejectUnverifiedPublishMove(ctx)
 		}
 		target, err := s.volumeProvider.GetVolumeInNode(ctx, volumeID, nodeID)
 		if err != nil {

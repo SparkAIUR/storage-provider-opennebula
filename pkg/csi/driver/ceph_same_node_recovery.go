@@ -110,7 +110,12 @@ func (s *ControllerServer) rescueCephSameNodeUnpublish(ctx context.Context, req 
 	if err != nil {
 		return true, nil, cephRetentionUnavailable("provider recheck failed", err)
 	}
-	if lastDisk == nil || firstObservation != *lastDisk {
+	if lastDisk == nil || !opennebula.DeviceSerialMatchesImage(lastDisk.DeviceSerial, imageID) {
+		return true, nil, cephRetentionUnavailable("provider identity or capacity changed during retention checks", nil)
+	}
+	lastObservation := *lastDisk
+	lastObservation.DeviceSerial = firstObservation.DeviceSerial
+	if firstObservation != lastObservation {
 		return true, nil, cephRetentionUnavailable("provider identity or capacity changed during retention checks", nil)
 	}
 	lastRuntime, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId)
@@ -143,9 +148,6 @@ func validateCephRetentionDisk(req *csi.ControllerUnpublishVolumeRequest, imageI
 	if err := validateAttachmentImageAssertions(authority.AttachmentMetadata, disk.ImageID); err != nil {
 		return cephRetentionUnavailable("VolumeAttachment device identity contradicts the pinned image", err)
 	}
-	if observed, present := authority.AttachmentMetadata[publishContextDeviceSerial]; present && strings.TrimSpace(observed) != disk.DeviceSerial {
-		return cephRetentionUnavailable("VolumeAttachment serial contradicts the current device", nil)
-	}
 	if target, present := authority.AttachmentMetadata["volumeName"]; present &&
 		firstNonEmpty(authority.AdoptedTarget, strings.TrimPrefix(strings.TrimSpace(target), "/dev/")) != disk.Target {
 		return cephRetentionUnavailable("VolumeAttachment target contradicts the current device", nil)
@@ -162,10 +164,12 @@ func validateCephRetentionDisk(req *csi.ControllerUnpublishVolumeRequest, imageI
 	if history.LastSuccessfulImageID != disk.ImageID || history.LastSuccessfulNodeName != req.NodeId || history.LastSuccessfulNodeUID != string(authority.NodeUID) || history.LastSuccessfulOpenNebulaVMID <= 0 || history.LastSuccessfulOpenNebulaVMID != disk.NodeID {
 		return cephRetentionUnavailable("observed volume history does not match image and node identity", nil)
 	}
-	if (history.LastSuccessfulDiskID != nil && *history.LastSuccessfulDiskID != disk.DiskID) || (history.LastSuccessfulTarget != "" && history.LastSuccessfulTarget != disk.Target) || (history.LastSuccessfulDeviceSerial != "" && history.LastSuccessfulDeviceSerial != disk.DeviceSerial) {
+	if (history.LastSuccessfulDiskID != nil && *history.LastSuccessfulDiskID != disk.DiskID) ||
+		(history.LastSuccessfulTarget != "" && history.LastSuccessfulTarget != disk.Target) ||
+		(history.LastSuccessfulDeviceSerial != "" && !opennebula.DeviceSerialMatchesImage(history.LastSuccessfulDeviceSerial, imageID)) {
 		return cephRetentionUnavailable("current device identity contradicts observed history", nil)
 	}
-	if disk.DeviceSerial != fmt.Sprintf("onecsi-%d", disk.ImageID) {
+	if !opennebula.DeviceSerialMatchesImage(disk.DeviceSerial, imageID) {
 		return cephRetentionUnavailable("device serial does not identify the pinned image", nil)
 	}
 	return nil
@@ -568,7 +572,7 @@ func validateAttachmentImageAssertions(metadata map[string]string, imageID int) 
 			return fmt.Errorf("VolumeAttachment image identity does not match")
 		}
 	}
-	if raw, present := metadata[publishContextDeviceSerial]; present && strings.TrimSpace(raw) != fmt.Sprintf("onecsi-%d", imageID) {
+	if raw, present := metadata[publishContextDeviceSerial]; present && !opennebula.DeviceSerialMatchesImage(strings.TrimSpace(raw), imageID) {
 		return fmt.Errorf("VolumeAttachment device serial does not match the image")
 	}
 	return nil
