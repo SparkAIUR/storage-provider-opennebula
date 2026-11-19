@@ -740,12 +740,15 @@ func (m *VolumeRepairStateManager) persistWrongDeviceObservation(ctx context.Con
 		current := observed
 		if previous.Classification == repairClassificationWrongDeviceIdentity {
 			sameNode := previous.RequestedNode == observed.RequestedNode && previous.LastKnownNodeName == observed.LastKnownNodeName
-			if !observed.LastObservedAt.After(previous.LastObservedAt) ||
-				(sameNode && sameLocalDiskEvidence(previous.LastHealthyIdentity, observed.LastHealthyIdentity) &&
-					sameLocalDiskEvidence(previous.LastObservedIdentity, observed.LastObservedIdentity)) {
+			if !observed.LastObservedAt.After(previous.LastObservedAt) {
 				return previous, false
 			}
 			if sameNode {
+				if sameLocalDiskEvidence(previous.LastHealthyIdentity, observed.LastHealthyIdentity) &&
+					sameLocalDiskEvidence(previous.LastObservedIdentity, observed.LastObservedIdentity) {
+					previous.LastObservedAt = observed.LastObservedAt
+					return previous, true
+				}
 				current.FirstObservedAt = previous.FirstObservedAt
 				current.FailureCount = previous.FailureCount + 1
 				current.RecoveryToken = previous.RecoveryToken

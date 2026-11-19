@@ -271,18 +271,25 @@ func (ns *NodeServer) recordWrongDeviceIdentityReport(ctx context.Context, sessi
 	observedAt := wrongDeviceObservedAt(observed)
 	key := localDeviceReportKey(node, volumeID)
 	namespace := namespaceFromServiceAccount()
+	distinct := false
 	err := updateLocalDeviceReportIf(ctx, ns.Driver.kubeRuntime, namespace, key, func(report *LocalDeviceMissingReport) bool {
+		distinct = false
 		if report.VolumeID != "" && (report.VolumeID != volumeID || report.Node != node) {
 			return false
 		}
-		if localDeviceFailureClass(*report) == localDeviceFailureClassWrongIdentity &&
-			(!observedAt.After(report.LastObservedAt) || (sameLocalDiskEvidence(report.ExpectedIdentity, session.Identity) &&
-				sameLocalDiskEvidence(report.ObservedIdentity, observed))) {
-			return false
+		if localDeviceFailureClass(*report) == localDeviceFailureClassWrongIdentity {
+			if !observedAt.After(report.LastObservedAt) {
+				return false
+			}
+			if sameLocalDiskEvidence(report.ExpectedIdentity, session.Identity) && sameLocalDiskEvidence(report.ObservedIdentity, observed) {
+				report.LastObservedAt = observedAt
+				return true
+			}
 		}
 		if !report.recordFailureObservation(observedAt) {
 			return true
 		}
+		distinct = true
 		report.Node = node
 		report.VolumeID = volumeID
 		report.VolumeName = strings.TrimSpace(session.VolumeName)
@@ -314,10 +321,12 @@ func (ns *NodeServer) recordWrongDeviceIdentityReport(ctx context.Context, sessi
 		klog.V(2).InfoS("Failed to persist wrong-device identity report", "node", node, "volumeID", volumeID, "err", err)
 		return
 	}
-	ns.recordPVCWarningFromPublishContext(ctx, map[string]string{
-		paramPVCNamespace: session.PVCNamespace,
-		paramPVCName:      session.PVCName,
-	}, eventReasonWrongDeviceIdentity, wrongDeviceIdentityMessage(volumeID, session.Identity, observed))
+	if distinct {
+		ns.recordPVCWarningFromPublishContext(ctx, map[string]string{
+			paramPVCNamespace: session.PVCNamespace,
+			paramPVCName:      session.PVCName,
+		}, eventReasonWrongDeviceIdentity, wrongDeviceIdentityMessage(volumeID, session.Identity, observed))
+	}
 }
 
 func (ns *NodeServer) currentLocalDeviceReport(ctx context.Context, volumeID string) (LocalDeviceMissingReport, bool) {

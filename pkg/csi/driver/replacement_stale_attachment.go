@@ -95,9 +95,15 @@ func (s *ControllerServer) checkReplacedNodeStaleAttachment(ctx context.Context,
 	} else if va.Name != expected.Name || va.UID != expected.UID || va.ResourceVersion != expected.ResourceVersion || va.DeletionTimestamp != nil {
 		return deny(nil)
 	}
-	if target, ok := va.Status.AttachmentMetadata["volumeName"]; ok &&
-		strings.TrimPrefix(strings.TrimSpace(target), "/dev/") != history.LastSuccessfulTarget {
-		return deny(nil)
+	verifyTarget := func() error {
+		metadata := va.Status.AttachmentMetadata
+		if target, ok := metadata["volumeName"]; ok && strings.TrimPrefix(strings.TrimSpace(target), "/dev/") != history.LastSuccessfulTarget {
+			return s.driver.volumeRecoveryControl.verifyAdoptedGuestTarget(ctx, volume, nodeName, pv.Name, pvc, history, metadata)
+		}
+		return nil
+	}
+	if err := verifyTarget(); err != nil {
+		return deny(err)
 	}
 	runtimeCtx := &VolumeRuntimeContext{PVName: pv.Name, PVCNamespace: pvc.Namespace, PVCName: pvc.Name,
 		PVCUID: pvc.UID, verifiedClaimBinding: true, PVAnnotations: pv.Annotations, PVCAnnotations: pvc.Annotations,
@@ -173,6 +179,9 @@ func (s *ControllerServer) checkReplacedNodeStaleAttachment(ctx context.Context,
 	if err != nil || currentVA.UID != va.UID || currentVA.ResourceVersion != va.ResourceVersion ||
 		!reflect.DeepEqual(currentVA.Spec, va.Spec) || !reflect.DeepEqual(currentVA.Status, va.Status) ||
 		!reflect.DeepEqual(currentVA.DeletionTimestamp, va.DeletionTimestamp) {
+		return deny(err)
+	}
+	if err := verifyTarget(); err != nil {
 		return deny(err)
 	}
 	return true, s.recheckAttachmentBinding(ctx, pv, pvc, false)

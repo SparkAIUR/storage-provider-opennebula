@@ -635,7 +635,10 @@ func TestWrongDeviceObservationOrdering(t *testing.T) {
 	require.Equal(t, localDeviceConfirmationStateInProgress, report.ConfirmationState)
 
 	record(staleNode, at.Add(time.Second), "sdg", "onecsi-11", "onecsi-12")
-	record(staleNode, at.Add(3*time.Second), "sdf", "onecsi-9", "onecsi-10")
+	record(staleNode, at.Add(4*time.Second), "sdf", "onecsi-9", "onecsi-10")
+	record(staleNode, at.Add(3*time.Second), "sdg", "onecsi-11", "onecsi-12")
+	report.LastObservedAt = at.Add(4 * time.Second)
+	repair.LastObservedAt = report.LastObservedAt
 	unchangedReport, unchangedRepair := read()
 	require.Equal(t, report, unchangedReport)
 	require.Equal(t, repair, unchangedRepair)

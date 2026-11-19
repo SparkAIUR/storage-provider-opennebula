@@ -925,6 +925,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			if err := s.recheckPublishTarget(ctx, req, observation, publishNode); err != nil {
 				return nil, err
 			}
+			if completed.consumedGrant {
+				s.recordCrossNodeOverrideUsed(ctx, completed.admission.binding, protection.Message)
+			}
 			if completed.annotatePlacement {
 				s.finishPublishMetadata(req, completed.admission.binding)
 			}
@@ -980,7 +983,6 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	}
 	if protection.OverrideUsed {
 		s.driver.metrics.RecordLocalRWOProtection(protection.Reason, "override")
-		s.recordCrossNodeOverrideUsed(ctx, protection.RuntimeContext, protection.Message)
 	}
 
 	if cooldown, ok := s.hotplugCooldownState(ctx, req.NodeId); ok {
@@ -1226,6 +1228,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	ctx = completed.withAdmission(ctx)
 	if err := s.recheckPublishTarget(ctx, req, completed.observation, publishNode); err != nil {
 		return nil, err
+	}
+	if completed.consumedGrant {
+		s.recordCrossNodeOverrideUsed(ctx, completed.admission.binding, protection.Message)
 	}
 	s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
 	s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
@@ -2168,6 +2173,7 @@ type diskPublishCompletion struct {
 	response          *csi.ControllerPublishVolumeResponse
 	admission         publishPVAdmission
 	annotatePlacement bool
+	consumedGrant     bool
 }
 
 func (completion *diskPublishCompletion) withAdmission(ctx context.Context) context.Context {
@@ -2178,30 +2184,53 @@ func (completion *diskPublishCompletion) withAdmission(ctx context.Context) cont
 }
 
 func (s *ControllerServer) completeDiskPublish(ctx context.Context, req *csi.ControllerPublishVolumeRequest, observation successfulAttachmentObservation, admittedNode KubernetesNodeIdentity, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision, publishContext map[string]string) (*diskPublishCompletion, error) {
-	if err := s.recheckPublishTarget(ctx, req, observation, admittedNode); err != nil {
-		return nil, err
-	}
 	admission, _ := ctx.Value(publishPVImageCheckKey{}).(publishPVAdmission)
 	completed := &diskPublishCompletion{
 		observation: observation, response: &csi.ControllerPublishVolumeResponse{PublishContext: publishContext},
 		admission: admission, annotatePlacement: admission.binding != nil,
 	}
-	if protection.OverrideUsed && admission.binding != nil && admission.binding.verifiedClaimBinding {
-		binding, consumed, err := s.driver.kubeRuntime.consumePublishGrant(ctx, admission.binding, s.driver.name, req.VolumeId)
+	usesGrant := protection.OverrideUsed && admission.binding != nil && admission.binding.verifiedClaimBinding
+	if usesGrant {
+		binding, _, err := s.driver.kubeRuntime.checkPublishGrant(ctx, admission.binding, s.driver.name, req.VolumeId, nil)
+		if err != nil {
+			return nil, err
+		}
+		completed.admission.binding = binding
+		ctx = completed.withAdmission(ctx)
+	}
+	verify := func() error { return s.recheckPublishTarget(ctx, req, observation, admittedNode) }
+	if !usesGrant {
+		if err := verify(); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, observation, req.GetVolumeContext(), runtimeCtx, usesGrant, verify); err != nil {
+		return nil, err
+	}
+	if usesGrant {
+		binding, consumed, err := s.driver.kubeRuntime.checkPublishGrant(ctx, admission.binding, s.driver.name, req.VolumeId, func(binding *VolumeRuntimeContext) error {
+			return recheckPublishPVImage(context.WithValue(ctx, publishPVImageCheckKey{}, publishPVAdmission{binding: binding, check: admission.check}))
+		})
 		if err != nil {
 			return nil, attachmentEvidenceUnavailable("used Publish placement grant could not be consumed", err)
 		}
 		completed.admission.binding = binding
+		completed.consumedGrant = consumed
 		completed.annotatePlacement = consumed
 		ctx = completed.withAdmission(ctx)
-		if consumed {
-			s.recordPVCEventFromRuntimeContext(ctx, binding, eventReasonCrossNodeOverrideUsed, protection.Message)
+		_, err = s.driver.volumeHistory.upsert(ctx, req.VolumeId, func(state *VolumeHistoryRecord) error {
+			if err := verify(); err != nil {
+				return err
+			}
+			if !state.matchesPublishedDisk(observation) || state.PendingReplacementAttach != nil {
+				return attachmentEvidenceUnavailable("verified Publish history changed during grant consumption", nil)
+			}
+			state.LastSuccessfulPublishTime = time.Now().UTC()
+			return nil
+		})
+		if err != nil {
+			return nil, attachmentEvidenceUnavailable("Publish completion could not be persisted", err)
 		}
-	}
-	if err := s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, observation, req.GetVolumeContext(), runtimeCtx, func() error {
-		return s.recheckPublishTarget(ctx, req, observation, admittedNode)
-	}); err != nil {
-		return nil, err
 	}
 	return completed, nil
 }

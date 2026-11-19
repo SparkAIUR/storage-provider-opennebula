@@ -36,6 +36,7 @@ type cephRetentionAuthority struct {
 	ConsumerUIDs                          []string
 	History                               VolumeHistoryRecord
 	AttachmentMetadata                    map[string]string
+	AdoptedTarget                         string
 }
 
 func cephRetentionUnavailable(message string, err error) error {
@@ -145,7 +146,8 @@ func validateCephRetentionDisk(req *csi.ControllerUnpublishVolumeRequest, imageI
 	if observed, present := authority.AttachmentMetadata[publishContextDeviceSerial]; present && strings.TrimSpace(observed) != disk.DeviceSerial {
 		return cephRetentionUnavailable("VolumeAttachment serial contradicts the current device", nil)
 	}
-	if target, present := authority.AttachmentMetadata["volumeName"]; present && strings.TrimPrefix(strings.TrimSpace(target), "/dev/") != disk.Target {
+	if target, present := authority.AttachmentMetadata["volumeName"]; present &&
+		firstNonEmpty(authority.AdoptedTarget, strings.TrimPrefix(strings.TrimSpace(target), "/dev/")) != disk.Target {
 		return cephRetentionUnavailable("VolumeAttachment target contradicts the current device", nil)
 	}
 	history := authority.History
@@ -247,6 +249,14 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	}
 	if history.VolumeID != req.VolumeId || !cephHistoryHasObservedAuthority(history) {
 		return nil, cephRetentionUnavailable("observed volume history is unavailable", nil)
+	}
+	if target, present := authority.AttachmentMetadata["volumeName"]; present &&
+		strings.TrimPrefix(strings.TrimSpace(target), "/dev/") != history.LastSuccessfulTarget &&
+		authority.AttachmentMetadata[publishContextRecoveryAdoptedDevice] != "" {
+		if err := s.driver.volumeRecoveryControl.verifyAdoptedGuestTarget(ctx, req.VolumeId, req.NodeId, pv.Name, pvc, history, authority.AttachmentMetadata); err != nil {
+			return nil, err
+		}
+		authority.AdoptedTarget = history.LastSuccessfulTarget
 	}
 	if err := validatePVImageAssertions(pv.Spec.CSI.VolumeAttributes, history.LastSuccessfulImageID); err != nil {
 		return nil, err

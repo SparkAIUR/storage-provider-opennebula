@@ -731,6 +731,14 @@ func (s *ControllerServer) publishProtectionCheck(ctx context.Context, volume, n
 			(placement.Source == protectionSourceExplicitRequiredNode && placement.ExplicitRequiredNodeUntil != nil && !placement.ExplicitRequiredNodeUntil.After(now)) {
 			return attachmentEvidenceUnavailable("Publish placement grant expired during admission", nil)
 		}
+		if placement.OverrideUsed {
+			if admission, ok := ctx.Value(publishPVImageCheckKey{}).(publishPVAdmission); ok && admission.binding != nil &&
+				admission.binding.PVAnnotations[annotationAllowCrossNodeUntil] != "" {
+				if deadline, valid := crossNodeOverrideDeadline(admission.binding); !valid || !deadline.After(now) {
+					return attachmentEvidenceUnavailable("Publish placement renewal expired during admission", nil)
+				}
+			}
+		}
 		if control.Active() && control.ExpiresAt != nil && !control.ExpiresAt.After(now) {
 			return attachmentEvidenceUnavailable("Publish recovery grant expired during admission", nil)
 		}
@@ -857,8 +865,18 @@ func (s *ControllerServer) checkPublishedAttachmentNode(ctx context.Context, vol
 	return ctx.Err()
 }
 
-func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID string, observation successfulAttachmentObservation, sourceContext map[string]string, runtimeCtx *VolumeRuntimeContext, verify func() error) error {
+func (state VolumeHistoryRecord) matchesPublishedDisk(observation successfulAttachmentObservation) bool {
+	return state.LastSuccessfulNodeUID == observation.nodeUID && state.LastSuccessfulNodeName == observation.nodeName &&
+		state.LastSuccessfulImageID == observation.imageID && state.LastSuccessfulOpenNebulaVMID == observation.vmID &&
+		state.LastSuccessfulDiskID != nil && *state.LastSuccessfulDiskID == observation.diskID &&
+		state.LastSuccessfulTarget == observation.target && state.LastSuccessfulDeviceSerial == observation.serial
+}
+
+func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID string, observation successfulAttachmentObservation, sourceContext map[string]string, runtimeCtx *VolumeRuntimeContext, beforeGrantConsumption bool, verify func() error) error {
 	if s == nil || s.driver == nil || s.driver.volumeHistory == nil || strings.TrimSpace(volumeID) == "" {
+		if beforeGrantConsumption {
+			return attachmentEvidenceUnavailable("Publish history is unavailable for grant consumption", nil)
+		}
 		return nil
 	}
 	now := time.Now().UTC()
@@ -900,7 +918,9 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 		state.BootstrappedFields = nil
 		state.PendingReplacementAttach = nil
 		state.observeSuccessfulAttachment(observation)
-		state.LastSuccessfulPublishTime = now
+		if !beforeGrantConsumption {
+			state.LastSuccessfulPublishTime = now
+		}
 		return nil
 	})
 	if errors.Is(err, errRetainedAttachmentNodeChanged) {
@@ -910,18 +930,14 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 	case codes.Unavailable, codes.FailedPrecondition:
 		return err
 	}
-	if observation.replacementAttempt != nil {
+	if beforeGrantConsumption || observation.replacementAttempt != nil {
 		if err != nil {
-			return attachmentEvidenceUnavailable("replacement Ceph attach completion could not be persisted", err)
+			return attachmentEvidenceUnavailable("verified Publish attachment could not be persisted", err)
 		}
 		current, err := s.readAttachmentHistory(ctx, volumeID)
-		if err != nil || current.PendingReplacementAttach != nil ||
-			current.LastSuccessfulNodeUID != observation.nodeUID || current.LastSuccessfulNodeName != observation.nodeName ||
-			current.LastSuccessfulImageID != observation.imageID || current.LastSuccessfulOpenNebulaVMID != observation.vmID ||
-			current.LastSuccessfulDiskID == nil || *current.LastSuccessfulDiskID != observation.diskID ||
-			current.LastSuccessfulTarget != observation.target || current.LastSuccessfulDeviceSerial != observation.serial ||
-			!current.LastSuccessfulPublishTime.Equal(now) {
-			return attachmentEvidenceUnavailable("replacement Ceph attach completion readback failed", err)
+		if err != nil || current.PendingReplacementAttach != nil || !current.matchesPublishedDisk(observation) ||
+			(!beforeGrantConsumption && !current.LastSuccessfulPublishTime.Equal(now)) {
+			return attachmentEvidenceUnavailable("verified Publish attachment readback failed", err)
 		}
 	}
 	if err == nil {
@@ -978,6 +994,24 @@ func (ns *NodeServer) recordSuccessfulLocalVolumeStage(ctx context.Context, volu
 	_, err := ns.Driver.volumeHistory.upsert(ctx, volumeID, func(state *VolumeHistoryRecord) error {
 		if err := state.checkAttachmentNode(observation); err != nil {
 			return err
+		}
+		targetDiffersFromPublishedDisk := state.LastSuccessfulDiskID != nil &&
+			state.LastSuccessfulNodeName == observation.nodeName && state.LastSuccessfulNodeUID == observation.nodeUID &&
+			observation.serial == state.LastSuccessfulDeviceSerial && observation.target != "" && observation.target != state.LastSuccessfulTarget
+		if publishContext[publishContextRecoveryAdoptedDevice] != "" || targetDiffersFromPublishedDisk {
+			runtime := ns.Driver.kubeRuntime
+			if runtime == nil || !runtime.enabled || observation.nodeUID == "" || observation.nodeUID != state.LastSuccessfulNodeUID ||
+				localDiskObservedDeviceSerial(identity) != state.LastSuccessfulDeviceSerial {
+				return attachmentEvidenceUnavailable("adopted Stage attachment identity is unverified", nil)
+			}
+			pvc, err := runtime.client.CoreV1().PersistentVolumeClaims(publishContext[paramPVCNamespace]).Get(ctx, publishContext[paramPVCName], metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			if err := ns.Driver.volumeRecoveryControl.verifyAdoptedGuestTarget(ctx, volumeID, observation.nodeName, publishContext[paramPVName], pvc, *state, publishContext); err != nil {
+				return err
+			}
+			observation.target = state.LastSuccessfulTarget
 		}
 		state.PVName = firstNonEmpty(state.PVName, strings.TrimSpace(publishContext[paramPVName]))
 		state.PVCNamespace = firstNonEmpty(state.PVCNamespace, strings.TrimSpace(publishContext[paramPVCNamespace]))
@@ -1342,9 +1376,7 @@ func (s *ControllerServer) activeHostArtifactQuarantine(ctx context.Context, vol
 	return false, nil
 }
 
-func (s *ControllerServer) recordCrossNodeOverrideUsed(ctx context.Context, runtimeCtx *VolumeRuntimeContext, message string) {
-	if runtimeCtx == nil {
-		return
-	}
-	s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonCrossNodeOverrideUsed, message)
+func (s *ControllerServer) recordCrossNodeOverrideUsed(ctx context.Context, binding *VolumeRuntimeContext, message string) {
+	s.driver.kubeRuntime.emitNamespacedEvent(ctx, binding.PVCNamespace, binding.PVCName, binding.PVCUID,
+		"PersistentVolumeClaim", corev1.EventTypeNormal, eventReasonCrossNodeOverrideUsed, message)
 }

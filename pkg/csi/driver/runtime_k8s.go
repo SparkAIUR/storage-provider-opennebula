@@ -307,7 +307,7 @@ func (r *KubeRuntime) annotatePublishedPV(ctx context.Context, binding *VolumeRu
 	return err
 }
 
-func (r *KubeRuntime) consumePublishGrant(ctx context.Context, binding *VolumeRuntimeContext, driver, volume string) (*VolumeRuntimeContext, bool, error) {
+func (r *KubeRuntime) checkPublishGrant(ctx context.Context, binding *VolumeRuntimeContext, driver, volume string, authorizeConsumption func(*VolumeRuntimeContext) error) (*VolumeRuntimeContext, bool, error) {
 	pvs := r.client.CoreV1().PersistentVolumes()
 	admittedGrant := binding.PVAnnotations[annotationAllowCrossNodeUntil]
 	current := *binding
@@ -330,6 +330,16 @@ func (r *KubeRuntime) consumePublishGrant(ctx context.Context, binding *VolumeRu
 		if reused || pvc == nil || pvc.UID != binding.PVCUID || pvc.Status.Phase != binding.pvcPhase ||
 			pvc.DeletionTimestamp != nil || !samePublishAnnotations(binding.PVCAnnotations, pvc.Annotations) {
 			return attachmentEvidenceUnavailable("Publish claim authority changed during grant consumption", nil)
+		}
+		deadline, valid := crossNodeOverrideDeadline(&current)
+		if !valid || !deadline.After(time.Now()) {
+			return attachmentEvidenceUnavailable("Publish placement grant was revoked, invalid or expired", nil)
+		}
+		if authorizeConsumption == nil {
+			return nil
+		}
+		if err := authorizeConsumption(&current); err != nil {
+			return err
 		}
 		if grant != admittedGrant {
 			return nil

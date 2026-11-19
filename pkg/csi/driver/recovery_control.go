@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/klog/v2"
 )
@@ -254,6 +255,40 @@ func (m *VolumeRecoveryControlManager) MarkAdopted(ctx context.Context, volumeID
 		state.AdoptedDeviceSerial = strings.TrimSpace(serial)
 		state.AdoptedVolumeName = strings.TrimSpace(volumeName)
 	})
+}
+
+func (m *VolumeRecoveryControlManager) verifyAdoptedGuestTarget(ctx context.Context, volume, node, pvName string, pvc *corev1.PersistentVolumeClaim, history VolumeHistoryRecord, metadata map[string]string) error {
+	unverified := attachmentEvidenceUnavailable("adopted guest device does not match the current attachment", nil)
+	guest := strings.TrimPrefix(strings.TrimSpace(metadata["volumeName"]), "/dev/")
+	if m == nil || m.runtime == nil || !m.runtime.enabled || metadata[publishContextRecoveryAdoptedDevice] != "true" ||
+		guest == "" || pvc == nil || pvc.UID == "" || pvc.DeletionTimestamp != nil ||
+		pvc.Status.Phase != corev1.ClaimBound || pvName == "" || pvc.Spec.VolumeName != pvName ||
+		metadata[paramPVName] != pvName || metadata[paramPVCName] != pvc.Name || metadata[paramPVCNamespace] != pvc.Namespace ||
+		history.VolumeID != volume || history.PVName != pvName || history.PVCName != pvc.Name || history.PVCNamespace != pvc.Namespace ||
+		history.LastSuccessfulNodeName != node || history.LastSuccessfulNodeUID == "" ||
+		history.LastSuccessfulPublishTime.IsZero() || history.LastSuccessfulOpenNebulaVMID <= 0 ||
+		history.LastSuccessfulImageID <= 0 || history.LastSuccessfulDiskID == nil || history.LastSuccessfulTarget == "" ||
+		history.LastSuccessfulDeviceSerial != fmt.Sprintf("onecsi-%d", history.LastSuccessfulImageID) ||
+		metadata[publishContextDeviceSerial] != history.LastSuccessfulDeviceSerial ||
+		metadata[publishContextOpenNebulaImageID] == "" || validateAttachmentImageAssertions(metadata, history.LastSuccessfulImageID) != nil {
+		return unverified
+	}
+	cm, err := m.runtime.GetConfigMap(ctx, m.namespace, volumeRecoveryControlStateConfigMapName)
+	if err != nil {
+		return attachmentEvidenceUnavailable("adopted guest device evidence is unreadable", err)
+	}
+	var adoption VolumeRecoveryControlState
+	if err := decodeCephRetentionProtection(cm.Data[volume], &adoption); err != nil {
+		return unverified
+	}
+	if adoption.VolumeID != volume || adoption.Version != stateObjectVersion || !adoption.Adopted || adoption.Invalid ||
+		adoption.AdoptedAt == nil || adoption.AdoptedAt.Before(history.LastSuccessfulPublishTime) ||
+		adoption.AdoptedAt.Before(pvc.CreationTimestamp.Time) ||
+		adoption.PVName != pvName || adoption.PVCName != pvc.Name || adoption.PVCNamespace != pvc.Namespace ||
+		adoption.AdoptedNode != node || adoption.AdoptedVolumeName != guest || adoption.AdoptedDeviceSerial != history.LastSuccessfulDeviceSerial {
+		return unverified
+	}
+	return nil
 }
 
 func (m *VolumeRecoveryControlManager) MarkExpiryWarningEmitted(ctx context.Context, volumeID string) error {
