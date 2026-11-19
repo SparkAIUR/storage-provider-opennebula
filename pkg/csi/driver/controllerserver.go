@@ -1371,9 +1371,9 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		(recoveryRuntimeCtx != nil && (isCephBackend(recoveryRuntimeCtx.Backend) || isCephBackend(recoveryRuntimeCtx.backendAttribute)))
 	backend, backendErr := recoveryRuntimeCtx.verifiedAttachmentBackend()
 	var providerBackendErr error
-	if pendingDestination == nil && !ceph && backendErr == nil && runtimeContextEligibleForMaintenance(recoveryRuntimeCtx, req.VolumeId) {
+	if !ceph && backendErr == nil && runtimeContextEligibleForMaintenance(recoveryRuntimeCtx, req.VolumeId) {
 		desired, reason, desiredErr := s.driver.kubeRuntime.VolumeDesiredOnNode(ctx, req.VolumeId, req.NodeId)
-		sameNode := desiredErr == nil && desired
+		sameNode := pendingDestination == nil && desiredErr == nil && desired
 		maintenance := s.driver.maintenanceMode != nil && s.driver.maintenanceMode.Active()
 		if sameNode || maintenance {
 			providerBackendErr = s.verifyProviderAttachmentBackend(ctx, req.VolumeId, req.NodeId, volumeID, nodeID, backend)
@@ -1385,7 +1385,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 				}
 			}
 			if maintenance {
-				if held, response, holdErr := s.startMaintenanceDetachHold(ctx, req); held {
+				if held, response, holdErr := s.startMaintenanceDetachHold(ctx, req, volumeID, nodeID); held {
 					return response, holdErr
 				}
 			}
@@ -1493,14 +1493,14 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 				if err != nil || node != move.Destination || move.Image != volumeID || node.VM != nodeID {
 					return attachmentEvidenceUnavailable("pending Publish destination identity changed", nil)
 				}
-				admission, err := s.checkPublishMoveScope(queueCtx, req.VolumeId, move, current)
+				admission, err := s.checkPublishMoveScope(queueCtx, req.VolumeId, move, current, false)
 				if err != nil {
 					return err
 				}
 				if stickyState.PVCUID != admission.binding.PVCUID || admission.binding.RestartMode != restartOptimizationAnnotationValue {
 					return attachmentEvidenceUnavailable("pending Publish destination detach grace binding changed", nil)
 				}
-				if _, err := s.publishMoveDeletingVA(queueCtx, req.VolumeId, move, admission.binding, nil); err != nil {
+				if _, err := s.publishMoveDeletingVA(queueCtx, req.VolumeId, move, admission.binding); err != nil {
 					return err
 				}
 				if err := admission.check(queueCtx, admission.binding); err != nil {
@@ -2932,16 +2932,49 @@ func (s *ControllerServer) maintenanceBlocksPublish(ctx context.Context, req *cs
 	return true, maintenanceModeError(req.VolumeId, req.NodeId, lastNode).Error()
 }
 
-func (s *ControllerServer) startMaintenanceDetachHold(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (bool, *csi.ControllerUnpublishVolumeResponse, error) {
+func (s *ControllerServer) startMaintenanceDetachHold(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, imageID, vmID int) (bool, *csi.ControllerUnpublishVolumeResponse, error) {
 	if s == nil || s.driver == nil || s.driver.maintenanceMode == nil || !s.driver.maintenanceMode.Active() {
 		return false, nil, nil
 	}
 	if req == nil || s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled || s.driver.stickyAttachments == nil {
 		return false, nil, nil
 	}
+	releaseNode := s.driver.operationLocks.Acquire(controllerNodeLockKey(req.NodeId))
+	defer releaseNode()
+	releaseVolume := s.driver.operationLocks.Acquire(controllerVolumeLockKey(req.VolumeId))
+	defer releaseVolume()
+	if !s.driver.maintenanceMode.Active() {
+		return false, nil, nil
+	}
 	runtimeCtx, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, req.VolumeId)
 	if err != nil || !runtimeContextEligibleForMaintenance(runtimeCtx, req.VolumeId) {
 		return false, nil, nil
+	}
+	history, err := s.readAttachmentHistory(ctx, req.VolumeId)
+	if err != nil {
+		return true, nil, attachmentEvidenceUnavailable("maintenance detach history is unreadable", err)
+	}
+	move := history.publishMoveDestination(req.NodeId)
+	if move != nil {
+		node, err := s.publishMoveNode(ctx, req.NodeId)
+		if err != nil || node != move.Destination || move.Image != imageID || node.VM != vmID || move.Detach != nil {
+			return true, nil, attachmentEvidenceUnavailable("pending Publish destination identity changed", nil)
+		}
+		admission, err := s.checkPublishMoveScope(ctx, req.VolumeId, move, history, true)
+		if err != nil {
+			return true, nil, err
+		}
+		target, err := s.volumeProvider.GetVolumeInNode(opennebula.WithExpectedImageID(ctx, imageID), imageID, vmID)
+		if err != nil || target != move.Target {
+			return true, nil, attachmentEvidenceUnavailable("pending Publish destination attachment is unverified", err)
+		}
+		if _, err := s.publishMoveDeletingVA(ctx, req.VolumeId, move, admission.binding); err != nil {
+			return true, nil, err
+		}
+		if err := admission.check(ctx, admission.binding); err != nil {
+			return true, nil, err
+		}
+		runtimeCtx = admission.binding
 	}
 	graceSeconds := maintenanceStickyGraceSeconds(s.driver.PluginConfig)
 	now := time.Now().UTC()
@@ -2967,6 +3000,9 @@ func (s *ControllerServer) startMaintenanceDetachHold(ctx context.Context, req *
 	s.driver.metrics.RecordStickyDetach("started", state.Reason)
 	s.driver.metrics.RecordMaintenance("hold", "started")
 	s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonMaintenanceModePrepared, fmt.Sprintf("maintenance mode is holding local RWO volume %s on node %s without detaching", req.VolumeId, req.NodeId))
+	if move != nil {
+		return true, nil, attachmentEvidenceUnavailable("maintenance mode is holding the pending Publish destination", nil)
+	}
 	s.annotateRestartOptimization(ctx, runtimeCtx, req.NodeId, graceSeconds)
 	return true, &csi.ControllerUnpublishVolumeResponse{}, nil
 }
@@ -3242,6 +3278,9 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 			return attachmentEvidenceUnavailable("detach history is unreadable", err)
 		}
 		move := history.publishMoveDestination(confirmed.NodeID)
+		if move != nil && s.driver.maintenanceMode != nil && s.driver.maintenanceMode.Active() {
+			return attachmentEvidenceUnavailable("maintenance mode is holding the pending Publish destination", nil)
+		}
 		if move != nil && move.Detach != nil {
 			return s.settlePublishMoveDetach(queueCtx, confirmed.VolumeID, move, true)
 		}

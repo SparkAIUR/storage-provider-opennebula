@@ -109,15 +109,17 @@ func (m *StickyAttachmentManager) Clear(volumeID string) error {
 }
 
 func (m *StickyAttachmentManager) clearReleasedPublishMoveGrace(ctx context.Context, volume, node string, binding *VolumeRuntimeContext) error {
-	if m == nil || m.runtime == nil || !m.runtime.enabled || binding.RestartMode != restartOptimizationAnnotationValue {
+	if m == nil || m.runtime == nil || !m.runtime.enabled {
 		return nil
 	}
 	deny := attachmentEvidenceUnavailable("pending Publish destination detach grace is unverified", nil)
 	matches := func(state StickyAttachmentState) bool {
+		releasedHold := (state.Reason == "stateful_restart" && binding.RestartMode == restartOptimizationAnnotationValue) ||
+			state.Reason == maintenanceStickyReason || state.Reason == maintenanceReleaseReason
 		return state.VolumeID == volume && state.NodeID == node && state.Backend == "local" &&
-			state.Reason == "stateful_restart" && state.PVCUID == binding.PVCUID &&
+			releasedHold && state.PVCUID == binding.PVCUID &&
 			state.PVCName == binding.PVCName && state.PVCNamespace == binding.PVCNamespace &&
-			!state.StartedAt.IsZero() && state.ExpiresAt.After(state.StartedAt) && !state.ExpiresAt.After(time.Now())
+			!state.StartedAt.IsZero() && !state.ExpiresAt.Before(state.StartedAt) && !state.ExpiresAt.After(time.Now())
 	}
 	read := func() (*corev1.ConfigMap, string, error) {
 		cm, err := m.runtime.GetConfigMap(ctx, m.namespace, stickyAttachmentStateConfigMapName)

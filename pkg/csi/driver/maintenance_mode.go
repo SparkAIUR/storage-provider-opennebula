@@ -285,6 +285,19 @@ func (m *MaintenanceModeManager) prepare(ctx context.Context) maintenancePrepare
 		}
 		report.Protected++
 		if pv.Annotations == nil || strings.TrimSpace(pv.Annotations[annotationLastAttachedNode]) != node {
+			if m.driver != nil && m.driver.volumeHistory != nil {
+				server := ControllerServer{driver: m.driver}
+				history, err := server.readAttachmentHistory(ctx, volumeHandle)
+				if err != nil {
+					report.Skipped++
+					m.recordMaintenanceOutcome("prepare", "patch_error")
+					continue
+				}
+				if history.PendingPublishMove != nil {
+					m.recordMaintenanceOutcome("prepare", "observed")
+					continue
+				}
+			}
 			if err := m.patchPVLastAttachedNode(ctx, pv.Name, node); err != nil {
 				report.Skipped++
 				m.recordMaintenanceOutcome("prepare", "patch_error")

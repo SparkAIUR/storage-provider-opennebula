@@ -1017,10 +1017,10 @@ func (s *ControllerServer) recordSafeDetachReadback(ctx context.Context, volumeI
 			if move.Image != imageID || move.Source.VM != vmID || !move.matchesHistory(*state) {
 				return attachmentEvidenceUnavailable("pending Publish source detach is unverified", nil)
 			}
-			if err := s.verifyPublishMoveRelease(ctx, volumeID, imageID, move.Source); err != nil {
+			if err := s.verifyPublishMoveRelease(ctx, imageID, move.Source); err != nil {
 				return err
 			}
-			if _, err := s.checkPublishMoveScope(ctx, volumeID, move, *state); err != nil {
+			if _, err := s.checkPublishMoveScope(ctx, volumeID, move, *state, false); err != nil {
 				return err
 			}
 			sourceReadback = true

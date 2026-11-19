@@ -32,7 +32,7 @@ const (
 	detachCanceledOrphanReadback
 	detachPreparedRetirement
 	detachRetiredReadback
-	detachPublishMoveRetirement
+	detachPublishMoveReadback
 )
 
 type physicalDetachIdentity struct {
@@ -182,10 +182,15 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		attempt = identity.replacement
 	}
 	replacementDetach := attempt != nil
-	retiringPublishMove := check == detachPublishMoveRetirement
-	if retiringPublishMove && (replacementDetach || identity.publishMove == nil || identity.publishMove.Detach == nil ||
-		!samePendingPublishMove(history.PendingPublishMove, identity.publishMove)) {
-		return attachmentEvidenceUnavailable("pending Publish retirement authority changed", nil)
+	var publishRelease *publishMoveDetach
+	if check == detachPublishMoveReadback {
+		move := identity.publishMove
+		if replacementDetach || move == nil || move.Detach == nil || move.Detach.VAUID == "" ||
+			move.Destination.Name != nodeName || move.Detach.VAName != csiVolumeAttachmentName(volume, s.driver.name, nodeName) ||
+			!samePendingPublishMove(history.PendingPublishMove, move) {
+			return attachmentEvidenceUnavailable("pending Publish detach readback authority changed", nil)
+		}
+		publishRelease = move.Detach
 	}
 	if !readback {
 		move := history.PendingPublishMove
@@ -202,7 +207,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		return attachmentEvidenceUnavailable("replacement detach attempt changed", nil)
 	}
 	attachmentNode := nodeName
-	if replacementDetach || retiringPublishMove {
+	if replacementDetach || publishRelease != nil {
 		attachmentNode = ""
 	}
 	attachments, err := s.detachVolumeAttachments(ctx, pv.Name, attachmentNode)
@@ -222,7 +227,12 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	var localVAName, destinationVAName string
 	var localVA, destinationVA detachAttachmentAuthority
 	var publishSuccessorName string
-	var publishSuccessor detachAttachmentAuthority
+	var publishOld, publishSuccessor detachAttachmentAuthority
+	if publishRelease != nil {
+		if va := attachments[publishRelease.VAName]; va.uid == publishRelease.VAUID && va.deleting {
+			publishOld = va
+		}
+	}
 	for name, va := range attachments {
 		if err := validateAttachmentImageAssertions(va.metadata, identity.imageID); err != nil {
 			return status.Error(codes.Unavailable, err.Error())
@@ -234,9 +244,15 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			}
 			return status.Error(codes.Unavailable, "replacement detach has an unverified destination VolumeAttachment")
 		}
-		if retiringPublishMove && len(attachments) == 1 && !va.deleting && !va.attached && len(va.metadata) == 0 &&
-			va.uid != "" && va.uid != identity.publishMove.Detach.VAUID && va.node != "" && va.attacher == s.driver.name &&
-			name == csiVolumeAttachmentName(volume, s.driver.name, va.node) {
+		if publishRelease != nil {
+			if name == publishRelease.VAName && publishOld.uid != "" {
+				continue
+			}
+			if publishSuccessorName != "" || va.deleting || va.attached || len(va.metadata) != 0 ||
+				va.uid == "" || va.uid == publishRelease.VAUID || va.node == "" || va.attacher != s.driver.name ||
+				name != csiVolumeAttachmentName(volume, s.driver.name, va.node) {
+				return attachmentEvidenceUnavailable("pending Publish successor VolumeAttachment is unverified", nil)
+			}
 			publishSuccessorName, publishSuccessor = name, va
 			continue
 		}
@@ -458,7 +474,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			desired.DemandSource != volumeDemandSourceActivePod {
 			return attachmentEvidenceUnavailable("Publish successor binding or demand is unverified", nil)
 		}
-		publishWaitingNode, publishWaitingVM, err = s.publishMoveWaitingNode(ctx, volume, identity.publishMove, publishSuccessor)
+		publishWaitingNode, publishWaitingVM, err = s.publishMoveWaitingNode(ctx, identity.publishMove, publishSuccessor)
 		if err != nil {
 			return err
 		}
@@ -590,7 +606,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		waitingNode = destination
 	}
 	var waiting waitingConsumers
-	requireStarted := strictWaiting && waitingNode != nil && nodeReportsVolumeInUse(waitingNode, s.driver.name, volume)
+	requireStarted := (strictWaiting || publishWaitingNode != nil) && waitingNode != nil && nodeReportsVolumeInUse(waitingNode, s.driver.name, volume)
 	if waitingNode != nil {
 		waiting, err = s.replacementWaitingConsumers(ctx, pv, pvc, waitingNode, requireStarted)
 		if err != nil {
@@ -607,7 +623,9 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			return attachmentEvidenceUnavailable("retired replacement destination demand changed", nil)
 		}
 	}
-	if node != nil && (publishWaitingNode != nil || waitingNode != node || len(waiting) == 0) && nodeReportsVolumeInUse(node, s.driver.name, volume) {
+	waitingOnTarget := waitingNode == node || (publishWaitingNode != nil && publishOld.uid == "" &&
+		publishWaitingNode.Name == nodeName && node != nil && publishWaitingNode.UID == node.UID && requireStarted)
+	if node != nil && (!waitingOnTarget || len(waiting) == 0) && nodeReportsVolumeInUse(node, s.driver.name, volume) {
 		return status.Error(codes.Unavailable, "detach node still reports the volume in use")
 	}
 	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, replacement); err != nil {
@@ -686,7 +704,12 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		if err := s.recheckAttachmentReleaseNode(ctx, publishWaitingNode, volume); err != nil {
 			return err
 		}
-		if err := s.recheckPublishMoveSuccessor(ctx, pv.Name, identity.publishMove.Detach.VAName, publishSuccessorName, publishSuccessor); err != nil {
+		if err := s.recheckPublishMoveSuccessor(ctx, pv.Name, publishSuccessorName, publishSuccessor); err != nil {
+			return err
+		}
+	}
+	if publishRelease != nil && publishSuccessorName != publishRelease.VAName {
+		if err := s.recheckPublishMoveOldVA(ctx, identity.publishMove, pv.Name, publishRelease.VAName, publishOld); err != nil {
 			return err
 		}
 	}
