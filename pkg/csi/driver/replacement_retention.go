@@ -51,10 +51,14 @@ func (s *ControllerServer) checkReplacementVAOrigin(ctx context.Context, attempt
 	if string(observed.uid) == attempt.VAUID {
 		return ctx.Err()
 	}
+	return s.recheckReplacementVolumeAttachment(ctx, pvName, name, observed)
+}
+
+func (s *ControllerServer) recheckReplacementVolumeAttachment(ctx context.Context, pvName, name string, observed detachAttachmentAuthority) error {
 	current, err := s.driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(ctx, name, metav1.GetOptions{})
 	if err != nil || current == nil || current.Name != name || !matchesVolumeAttachment(pvName, current) ||
 		!reflect.DeepEqual(observed, detachAttachmentSnapshot(current)) {
-		return attachmentEvidenceUnavailable("successor VolumeAttachment or original retirement is unverified", err)
+		return attachmentEvidenceUnavailable("replacement VolumeAttachment identity is unverified", err)
 	}
 	return ctx.Err()
 }

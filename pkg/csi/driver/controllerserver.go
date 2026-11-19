@@ -1248,7 +1248,11 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		var missingNode *opennebula.VMNotFoundError
 		if errors.As(err, &missingNode) && history.LastSuccessfulNodeName == req.NodeId &&
 			history.LastSuccessfulImageID == volumeID && history.LastSuccessfulOpenNebulaVMID > 0 {
-			return s.confirmUnpublishAbsence(ctx, req, volumeID, history.LastSuccessfulOpenNebulaVMID, true)
+			vmID := history.LastSuccessfulOpenNebulaVMID
+			if attempt := history.PendingReplacementAttach; attempt != nil && attempt.prepared() && attempt.matchesHistory(history) {
+				vmID = attempt.VMID
+			}
+			return s.confirmUnpublishAbsence(ctx, req, volumeID, vmID, true)
 		}
 		return nil, attachmentEvidenceUnavailable("attachment node identity is unavailable", err)
 	}
@@ -1534,13 +1538,12 @@ func (s *ControllerServer) confirmUnpublishAbsence(ctx context.Context, req *csi
 			return nil, status.Error(codes.Aborted, "unpublish completion is unverified while the volume is attached; retry the request")
 		}
 	}
-	if !retiredRequired {
-		if handled, err := s.finishVerifiedReplacementAbsence(ctx, req.VolumeId, req.NodeId, physicalDetachIdentity{imageID: imageID, vmID: vmID, diskID: -1}); handled {
-			if err != nil {
-				return nil, err
-			}
-			return &csi.ControllerUnpublishVolumeResponse{}, nil
+	if handled, err := s.finishVerifiedReplacementAbsence(ctx, req.VolumeId, req.NodeId,
+		physicalDetachIdentity{imageID: imageID, vmID: vmID, diskID: -1}, retiredRequired); handled {
+		if err != nil {
+			return nil, err
 		}
+		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 	if err := s.checkDetachAbsenceTarget(ctx, req.VolumeId, req.NodeId, imageID, vmID, "", retiredRequired); err != nil {
 		return nil, err
@@ -2252,7 +2255,7 @@ func (s *ControllerServer) precheckUnpublishHotplug(ctx context.Context, req *cs
 		if decision.Evidence.OpenNebulaImageID != imageID || decision.Evidence.OpenNebulaNodeID != vmID {
 			return true, nil, attachmentEvidenceUnavailable("replacement detach provider identity changed", nil)
 		}
-		handled, err := s.finishVerifiedReplacementAbsence(ctx, req.VolumeId, req.NodeId, physicalDetachIdentity{imageID: imageID, vmID: vmID, diskID: -1})
+		handled, err := s.finishVerifiedReplacementAbsence(ctx, req.VolumeId, req.NodeId, physicalDetachIdentity{imageID: imageID, vmID: vmID, diskID: -1}, false)
 		if err != nil {
 			return true, nil, err
 		}

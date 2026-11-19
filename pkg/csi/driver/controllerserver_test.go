@@ -2063,10 +2063,10 @@ func TestControllerPublishRedactsPersistedSlotQuarantine(t *testing.T) {
 				payload = nil
 			}
 			require.NoError(t, driver.kubeRuntime.UpsertConfigMapData(ctx, "default", hostArtifactStateConfigMapName, map[string]string{state.Key: string(payload)}))
+			var quarantineCleared atomic.Bool
 			if mode == "refresh-unavailable" {
-				var reads atomic.Int32
 				driver.kubeRuntime.client.(*fake.Clientset).PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
-					if action.(ktesting.GetAction).GetName() == hostArtifactStateConfigMapName && reads.Add(1) > 1 {
+					if action.(ktesting.GetAction).GetName() == hostArtifactStateConfigMapName && quarantineCleared.Load() {
 						return true, nil, errors.New("quarantine refresh unavailable")
 					}
 					return false, nil, nil
@@ -2081,7 +2081,17 @@ func TestControllerPublishRedactsPersistedSlotQuarantine(t *testing.T) {
 				targetErr = errors.New("provider-private target error")
 			}
 			provider.On("InspectHostArtifactAttachmentTarget", mock.Anything, volume, "node-161", mock.Anything).
-				Return(&opennebula.HostArtifactAttachmentTarget{VMID: 161, DiskID: 2}, targetErr).Once()
+				Return(&opennebula.HostArtifactAttachmentTarget{VMID: 161, DiskID: 2}, targetErr).Once().Run(func(mock.Arguments) {
+				if mode == "refresh-unavailable" {
+					configMaps := driver.kubeRuntime.client.CoreV1().ConfigMaps("default")
+					cm, err := configMaps.Get(ctx, hostArtifactStateConfigMapName, metav1.GetOptions{})
+					require.NoError(t, err)
+					delete(cm.Data, state.Key)
+					_, err = configMaps.Update(ctx, cm, metav1.UpdateOptions{})
+					require.NoError(t, err)
+					quarantineCleared.Store(true)
+				}
+			})
 			if mode == "observe-other-volume" {
 				provider.On("GetVolumeInNode", mock.Anything, 233, 161).Return("vdb", nil)
 			}
@@ -2097,16 +2107,19 @@ func TestControllerPublishRedactsPersistedSlotQuarantine(t *testing.T) {
 				}
 			}
 			switch mode {
-			case "same-handle-rebound", "other-volume", "refresh-unavailable":
+			case "same-handle-rebound", "other-volume":
 				require.Equal(t, codes.FailedPrecondition, status.Code(err))
 				require.Nil(t, reply)
 				require.Equal(t, generic, status.Convert(err).Message())
 				require.Equal(t, []string{generic}, warnings)
-			case "target-unavailable", "empty-slot":
+			case "target-unavailable", "empty-slot", "refresh-unavailable":
 				require.Equal(t, codes.Unavailable, status.Code(err))
 				require.Nil(t, reply)
 				require.NotContains(t, err.Error(), "provider-private")
 				require.Empty(t, warnings)
+				if mode == "refresh-unavailable" {
+					require.True(t, quarantineCleared.Load())
+				}
 			case "observe-same-handle-rebound":
 				require.Equal(t, codes.FailedPrecondition, status.Code(err))
 				require.Nil(t, reply)

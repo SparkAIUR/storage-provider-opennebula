@@ -65,7 +65,7 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 		!attachment.deleting || attachment.attached {
 		return unavailable(nil)
 	}
-	var sourceSuccessor detachAttachmentAuthority
+	var sourceAttachment detachAttachmentAuthority
 	for name, observed := range attachments {
 		if name == destinationName {
 			continue
@@ -78,11 +78,11 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 		if err := validateAttachmentImageAssertions(observed.metadata, imageID); err != nil {
 			return unavailable(err)
 		}
-		if attempt.prepared() && string(observed.uid) != attempt.VAUID {
-			if !observed.deleting || observed.attached {
+		if attempt.prepared() && (!observed.deleting || string(observed.uid) != attempt.VAUID) {
+			if observed.attached {
 				return unavailable(nil)
 			}
-			sourceSuccessor = observed
+			sourceAttachment = observed
 		}
 	}
 	if err := validateAttachmentImageAssertions(attachment.metadata, imageID); err != nil {
@@ -118,25 +118,39 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 	var source *corev1.Node
 	var sourceWaiting waitingConsumers
 	var sourceInUse bool
+	waitingSource := sourceAttachment.uid != "" && !sourceAttachment.deleting
 	sourceTarget := opennebula.HostArtifactAttachmentTarget{NodeName: attempt.Node, VMID: attempt.VMID, ImageID: imageID, DiskID: -1}
-	if sourceSuccessor.uid != "" {
+	if sourceAttachment.uid != "" {
 		source, err = client.Nodes().Get(ctx, attempt.Node, metav1.GetOptions{})
 		if err != nil || source == nil || source.Name != attempt.Node || string(source.UID) != attempt.ReplacementUID ||
-			source.DeletionTimestamp != nil || source.CreationTimestamp.IsZero() || !sourceSuccessor.created.After(source.CreationTimestamp.Time) ||
+			source.DeletionTimestamp != nil || source.CreationTimestamp.IsZero() || !sourceAttachment.created.After(source.CreationTimestamp.Time) ||
 			!slices.ContainsFunc(source.Status.Conditions, func(c corev1.NodeCondition) bool {
 				return c.Type == corev1.NodeReady && c.Status == corev1.ConditionTrue
 			}) {
 			return unavailable(err)
 		}
 		sourceInUse = nodeReportsVolumeInUse(source, s.driver.name, volume)
-		sourceWaiting, err = s.replacementDestinationConsumers(ctx, pv, pvc, replaced, liveBinding, source, sourceInUse)
-		if err != nil || (len(sourceWaiting) != 0 && len(waiting) != 0) ||
-			(len(sourceWaiting) > 1 && pv.Spec.AccessModes[0] == corev1.ReadWriteOncePod) {
-			return unavailable(err)
-		}
-		sourceVM, err := s.volumeProvider.NodeExists(ctx, source.Name)
-		if err != nil || sourceVM != attempt.VMID {
-			return unavailable(err)
+		if waitingSource {
+			if !liveBinding || len(waiting) != 0 {
+				return unavailable(nil)
+			}
+			sourceWaiting, err = s.replacementWaitingConsumers(ctx, pv, pvc, source, sourceInUse)
+			if err != nil || len(sourceWaiting) == 0 {
+				return unavailable(err)
+			}
+			if _, err := s.inspectReplacementDisk(ctx, attempt, false); err != nil {
+				return err
+			}
+		} else {
+			sourceWaiting, err = s.replacementDestinationConsumers(ctx, pv, pvc, replaced, liveBinding, source, sourceInUse)
+			if err != nil || (len(sourceWaiting) != 0 && len(waiting) != 0) ||
+				(len(sourceWaiting) > 1 && pv.Spec.AccessModes[0] == corev1.ReadWriteOncePod) {
+				return unavailable(err)
+			}
+			sourceVM, err := s.volumeProvider.NodeExists(ctx, source.Name)
+			if err != nil || sourceVM != attempt.VMID {
+				return unavailable(err)
+			}
 		}
 	}
 	verifier, ok := s.volumeProvider.(opennebula.ReplacementDestinationAbsenceVerifier)
@@ -179,14 +193,29 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 		if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, sourceTarget, pv, pvc, replaced); err != nil {
 			return err
 		}
-		currentWaiting, err := s.replacementDestinationConsumers(ctx, pv, pvc, replaced, liveBinding, source, sourceInUse)
+		var currentWaiting waitingConsumers
+		if waitingSource {
+			currentWaiting, err = s.replacementWaitingConsumers(ctx, pv, pvc, source, sourceInUse)
+		} else {
+			currentWaiting, err = s.replacementDestinationConsumers(ctx, pv, pvc, replaced, liveBinding, source, sourceInUse)
+		}
 		if err != nil || !sameWaitingConsumers(sourceWaiting, currentWaiting) {
 			return unavailable(err)
 		}
 		if err := s.recheckAttachmentReleaseNode(ctx, source, volume); err != nil {
 			return err
 		}
-		if err := s.checkReplacementSuccessor(ctx, attempt, pv, attempt.VAName, sourceSuccessor); err != nil {
+		if string(sourceAttachment.uid) == attempt.VAUID {
+			if attempt.VAName != csiVolumeAttachmentName(volume, s.driver.name, attempt.Node) {
+				return unavailable(nil)
+			}
+			if err := validateMarkedReplacementMetadata(sourceAttachment, pv, "", fmt.Sprintf("onecsi-%d", imageID)); err != nil {
+				return err
+			}
+			if err := s.recheckReplacementVolumeAttachment(ctx, pv.Name, attempt.VAName, sourceAttachment); err != nil {
+				return err
+			}
+		} else if err := s.checkReplacementSuccessor(ctx, attempt, pv, attempt.VAName, sourceAttachment); err != nil {
 			return err
 		}
 	}
@@ -195,6 +224,17 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 	}
 	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
 		return err
+	}
+	if waitingSource {
+		if err := s.recheckReplacementVolumeAttachment(ctx, pv.Name, destinationName, attachment); err != nil {
+			return err
+		}
+		if err := s.attachmentProtectionChecks(ctx, volume, runtimeCtx, sourceTarget); err != nil {
+			return err
+		}
+		if err := s.attachmentProtectionChecks(ctx, volume, runtimeCtx, target); err != nil {
+			return err
+		}
 	}
 	if err := s.recheckAttachmentBinding(ctx, pv, pvc, replaced); err != nil {
 		return err

@@ -150,10 +150,14 @@ these verified Ceph paths.
 If a replacement attach is still prepared, Unpublish can acknowledge its
 exact deleting and unattached VolumeAttachment, or a verified deleting
 successor under the same canonical name after the pinned UID is gone. Each
-acknowledgement verifies provider absence and any waiting-only Pod demand on
-the admitted node. The preparation stays available for retries while the
-deleting attachment exists. If a remote destination is also deleting,
-its independent release check can let it finalize first.
+acknowledgement verifies provider absence and any waiting-only Pod demand.
+One verified waiting attachment may coexist with the deleting attachment,
+whether the workload is waiting on the source or the remote node. The
+preparation stays available for retries while the deleting attachment exists.
+If both attachments are deleting, the remote attachment can finalize first
+after its independent release check. If the source Node and VM have retired,
+only the exact pinned source attachment can be acknowledged, after confirming
+their absence and settled global ownership.
 An attach that definitively did not take effect can restore that same
 preparation through a conditional update. Once the deleting attachment is gone,
 verified release can retire the preparation with no attachment or an eligible
