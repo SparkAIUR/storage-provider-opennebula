@@ -74,11 +74,13 @@ Set `csi_tag`, `release_run`, `release_attempt`, `assets`, and `channel` from th
   curl -fsSL "$pages/$chart" -o "$assets/served-chart.tgz" || exit
   cmp "$assets/$chart" "$assets/served-chart.tgz" || exit
   curl -fsSL "$pages/index.yaml" -o "$assets/index.yaml" || exit
-  ghcr_digest=$(docker buildx imagetools inspect \
-    "ghcr.io/sparkaiur/opennebula-csi:$csi_tag" --format '{{.Manifest.Digest}}') || exit
-  dockerhub_digest=$(docker buildx imagetools inspect \
-    "docker.io/nudevco/opennebula-csi:$csi_tag" --format '{{.Manifest.Digest}}') || exit
-  test -n "$ghcr_digest" && test "$ghcr_digest" = "$dockerhub_digest" || exit 1
+  registry_digest() {
+    docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' |
+      jq -er '.digest | select(type == "string" and test("^sha256:[0-9a-f]{64}$"))'
+  }
+  ghcr_digest=$(registry_digest "ghcr.io/sparkaiur/opennebula-csi:$csi_tag") || exit
+  dockerhub_digest=$(registry_digest "docker.io/nudevco/opennebula-csi:$csi_tag") || exit
+  test "$ghcr_digest" = "$dockerhub_digest" || exit 1
   helm show chart "$assets/$chart" || exit
   shasum -a 256 "$assets/$chart" || exit
   printf 'GitHub release ID %s\nOCI index digest %s\n' "$release_id" "$ghcr_digest"
