@@ -366,7 +366,7 @@ func (r *AttachmentReconciler) reconcileReleasedReplacementAttempts(ctx context.
 			return string(va.UID) == attempt.VAUID || va.DeletionTimestamp != nil
 		})
 		if (attempt.prepared() || attempt.detachAccepted()) && attempt.matchesHistory(history) && attempt.Driver == s.driver.name &&
-			pv != nil && attempt.PVUID == string(pv.UID) && len(disks[volume]) == 0 &&
+			pv != nil && (attempt.PVUID == string(pv.UID) || attempt.acceptedOrphan()) && len(disks[volume]) == 0 &&
 			(attempt.detachAccepted() || !awaitingFinalization) && !unresolved[volume] && !r.skipDiskAttachmentReconcile(ctx, volume, pv) {
 			key := volume + "@" + attempt.Node + "@" + string(pv.UID) + "@" + attempt.ID
 			currentOrphans[key] = struct{}{}
@@ -386,7 +386,9 @@ func (r *AttachmentReconciler) settleReleasedReplacement(ctx context.Context, hi
 	identity := physicalDetachIdentity{pvUID: pvUID, nodeUID: types.UID(attempt.ReplacementUID), imageID: attempt.ImageID, vmID: attempt.VMID,
 		diskID: -1, background: true, cephSingleWriter: true, replacement: &attempt}
 	var err error
-	if successor && (attempt.acceptedOrphan() || attempt.prepared()) {
+	if attempt.acceptedOrphan() && attempt.PVUID != string(pvUID) {
+		err = s.retireReboundOrphanReceipt(ctx, history, attempt)
+	} else if successor && (attempt.acceptedOrphan() || attempt.prepared()) {
 		err = s.retireReplacementForSuccessor(ctx, history, attempt)
 	} else if attempt.detachAccepted() {
 		err = s.completeVerifiedReplacementDetach(ctx, attempt.VolumeID, attempt.Node, &identity, detachReadback)

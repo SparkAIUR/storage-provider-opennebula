@@ -534,6 +534,17 @@ func (s *ControllerServer) inspectReplacementDisk(ctx context.Context, attempt r
 	return disk, nil
 }
 
+func (s *ControllerServer) verifyRetiredReplacementSource(ctx context.Context, attempt replacementAttachAttempt) error {
+	verifier, ok := s.volumeProvider.(opennebula.RetiredReplacementSourceVerifier)
+	if !ok {
+		return attachmentEvidenceUnavailable("retired replacement source inspection is unavailable", nil)
+	}
+	if err := verifier.VerifyRetiredReplacementSource(ctx, attempt.VolumeID, attempt.Node, attempt.ImageID, attempt.VMID, attempt.OriginalVMID, attempt.OriginalVMName); err != nil {
+		return attachmentEvidenceUnavailable("retired replacement source release is unverified", err)
+	}
+	return nil
+}
+
 func (s *ControllerServer) restoreUnsentReplacement(ctx context.Context, prepared, armed replacementAttachAttempt) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()

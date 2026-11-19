@@ -89,6 +89,7 @@ type PlacementReport struct {
 
 type VolumeRuntimeContext struct {
 	PVName               string
+	pvUID                types.UID
 	PVCNamespace         string
 	PVCName              string
 	PVCUID               types.UID
@@ -506,6 +507,7 @@ func (r *KubeRuntime) ResolveVolumeRuntimeContext(ctx context.Context, volumeHan
 
 		runtimeCtx := &VolumeRuntimeContext{
 			PVName:        pv.Name,
+			pvUID:         pv.UID,
 			PVAnnotations: cloneStringMap(pv.Annotations),
 			AccessModes:   append([]corev1.PersistentVolumeAccessMode(nil), pv.Spec.AccessModes...),
 		}

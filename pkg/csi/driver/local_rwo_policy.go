@@ -11,6 +11,7 @@ import (
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 )
 
@@ -658,9 +659,13 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 		if err := state.checkAttachmentNode(observation); err != nil {
 			return err
 		}
-		state.PVName = firstNonEmpty(state.PVName, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVName }), strings.TrimSpace(sourceContext[paramPVName]))
-		state.PVCNamespace = firstNonEmpty(state.PVCNamespace, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVCNamespace }), strings.TrimSpace(sourceContext[paramPVCNamespace]))
-		state.PVCName = firstNonEmpty(state.PVCName, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVCName }), strings.TrimSpace(sourceContext[paramPVCName]))
+		if s.publishHistoryBindingVerified(ctx, volumeID, observation.imageID, runtimeCtx) {
+			state.PVName, state.PVCNamespace, state.PVCName = runtimeCtx.PVName, runtimeCtx.PVCNamespace, runtimeCtx.PVCName
+		} else {
+			state.PVName = firstNonEmpty(state.PVName, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVName }), strings.TrimSpace(sourceContext[paramPVName]))
+			state.PVCNamespace = firstNonEmpty(state.PVCNamespace, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVCNamespace }), strings.TrimSpace(sourceContext[paramPVCNamespace]))
+			state.PVCName = firstNonEmpty(state.PVCName, runtimeCtxField(runtimeCtx, func(v *VolumeRuntimeContext) string { return v.PVCName }), strings.TrimSpace(sourceContext[paramPVCName]))
+		}
 		if backend, err := runtimeCtx.verifiedAttachmentBackend(); err == nil {
 			state.Backend = backend
 		}
@@ -708,6 +713,23 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 		}
 	}
 	return nil
+}
+
+func (s *ControllerServer) publishHistoryBindingVerified(ctx context.Context, volumeID string, imageID int, admitted *VolumeRuntimeContext) bool {
+	if admitted == nil || !admitted.verifiedClaimBinding || admitted.pvUID == "" || admitted.PVCUID == "" {
+		return false
+	}
+	pv, err := s.ownedDeletionPV(ctx, volumeID)
+	if err != nil || pv == nil || pv.UID != admitted.pvUID || pv.Name != admitted.PVName ||
+		pv.DeletionTimestamp != nil || pv.Status.Phase != corev1.VolumeBound ||
+		validateAttachmentImageAssertions(pv.Spec.CSI.VolumeAttributes, imageID) != nil {
+		return false
+	}
+	pvc, replaced, err := s.driver.kubeRuntime.attachmentClaim(ctx, pv)
+	return err == nil && !replaced && pvc != nil && pvc.UID == admitted.PVCUID &&
+		pvc.Namespace == admitted.PVCNamespace && pvc.Name == admitted.PVCName &&
+		pvc.DeletionTimestamp == nil && pvc.Status.Phase == corev1.ClaimBound &&
+		s.recheckAttachmentBinding(ctx, pv, pvc, false) == nil
 }
 
 func (s *ControllerServer) recordSafeDetach(ctx context.Context, volumeID, nodeID string) {

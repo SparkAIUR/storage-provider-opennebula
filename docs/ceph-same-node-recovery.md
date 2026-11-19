@@ -140,7 +140,13 @@ released the disk, and the image has no owners. The receipt remains until
 the recorded attachment UID is gone. For an orphan detach issued without
 a VolumeAttachment, the same settled absence checks and confirmation that
 the pinned attachment is gone let reconciliation retire the accepted record
-after a restart.
+after a restart. One independently verified remote attachment can wait
+without delaying retirement of the old source. If the original PV and PVC
+have been replaced by an idle, statically bound pair for the same image, two
+matching observations of those identities and provider release let
+reconciliation retire only the old orphan receipt. Any later Publish must
+verify the current binding independently. A successful Publish records the
+verified PV and claim names together for future recovery.
 It refreshes protection, confirms Pod, Node and attachment evidence, and
 checks the binding and recovery annotations once more. These bounded
 observations do not fence provider or Kubernetes changes.
