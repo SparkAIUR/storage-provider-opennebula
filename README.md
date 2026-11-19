@@ -1,6 +1,6 @@
 # SparkAI OpenNebula CSI
 
-`storage-provider-opennebula` is the SparkAI fork of the OpenNebula CSI driver for Kubernetes. The 0.6.0 candidate targets the installed OpenNebula 7.4.0 over XML-RPC. Each OpenNebula patch, including the planned 7.4.2, requires its own native qualification. See [release artifacts](#release-artifacts) for distribution and the [upgrade runbook](docs/opennebula-74-upgrade.md) for qualification and rollout gates.
+`storage-provider-opennebula` is the SparkAI fork of the OpenNebula CSI driver for Kubernetes. The 0.6.0 candidate targets the installed OpenNebula 7.4.0 over XML-RPC. See [release artifacts](#release-artifacts) for distribution and exact-patch compatibility records, and the [upgrade runbook](docs/opennebula-74-upgrade.md) for qualification and rollout gates.
 
 This fork is focused on Omni deployments on OpenNebula and removes the old requirement that a datastore literally named `default` must exist for PVC provisioning.
 

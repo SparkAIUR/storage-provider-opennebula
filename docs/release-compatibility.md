@@ -1,13 +1,13 @@
 # OpenNebula release compatibility
 
-The installed validation target is OpenNebula **7.4.0**. Treat **7.4.2** as a new target that needs its own native evidence. A CSI release carries a compatibility claim for one exact provider patch and the recorded artifacts and profile.
+The installed validation target is OpenNebula **7.4.0**. A compatibility record applies to one exact provider patch, the recorded artifacts and the named profile. Qualifying **7.4.2** requires new native evidence for that patch.
 
 | Publication | Canonical CSI tag | Helm chart version | Immutable discovery reference | Record status |
 | --- | --- | --- | --- | --- |
 | RC4 on the 7.4.0 target | `v0.6.0-rc.4` | `0.6.0-rc.4` | `7.4.0-csi.0.6.0-rc.4` | `target-only` |
 | Stable after native qualification on 7.4.0 | `v0.6.0` | `0.6.0` | `7.4.0-csi.0.6.0` | `native-verified` |
 
-Candidate publication establishes artifact custody and target intent. Stable promotion retains the qualified RC image digest and binary `VendorVersion`. The stable chart retains the RC `appVersion` and uses the stable chart version. GitOps pins the exact Helm chart version and the OCI image digests for the driver and sidecars. Release readback separately verifies the served chart package and its index entry against the recorded SHA-256 before operators approve the GitOps pins.
+A candidate record identifies the intended OpenNebula patch for the published artifacts. GitOps pins the exact Helm chart version and the OCI image digests for the driver and sidecars. Before approving those pins, operators separately verify the served chart package and its index entry against the recorded SHA-256 during release readback.
 
 The profile `opennebula-74-upgrade/v1` follows the [native qualification contract](opennebula-74-upgrade.md). Detached disk growth and disk-path snapshots are excluded from positive support and retain their rejection tests. On 7.4.0, affected persistent SYSTEM/SELF growth and growth on reattach are guarded. The candidate record lists this as a further exclusion. The current stable gate still requires positive attached growth and ordinary reattach on the affected path, with verified capacity and data. A successful guard rejection cannot satisfy that gate. Stable also requires all other native results and separate ordered 24-hour observations for hpldb, hplsvc, and Bravo. Review the approved provider-version readback for each qualifying environment. The receipt must report the exact observed patch.
 
@@ -87,11 +87,11 @@ Set `csi_tag`, `release_run`, `release_attempt`, `assets`, and `channel` from th
 )
 ```
 
-Confirm the matching `opennebula-csi` index entry has the exact version, served archive URL and digest. For stable, require the promoted digest to match the qualified image and retain the successful promotion chart-equivalence result. Use the native receipt's exact version and confirm it against approved provider readback.
+Match the publication attempt's head commit to the fetched tag commit. Confirm the matching `opennebula-csi` index entry has the exact version, served archive URL and digest. For stable, require the promoted digest to match the qualified image and retain the successful promotion chart-equivalence result. Use the native receipt's exact OpenNebula version and confirm it against approved provider readback.
 
 ## Author and verify the record
 
-Save `release-readback.json` in controlled storage with these fields. Values in angle brackets below are placeholders for the observed values. Use the GitHub release ID printed by the readback for `publication.releaseId`. The `releaseId`, `runId`, and `runAttempt` fields take positive JSON integers. `chartSHA256` and `evidence.sha256` are lowercase hex without a `sha256:` prefix.
+Save `release-readback.json` in controlled storage with these fields. Replace the placeholders and example publication values with the observed values. Use the GitHub release ID printed by the readback for `publication.releaseId`. The `releaseId`, `runId`, and `runAttempt` fields take positive JSON integers. `chartSHA256` and `evidence.sha256` are lowercase hex without a `sha256:` prefix.
 
 ```json
 {
@@ -103,14 +103,16 @@ Save `release-readback.json` in controlled storage with these fields. Values in 
   "sourceTree": "<tag tree>",
   "imageDigest": "sha256:<matching OCI index digest>",
   "chartSHA256": "<downloaded and served chart SHA-256>",
-  "publication": {"releaseId": 0, "runId": 0, "runAttempt": 0},
+  "publication": {"releaseId": 123456789, "runId": 9876543210, "runAttempt": 1},
   "evidence": {"sha256": "<evidence SHA-256>"}
 }
 ```
 
 For a candidate, the helper derives the evidence URL from `publication`. Set `evidence.sha256` to the SHA-256 of the downloaded `SHA256SUMS` bytes. Include the affected SYSTEM/SELF exclusion only for a 7.4.0 candidate. For stable, change `csiTag` to `v0.6.0`, use only the first two exclusions, add the protected qualification `runId` and `runAttempt` to `evidence`, and set `evidence.sha256` to the raw-byte SHA-256 of `native.json`. An authenticated reviewer approves the exact readback file hash in the protected release record after verifying the scope, authenticity, and publication checks. Retrieve `approved_readback_sha256` from that approval.
 
-The authoritative discovery location is the asset named `release-compatibility-<discovery-reference>.json` on the canonical GitHub Release identified by the approved `publication.releaseId`. After protected approval, run the following Bash block from a checkout containing the helper, with the functions above, authenticated `gh`, `jq`, and `uv` available. Set `records` and `published_records` to separate existing local directories and use an empty `published_records` for each readback. For stable, set `qualification` to the controlled directory holding the two qualification inputs.
+The authoritative discovery location is the asset named `release-compatibility-<discovery-reference>.json` on the canonical GitHub Release identified by the approved `publication.releaseId`. For every retry, recover the original approval and exact readback bytes from controlled storage. Use the original release ID and discovery reference for lookup even when retrying from a fresh directory. Stop if the release identity, scope, or evidence has changed.
+
+After protected approval, run the following Bash block from a checkout containing the helper. It uses the functions above, authenticated `gh`, `jq`, and `uv` with Python 3.9 or newer. Set `readback` to the path of the approved `release-readback.json` in controlled storage. Set `records` and `published_records` to separate existing local directories and use an empty `published_records` for each readback. For stable, set `qualification` to the controlled directory holding the two qualification inputs.
 
 ```bash
 (
@@ -123,7 +125,7 @@ The authoritative discovery location is the asset named `release-compatibility-<
   fi
   compatibility_record() {
     uv run --no-project --with PyYAML==6.0.3 python hack/release_compatibility.py \
-      --readback release-readback.json --approved-readback-sha256 "$approved_readback_sha256" \
+      --readback "$readback" --approved-readback-sha256 "$approved_readback_sha256" \
       --release-assets "$assets" "$@"
   }
 

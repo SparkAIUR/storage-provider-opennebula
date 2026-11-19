@@ -44,7 +44,7 @@ Current source target is OpenNebula 7.4.0, with no direct OpenNebula host action
 
 - Pause attachment reconciliation on unknown provider observations and retain sticky holds; only typed absence can authorize absence handling.
 
-- Target OpenNebula7.4.x with the7.4 GoCA SDK, Go1.27.4, Kubernetes0.36.6 libraries, CSI1.13 and current storage sidecars.
+- Move to the OpenNebula 7.4 GoCA SDK, Go 1.27.4, Kubernetes 0.36.6 libraries, CSI 1.13 and current storage sidecars.
 - Preserve holds on uncertain provider evidence; pin known IDs, observe nonforced deletion, verify attached resize completion and restore verified capacity on reattach.
 - Reconcile clone retries through atomically inherited durable origin metadata. Reject new disk snapshots and detached growth until lifecycle qualification.
 - Revalidate datastore authority at allocation and report disabled/unknown Ceph bridge feasibility.
