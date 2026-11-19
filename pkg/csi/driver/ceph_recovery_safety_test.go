@@ -679,7 +679,6 @@ func TestControllerUnpublishCephEventUsesVerifiedClaimWithoutLateReads(t *testin
 			f := newCephRestartTestFixture(t, queued)
 			client := f.server.driver.kubeRuntime.client.(*fake.Clientset)
 			var finalPodRead atomic.Bool
-			var finalAttachmentRead atomic.Bool
 			var finalAuthorityRead atomic.Bool
 			var lateActions atomic.Int32
 			client.PrependReactor("*", "*", func(action ktesting.Action) (bool, kruntime.Object, error) {
@@ -690,9 +689,6 @@ func TestControllerUnpublishCephEventUsesVerifiedClaimWithoutLateReads(t *testin
 					finalPodRead.Store(true)
 				}
 				if action.Matches("list", "volumeattachments") && finalPodRead.Load() {
-					finalAttachmentRead.Store(true)
-				}
-				if action.Matches("get", "persistentvolumeclaims") && finalAttachmentRead.Load() {
 					finalAuthorityRead.Store(true)
 				}
 				return false, nil, nil
@@ -1310,10 +1306,18 @@ func TestControllerUnpublishCephRejectsVAReplacementDuringFinalProtectionRead(t 
 			kube := f.server.driver.kubeRuntime.client.(*fake.Clientset)
 			f.provider.inspections.Store(0)
 			var replaced atomic.Bool
+			var reads int
 			kube.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
 				if action.(ktesting.GetAction).GetName() == hostArtifactStateConfigMapName &&
-					f.provider.inspections.Load() == 2 && replaced.CompareAndSwap(false, true) {
-					replaceDeletingVolumeAttachment(t, kube, f.va)
+					f.provider.inspections.Load() == 2 {
+					reads++
+					if reads == 3 {
+						replacement := f.va.DeepCopy()
+						replacement.UID = "current-nondeleting-successor"
+						replacement.DeletionTimestamp = nil
+						require.NoError(t, kube.Tracker().Update(storagev1.SchemeGroupVersion.WithResource("volumeattachments"), replacement, ""))
+						replaced.Store(true)
+					}
 				}
 				return false, nil, nil
 			})

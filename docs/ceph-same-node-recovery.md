@@ -123,17 +123,21 @@ settlement without sending another detach. It does not authorize Unpublish
 success or publication on its own. The existing bounded poll covers stale image
 ownership and original VM settlement. Completion requires fresh provider absence
 and verified original VM release, along with the current Kubernetes scope and
-per-volume controls. The acceptance write records the exact reply even if a
-control changes while the detach is in flight. Settlement rechecks current
-controls after checking Pod, Node and attachment evidence. These bounded
-observations do not fence provider or Kubernetes changes.
+per-volume controls. The acceptance write preserves the exact reply across
+control changes and verified claim or attachment turnover while keeping the
+original detach scope. Settlement refreshes controls, then confirms the Pod,
+Node and attachment evidence again. These bounded observations do not fence
+provider or Kubernetes changes.
 
 When a detach was accepted without a source VolumeAttachment, reconciliation
-or a fresh Publish can retire that record after settlement for a verified
-same-node successor whose consumer is still waiting to mount. The successor
-requires its own Publish and attach authorization. An uncertain reply or a failed acceptance write leaves the
-attempt unresolved. Global local-disk maintenance does not govern these verified
-Ceph paths.
+or a fresh Publish can retire that record after settlement for a successor with
+the same canonical attachment name and a new UID whose consumer is still
+waiting to mount. If that successor is deleting and unattached, Unpublish can
+acknowledge it after verifying release and settled absence. The accepted record
+remains until its normal retirement checks pass. Each new publication requires
+its own attach authorization. An uncertain reply or a failed acceptance write
+leaves the attempt unresolved. Global local-disk maintenance does not govern
+these verified Ceph paths.
 
 An attached VolumeAttachment that predates a verified same-name Node
 replacement can converge after the controller proves release on both the pinned

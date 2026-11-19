@@ -386,7 +386,7 @@ func (r *AttachmentReconciler) settleReleasedReplacement(ctx context.Context, hi
 	if attempt.acceptedOrphan() && successor {
 		err = s.retireAcceptedOrphanForPublish(ctx, history, attempt)
 	} else if attempt.detachAccepted() {
-		err = s.completeVerifiedReplacementDetach(ctx, attempt.VolumeID, attempt.Node, &identity)
+		err = s.completeVerifiedReplacementDetach(ctx, attempt.VolumeID, attempt.Node, &identity, detachReadback)
 	} else if err = s.checkPhysicalDetachAuthority(ctx, attempt.VolumeID, attempt.Node, &identity, detachReadback); err == nil {
 		err = s.retireVerifiedReplacement(ctx, attempt)
 	}
@@ -781,6 +781,9 @@ func (r *AttachmentReconciler) deleteStaleVolumeAttachment(ctx context.Context, 
 	if err != nil || nodeID <= 0 {
 		return fmt.Errorf("stale attachment node identity is unknown: %v", err)
 	}
+	if err := checkIdentity(); err != nil {
+		return err
+	}
 	handled, err := r.server.checkReplacedNodeStaleAttachment(ctx, volume, va.Spec.NodeName, imageID, nodeID, history, va)
 	if err != nil {
 		return err
@@ -789,11 +792,9 @@ func (r *AttachmentReconciler) deleteStaleVolumeAttachment(ctx context.Context, 
 		if _, err := r.server.volumeProvider.GetVolumeInNode(ctx, imageID, nodeID); !errors.Is(err, opennebula.ErrAttachmentNotFound) {
 			return fmt.Errorf("stale attachment absence is unverified: %v", err)
 		}
-	}
-	if err := checkIdentity(); err != nil {
-		return err
-	}
-	if !handled {
+		if err := checkIdentity(); err != nil {
+			return err
+		}
 		if err := r.server.verifyDetachAbsenceTarget(ctx, volume, va.Spec.NodeName, imageID, nodeID, types.UID(identity.UID)); err != nil {
 			return err
 		}

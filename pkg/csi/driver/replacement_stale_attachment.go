@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -138,21 +139,12 @@ func (s *ControllerServer) checkReplacedNodeStaleAttachment(ctx context.Context,
 		return deny(err)
 	}
 	waiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, currentNode, false)
-	if err != nil || (!waiting && nodeReportsVolumeInUse(currentNode, s.driver.name, volume)) {
+	if err != nil || (len(waiting) == 0 && nodeReportsVolumeInUse(currentNode, s.driver.name, volume)) {
 		return deny(err)
 	}
 	currentHistory, err := s.readAttachmentHistory(ctx, volume)
 	if err != nil || currentHistory.PendingReplacementAttach != nil ||
 		replacementHistoryGeneration(currentHistory) != replacementHistoryGeneration(history) {
-		return deny(err)
-	}
-	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
-		return true, err
-	}
-	currentVA, err := vas.Get(ctx, va.Name, metav1.GetOptions{})
-	if err != nil || currentVA.UID != va.UID || currentVA.ResourceVersion != va.ResourceVersion ||
-		!reflect.DeepEqual(currentVA.Spec, va.Spec) || !reflect.DeepEqual(currentVA.Status, va.Status) ||
-		!reflect.DeepEqual(currentVA.DeletionTimestamp, va.DeletionTimestamp) {
 		return deny(err)
 	}
 	if originalVM := history.LastSuccessfulOpenNebulaVMID; originalVM != vmID {
@@ -164,6 +156,22 @@ func (s *ControllerServer) checkReplacedNodeStaleAttachment(ctx context.Context,
 	}
 	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, false); err != nil {
 		return true, err
+	}
+	finalWaiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, currentNode, false)
+	if err != nil || !maps.Equal(waiting, finalWaiting) {
+		return deny(err)
+	}
+	if err := s.recheckAttachmentReleaseNode(ctx, currentNode, volume); err != nil {
+		return true, err
+	}
+	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
+		return true, err
+	}
+	currentVA, err := vas.Get(ctx, va.Name, metav1.GetOptions{})
+	if err != nil || currentVA.UID != va.UID || currentVA.ResourceVersion != va.ResourceVersion ||
+		!reflect.DeepEqual(currentVA.Spec, va.Spec) || !reflect.DeepEqual(currentVA.Status, va.Status) ||
+		!reflect.DeepEqual(currentVA.DeletionTimestamp, va.DeletionTimestamp) {
+		return deny(err)
 	}
 	return true, nil
 }

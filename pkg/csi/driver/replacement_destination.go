@@ -126,6 +126,18 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, replaced); err != nil {
 		return err
 	}
+	current, err := client.Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil || !replacementDestinationReleased(current, nodeName, attachment, attempt) || current.UID != node.UID ||
+		!current.CreationTimestamp.Equal(&node.CreationTimestamp) || nodeReportsVolumeInUse(current, s.driver.name, volume) != inUse {
+		return unavailable(err)
+	}
+	verifiedWaiting, err := s.replacementDestinationConsumers(ctx, claim, pvc, replaced, liveBinding, current, inUse)
+	if err != nil || !maps.Equal(waiting, verifiedWaiting) {
+		return unavailable(err)
+	}
+	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, replaced); err != nil {
+		return err
+	}
 	if replaced {
 		if err := runtime.verifyReleasedClaimNameReuse(ctx, pv, pvc); err != nil {
 			return err
@@ -134,19 +146,14 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 	if err := s.checkReplacementAttemptReadback(ctx, attempt); err != nil {
 		return err
 	}
-	current, err := client.Nodes().Get(ctx, nodeName, metav1.GetOptions{})
-	if err != nil || !replacementDestinationReleased(current, nodeName, attachment, attempt) || current.UID != node.UID ||
-		!current.CreationTimestamp.Equal(&node.CreationTimestamp) || nodeReportsVolumeInUse(current, s.driver.name, volume) != inUse {
-		return unavailable(err)
-	}
 	finalWaiting, err := s.replacementDestinationConsumers(ctx, claim, pvc, replaced, liveBinding, current, inUse)
 	if err != nil || !maps.Equal(waiting, finalWaiting) {
 		return unavailable(err)
 	}
-	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
+	if err := s.recheckAttachmentReleaseNode(ctx, current, volume); err != nil {
 		return err
 	}
-	return s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, replaced)
+	return s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments)
 }
 
 func (s *ControllerServer) replacementDestinationConsumers(ctx context.Context, claim *corev1.ObjectReference, pvc *corev1.PersistentVolumeClaim,

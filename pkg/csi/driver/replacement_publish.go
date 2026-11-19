@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,8 +18,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 )
@@ -204,26 +205,29 @@ func (s *ControllerServer) retireAcceptedOrphanForPublish(ctx context.Context, h
 	}
 	diskID, _ := strconv.Atoi(attempt.DetachAcceptance.DiskID)
 	proveVA := func(name string, va detachAttachmentAuthority, pv *corev1.PersistentVolume, _ *corev1.PersistentVolumeClaim) error {
-		if name != csiVolumeAttachmentName(attempt.VolumeID, attempt.Driver, attempt.Node) ||
-			va.deleting || va.attached || string(va.uid) == attempt.VAUID {
+		if va.deleting {
 			return attachmentEvidenceUnavailable("accepted orphan detach successor is unverified", nil)
 		}
-		if err := validateMarkedReplacementMetadata(va, pv, "", attempt.DetachAcceptance.Serial); err != nil {
-			return err
-		}
-		if name == attempt.VAName {
-			return s.checkReplacementVAOrigin(ctx, attempt, pv.Name, name, va)
-		}
-		_, err := s.driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(ctx, attempt.VAName, metav1.GetOptions{})
-		if !apierrors.IsNotFound(err) {
-			return attachmentEvidenceUnavailable("accepted orphan detach original attachment absence is unverified", err)
-		}
-		return nil
+		return s.checkOrphanSuccessor(ctx, attempt, pv, name, va)
 	}
 	if _, err := s.verifyReplacementBinding(ctx, history, attempt, diskID, proveVA); err != nil {
 		return err
 	}
 	return s.retireVerifiedReplacement(ctx, attempt)
+}
+
+func (s *ControllerServer) checkOrphanSuccessor(ctx context.Context, attempt replacementAttachAttempt, pv *corev1.PersistentVolume, name string, va detachAttachmentAuthority) error {
+	if name != attempt.VAName || name != csiVolumeAttachmentName(attempt.VolumeID, attempt.Driver, attempt.Node) ||
+		va.node != attempt.Node || va.attacher != attempt.Driver || va.uid == "" || string(va.uid) == attempt.VAUID || va.attached {
+		return attachmentEvidenceUnavailable("orphan detach successor is unverified", nil)
+	}
+	if err := validateAttachmentImageAssertions(va.metadata, attempt.ImageID); err != nil {
+		return attachmentEvidenceUnavailable("orphan detach successor image is unverified", err)
+	}
+	if err := validateMarkedReplacementMetadata(va, pv, "", fmt.Sprintf("onecsi-%d", attempt.ImageID)); err != nil {
+		return err
+	}
+	return s.checkReplacementVAOrigin(ctx, attempt, pv.Name, name, va)
 }
 
 func replacementPublishCanWrite(req *csi.ControllerPublishVolumeRequest) bool {
@@ -309,7 +313,8 @@ func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, history
 			return unavailable()
 		}
 	}
-	if waiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, current, requireStarted); err != nil || !waiting {
+	waiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, current, requireStarted)
+	if err != nil || len(waiting) == 0 {
 		return unavailable()
 	}
 	if proveVA != nil {
@@ -319,49 +324,46 @@ func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, history
 			}
 		}
 	}
-	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
+	if err := s.recheckAttachmentAuthority(ctx, attempt.VolumeID, runtimeCtx, target, pv, pvc, false); err != nil {
 		return attempt, err
 	}
-	if attempt.acceptedOrphan() {
-		latest, err := client.Nodes().Get(ctx, attempt.Node, metav1.GetOptions{})
-		if err != nil || latest.UID != current.UID || !latest.CreationTimestamp.Equal(&current.CreationTimestamp) ||
-			latest.DeletionTimestamp != nil || nodeReportsVolumeInUse(latest, s.driver.name, attempt.VolumeID) != requireStarted ||
-			!slices.ContainsFunc(latest.Status.Conditions, func(c corev1.NodeCondition) bool {
-				return c.Type == corev1.NodeReady && c.Status == corev1.ConditionTrue
-			}) {
-			return unavailable()
-		}
+	finalWaiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, current, requireStarted)
+	if err != nil || !maps.Equal(waiting, finalWaiting) {
+		return unavailable()
 	}
-	if err := s.recheckAttachmentAuthority(ctx, attempt.VolumeID, runtimeCtx, target, pv, pvc, false); err != nil {
+	if err := s.recheckAttachmentReleaseNode(ctx, current, attempt.VolumeID); err != nil {
+		return attempt, err
+	}
+	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
 		return attempt, err
 	}
 	return attempt, nil
 }
 
-func (s *ControllerServer) replacementWaitingConsumers(ctx context.Context, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, node *corev1.Node, requireStarted bool) (bool, error) {
+func (s *ControllerServer) replacementWaitingConsumers(ctx context.Context, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, node *corev1.Node, requireStarted bool) (map[types.UID]string, error) {
 	pods, err := s.driver.kubeRuntime.client.CoreV1().Pods(pv.Spec.ClaimRef.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return false, attachmentEvidenceUnavailable("replacement consumer state is unreadable", err)
+		return nil, attachmentEvidenceUnavailable("replacement consumer state is unreadable", err)
 	}
-	consumers := 0
+	consumers := make(map[types.UID]string)
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		references, err := podReferencesClaim(pod, pv.Spec.ClaimRef.Name, pvc)
 		if err != nil {
-			return false, attachmentEvidenceUnavailable("replacement consumer claim is unverified", err)
+			return nil, attachmentEvidenceUnavailable("replacement consumer claim is unverified", err)
 		}
 		if !references || terminalPodMayBeReleased(pod) {
 			continue
 		}
 		if !replacementPodWaitingOnNode(pod, node) || (requireStarted && pod.Status.StartTime == nil) {
-			return false, attachmentEvidenceUnavailable("replacement consumer may already be using the volume", nil)
+			return nil, attachmentEvidenceUnavailable("replacement consumer may already be using the volume", nil)
 		}
-		consumers++
+		consumers[pod.UID] = pod.ResourceVersion
 	}
-	if consumers > 1 && pv.Spec.AccessModes[0] == corev1.ReadWriteOncePod {
-		return false, attachmentEvidenceUnavailable("replacement volume has multiple consumers", nil)
+	if len(consumers) > 1 && pv.Spec.AccessModes[0] == corev1.ReadWriteOncePod {
+		return nil, attachmentEvidenceUnavailable("replacement volume has multiple consumers", nil)
 	}
-	return consumers > 0, ctx.Err()
+	return consumers, ctx.Err()
 }
 
 func replacementPodWaitingOnNode(pod *corev1.Pod, node *corev1.Node) bool {

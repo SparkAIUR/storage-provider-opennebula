@@ -258,41 +258,60 @@ func (s *ControllerServer) cephRetentionAuthority(ctx context.Context, req *csi.
 	if err := s.recheckAttachmentAuthority(ctx, req.VolumeId, currentRuntime, target, pv, pvc, false); err != nil {
 		return nil, err
 	}
-	pods, err := runtime.client.CoreV1().Pods(pvc.Namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, cephRetentionUnavailable("current Pod demand lookup failed", err)
-	}
-	for _, pod := range pods.Items {
-		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
-			continue
-		}
-		referencesPVC, err := podReferencesClaim(&pod, pvc.Name, pvc)
+	readConsumers := func() ([]string, error) {
+		var consumers []string
+		pods, err := runtime.client.CoreV1().Pods(pvc.Namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
-			return nil, cephRetentionUnavailable("current Pod claim is unverified", err)
+			return nil, cephRetentionUnavailable("current Pod demand lookup failed", err)
 		}
-		if !referencesPVC {
-			continue
+		for _, pod := range pods.Items {
+			if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+				continue
+			}
+			referencesPVC, err := podReferencesClaim(&pod, pvc.Name, pvc)
+			if err != nil {
+				return nil, cephRetentionUnavailable("current Pod claim is unverified", err)
+			}
+			if !referencesPVC {
+				continue
+			}
+			if pod.UID == "" || pod.Spec.NodeName != req.NodeId {
+				return nil, cephRetentionUnavailable("current Pod demand is ambiguous or cross-node", nil)
+			}
+			consumers = append(consumers, string(pod.UID))
 		}
-		if pod.UID == "" || pod.Spec.NodeName != req.NodeId {
-			return nil, cephRetentionUnavailable("current Pod demand is ambiguous or cross-node", nil)
+		if len(consumers) == 0 {
+			return nil, cephRetentionUnavailable("current same-node Pod demand disappeared", nil)
 		}
-		authority.ConsumerUIDs = append(authority.ConsumerUIDs, string(pod.UID))
+		if pv.Spec.AccessModes[0] == corev1.ReadWriteOncePod && len(consumers) != 1 {
+			return nil, cephRetentionUnavailable("RWOP volume has multiple consumers", nil)
+		}
+		sort.Strings(consumers)
+		return consumers, nil
 	}
-	if len(authority.ConsumerUIDs) == 0 {
-		return nil, cephRetentionUnavailable("current same-node Pod demand disappeared", nil)
+	authority.ConsumerUIDs, err = readConsumers()
+	if err != nil {
+		return nil, err
 	}
-	if pv.Spec.AccessModes[0] == corev1.ReadWriteOncePod && len(authority.ConsumerUIDs) != 1 {
-		return nil, cephRetentionUnavailable("RWOP volume has multiple consumers", nil)
-	}
-	sort.Strings(authority.ConsumerUIDs)
 	currentNode, err := runtime.NodeIdentity(ctx, req.NodeId)
 	if err != nil || !currentNode.Exists || !currentNode.Ready || currentNode.Deleting || currentNode.UID != identity.UID {
 		return nil, cephRetentionUnavailable("node identity or readiness changed during retention checks", err)
 	}
-	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
+	if err := s.recheckAttachmentAuthority(ctx, req.VolumeId, currentRuntime, target, pv, pvc, false); err != nil {
 		return nil, err
 	}
-	if err := s.recheckAttachmentAuthority(ctx, req.VolumeId, currentRuntime, target, pv, pvc, false); err != nil {
+	finalConsumers, err := readConsumers()
+	if err != nil {
+		return nil, err
+	}
+	if !slices.Equal(authority.ConsumerUIDs, finalConsumers) {
+		return nil, cephRetentionUnavailable("current Pod demand changed during retention checks", nil)
+	}
+	finalNode, err := runtime.NodeIdentity(ctx, req.NodeId)
+	if err != nil || finalNode != currentNode {
+		return nil, cephRetentionUnavailable("node identity or readiness changed during retention checks", err)
+	}
+	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
 		return nil, err
 	}
 	return authority, nil
