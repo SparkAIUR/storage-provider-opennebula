@@ -4232,7 +4232,7 @@ func fixtureDetachImageOwner(body string, vmID int) string {
 
 func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "safe-detach-updated", "unknown", "final-refusal", "authorization-refusal", "authorization-text", "authorization-malformed", "authentication-refusal", "authentication-text", "write-conflict", "lost-write-reply", "readback-failed", "readback-unproven", "prepared-outage", "armed-outage", "armed-lost-ack", "armed-lost-ack-canceled", "armed-lost-ack-consumer-gone", "armed-lost-ack-retire-conflict", "armed-lost-ack-one-conflict", "armed-lost-ack-conflict-competing", "competing-arm", "prepared-abandoned", "prepared-abandoned-quarantine", "prepared-abandoned-conflict", "prepared-abandoned-orphan", "prepared-abandoned-destination", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
+		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "safe-detach-updated", "unknown", "final-refusal", "authorization-refusal", "authorization-text", "authorization-malformed", "authentication-refusal", "authentication-text", "write-conflict", "lost-write-reply", "readback-failed", "readback-unproven", "prepared-outage", "armed-outage", "armed-lost-ack", "armed-lost-ack-canceled", "armed-lost-ack-consumer-gone", "armed-lost-ack-retire-conflict", "armed-lost-ack-one-conflict", "armed-lost-ack-conflict-competing", "competing-arm", "prepared-abandoned", "prepared-abandoned-quarantine", "prepared-abandoned-conflict", "prepared-abandoned-orphan", "prepared-abandoned-destination", "prepared-abandoned-waiting", "prepared-abandoned-waiting-distinct-vm", "prepared-abandoned-waiting-arm-race", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
 			"distinct-vm-inflight", "same-vm-abandoned-replay",
 			"no-publish-va", "attached-publish-va", "deleting-publish-va", "foreign-publish-va", "removed-publish-va", "replaced-publish-va",
 			"current-runtime-consumer", "current-terminated-container", "current-restarted-container", "current-sandbox-ready",
@@ -4248,7 +4248,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 			"distinct-vm-abandoned-replay-detach-lag-reboot", "distinct-vm-abandoned-replay-detach-lag-persistent-reboot",
 			"distinct-vm-abandoned-replay-detach-lag-original-conflict",
 			"same-vm-abandoned-replay-detach-lag-deadline", "same-vm-abandoned-orphan-republish",
-			"distinct-vm-orphan-republish", "distinct-vm-orphan-remote-orphan-republish", "distinct-vm-abandoned-replay-accepted-wire-observe", "distinct-vm-abandoned-replay-accepted-wire-node-change", "same-vm-abandoned-replay-accepted-wire-claim-gone", "distinct-vm-abandoned-replay-accepted-wire-claim-gone", "distinct-vm-abandoned-replay-accepted-wire-claim-changed", "distinct-vm-abandoned-replay-accepted-wire-claim-reuse", "distinct-vm-abandoned-replay-accepted-wire-claim-conflict", "distinct-vm-abandoned-replay-detach-acceptance-write-failed",
+			"distinct-vm-orphan-republish", "distinct-vm-orphan-remote-orphan-republish", "distinct-vm-abandoned-replay-accepted-wire-observe", "distinct-vm-abandoned-replay-accepted-wire-node-change", "same-vm-abandoned-replay-accepted-wire-claim-gone", "distinct-vm-abandoned-replay-accepted-wire-claim-gone", "distinct-vm-abandoned-replay-accepted-wire-claim-changed", "distinct-vm-abandoned-replay-accepted-wire-claim-reuse", "distinct-vm-abandoned-replay-accepted-wire-claim-conflict", "distinct-vm-abandoned-replay-accepted-wire-claim-pending", "distinct-vm-abandoned-replay-accepted-wire-claim-pending-conflict", "distinct-vm-abandoned-replay-detach-acceptance-write-failed",
 			"distinct-vm-abandoned-replay-detach-reply-wrong-vm", "distinct-vm-abandoned-replay-detach-reply-string", "distinct-vm-abandoned-replay-detach-reply-failed",
 			"distinct-vm-abandoned-replay-missing-va-pins", "distinct-vm-abandoned-replay-missing-va-name", "distinct-vm-abandoned-replay-missing-va-uid",
 			"distinct-vm-abandoned-replay-wrong-va-uid", "distinct-vm-abandoned-hidden-pinned-va",
@@ -4267,6 +4267,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				var pendingWritten, readbackFailed, apiOutage, outageInjected, abandoned atomic.Bool
 				var detachProofs atomic.Int32
 				abandonedPreparation := strings.HasPrefix(mode, "prepared-abandoned")
+				renewedPreparation := strings.HasPrefix(mode, "prepared-abandoned-waiting")
 				lostArmAck := strings.HasPrefix(mode, "armed-lost-ack")
 				armError := mode == "armed-outage" || lostArmAck || mode == "competing-arm"
 				competingAfterConflict := mode == "armed-lost-ack-conflict-competing"
@@ -4312,8 +4313,19 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				wireClaimGone := strings.HasSuffix(mode, "-wire-claim-gone")
 				wireClaimChanged := strings.HasSuffix(mode, "-wire-claim-changed")
 				wireClaimRebound := strings.HasSuffix(mode, "-wire-claim-reuse")
-				wireClaimConflict := strings.HasSuffix(mode, "-wire-claim-conflict")
-				claimTurnover := wireClaimGone || wireClaimRebound
+				wireClaimPending := strings.HasSuffix(mode, "-wire-claim-pending")
+				wirePendingConflict := strings.HasSuffix(mode, "-wire-claim-pending-conflict")
+				wireClaimConflict := strings.HasSuffix(mode, "-wire-claim-conflict") || wirePendingConflict
+				claimTurnover := wireClaimGone || wireClaimRebound || wireClaimPending
+				bindIndependentClaim := func(reused *corev1.PersistentVolumeClaim) {
+					other := pv.DeepCopy()
+					other.Name, other.UID, other.Spec.CSI.VolumeHandle = "independent-pv", "independent-pv-uid", "independent-volume"
+					other.Spec.ClaimRef.UID = reused.UID
+					reused.Spec.VolumeName = other.Name
+					reused.Status.Phase = corev1.ClaimBound
+					_, err := kube.CoreV1().PersistentVolumes().Create(ctx, other, metav1.CreateOptions{})
+					require.NoError(t, err)
+				}
 				orphanRepublish := strings.HasSuffix(mode, "-orphan-republish")
 				remoteOrphan := mode == "distinct-vm-orphan-remote-orphan-republish"
 				remoteNode := newReadyNode("node-remote", true)
@@ -4348,16 +4360,17 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							require.Equal(t, corev1.VolumeBound, admitted.Status.Phase)
 							claims := kube.CoreV1().PersistentVolumeClaims(pvc.Namespace)
 							require.NoError(t, claims.Delete(ctx, pvc.Name, metav1.DeleteOptions{}))
-							if wireClaimRebound || wireClaimConflict {
+							if wireClaimRebound || wireClaimPending || wireClaimConflict {
 								reused := pvc.DeepCopy()
 								reused.UID = "new-pvc-uid"
 								if wireClaimRebound {
-									other := pv.DeepCopy()
-									other.Name, other.UID, other.Spec.CSI.VolumeHandle = "independent-pv", "independent-pv-uid", "independent-volume"
-									other.Spec.ClaimRef.UID = reused.UID
-									reused.Spec.VolumeName = other.Name
-									_, err := kube.CoreV1().PersistentVolumes().Create(ctx, other, metav1.CreateOptions{})
-									require.NoError(t, err)
+									bindIndependentClaim(reused)
+								}
+								if wireClaimPending || wirePendingConflict {
+									reused.Status.Phase = corev1.ClaimPending
+								}
+								if wireClaimPending {
+									reused.Spec.VolumeName = ""
 								}
 								_, err := claims.Create(ctx, reused, metav1.CreateOptions{})
 								require.NoError(t, err)
@@ -4498,7 +4511,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					consumer.CreationTimestamp = metav1.Time{}
 				}
 				publishVA = replacementPublishVA(pv, replacement)
-				if orphanRepublish {
+				if orphanRepublish || renewedPreparation {
 					publishVA.Name = canonicalVA
 				}
 				switch mode {
@@ -4541,7 +4554,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					wire.attachRefusal = mode
 				}
 				vmID := 41
-				if strings.HasPrefix(mode, "distinct-vm") {
+				if strings.HasPrefix(mode, "distinct-vm") || mode == "prepared-abandoned-waiting-distinct-vm" {
 					vmID = 42
 					wire.vmNames = map[int]string{41: "retired-vm", 42: node.Name}
 					wire.omitOriginalVM = mode == "distinct-vm-unreadable-original" || mode == "distinct-vm-original-gone-at-admission"
@@ -4717,6 +4730,124 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					fresh := newStickyTestDriver(t)
 					fresh.kubeRuntime.client = kube
 					restarted := makeClient(fresh)
+					if renewedPreparation {
+						require.NotNil(t, stored.PendingReplacementAttach)
+						require.True(t, stored.PendingReplacementAttach.prepared())
+						require.Equal(t, vmID, stored.PendingReplacementAttach.VMID)
+						pods := kube.CoreV1().Pods(pvc.Namespace)
+						require.NoError(t, pods.Delete(ctx, consumer.Name, metav1.DeleteOptions{}))
+						waiting := latePod.DeepCopy()
+						_, err = pods.Create(ctx, waiting, metav1.CreateOptions{})
+						require.NoError(t, err)
+						unpublish := func() error {
+							_, err := restarted.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+							return err
+						}
+						require.Error(t, unpublish(), "the live pinned VA cannot be released by Unpublish")
+						deleting := publishVA.DeepCopy()
+						now := metav1.Now()
+						deleting.DeletionTimestamp = &now
+						deleting.Finalizers = []string{"external-attacher/" + driver.name}
+						wrong := deleting.DeepCopy()
+						wrong.UID = "unadmitted-attachment"
+						_, err = vas.Update(ctx, wrong, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						require.Error(t, unpublish())
+						attached := deleting.DeepCopy()
+						attached.Status.Attached = true
+						_, err = vas.Update(ctx, attached, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						require.Error(t, unpublish())
+						_, err = vas.Update(ctx, deleting, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						inUse := waiting.DeepCopy()
+						inUse.Status.ContainerStatuses[0].ContainerID = "containerd://running"
+						_, err = pods.UpdateStatus(ctx, inUse, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						require.Error(t, unpublish())
+						inUse = waiting.DeepCopy()
+						inUse.Status.StartTime = nil
+						_, err = pods.UpdateStatus(ctx, inUse, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						require.Error(t, unpublish(), "volumesInUse needs a verified waiting Pod start")
+						_, err = pods.UpdateStatus(ctx, waiting, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						wire.mu.Lock()
+						wire.disks[41] = 128
+						wire.mu.Unlock()
+						require.Error(t, unpublish(), "a prepared attempt cannot release a provider-owned disk")
+						wire.mu.Lock()
+						delete(wire.disks, 41)
+						wire.mu.Unlock()
+						preserved, err := server.readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.Equal(t, stored, preserved)
+
+						if mode == "prepared-abandoned-waiting-arm-race" {
+							armed := *stored.PendingReplacementAttach
+							armed.Phase, armed.ID = replacementAttachArmed, strings.Repeat("b", 64)
+							competing := stored
+							competing.PendingReplacementAttach = &armed
+							payload, err := json.Marshal(competing)
+							require.NoError(t, err)
+							var raced atomic.Bool
+							kube.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+								cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
+								if cm.Name != volumeHistoryStateConfigMapName || !raced.CompareAndSwap(false, true) {
+									return false, nil, nil
+								}
+								current := cm.DeepCopy()
+								current.ResourceVersion = "102"
+								current.Data[volume] = string(payload)
+								resource := corev1.SchemeGroupVersion.WithResource("configmaps")
+								require.NoError(t, kube.Tracker().Update(resource, current, current.Namespace))
+								return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), cm.Name, errors.New("prepared attempt armed concurrently"))
+							})
+							require.Error(t, unpublish())
+							require.True(t, raced.Load())
+							preserved, err := server.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.Equal(t, competing, preserved)
+							wire.mu.Lock()
+							defer wire.mu.Unlock()
+							require.Zero(t, wire.attachAttempts)
+							require.Zero(t, wire.detachAttempts)
+							require.Empty(t, wire.mutations)
+							return
+						}
+
+						_, err = restarted.ControllerPublishVolume(ctx, publish)
+						require.Error(t, err, "Publish must wait for deletion of the pinned VA")
+						require.NoError(t, unpublish())
+						retired, err := server.readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						want := stored
+						want.PendingReplacementAttach = nil
+						require.Equal(t, want, retired)
+						currentVA, err := vas.Get(ctx, deleting.Name, metav1.GetOptions{})
+						require.NoError(t, err)
+						require.Equal(t, deleting, currentVA)
+						_, err = restarted.ControllerPublishVolume(ctx, publish)
+						require.Error(t, err, "the finalizer still owns VA retirement")
+						wire.mu.Lock()
+						require.Zero(t, wire.attachAttempts)
+						require.Zero(t, wire.detachAttempts)
+						require.Empty(t, wire.mutations)
+						wire.mu.Unlock()
+						require.NoError(t, vas.Delete(ctx, deleting.Name, metav1.DeleteOptions{}))
+						next := publishVA.DeepCopy()
+						next.UID = "later-publication"
+						_, err = vas.Create(ctx, next, metav1.CreateOptions{})
+						require.NoError(t, err)
+						reply, err := restarted.ControllerPublishVolume(ctx, publish)
+						require.NoError(t, err)
+						require.Equal(t, "onecsi-7", reply.GetPublishContext()[publishContextDeviceSerial])
+						wire.mu.Lock()
+						defer wire.mu.Unlock()
+						require.Equal(t, []string{fmt.Sprintf("attach:%d:false", vmID)}, wire.mutations)
+						require.Zero(t, wire.detachAttempts)
+						return
+					}
 					if abandonedPreparation {
 						if mode != "prepared-abandoned-destination" {
 							require.NoError(t, vas.Delete(ctx, publishVA.Name, metav1.DeleteOptions{}))
@@ -5542,6 +5673,17 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							released.Status.Phase = corev1.VolumeReleased
 							_, err = kube.CoreV1().PersistentVolumes().Update(ctx, released, metav1.UpdateOptions{})
 							require.NoError(t, err)
+
+							if wireClaimPending {
+								require.Error(t, unpublish(restarted), "a Pending replacement claim cannot authorize settlement")
+								claims := kube.CoreV1().PersistentVolumeClaims(pvc.Namespace)
+								pending, err := claims.Get(ctx, pvc.Name, metav1.GetOptions{})
+								require.NoError(t, err)
+								require.Equal(t, corev1.ClaimPending, pending.Status.Phase)
+								bindIndependentClaim(pending)
+								_, err = claims.Update(ctx, pending, metav1.UpdateOptions{})
+								require.NoError(t, err)
+							}
 						}
 
 						fresh := newStickyTestDriver(t)

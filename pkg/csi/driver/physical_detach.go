@@ -193,6 +193,8 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		localVAName, localVA = name, va
 	}
 	canceledSuccessor := check == detachCanceledOrphanReadback && accepted && attempt.acceptedOrphan() && localVAName != ""
+	preparedDeletion := readback && replacementDetach && attempt.prepared() && localVAName != ""
+	strictWaiting := canceledSuccessor || preparedDeletion
 	if canceledSuccessor && destinationVAName != "" && (destinationVA.uid == localVA.uid || string(destinationVA.uid) == attempt.VAUID) {
 		return attachmentEvidenceUnavailable("canceled orphan successor has conflicting VolumeAttachments", nil)
 	}
@@ -239,9 +241,13 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 				return err
 			}
 		}
-		if attempt.prepared() && localVAName != "" &&
-			(localVAName != attempt.VAName || string(localVA.uid) != attempt.VAUID) {
-			return attachmentEvidenceUnavailable("prepared replacement detach attachment identity changed", nil)
+		if preparedDeletion {
+			if localVAName != attempt.VAName || string(localVA.uid) != attempt.VAUID || localVA.attached {
+				return attachmentEvidenceUnavailable("prepared replacement detach attachment identity changed", nil)
+			}
+			if err := validateMarkedReplacementMetadata(localVA, pv, "", fmt.Sprintf("onecsi-%d", attempt.ImageID)); err != nil {
+				return err
+			}
 		}
 		if attempt.detached() || accepted {
 			completion := attempt.DetachCompletion
@@ -327,7 +333,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, replacement); err != nil {
 		return err
 	}
-	waitingOnSource := (receipt || canceledSuccessor) && !replacement && !remoteReplacement
+	waitingOnSource := (receipt || strictWaiting) && !replacement && !remoteReplacement
 	checkConsumers := func() (terminalOnNode bool, remoteConsumerNode string, err error) {
 		if claim := pv.Spec.ClaimRef; claim != nil && !waitingOnSource {
 			pods, err := runtime.client.CoreV1().Pods(claim.Namespace).List(ctx, metav1.ListOptions{})
@@ -365,7 +371,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	if err != nil {
 		return err
 	}
-	if !receipt && !canceledSuccessor && (desired.desiresNode(nodeName) || (replacementDetach && !remoteReplacement && (desired.Desired || desired.MultipleNodes))) {
+	if !receipt && !strictWaiting && (desired.desiresNode(nodeName) || (replacementDetach && !remoteReplacement && (desired.Desired || desired.MultipleNodes))) {
 		return attachmentEvidenceUnavailable("current volume release is unverified", nil)
 	}
 	node, err := runtime.client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
@@ -390,7 +396,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 				return err
 			}
 		}
-		if localVAName != "" && string(localVA.uid) != attempt.VAUID &&
+		if localVAName != "" && (preparedDeletion || string(localVA.uid) != attempt.VAUID) &&
 			(node.CreationTimestamp.IsZero() || !localVA.created.After(node.CreationTimestamp.Time)) {
 			return attachmentEvidenceUnavailable("deleting successor VolumeAttachment does not belong to the replacement node", nil)
 		}
@@ -422,14 +428,14 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		waitingNode = destination
 	}
 	var waiting waitingConsumers
-	requireStarted := canceledSuccessor && waitingNode != nil && nodeReportsVolumeInUse(waitingNode, s.driver.name, volume)
+	requireStarted := strictWaiting && waitingNode != nil && nodeReportsVolumeInUse(waitingNode, s.driver.name, volume)
 	if waitingNode != nil {
 		waiting, err = s.replacementWaitingConsumers(ctx, pv, pvc, waitingNode, requireStarted)
 		if err != nil {
 			return err
 		}
 		if len(waiting) != 0 && (pvc == nil || pv.Status.Phase != corev1.VolumeBound || pvc.DeletionTimestamp != nil ||
-			(canceledSuccessor && (pvc.Status.Phase != corev1.ClaimBound || pv.DeletionTimestamp != nil))) {
+			(strictWaiting && (pvc.Status.Phase != corev1.ClaimBound || pv.DeletionTimestamp != nil))) {
 			return attachmentEvidenceUnavailable("replacement detach binding is unverified", nil)
 		}
 		if canceledSuccessor && remoteReplacement && len(waiting) == 0 {
@@ -784,15 +790,17 @@ func (s *ControllerServer) checkAcceptedDetachIdentity(ctx context.Context, volu
 		return unavailable(nil)
 	}
 	if err == nil {
-		if pvc == nil || pvc.Name != claim.Name || pvc.Namespace != claim.Namespace {
+		if pvc == nil || pvc.UID == "" || pvc.Name != claim.Name || pvc.Namespace != claim.Namespace {
 			return unavailable(nil)
 		}
 		if pvc.UID == claim.UID {
 			if pvc.Spec.VolumeName != pv.Name {
 				return unavailable(nil)
 			}
-		} else if err := runtime.verifyIndependentClaimBinding(ctx, pv, pvc); err != nil {
-			return err
+		} else if pvc.Status.Phase != corev1.ClaimPending || pvc.Spec.VolumeName != "" {
+			if err := runtime.verifyIndependentClaimBinding(ctx, pv, pvc); err != nil {
+				return err
+			}
 		}
 	}
 	current, err := runtime.client.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})

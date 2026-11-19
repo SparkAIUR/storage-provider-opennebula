@@ -126,7 +126,8 @@ and verified original VM release, along with the current Kubernetes scope and
 per-volume controls. The acceptance write preserves the exact reply across
 control changes and verified claim or attachment turnover while keeping the
 original detach scope. It can record the reply while the original claim is
-absent and the PV still says Bound. Settlement retains its binding requirements.
+absent and the PV still says Bound, including when a distinct, unbound
+same-name claim is Pending. Settlement retains its binding requirements.
 It refreshes protection, confirms Pod, Node and attachment evidence, and
 checks the binding and recovery annotations once more. These bounded
 observations do not fence provider or Kubernetes changes.
@@ -141,6 +142,12 @@ The accepted record remains until its normal retirement checks pass. Each new pu
 its own attach authorization. An uncertain reply or a failed acceptance write
 leaves the attempt unresolved. Global local-disk maintenance does not govern
 these verified Ceph paths.
+
+If a replacement attach is still prepared, Unpublish can acknowledge its
+exact deleting and unattached VolumeAttachment after verifying provider
+absence and any waiting-only Pod demand on the admitted node. The conditional
+history update retires only the same prepared attempt. The next Publish
+requires a new VolumeAttachment and fresh attach authorization.
 
 An attached VolumeAttachment that predates a verified same-name Node
 replacement can converge after the controller proves release on both the pinned
