@@ -88,6 +88,8 @@ type nodeAttachmentProtocol struct {
 	hideImageName       bool
 	omitOriginalVM      bool
 	missingOriginalVM   bool
+	omitVMID            int
+	missingVMID         int
 	replacementDisk     bool
 	imageDatastoreID    int
 	imageSizeMiB        int
@@ -313,10 +315,12 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				}
 			case "one.vmpool.info", "one.vmpool.infoextended":
 				body = "<VM_POOL>"
-				if !state.omitOriginalVM {
+				if !state.omitOriginalVM && state.omitVMID != 41 {
 					body += vmXML(41, false)
 				}
-				body += vmXML(42, false)
+				if state.omitVMID != 42 {
+					body += vmXML(42, false)
+				}
 				if _, present := state.disks[43]; present || state.vmNames[43] != "" {
 					body += vmXML(43, false)
 				}
@@ -332,7 +336,7 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				}
 			case "one.vm.info":
 				body = vmXML(number(1), true)
-				if number(1) == 41 && state.missingOriginalVM {
+				if number(1) == state.missingVMID || (number(1) == 41 && state.missingOriginalVM) {
 					ok, body, code = 0, "VM not found", 0x400
 				}
 			case "one.datastorepool.info":
@@ -4233,7 +4237,10 @@ func fixtureDetachImageOwner(body string, vmID int) string {
 
 func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "safe-detach-updated", "unknown", "final-refusal", "authorization-refusal", "authorization-text", "authorization-malformed", "authentication-refusal", "authentication-text", "write-conflict", "lost-write-reply", "readback-failed", "readback-unproven", "prepared-outage", "armed-outage", "armed-lost-ack", "armed-lost-ack-canceled", "armed-lost-ack-consumer-gone", "armed-lost-ack-retire-conflict", "armed-lost-ack-one-conflict", "armed-lost-ack-conflict-competing", "competing-arm", "prepared-abandoned", "prepared-abandoned-quarantine", "prepared-abandoned-conflict", "prepared-abandoned-orphan", "prepared-abandoned-destination", "prepared-abandoned-waiting", "prepared-abandoned-waiting-distinct-vm", "prepared-abandoned-waiting-arm-race", "prepared-abandoned-waiting-remote-publish", "prepared-abandoned-waiting-remote-reconcile", "prepared-abandoned-waiting-deleting-successor", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
+		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "safe-detach-updated", "unknown", "final-refusal", "authorization-refusal", "authorization-text", "authorization-malformed", "authentication-refusal", "authentication-text", "write-conflict", "lost-write-reply", "readback-failed", "readback-unproven", "prepared-outage", "armed-outage", "armed-lost-ack", "armed-lost-ack-canceled", "armed-lost-ack-consumer-gone", "armed-lost-ack-retire-conflict", "armed-lost-ack-one-conflict", "armed-lost-ack-conflict-competing", "competing-arm", "prepared-abandoned", "prepared-abandoned-quarantine", "prepared-abandoned-conflict", "prepared-abandoned-orphan", "prepared-abandoned-destination", "prepared-abandoned-waiting", "prepared-abandoned-waiting-distinct-vm", "prepared-abandoned-waiting-arm-race", "prepared-abandoned-waiting-remote-publish", "prepared-abandoned-waiting-remote-reconcile", "prepared-abandoned-waiting-deleting-successor", "prepared-abandoned-waiting-deleting-successor-distinct-vm",
+			"prepared-abandoned-destination-successor", "prepared-abandoned-destination-successor-distinct-vm",
+			"prepared-abandoned-waiting-remote-retired-publish", "prepared-abandoned-waiting-remote-retired-reconcile-distinct-vm",
+			"prepared-abandoned-retired-without-va", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
 			"distinct-vm-inflight", "same-vm-abandoned-replay",
 			"no-publish-va", "attached-publish-va", "deleting-publish-va", "foreign-publish-va", "removed-publish-va", "replaced-publish-va",
 			"current-runtime-consumer", "current-terminated-container", "current-restarted-container", "current-sandbox-ready",
@@ -4269,6 +4276,10 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				var detachProofs atomic.Int32
 				abandonedPreparation := strings.HasPrefix(mode, "prepared-abandoned")
 				renewedPreparation := strings.HasPrefix(mode, "prepared-abandoned-waiting")
+				canceledDestination := strings.HasPrefix(mode, "prepared-abandoned-destination")
+				destinationHasSourceSuccessor := strings.HasPrefix(mode, "prepared-abandoned-destination-successor")
+				retiredSource := strings.Contains(mode, "remote-retired")
+				distinctPreparation := abandonedPreparation && strings.HasSuffix(mode, "-distinct-vm")
 				lostArmAck := strings.HasPrefix(mode, "armed-lost-ack")
 				armError := mode == "armed-outage" || lostArmAck || mode == "competing-arm"
 				competingAfterConflict := mode == "armed-lost-ack-conflict-competing"
@@ -4522,7 +4533,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					consumer.CreationTimestamp = metav1.Time{}
 				}
 				publishVA = replacementPublishVA(pv, replacement)
-				if orphanRepublish || renewedPreparation {
+				if orphanRepublish || renewedPreparation || destinationHasSourceSuccessor {
 					publishVA.Name = canonicalVA
 				}
 				switch mode {
@@ -4565,7 +4576,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					wire.attachRefusal = mode
 				}
 				vmID := 41
-				if strings.HasPrefix(mode, "distinct-vm") || mode == "prepared-abandoned-waiting-distinct-vm" {
+				if strings.HasPrefix(mode, "distinct-vm") || distinctPreparation {
 					vmID = 42
 					wire.vmNames = map[int]string{41: "retired-vm", 42: node.Name}
 					wire.omitOriginalVM = mode == "distinct-vm-unreadable-original" || mode == "distinct-vm-original-gone-at-admission"
@@ -4901,7 +4912,10 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							require.NoError(t, err)
 							publish, publishVM = newPublishReq(volume, destination.Name), 43
 							wire.mu.Lock()
-							wire.vmNames = map[int]string{41: node.Name, 43: destination.Name}
+							if wire.vmNames == nil {
+								wire.vmNames = map[int]string{41: node.Name}
+							}
+							wire.vmNames[43] = destination.Name
 							wire.expectedAttachNonce = nil
 							wire.mu.Unlock()
 							wrongDestination := next.DeepCopy()
@@ -4912,7 +4926,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							require.Error(t, err)
 							require.NoError(t, vas.Delete(ctx, wrongDestination.Name, metav1.DeleteOptions{}))
 						}
-						if mode == "prepared-abandoned-waiting-deleting-successor" {
+						if strings.HasPrefix(mode, "prepared-abandoned-waiting-deleting-successor") {
 							canceled := next.DeepCopy()
 							canceled.DeletionTimestamp = &now
 							canceled.Finalizers = deleting.Finalizers
@@ -4927,10 +4941,37 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							require.Error(t, unpublish())
 							_, err = pods.UpdateStatus(ctx, waiting, metav1.UpdateOptions{})
 							require.NoError(t, err)
-							require.NoError(t, unpublish())
-							retired, err := server.readAttachmentHistory(ctx, volume)
+							var acknowledged atomic.Bool
+							lost := reviewControllerClient(t, NewControllerServer(fresh, provider, nil), grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+								reply, err := handler(ctx, req)
+								if err == nil {
+									acknowledged.Store(true)
+									return nil, status.Error(codes.Unavailable, "CSI response lost after successor Unpublish completed")
+								}
+								return reply, err
+							}))
+							_, err = lost.ControllerUnpublishVolume(ctx, req)
+							require.Equal(t, codes.Unavailable, status.Code(err))
+							require.True(t, acknowledged.Load())
+							fresh = newStickyTestDriver(t)
+							fresh.kubeRuntime.client = kube
+							restarted = makeClient(fresh)
+							reconciler := NewAttachmentReconciler(NewControllerServer(fresh, provider, nil))
+							reconciler.orphanGrace = 0
+							require.NoError(t, reconciler.ReconcileOnce(ctx))
+							require.NoError(t, reconciler.ReconcileOnce(ctx))
+							changed := canceled.DeepCopy()
+							changed.Spec.Attacher = "foreign.example"
+							_, err = vas.Update(ctx, changed, metav1.UpdateOptions{})
 							require.NoError(t, err)
-							require.Nil(t, retired.PendingReplacementAttach)
+							require.Error(t, unpublish())
+							_, err = vas.Update(ctx, canceled, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							require.NoError(t, unpublish(), "the deleting successor must replay after restart and reconciliation")
+							require.NoError(t, unpublish())
+							current, err := server.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.Equal(t, stored, current)
 							unchanged, err := vas.Get(ctx, canceled.Name, metav1.GetOptions{})
 							require.NoError(t, err)
 							require.Equal(t, canceled, unchanged)
@@ -4951,6 +4992,57 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							require.Equal(t, stored, preserved)
 							_, err = pods.UpdateStatus(ctx, waiting, metav1.UpdateOptions{})
 							require.NoError(t, err)
+							if retiredSource {
+								require.NoError(t, nodes.Delete(ctx, node.Name, metav1.DeleteOptions{}))
+								_, err = restarted.ControllerPublishVolume(ctx, publish)
+								require.Error(t, err, "Kubernetes Node absence cannot substitute for pinned VM absence")
+								wire.mu.Lock()
+								wire.omitVMID = vmID
+								wire.mu.Unlock()
+								_, err = restarted.ControllerPublishVolume(ctx, publish)
+								require.Error(t, err, "a VM pool miss cannot substitute for direct pinned VM absence")
+								wire.mu.Lock()
+								wire.omitVMID, wire.missingVMID = 0, vmID
+								wire.mu.Unlock()
+								_, err = restarted.ControllerPublishVolume(ctx, publish)
+								require.Error(t, err, "the VM census must agree with direct absence")
+								wire.mu.Lock()
+								wire.omitVMID = vmID
+								wire.disks[43] = 128
+								wire.mu.Unlock()
+								_, err = restarted.ControllerPublishVolume(ctx, publish)
+								require.Error(t, err, "a different VM must not own the image during preparation retirement")
+								wire.mu.Lock()
+								delete(wire.disks, 43)
+								wire.extendedPoolExtraVM = fmt.Sprintf("<VM><ID>44</ID><NAME>%s</NAME><TEMPLATE></TEMPLATE></VM>", node.Name)
+								wire.mu.Unlock()
+								_, err = restarted.ControllerPublishVolume(ctx, publish)
+								require.Error(t, err, "a similarly named VM is not the retired source")
+								wire.mu.Lock()
+								wire.extendedPoolExtraVM = ""
+								wire.mu.Unlock()
+								var failSourceRead atomic.Bool
+								kube.PrependReactor("get", "nodes", func(action ktesting.Action) (bool, kruntime.Object, error) {
+									if failSourceRead.Load() && action.(ktesting.GetAction).GetName() == node.Name {
+										return true, nil, errors.New("source Node read unavailable")
+									}
+									return false, nil, nil
+								})
+								failSourceRead.Store(true)
+								_, err = restarted.ControllerPublishVolume(ctx, publish)
+								require.Error(t, err, "a failed Node read cannot prove retirement")
+								failSourceRead.Store(false)
+								recreated := replacement.DeepCopy()
+								recreated.UID = "unrelated-new-source"
+								_, err = nodes.Create(ctx, recreated, metav1.CreateOptions{})
+								require.NoError(t, err)
+								_, err = restarted.ControllerPublishVolume(ctx, publish)
+								require.Error(t, err, "a same-name Kubernetes Node is not the retired source")
+								require.NoError(t, nodes.Delete(ctx, node.Name, metav1.DeleteOptions{}))
+								preserved, err := server.readAttachmentHistory(ctx, volume)
+								require.NoError(t, err)
+								require.Equal(t, stored, preserved)
+							}
 						} else {
 							require.Error(t, unpublish(), "a late Unpublish cannot acknowledge the nondeleting source successor")
 						}
@@ -4976,7 +5068,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						return
 					}
 					if abandonedPreparation {
-						if mode != "prepared-abandoned-destination" {
+						if !canceledDestination {
 							require.NoError(t, vas.Delete(ctx, publishVA.Name, metav1.DeleteOptions{}))
 						}
 						released := replacement.DeepCopy()
@@ -4984,11 +5076,17 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						_, err := nodes.UpdateStatus(ctx, released, metav1.UpdateOptions{})
 						require.NoError(t, err)
 						require.NoError(t, kube.CoreV1().Pods(pvc.Namespace).Delete(ctx, consumer.Name, metav1.DeleteOptions{}))
-						if mode == "prepared-abandoned-destination" {
+						if canceledDestination {
 							now := metav1.Now()
 							finalizers := []string{"external-attacher/" + driver.name}
 							publishVA.DeletionTimestamp, publishVA.Finalizers = &now, finalizers
-							_, err = vas.Update(ctx, publishVA, metav1.UpdateOptions{})
+							if destinationHasSourceSuccessor {
+								require.NoError(t, vas.Delete(ctx, publishVA.Name, metav1.DeleteOptions{}))
+								publishVA.UID = "canceled-source-successor"
+								_, err = vas.Create(ctx, publishVA, metav1.CreateOptions{})
+							} else {
+								_, err = vas.Update(ctx, publishVA, metav1.UpdateOptions{})
+							}
 							require.NoError(t, err)
 							remote := newReadyNode("remote-node", true)
 							remote.UID = "destination-node"
@@ -5001,19 +5099,46 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							_, err = vas.Create(ctx, destination, metav1.CreateOptions{})
 							require.NoError(t, err)
 							wire.mu.Lock()
-							wire.vmNames = map[int]string{41: node.Name, 43: remote.Name}
-							wire.disks[41] = 128
+							if wire.vmNames == nil {
+								wire.vmNames = map[int]string{41: node.Name}
+							}
+							wire.vmNames[43] = remote.Name
+							wire.disks[vmID] = 128
 							wire.mu.Unlock()
 
 							request := &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: remote.Name}
 							_, err = restarted.ControllerUnpublishVolume(ctx, request)
 							require.Error(t, err, "preparation alone cannot authorize acknowledgement of an owned image")
 							wire.mu.Lock()
-							delete(wire.disks, 41)
+							delete(wire.disks, vmID)
 							wire.mu.Unlock()
 
 							_, err = restarted.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
 							require.Error(t, err)
+							if destinationHasSourceSuccessor {
+								foreign := publishVA.DeepCopy()
+								foreign.Spec.Attacher = "foreign.example"
+								_, err = vas.Update(ctx, foreign, metav1.UpdateOptions{})
+								require.NoError(t, err)
+								_, err = restarted.ControllerUnpublishVolume(ctx, request)
+								require.Error(t, err)
+								attached := publishVA.DeepCopy()
+								attached.Status.Attached = true
+								_, err = vas.Update(ctx, attached, metav1.UpdateOptions{})
+								require.NoError(t, err)
+								_, err = restarted.ControllerUnpublishVolume(ctx, request)
+								require.Error(t, err)
+								_, err = vas.Update(ctx, publishVA, metav1.UpdateOptions{})
+								require.NoError(t, err)
+								busy := released.DeepCopy()
+								busy.Status.VolumesInUse = replacement.Status.VolumesInUse
+								_, err = nodes.UpdateStatus(ctx, busy, metav1.UpdateOptions{})
+								require.NoError(t, err)
+								_, err = restarted.ControllerUnpublishVolume(ctx, request)
+								require.Error(t, err)
+								_, err = nodes.UpdateStatus(ctx, released, metav1.UpdateOptions{})
+								require.NoError(t, err)
+							}
 							kube.ClearActions()
 							_, err = restarted.ControllerUnpublishVolume(ctx, request)
 							require.NoError(t, err)
@@ -5023,6 +5148,11 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							current, err := server.readAttachmentHistory(ctx, volume)
 							require.NoError(t, err)
 							require.Equal(t, stored, current)
+							fresh = newStickyTestDriver(t)
+							fresh.kubeRuntime.client = kube
+							restarted = makeClient(fresh)
+							_, err = restarted.ControllerUnpublishVolume(ctx, request)
+							require.NoError(t, err, "destination can replay while both finalizers are present")
 							destination.Finalizers = nil
 							_, err = vas.Update(ctx, destination, metav1.UpdateOptions{})
 							require.NoError(t, err)
@@ -5042,8 +5172,15 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 								return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), cm.Name, errors.New("competing phase update"))
 							})
 						}
-						if mode == "prepared-abandoned-orphan" {
-							r := NewAttachmentReconciler(NewControllerServer(driver, provider, nil))
+						retiredWithoutVA := mode == "prepared-abandoned-retired-without-va"
+						if retiredWithoutVA {
+							require.NoError(t, nodes.Delete(ctx, node.Name, metav1.DeleteOptions{}))
+							wire.mu.Lock()
+							wire.omitVMID, wire.missingVMID = vmID, vmID
+							wire.mu.Unlock()
+						}
+						if mode == "prepared-abandoned-orphan" || retiredWithoutVA {
+							r := NewAttachmentReconciler(NewControllerServer(fresh, provider, nil))
 							r.orphanGrace = 0
 							require.NoError(t, r.ReconcileOnce(ctx))
 							require.NoError(t, r.ReconcileOnce(ctx))
@@ -5052,15 +5189,17 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						}
 						current, historyErr := server.readAttachmentHistory(ctx, volume)
 						require.NoError(t, historyErr)
-						if mode == "prepared-abandoned-destination" {
+						if canceledDestination {
 							require.NoError(t, err)
 							require.Equal(t, stored.PendingReplacementAttach, current.PendingReplacementAttach)
+							_, err = restarted.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
+							require.NoError(t, err, "source can replay after the destination retires")
 							require.NoError(t, vas.Delete(ctx, publishVA.Name, metav1.DeleteOptions{}))
 							_, err = restarted.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
 							current, historyErr = server.readAttachmentHistory(ctx, volume)
 							require.NoError(t, historyErr)
 						}
-						if mode == "prepared-abandoned" || mode == "prepared-abandoned-orphan" || mode == "prepared-abandoned-destination" {
+						if mode == "prepared-abandoned" || mode == "prepared-abandoned-orphan" || retiredWithoutVA || canceledDestination {
 							require.NoError(t, err)
 							require.Nil(t, current.PendingReplacementAttach)
 						} else {
@@ -5072,6 +5211,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						wire.mu.Lock()
 						defer wire.mu.Unlock()
 						require.Zero(t, wire.attachAttempts)
+						require.Zero(t, wire.detachAttempts)
 						require.Empty(t, wire.mutations)
 						return
 					}

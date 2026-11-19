@@ -148,14 +148,19 @@ leaves the attempt unresolved. Global local-disk maintenance does not govern
 these verified Ceph paths.
 
 If a replacement attach is still prepared, Unpublish can acknowledge its
-exact deleting and unattached VolumeAttachment after verifying provider
-absence and any waiting-only Pod demand on the admitted node. The preparation
-remains available for retries until its VolumeAttachment UID is gone.
+exact deleting and unattached VolumeAttachment, or a verified deleting
+successor under the same canonical name after the pinned UID is gone. Each
+acknowledgement verifies provider absence and any waiting-only Pod demand on
+the admitted node. The preparation stays available for retries while the
+deleting attachment exists. If a remote destination is also deleting,
+its independent release check can let it finalize first.
 An attach that definitively did not take effect can restore that same
-preparation through a conditional update. Once the original attachment UID
-is gone, verified release can retire the preparation even when a canonical
-remote destination or a deleting same-node successor is present. Publishing
-the successor requires fresh attach authorization.
+preparation through a conditional update. Once the deleting attachment is gone,
+verified release can retire the preparation with no attachment or an eligible
+successor present. If the source Node has retired, remote Publish or
+reconciliation must also verify absence of the pinned source VM and settled
+global ownership before retiring the preparation. Publishing the successor
+requires fresh attach authorization.
 
 An attached VolumeAttachment that predates a verified same-name Node
 replacement can converge after the controller proves release on both the pinned

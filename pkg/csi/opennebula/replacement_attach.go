@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	img "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/image"
 	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/shared"
@@ -208,6 +210,80 @@ func (p *PersistentDiskVolumeProvider) InspectReplacementRelease(ctx context.Con
 
 type ReplacementDestinationAbsenceVerifier interface {
 	VerifyReplacementDestinationAbsent(ctx context.Context, volume, node string, imageID, vmID, sourceVMID int) error
+}
+
+type RetiredReplacementSourceVerifier interface {
+	VerifyRetiredReplacementSource(ctx context.Context, volume, node string, imageID, vmID, originalVMID int, originalVMName string) error
+}
+
+func (p *PersistentDiskVolumeProvider) VerifyRetiredReplacementSource(ctx context.Context, volume, node string, imageID, vmID, originalVMID int, originalVMName string) error {
+	denied := fmt.Errorf("%w: retired replacement source absence is unverified", ErrConflictingAttachmentEvidence)
+	if imageID <= 0 || vmID <= 0 || node == "" || volume == "" {
+		return denied
+	}
+	version, err := p.ctrl.SystemVersionContext(ctx)
+	if err != nil || version != "7.4.0" {
+		return denied
+	}
+	if originalVMID != 0 {
+		if _, err := p.InspectReplacementRelease(ctx, imageID, originalVMID, originalVMName); err != nil {
+			return err
+		}
+	}
+	readReadyImage := func() (*img.Image, error) {
+		image, err := p.readAttachmentImageInfo(ctx, imageID)
+		if err != nil {
+			return nil, err
+		}
+		if image.Name != volume || image.ID != imageID || image.DatastoreID == nil || *image.DatastoreID < 0 ||
+			image.Persistent == nil || *image.Persistent != 1 || image.CloningOps != 0 ||
+			image.StateRaw != int(img.Ready) || image.RunningVMs != 0 || len(image.VMs.ID) != 0 {
+			return nil, denied
+		}
+		return image, nil
+	}
+	image, err := readReadyImage()
+	if err != nil {
+		return err
+	}
+	datastore, err := p.attachmentDatastore(ctx, *image.DatastoreID)
+	if err != nil || datastore.Backend != "ceph" {
+		return denied
+	}
+	rows, err := readVMPool(ctx, p.ctrl, true)
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if slices.Contains(row.candidateIDs(), vmID) || slices.ContainsFunc(row.Names, func(name string) bool {
+			return strings.EqualFold(name, node)
+		}) {
+			return denied
+		}
+	}
+	vms, err := attachmentVMsFromRows(rows, imageID, attachmentVMIdentity{}, vmID, originalVMID)
+	if err != nil {
+		return err
+	}
+	for _, info := range vms {
+		if _, _, err := volumeDiskFromVM(&info, imageID, info.ID, true); !errors.Is(err, ErrAttachmentNotFound) {
+			return denied
+		}
+	}
+	if _, err := p.readVMInfo(ctx, vmID, vmDisks); !IsAuthoritativeVolumeAbsence(err) {
+		return denied
+	}
+	if liveID, err := p.lookupImageID(ctx, volume); err != nil || liveID != imageID {
+		return denied
+	}
+	current, err := readReadyImage()
+	if err != nil {
+		return err
+	}
+	if *current.DatastoreID != *image.DatastoreID {
+		return denied
+	}
+	return ctx.Err()
 }
 
 func (p *PersistentDiskVolumeProvider) VerifyReplacementDestinationAbsent(ctx context.Context, volume, node string, imageID, vmID, sourceVMID int) error {

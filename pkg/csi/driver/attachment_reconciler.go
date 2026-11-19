@@ -363,12 +363,12 @@ func (r *AttachmentReconciler) reconcileReleasedReplacementAttempts(ctx context.
 		successor := slices.ContainsFunc(vas[volume], func(va storagev1.VolumeAttachment) bool {
 			return va.Spec.NodeName == attempt.Node && va.DeletionTimestamp == nil && string(va.UID) != attempt.VAUID
 		})
-		pinned := slices.ContainsFunc(vas[volume], func(va storagev1.VolumeAttachment) bool {
-			return string(va.UID) == attempt.VAUID
+		sourceAwaitingFinalization := slices.ContainsFunc(vas[volume], func(va storagev1.VolumeAttachment) bool {
+			return string(va.UID) == attempt.VAUID || (va.Spec.NodeName == attempt.Node && va.DeletionTimestamp != nil)
 		})
 		if (attempt.prepared() || attempt.detachAccepted()) && attempt.matchesHistory(history) && attempt.Driver == s.driver.name &&
 			pv != nil && attempt.PVUID == string(pv.UID) && len(disks[volume]) == 0 &&
-			(attempt.detachAccepted() || !pinned) && !unresolved[volume] && !r.skipDiskAttachmentReconcile(ctx, volume, pv) {
+			(attempt.detachAccepted() || !sourceAwaitingFinalization) && !unresolved[volume] && !r.skipDiskAttachmentReconcile(ctx, volume, pv) {
 			key := volume + "@" + attempt.Node + "@" + string(pv.UID) + "@" + attempt.ID
 			currentOrphans[key] = struct{}{}
 			if r.due(r.orphanSeen, key, now, r.orphanGrace) {
@@ -391,7 +391,7 @@ func (r *AttachmentReconciler) settleReleasedReplacement(ctx context.Context, hi
 		err = s.retireReplacementForSuccessor(ctx, history, attempt)
 	} else if attempt.detachAccepted() {
 		err = s.completeVerifiedReplacementDetach(ctx, attempt.VolumeID, attempt.Node, &identity, detachReadback)
-	} else if err = s.checkPhysicalDetachAuthority(ctx, attempt.VolumeID, attempt.Node, &identity, detachReadback); err == nil {
+	} else if err = s.checkPhysicalDetachAuthority(ctx, attempt.VolumeID, attempt.Node, &identity, detachPreparedRetirement); err == nil {
 		err = s.retireVerifiedReplacement(ctx, attempt)
 	}
 	if err != nil {

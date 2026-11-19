@@ -234,6 +234,10 @@ func (p *PersistentDiskVolumeProvider) readAttachmentVMs(ctx context.Context, im
 	if err != nil {
 		return nil, err
 	}
+	return attachmentVMsFromRows(rows, imageID, requested, vmIDs...)
+}
+
+func attachmentVMsFromRows(rows []vmAuthorityXML, imageID int, requested attachmentVMIdentity, vmIDs ...int) ([]vmSchema.VM, error) {
 	if requested.name != "" {
 		lookupName := requested.lookupName
 		if lookupName == "" {

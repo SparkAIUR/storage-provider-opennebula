@@ -190,7 +190,7 @@ func (s *ControllerServer) replacementPublishHistory(ctx context.Context, req *c
 		attempt.Node != req.NodeId && replacementPublishCanWrite(req) {
 		identity := physicalDetachIdentity{pvUID: types.UID(attempt.PVUID), nodeUID: types.UID(attempt.ReplacementUID), imageID: attempt.ImageID,
 			vmID: attempt.VMID, diskID: -1, replacement: attempt, remoteNodeUID: types.UID(node.UID), remoteNodeName: req.NodeId}
-		if err := s.checkPhysicalDetachAuthority(ctx, req.VolumeId, attempt.Node, &identity, detachReadback); err != nil {
+		if err := s.checkPhysicalDetachAuthority(ctx, req.VolumeId, attempt.Node, &identity, detachPreparedRetirement); err != nil {
 			return history, false, err
 		}
 		if identity.attachments[csiVolumeAttachmentName(req.VolumeId, s.driver.name, req.NodeId)].node != req.NodeId {
