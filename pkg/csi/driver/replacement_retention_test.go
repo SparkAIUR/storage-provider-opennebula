@@ -140,9 +140,7 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 							kube.PrependReactor(verb, "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
 								var name string
 								switch action := action.(type) {
-								case ktesting.CreateAction:
-									name = action.GetObject().(*corev1.ConfigMap).Name
-								case ktesting.UpdateAction:
+								case interface{ GetObject() kruntime.Object }:
 									name = action.GetObject().(*corev1.ConfigMap).Name
 								case ktesting.PatchAction:
 									if action.GetName() == hotplugStateConfigMapName {

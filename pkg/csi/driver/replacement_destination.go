@@ -143,7 +143,10 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 	if err != nil || !maps.Equal(waiting, finalWaiting) {
 		return unavailable(err)
 	}
-	return s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments)
+	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
+		return err
+	}
+	return s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, replaced)
 }
 
 func (s *ControllerServer) replacementDestinationConsumers(ctx context.Context, claim *corev1.ObjectReference, pvc *corev1.PersistentVolumeClaim,

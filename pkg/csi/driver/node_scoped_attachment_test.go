@@ -3635,11 +3635,17 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 }
 
 func TestDetachRechecksVAAfterFinalProtectionRead(t *testing.T) {
-	for _, tc := range []struct{ queued, replace bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
-		t.Run(fmt.Sprintf("queued=%t/replace=%t", tc.queued, tc.replace), func(t *testing.T) {
+	for _, tc := range []struct{ queued, replace, observe bool }{
+		{false, false, false}, {true, false, false}, {false, true, false}, {true, true, false},
+		{false, false, true}, {true, false, true},
+	} {
+		t.Run(fmt.Sprintf("queued=%t/replace=%t/observe=%t", tc.queued, tc.replace, tc.observe), func(t *testing.T) {
 			ctx := context.Background()
 			const volume = "volume-test"
 			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			if tc.observe {
+				pv.Annotations[annotationBackend] = "ceph"
+			}
 			node := newReadyNode("node-old", true)
 			deleting := metav1.Now()
 			va := &storagev1.VolumeAttachment{
@@ -3650,6 +3656,9 @@ func TestDetachRechecksVAAfterFinalProtectionRead(t *testing.T) {
 			driver := newStickyTestDriver(t, pv, pvc, node, va)
 			driver.PluginConfig.OverrideVal(config.LocalRestartOptimizationEnabledVar, false)
 			provider, wire := nodeAttachmentProvider(t)
+			wire.mu.Lock()
+			wire.ceph = tc.observe
+			wire.mu.Unlock()
 			probe := &detachCensusProbe{PersistentDiskVolumeProvider: provider}
 			server := NewControllerServer(driver, probe, nil)
 			if tc.queued {
@@ -3666,14 +3675,31 @@ func TestDetachRechecksVAAfterFinalProtectionRead(t *testing.T) {
 				}
 				return false, nil, nil
 			})
+			var observeInstalled atomic.Bool
+			if tc.observe {
+				kube.PrependReactor("list", "pods", func(ktesting.Action) (bool, kruntime.Object, error) {
+					if probe.inDetach.Load() && protectionReads.Load() >= 2 && observeInstalled.CompareAndSwap(false, true) {
+						observed := pvc.DeepCopy()
+						observed.Annotations[annotationRecoveryMode] = recoveryModeObserve
+						require.NoError(t, kube.Tracker().Update(corev1.SchemeGroupVersion.WithResource("persistentvolumeclaims"), observed, pvc.Namespace))
+					}
+					return false, nil, nil
+				})
+			}
 			client := reviewControllerClient(t, server)
 			reply, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
 			require.GreaterOrEqual(t, protectionReads.Load(), int32(2))
 			wire.mu.Lock()
 			defer wire.mu.Unlock()
-			if tc.replace {
+			if tc.replace || tc.observe {
 				require.Equal(t, codes.Unavailable, status.Code(err))
-				require.ErrorContains(t, err, "VolumeAttachment deletion authority changed")
+				if tc.observe {
+					require.True(t, observeInstalled.Load())
+					require.GreaterOrEqual(t, protectionReads.Load(), int32(3))
+					require.ErrorContains(t, err, "recovery controls changed")
+				} else {
+					require.ErrorContains(t, err, "VolumeAttachment deletion authority changed")
+				}
 				require.Nil(t, reply)
 				require.Zero(t, wire.detachAttempts)
 				require.Contains(t, wire.disks, 41)
@@ -4209,7 +4235,8 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 			"same-vm-abandoned-replay-detach-lag", "distinct-vm-abandoned-replay-detach-lag-retry",
 			"distinct-vm-abandoned-replay-detach-lag-reboot", "distinct-vm-abandoned-replay-detach-lag-persistent-reboot",
 			"distinct-vm-abandoned-replay-detach-lag-original-conflict",
-			"same-vm-abandoned-replay-detach-lag-deadline", "distinct-vm-abandoned-replay-detach-acceptance-write-failed",
+			"same-vm-abandoned-replay-detach-lag-deadline", "same-vm-abandoned-orphan-republish",
+			"distinct-vm-orphan-republish", "distinct-vm-abandoned-replay-accepted-wire-observe", "distinct-vm-abandoned-replay-accepted-wire-node-change", "distinct-vm-abandoned-replay-detach-acceptance-write-failed",
 			"distinct-vm-abandoned-replay-detach-reply-wrong-vm", "distinct-vm-abandoned-replay-detach-reply-string", "distinct-vm-abandoned-replay-detach-reply-failed",
 			"distinct-vm-abandoned-replay-missing-va-pins", "distinct-vm-abandoned-replay-missing-va-name", "distinct-vm-abandoned-replay-missing-va-uid",
 			"distinct-vm-abandoned-replay-wrong-va-uid", "distinct-vm-abandoned-hidden-pinned-va",
@@ -4248,6 +4275,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				invalidPublishVA := strings.HasSuffix(mode, "-publish-va")
 				var publishVA *storagev1.VolumeAttachment
 				vas := kube.StorageV1().VolumeAttachments()
+				nodes := kube.CoreV1().Nodes()
 				latePod := activePodForPVC("post-detach-consumer", pvc.Name, node.Name)
 				latePod.UID = "post-detach-consumer"
 				latePod.Status.Phase = corev1.PodPending
@@ -4266,7 +4294,21 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					_, err = kube.CoreV1().PersistentVolumes().Update(ctx, current, metav1.UpdateOptions{})
 					require.NoError(t, err)
 				}
+				wireObserve := strings.HasSuffix(mode, "-wire-observe")
+				wireNodeChange := strings.HasSuffix(mode, "-wire-node-change")
 				provider, protocol := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+					if method == "one.vm.detach" && (wireObserve || wireNodeChange) && postDetachChange.CompareAndSwap(false, true) {
+						if wireObserve {
+							setObserve(true)
+						}
+						if wireNodeChange {
+							current, err := nodes.Get(ctx, node.Name, metav1.GetOptions{})
+							require.NoError(t, err)
+							current.UID = "changed-during-detach"
+							_, err = nodes.Update(ctx, current, metav1.UpdateOptions{})
+							require.NoError(t, err)
+						}
+					}
 					if (mode == "removed-publish-va" || mode == "replaced-publish-va") && method == "one.system.version" && !latePublishVAChanged.Load() {
 						history, err := (&ControllerServer{driver: driver}).readAttachmentHistory(ctx, volume)
 						require.NoError(t, err)
@@ -4343,7 +4385,6 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				_, err := client.ControllerPublishVolume(ctx, publish)
 				require.NoError(t, err)
 				setReplacementHistoryVersion(t, driver)
-				nodes := kube.CoreV1().Nodes()
 				require.NoError(t, nodes.Delete(ctx, node.Name, metav1.DeleteOptions{}))
 				replacement := node.DeepCopy()
 				replacement.UID = "replacement"
@@ -4958,10 +4999,11 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					} else {
 						require.NoError(t, vas.Delete(ctx, publishVA.Name, metav1.DeleteOptions{}))
 					}
-					ownershipLag := strings.Contains(mode, "-detach-lag")
+					orphanRepublish := strings.HasSuffix(mode, "-orphan-republish")
+					ownershipLag := strings.Contains(mode, "-detach-lag") || orphanRepublish
 					lagReplies, transitionalOriginalReads, originalReadsAfterImageLag := 0, 0, 0
 					persistentReboot := strings.HasSuffix(mode, "-persistent-reboot")
-					heldImageLag := strings.HasSuffix(mode, "-lag-deadline")
+					heldImageLag := strings.HasSuffix(mode, "-lag-deadline") || orphanRepublish
 					acceptanceWriteFailed := strings.HasSuffix(mode, "-acceptance-write-failed")
 					_, invalidDetachReply, _ := strings.Cut(mode, "-replay-detach-reply-")
 					wire.mu.Lock()
@@ -5095,12 +5137,13 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						})
 					}
 					abandoned.Store(true)
-					reconcile := func() {
-						r := NewAttachmentReconciler(NewControllerServer(driver, provider, nil))
+					reconcileDriver := func(owner *Driver) {
+						r := NewAttachmentReconciler(NewControllerServer(owner, provider, nil))
 						r.orphanGrace, r.staleVAGrace = 0, 0
 						require.NoError(t, r.ReconcileOnce(ctx))
 						require.NoError(t, r.ReconcileOnce(ctx))
 					}
+					reconcile := func() { reconcileDriver(driver) }
 					unpublish := func(client csi.ControllerClient) error {
 						_, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
 						return err
@@ -5109,6 +5152,137 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						reconcile()
 					} else {
 						err = unpublish(restarted)
+					}
+					if wireObserve || wireNodeChange {
+						require.Error(t, err)
+						require.True(t, postDetachChange.Load())
+						s := NewControllerServer(driver, provider, nil)
+						current, err := s.readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						if wireNodeChange {
+							require.Equal(t, stored, current)
+							_, err = nodes.Update(ctx, replacement, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							require.Error(t, unpublish(restarted))
+						} else {
+							require.True(t, current.PendingReplacementAttach.detachAccepted())
+							require.Empty(t, current.PendingReplacementAttach.DetachCompletion.VAUID)
+							require.Error(t, unpublish(restarted))
+							held, err := s.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.Equal(t, current, held)
+							setObserve(false)
+							fresh := newStickyTestDriver(t)
+							fresh.kubeRuntime.client = kube
+							require.NoError(t, unpublish(makeClient(fresh)))
+							completed, err := s.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.True(t, completed.PendingReplacementAttach.detached())
+						}
+						wire.mu.Lock()
+						defer wire.mu.Unlock()
+						require.Equal(t, 1, wire.detachAttempts)
+						require.Equal(t, []string{fmt.Sprintf("attach:%d:false", vmID), fmt.Sprintf("detach:%d", vmID)}, wire.mutations)
+						return
+					}
+					if orphanRepublish {
+						if !orphan {
+							require.Error(t, err)
+						}
+						s := NewControllerServer(driver, provider, nil)
+						current, err := s.readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.NotNil(t, current.PendingReplacementAttach)
+						require.True(t, current.PendingReplacementAttach.acceptedOrphan())
+						wire.mu.Lock()
+						wire.alterDirectImage, wire.loseAttachReply = nil, false
+						wire.mu.Unlock()
+						next := replacementPublishVA(pv, replacement)
+						next.Name, next.UID = "csi-e4d7495542eef331c88a720776eeb3967cbd4ea98eec490f4f49c37f7f9dbbda", "orphan-successor"
+						_, err = vas.Create(ctx, next, metav1.CreateOptions{})
+						require.NoError(t, err)
+						waiting := latePod.DeepCopy()
+						_, err = kube.CoreV1().Pods(pvc.Namespace).Create(ctx, waiting, metav1.CreateOptions{})
+						require.NoError(t, err)
+						require.Error(t, unpublish(restarted), "old Unpublish cannot acknowledge the live successor")
+						fresh := newStickyTestDriver(t)
+						fresh.kubeRuntime.client = kube
+						retry := makeClient(fresh)
+						rejectPublish := func() {
+							t.Helper()
+							_, err := retry.ControllerPublishVolume(ctx, publish)
+							require.Error(t, err)
+							observed, err := s.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.Equal(t, current, observed)
+							wire.mu.Lock()
+							defer wire.mu.Unlock()
+							require.Equal(t, []string{fmt.Sprintf("attach:%d:false", vmID), fmt.Sprintf("detach:%d", vmID)}, wire.mutations)
+						}
+						foreign := next.DeepCopy()
+						foreign.Spec.Attacher = "foreign.example.com"
+						_, err = vas.Update(ctx, foreign, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						rejectPublish()
+						_, err = vas.Update(ctx, next, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						changed := next.DeepCopy()
+						changed.UID = "changed-orphan-successor"
+						var changeSuccessor atomic.Bool
+						changeSuccessor.Store(true)
+						kube.PrependReactor("get", "volumeattachments", func(action ktesting.Action) (bool, kruntime.Object, error) {
+							if action.(ktesting.GetAction).GetName() == current.PendingReplacementAttach.VAName &&
+								changeSuccessor.CompareAndSwap(true, false) {
+								if err := kube.Tracker().Update(storagev1.SchemeGroupVersion.WithResource("volumeattachments"), changed, ""); err != nil {
+									return true, nil, err
+								}
+							}
+							return false, nil, nil
+						})
+						rejectPublish()
+						require.False(t, changeSuccessor.Load(), "successor changed during attachment verification")
+						_, err = vas.Update(ctx, next, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						wrongClaim := pvc.DeepCopy()
+						wrongClaim.Spec.VolumeName = "wrong-binding"
+						_, err = kube.CoreV1().PersistentVolumeClaims(pvc.Namespace).Update(ctx, wrongClaim, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						rejectPublish()
+						_, err = kube.CoreV1().PersistentVolumeClaims(pvc.Namespace).Update(ctx, pvc, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						used := waiting.DeepCopy()
+						used.Status.ContainerStatuses[0].ContainerID = "containerd://running"
+						_, err = kube.CoreV1().Pods(pvc.Namespace).UpdateStatus(ctx, used, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						rejectPublish()
+						_, err = kube.CoreV1().Pods(pvc.Namespace).UpdateStatus(ctx, waiting, metav1.UpdateOptions{})
+						require.NoError(t, err)
+						wire.mu.Lock()
+						wire.failMethod = "one.system.version"
+						wire.mu.Unlock()
+						rejectPublish()
+						wire.mu.Lock()
+						wire.failMethod = ""
+						wire.mu.Unlock()
+						if orphan {
+							worker := newStickyTestDriver(t)
+							worker.kubeRuntime.client = kube
+							worker.volumeHistory = NewVolumeHistoryManager(worker.kubeRuntime, driver.volumeHistory.namespace)
+							worker.PluginConfig.OverrideVal(config.StuckAttachmentReconcilerEnabledVar, true)
+							reconcileDriver(worker)
+							settled, err := s.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.Nil(t, settled.PendingReplacementAttach)
+						}
+						reply, err := retry.ControllerPublishVolume(ctx, publish)
+						require.NoError(t, err)
+						require.Equal(t, "onecsi-7", reply.GetPublishContext()[publishContextDeviceSerial])
+						require.Error(t, unpublish(retry))
+						wire.mu.Lock()
+						defer wire.mu.Unlock()
+						require.Equal(t, 1, wire.detachAttempts)
+						require.Equal(t, []string{fmt.Sprintf("attach:%d:false", vmID), fmt.Sprintf("detach:%d", vmID), fmt.Sprintf("attach:%d:false", vmID)}, wire.mutations)
+						return
 					}
 					if persistentReboot || originalConflict || heldImageLag {
 						require.Error(t, err)
@@ -5154,7 +5328,11 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						_, err = vas.Update(ctx, replayVA, metav1.UpdateOptions{})
 						require.NoError(t, err)
 						if persistentReboot {
-							reconcile()
+							worker := newStickyTestDriver(t)
+							worker.kubeRuntime.client = kube
+							worker.volumeHistory = NewVolumeHistoryManager(worker.kubeRuntime, driver.volumeHistory.namespace)
+							worker.PluginConfig.OverrideVal(config.StuckAttachmentReconcilerEnabledVar, true)
+							reconcileDriver(worker)
 							settled, err := s.readAttachmentHistory(ctx, volume)
 							require.NoError(t, err)
 							require.True(t, settled.PendingReplacementAttach.detached(), "the reconciler settles an accepted detach after restart")

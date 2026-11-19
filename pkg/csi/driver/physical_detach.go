@@ -28,12 +28,14 @@ type physicalDetachCheck uint8
 
 const (
 	detachDispatch physicalDetachCheck = iota
-	detachRecordAcceptance
 	detachReadback
 )
 
 type physicalDetachIdentity struct {
 	pvUID, nodeUID        types.UID
+	pvName                string
+	claimRef              corev1.ObjectReference
+	claimUID              types.UID
 	imageID, vmID, diskID int
 	background, ceph      bool
 	backendInferred       bool
@@ -246,22 +248,20 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			}
 			identity.diskID, _ = strconv.Atoi(completion.DiskID)
 		}
-		if check != detachRecordAcceptance {
-			disk, err := s.inspectReplacementDisk(ctx, *attempt, !readback)
-			if err != nil {
+		disk, err := s.inspectReplacementDisk(ctx, *attempt, !readback)
+		if err != nil {
+			return err
+		}
+		if disk != nil {
+			if err := validateMarkedReplacementMetadata(localVA, pv, disk.Target, disk.Serial); err != nil {
 				return err
 			}
-			if disk != nil {
-				if err := validateMarkedReplacementMetadata(localVA, pv, disk.Target, disk.Serial); err != nil {
-					return err
-				}
-				if (identity.diskID >= 0 && identity.diskID != disk.DiskID) ||
-					(identity.replacement != nil && identity.replacementDisk != *disk) {
-					return attachmentEvidenceUnavailable("replacement detach disk changed", nil)
-				}
-				identity.diskID = disk.DiskID
-				identity.replacementDisk = *disk
+			if (identity.diskID >= 0 && identity.diskID != disk.DiskID) ||
+				(identity.replacement != nil && identity.replacementDisk != *disk) {
+				return attachmentEvidenceUnavailable("replacement detach disk changed", nil)
 			}
+			identity.diskID = disk.DiskID
+			identity.replacementDisk = *disk
 		}
 		identity.replacement = attempt
 	}
@@ -381,7 +381,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	}
 	waiting := false
 	if receipt && !replacement && !remoteReplacement {
-		waiting, err = s.replacementWaitingConsumers(ctx, pv, pvc, node)
+		waiting, err = s.replacementWaitingConsumers(ctx, pv, pvc, node, false)
 		if err != nil {
 			return err
 		}
@@ -423,6 +423,16 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	}
 	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, attachmentNode, attachments); err != nil {
 		return err
+	}
+	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, replacement); err != nil {
+		return err
+	}
+	if replacementDetach {
+		identity.pvName, identity.claimRef = pv.Name, *pv.Spec.ClaimRef
+		identity.claimUID = ""
+		if pvc != nil {
+			identity.claimUID = pvc.UID
+		}
 	}
 	identity.attachments = attachments
 	identity.backend = backend
@@ -659,6 +669,59 @@ func (s *ControllerServer) retireVerifiedReplacement(ctx context.Context, attemp
 	return nil
 }
 
+func (s *ControllerServer) checkAcceptedDetachIdentity(ctx context.Context, volume, node string, identity *physicalDetachIdentity) error {
+	unavailable := func(err error) error {
+		return attachmentEvidenceUnavailable("accepted replacement detach identity changed", err)
+	}
+	runtime := s.driver.kubeRuntime
+	pv, err := s.ownedDeletionPV(ctx, volume)
+	if err != nil || pv == nil || pv.UID != identity.pvUID || pv.Name != identity.pvName ||
+		pv.Spec.ClaimRef == nil || *pv.Spec.ClaimRef != identity.claimRef {
+		return unavailable(err)
+	}
+	backend, err := persistentVolumeBackend(pv)
+	if err != nil {
+		if !identity.backendInferred || !errors.Is(err, errAttachmentBackendUndeclared) {
+			return unavailable(err)
+		}
+	} else if backend != identity.backend {
+		return unavailable(nil)
+	}
+	pvc, replaced, err := runtime.attachmentClaim(ctx, pv)
+	if err != nil || (pvc == nil && identity.claimUID != "") ||
+		(pvc != nil && pvc.UID != identity.claimUID) {
+		return unavailable(err)
+	}
+	if replaced {
+		if err := runtime.verifyReleasedClaimNameReuse(ctx, pv, pvc); err != nil {
+			return err
+		}
+	}
+	current, err := runtime.client.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
+	if err != nil || current == nil || current.Name != node || current.UID != identity.nodeUID {
+		return unavailable(err)
+	}
+	source := make(map[string]detachAttachmentAuthority)
+	for name, va := range identity.attachments {
+		if va.node == node {
+			source[name] = va
+		}
+	}
+	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, node, source); err != nil {
+		return err
+	}
+	attempt := identity.replacement
+	if va, present := source[attempt.VAName]; present {
+		currentVA, err := runtime.client.StorageV1().VolumeAttachments().Get(ctx, attempt.VAName, metav1.GetOptions{})
+		if err != nil || currentVA == nil || !matchesVolumeAttachment(pv.Name, currentVA) || !reflect.DeepEqual(va, detachAttachmentSnapshot(currentVA)) {
+			return unavailable(err)
+		}
+	} else if gone, err := s.replacementVAGone(ctx, attempt.VAName, attempt.VAUID); err != nil || !gone {
+		return unavailable(err)
+	}
+	return ctx.Err()
+}
+
 func (s *ControllerServer) recordReplacementDetachAcceptance(ctx context.Context, volume, node, vmName string, imageID, vmID, diskID int, identity *physicalDetachIdentity) error {
 	attempt := identity.replacement
 	disk := identity.replacementDisk
@@ -680,7 +743,7 @@ func (s *ControllerServer) recordReplacementDetachAcceptance(ctx context.Context
 		accepted.DetachAcceptance.VAName, accepted.DetachAcceptance.VAUID = attempt.VAName, string(va.uid)
 	}
 	err := retryOnConflict(retry.DefaultRetry, func() error {
-		if err := s.checkPhysicalDetachAuthority(ctx, volume, node, identity, detachRecordAcceptance); err != nil {
+		if err := s.checkAcceptedDetachIdentity(ctx, volume, node, identity); err != nil {
 			return err
 		}
 		_, writeErr := s.driver.volumeHistory.updateHistory(ctx, volume, true, func(current *VolumeHistoryRecord) error {

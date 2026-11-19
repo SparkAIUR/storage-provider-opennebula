@@ -137,7 +137,7 @@ func (s *ControllerServer) checkReplacedNodeStaleAttachment(ctx context.Context,
 		}) {
 		return deny(err)
 	}
-	waiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, currentNode)
+	waiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, currentNode, false)
 	if err != nil || (!waiting && nodeReportsVolumeInUse(currentNode, s.driver.name, volume)) {
 		return deny(err)
 	}
@@ -155,5 +155,15 @@ func (s *ControllerServer) checkReplacedNodeStaleAttachment(ctx context.Context,
 		!reflect.DeepEqual(currentVA.DeletionTimestamp, va.DeletionTimestamp) {
 		return deny(err)
 	}
-	return true, ctx.Err()
+	if originalVM := history.LastSuccessfulOpenNebulaVMID; originalVM != vmID {
+		original := target
+		original.VMID, original.DiskID = originalVM, *history.LastSuccessfulDiskID
+		if err := s.attachmentProtectionChecks(ctx, volume, runtimeCtx, original); err != nil {
+			return true, err
+		}
+	}
+	if err := s.recheckAttachmentAuthority(ctx, volume, runtimeCtx, target, pv, pvc, false); err != nil {
+		return true, err
+	}
+	return true, nil
 }

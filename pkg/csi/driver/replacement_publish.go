@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
@@ -168,6 +169,13 @@ func (s *ControllerServer) replacementPublishHistory(ctx context.Context, req *c
 	if err != nil {
 		return history, false, err
 	}
+	if attempt := history.PendingReplacementAttach; attempt != nil && attempt.acceptedOrphan() &&
+		attempt.Node == req.NodeId && attempt.ReplacementUID == node.UID && replacementPublishCanWrite(req) {
+		if err := s.retireAcceptedOrphanForPublish(ctx, history, *attempt); err != nil {
+			return history, false, err
+		}
+		retired = true
+	}
 	if retired {
 		history, err = s.readAttachmentHistory(ctx, req.VolumeId)
 		if err != nil {
@@ -181,6 +189,41 @@ func (s *ControllerServer) replacementPublishHistory(ctx context.Context, req *c
 	replacement := (isCephBackend(history.Backend) || isCephBackend(backend)) && volumeHistoryHasObservedSuccess(history) &&
 		history.LastSuccessfulNodeName == req.NodeId && history.LastSuccessfulNodeUID != "" && history.LastSuccessfulNodeUID != node.UID
 	return history, replacement, nil
+}
+
+func (attempt replacementAttachAttempt) acceptedOrphan() bool {
+	return attempt.detachAccepted() && attempt.DetachAcceptance.VAName == "" && attempt.DetachAcceptance.VAUID == ""
+}
+
+func (s *ControllerServer) retireAcceptedOrphanForPublish(ctx context.Context, history VolumeHistoryRecord, attempt replacementAttachAttempt) error {
+	if !attempt.acceptedOrphan() || !attempt.matchesHistory(history) || attempt.Driver != s.driver.name {
+		return attachmentEvidenceUnavailable("accepted orphan detach is unverified", nil)
+	}
+	if _, err := s.inspectReplacementDisk(ctx, attempt, false); err != nil {
+		return err
+	}
+	diskID, _ := strconv.Atoi(attempt.DetachAcceptance.DiskID)
+	proveVA := func(name string, va detachAttachmentAuthority, pv *corev1.PersistentVolume, _ *corev1.PersistentVolumeClaim) error {
+		if name != csiVolumeAttachmentName(attempt.VolumeID, attempt.Driver, attempt.Node) ||
+			va.deleting || va.attached || string(va.uid) == attempt.VAUID {
+			return attachmentEvidenceUnavailable("accepted orphan detach successor is unverified", nil)
+		}
+		if err := validateMarkedReplacementMetadata(va, pv, "", attempt.DetachAcceptance.Serial); err != nil {
+			return err
+		}
+		if name == attempt.VAName {
+			return s.checkReplacementVAOrigin(ctx, attempt, pv.Name, name, va)
+		}
+		_, err := s.driver.kubeRuntime.client.StorageV1().VolumeAttachments().Get(ctx, attempt.VAName, metav1.GetOptions{})
+		if !apierrors.IsNotFound(err) {
+			return attachmentEvidenceUnavailable("accepted orphan detach original attachment absence is unverified", err)
+		}
+		return nil
+	}
+	if _, err := s.verifyReplacementBinding(ctx, history, attempt, diskID, proveVA); err != nil {
+		return err
+	}
+	return s.retireVerifiedReplacement(ctx, attempt)
 }
 
 func replacementPublishCanWrite(req *csi.ControllerPublishVolumeRequest) bool {
@@ -259,7 +302,14 @@ func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, history
 		}) {
 		return unavailable()
 	}
-	if waiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, current); err != nil || !waiting {
+	requireStarted := false
+	if attempt.acceptedOrphan() {
+		requireStarted = nodeReportsVolumeInUse(current, s.driver.name, attempt.VolumeID)
+		if requireStarted != nodeReportsVolumeInUse(node, s.driver.name, attempt.VolumeID) {
+			return unavailable()
+		}
+	}
+	if waiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, current, requireStarted); err != nil || !waiting {
 		return unavailable()
 	}
 	if proveVA != nil {
@@ -272,10 +322,23 @@ func (s *ControllerServer) verifyReplacementBinding(ctx context.Context, history
 	if err := s.recheckDetachVolumeAttachments(ctx, pv.Name, "", attachments); err != nil {
 		return attempt, err
 	}
-	return attempt, ctx.Err()
+	if attempt.acceptedOrphan() {
+		latest, err := client.Nodes().Get(ctx, attempt.Node, metav1.GetOptions{})
+		if err != nil || latest.UID != current.UID || !latest.CreationTimestamp.Equal(&current.CreationTimestamp) ||
+			latest.DeletionTimestamp != nil || nodeReportsVolumeInUse(latest, s.driver.name, attempt.VolumeID) != requireStarted ||
+			!slices.ContainsFunc(latest.Status.Conditions, func(c corev1.NodeCondition) bool {
+				return c.Type == corev1.NodeReady && c.Status == corev1.ConditionTrue
+			}) {
+			return unavailable()
+		}
+	}
+	if err := s.recheckAttachmentAuthority(ctx, attempt.VolumeID, runtimeCtx, target, pv, pvc, false); err != nil {
+		return attempt, err
+	}
+	return attempt, nil
 }
 
-func (s *ControllerServer) replacementWaitingConsumers(ctx context.Context, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, node *corev1.Node) (bool, error) {
+func (s *ControllerServer) replacementWaitingConsumers(ctx context.Context, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, node *corev1.Node, requireStarted bool) (bool, error) {
 	pods, err := s.driver.kubeRuntime.client.CoreV1().Pods(pv.Spec.ClaimRef.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return false, attachmentEvidenceUnavailable("replacement consumer state is unreadable", err)
@@ -290,7 +353,7 @@ func (s *ControllerServer) replacementWaitingConsumers(ctx context.Context, pv *
 		if !references || terminalPodMayBeReleased(pod) {
 			continue
 		}
-		if !replacementPodWaitingOnNode(pod, node) {
+		if !replacementPodWaitingOnNode(pod, node) || (requireStarted && pod.Status.StartTime == nil) {
 			return false, attachmentEvidenceUnavailable("replacement consumer may already be using the volume", nil)
 		}
 		consumers++

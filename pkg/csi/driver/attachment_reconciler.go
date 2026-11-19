@@ -366,13 +366,15 @@ func (r *AttachmentReconciler) reconcileReleasedReplacementAttempts(ctx context.
 			key := volume + "@" + attempt.Node + "@" + string(pv.UID) + "@" + attempt.ID
 			currentOrphans[key] = struct{}{}
 			if r.due(r.orphanSeen, key, now, r.orphanGrace) {
-				r.settleReleasedReplacement(ctx, *attempt, pv.UID)
+				r.settleReleasedReplacement(ctx, history, *attempt, pv.UID, slices.ContainsFunc(vas[volume], func(va storagev1.VolumeAttachment) bool {
+					return va.Spec.NodeName == attempt.Node && va.DeletionTimestamp == nil
+				}))
 			}
 		}
 	}
 }
 
-func (r *AttachmentReconciler) settleReleasedReplacement(ctx context.Context, attempt replacementAttachAttempt, pvUID types.UID) {
+func (r *AttachmentReconciler) settleReleasedReplacement(ctx context.Context, history VolumeHistoryRecord, attempt replacementAttachAttempt, pvUID types.UID, successor bool) {
 	s := r.server
 	nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(attempt.Node))
 	defer nodeRelease()
@@ -381,7 +383,9 @@ func (r *AttachmentReconciler) settleReleasedReplacement(ctx context.Context, at
 	identity := physicalDetachIdentity{pvUID: pvUID, nodeUID: types.UID(attempt.ReplacementUID), imageID: attempt.ImageID, vmID: attempt.VMID,
 		diskID: -1, background: true, cephSingleWriter: true, replacement: &attempt}
 	var err error
-	if attempt.detachAccepted() {
+	if attempt.acceptedOrphan() && successor {
+		err = s.retireAcceptedOrphanForPublish(ctx, history, attempt)
+	} else if attempt.detachAccepted() {
 		err = s.completeVerifiedReplacementDetach(ctx, attempt.VolumeID, attempt.Node, &identity)
 	} else if err = s.checkPhysicalDetachAuthority(ctx, attempt.VolumeID, attempt.Node, &identity, detachReadback); err == nil {
 		err = s.retireVerifiedReplacement(ctx, attempt)
