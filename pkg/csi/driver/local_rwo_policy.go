@@ -484,6 +484,8 @@ type successfulAttachmentObservation struct {
 	nodeName, nodeUID, target, serial string
 	vmID, imageID, diskID             int
 	newAttachment                     bool
+	adopted                           bool
+	disk                              opennebula.VolumeDiskRecord
 	replacementAttempt                *replacementAttachAttempt
 }
 
@@ -704,6 +706,26 @@ func (s *ControllerServer) publishProtectionCheck(ctx context.Context, volume, n
 		}
 	}
 	return func(ctx context.Context) error {
+		if control.AdoptionRequested() {
+			current, err := readAdoptionProtection(ctx)
+			if err != nil || !reflect.DeepEqual(adoptedProtection, current) {
+				return attachmentEvidenceUnavailable("Publish adoption protection changed or is unreadable", err)
+			}
+		} else if s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
+			if s.driver.volumeRepairState != nil && s.driver.volumeQuarantine != nil && s.driver.hostArtifactQuarantine != nil {
+				if err := s.attachmentProtectionChecks(ctx, volume, binding, target); err != nil {
+					return err
+				}
+			} else {
+				if err := s.rejectIfActiveRepairState(ctx, volume, binding); err != nil {
+					return err
+				}
+				current, err := readAdoptionProtection(ctx)
+				if err != nil || current.volume.VolumeID != "" || len(current.hosts) != 0 {
+					return attachmentEvidenceUnavailable("Publish quarantine is active or unreadable", err)
+				}
+			}
+		}
 		now := time.Now().UTC()
 		if (placement.OverrideUsed && !placement.OverrideExpiresAt.After(now)) ||
 			(placement.Source == protectionSourceExplicitRequiredNode && placement.ExplicitRequiredNodeUntil != nil && !placement.ExplicitRequiredNodeUntil.After(now)) {
@@ -712,38 +734,15 @@ func (s *ControllerServer) publishProtectionCheck(ctx context.Context, volume, n
 		if control.Active() && control.ExpiresAt != nil && !control.ExpiresAt.After(now) {
 			return attachmentEvidenceUnavailable("Publish recovery grant expired during admission", nil)
 		}
-		if control.AdoptionRequested() {
-			current, err := readAdoptionProtection(ctx)
-			if err != nil || !reflect.DeepEqual(adoptedProtection, current) {
-				return attachmentEvidenceUnavailable("Publish adoption protection changed or is unreadable", err)
-			}
-			return ctx.Err()
-		}
-		if s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
-			return ctx.Err()
-		}
-		if s.driver.volumeRepairState != nil && s.driver.volumeQuarantine != nil && s.driver.hostArtifactQuarantine != nil {
-			if err := s.attachmentProtectionChecks(ctx, volume, binding, target); err != nil {
-				return err
-			}
-		} else {
-			if err := s.rejectIfActiveRepairState(ctx, volume, binding); err != nil {
-				return err
-			}
-			current, err := readAdoptionProtection(ctx)
-			if err != nil || current.volume.VolumeID != "" || len(current.hosts) != 0 {
-				return attachmentEvidenceUnavailable("Publish quarantine is active or unreadable", err)
-			}
-		}
 		return ctx.Err()
 	}, nil
 }
 
-func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target, adoptedSerial string, admittedNode KubernetesNodeIdentity, newAttachment bool) (successfulAttachmentObservation, error) {
+func (s *ControllerServer) observePublishedDisk(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target, adoptedSerial string) (successfulAttachmentObservation, error) {
 	observation := successfulAttachmentObservation{
 		nodeName: strings.TrimSpace(requestedNode), target: strings.TrimSpace(target),
 		imageID: imageID, vmID: vmID, diskID: -1, serial: firstNonEmpty(adoptedSerial, fmt.Sprintf("onecsi-%d", imageID)),
-		newAttachment: newAttachment,
+		adopted: adoptedSerial != "",
 	}
 	if observation.target == "" || imageID <= 0 || vmID <= 0 {
 		return observation, attachmentEvidenceUnavailable("publish attachment identity is incomplete", nil)
@@ -780,12 +779,15 @@ func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volume
 		if !ok {
 			return observation, attachmentEvidenceUnavailable("publish disk evidence is unavailable", censusErr)
 		}
+		currentImage, _, err := s.volumeProvider.VolumeExists(ctx, volumeID)
+		if err != nil || currentImage != imageID {
+			return observation, attachmentEvidenceUnavailable("publish image identity changed or is unverified", err)
+		}
 		disk, err := reader.InspectVolumeDisk(ctx, imageID, vmID)
-		if err == nil && disk.NodeID == vmID {
-			disks = []opennebula.VolumeDiskRecord{disk}
-		} else if adoptedSerial == "" || !errors.Is(err, opennebula.ErrAttachmentNotFound) {
+		if err != nil || disk.NodeID != vmID {
 			return observation, attachmentEvidenceUnavailable("publish disk evidence is unverified", err)
 		}
+		disks = []opennebula.VolumeDiskRecord{disk}
 	}
 	seen := false
 	for _, disk := range disks {
@@ -801,16 +803,22 @@ func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volume
 		}
 		if strings.TrimSpace(disk.Target) == observation.target {
 			observation.diskID = disk.DiskID
+			observation.disk = disk
 		}
 	}
-	if adoptedSerial == "" && observation.diskID < 0 {
+	if observation.diskID < 0 {
 		return observation, attachmentEvidenceUnavailable("publish attachment target changed", nil)
 	}
 
-	currentImage, _, err := s.volumeProvider.VolumeExists(ctx, volumeID)
-	if err != nil || currentImage != imageID {
-		return observation, attachmentEvidenceUnavailable("publish image identity changed or is unverified", err)
+	return observation, nil
+}
+
+func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target, adoptedSerial string, admittedNode KubernetesNodeIdentity, newAttachment bool) (successfulAttachmentObservation, error) {
+	observation, err := s.observePublishedDisk(ctx, volumeID, requestedNode, imageID, vmID, target, adoptedSerial)
+	if err != nil {
+		return observation, err
 	}
+	observation.newAttachment = newAttachment
 	currentVM, err := s.volumeProvider.NodeExists(ctx, requestedNode)
 	if err != nil || currentVM != vmID {
 		return observation, attachmentEvidenceUnavailable("publish VM identity changed or is unverified", err)
@@ -895,7 +903,8 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 	if errors.Is(err, errRetainedAttachmentNodeChanged) {
 		return status.Error(codes.Unavailable, err.Error())
 	}
-	if status.Code(err) == codes.Unavailable {
+	switch status.Code(err) {
+	case codes.Unavailable, codes.FailedPrecondition:
 		return err
 	}
 	if observation.replacementAttempt != nil {

@@ -272,7 +272,7 @@ func replacementPublishReadOnlyMany(req *csi.ControllerPublishVolumeRequest) boo
 	return req.GetVolumeCapability().GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
 }
 
-func (s *ControllerServer) verifyReadOnlyPublishTurnover(ctx context.Context, history VolumeHistoryRecord, volume, nodeName string, imageID, vmID int, admitted KubernetesNodeIdentity, requireAbsent, releaseObserved bool) error {
+func (s *ControllerServer) verifyReadOnlyPriorRelease(ctx context.Context, history VolumeHistoryRecord, volume, nodeName string, imageID, vmID int, admitted KubernetesNodeIdentity) error {
 	deny := func(err error) error {
 		return attachmentEvidenceUnavailable("read-only replacement release is unverified", err)
 	}
@@ -311,18 +311,24 @@ func (s *ControllerServer) verifyReadOnlyPublishTurnover(ctx context.Context, hi
 		validateMarkedReplacementMetadata(va, pv, "", fmt.Sprintf("onecsi-%d", imageID)) != nil {
 		return deny(err)
 	}
+	var waiting waitingConsumers
 	inUse := nodeReportsVolumeInUse(node, s.driver.name, volume)
-	waiting, err := s.replacementDestinationConsumers(ctx, pv, pvc, false, true, node, inUse)
-	if err != nil {
-		return err
+	if inUse {
+		waiting, err = s.replacementDestinationConsumers(ctx, pv, pvc, false, true, node, true)
+		if err != nil {
+			return deny(err)
+		}
 	}
 	verifier, ok := s.volumeProvider.(opennebula.VolumeAttachmentInspector)
 	if !ok {
 		return deny(nil)
 	}
-	metadata, err := verifier.InspectVolumeAttachment(opennebula.WithReadOnlyAttachmentVerification(ctx), volume, nodeName)
-	if err != nil || metadata == nil || metadata.ImageID != imageID || metadata.RequestedNodeID != vmID ||
-		(requireAbsent && metadata.AttachedToRequestedNode) {
+	metadata, err := verifier.InspectVolumeAttachment(ctx, volume, nodeName)
+	if err != nil || metadata == nil || metadata.ImageID != imageID || metadata.RequestedNodeID != vmID || metadata.RequestedNode != nodeName {
+		return deny(err)
+	}
+	datastore, err := s.inspectVolumeDatastore(ctx, volume, imageID)
+	if err != nil || !isCephBackend(datastore.Backend) {
 		return deny(err)
 	}
 	originalVM := history.LastSuccessfulOpenNebulaVMID
@@ -337,8 +343,8 @@ func (s *ControllerServer) verifyReadOnlyPublishTurnover(ctx context.Context, hi
 	}
 	owners := make(map[int]bool)
 	for _, disk := range metadata.DiskRecords {
-		if disk.NodeID == vmID && originalVM == vmID && !releaseObserved &&
-			(history.LastSuccessfulDiskID == nil || *history.LastSuccessfulDiskID == disk.DiskID) {
+		if !disk.ReadOnly || disk.ReplacementMarked || disk.Serial != fmt.Sprintf("onecsi-%d", imageID) ||
+			(disk.NodeID == vmID && originalVM == vmID && (history.LastSuccessfulDiskID == nil || *history.LastSuccessfulDiskID == disk.DiskID)) {
 			return deny(nil)
 		}
 		owners[disk.NodeID] = true
@@ -375,9 +381,11 @@ func (s *ControllerServer) verifyReadOnlyPublishTurnover(ctx context.Context, hi
 	if err != nil || currentHistory.PendingReplacementAttach != nil || replacementHistoryGeneration(currentHistory) != replacementHistoryGeneration(history) {
 		return deny(err)
 	}
-	currentWaiting, err := s.replacementDestinationConsumers(ctx, pv, pvc, false, true, node, inUse)
-	if err != nil || !sameWaitingConsumers(waiting, currentWaiting) {
-		return deny(err)
+	if inUse {
+		current, err := s.replacementDestinationConsumers(ctx, pv, pvc, false, true, node, true)
+		if err != nil || !sameWaitingConsumers(waiting, current) {
+			return deny(err)
+		}
 	}
 	if err := s.recheckAttachmentReleaseNode(ctx, node, volume); err != nil {
 		return err

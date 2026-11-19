@@ -550,18 +550,48 @@ func TestProviderRequestedVMCapacityWithMultipleAttachments(t *testing.T) {
 }
 
 func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
-	for _, shared := range []bool{false, true} {
-		t.Run(fmt.Sprintf("shared=%v", shared), func(t *testing.T) {
+	for _, mode := range []string{"shared=true", "shared=false", "conflict", "renewed", "replaced"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			shared := mode == "shared=true"
 			provider, state := nodeAttachmentProvider(t)
-			mode := corev1.ReadWriteOnce
+			accessMode := corev1.ReadWriteOnce
 			if shared {
-				mode = corev1.ReadOnlyMany
+				accessMode = corev1.ReadOnlyMany
 			}
-			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{mode}, nil)
+			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{accessMode}, nil)
+			pv.ResourceVersion = "1"
 			pv.Annotations[annotationAllowCrossNodeUntil] = time.Now().UTC().Add(time.Minute).Format(time.RFC3339)
 			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
 			if !shared {
 				require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{VolumeID: "volume-test", NodeID: "node-old", Backend: "local", StartedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Minute), GraceSeconds: 60}))
+			}
+			kube := driver.kubeRuntime.client.(*fake.Clientset)
+			var injected atomic.Bool
+			renewed := time.Now().UTC().Add(2 * time.Minute).Format(time.RFC3339)
+			if mode != "shared=false" && !shared {
+				kube.PrependReactor("update", "persistentvolumes", func(action ktesting.Action) (bool, kruntime.Object, error) {
+					pending := action.(ktesting.UpdateAction).GetObject().(*corev1.PersistentVolume)
+					if pending.Annotations[annotationAllowCrossNodeUntil] != "" || !injected.CompareAndSwap(false, true) {
+						return false, nil, nil
+					}
+					gvr := corev1.SchemeGroupVersion.WithResource("persistentvolumes")
+					obj, err := kube.Tracker().Get(gvr, "", pending.Name)
+					require.NoError(t, err)
+					current := obj.(*corev1.PersistentVolume)
+					current.ResourceVersion = "2"
+					switch mode {
+					case "conflict":
+						current.Annotations["fixture.example/description"] = "updated"
+						current.Annotations[annotationPlacementSummary] = "externally refreshed placement summary"
+					case "renewed":
+						current.Annotations[annotationAllowCrossNodeUntil] = renewed
+					case "replaced":
+						current.UID = "replacement-pv"
+					}
+					require.NoError(t, kube.Tracker().Update(gvr, current, ""))
+					return true, nil, apierrors.NewConflict(corev1.Resource("persistentvolumes"), current.Name, errors.New("concurrent PV update"))
+				})
 			}
 			controller := NewControllerServer(driver, provider, &MockSharedFilesystemProviderTestify{})
 			client := reviewControllerClient(t, controller)
@@ -573,7 +603,7 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 				req.VolumeCapability.AccessMode.Mode = csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
 				req.Readonly = true
 			}
-			response, err := client.ControllerPublishVolume(context.Background(), req)
+			response, err := client.ControllerPublishVolume(ctx, req)
 			require.NoError(t, err)
 			require.Equal(t, "vdb", response.GetPublishContext()["volumeName"])
 			state.mu.Lock()
@@ -592,9 +622,22 @@ func TestControllerPublishRealProviderStickyMoveAndSharedReader(t *testing.T) {
 			if !shared {
 				_, exists := driver.stickyAttachments.Get("volume-test")
 				require.False(t, exists)
-				current, err := driver.kubeRuntime.client.CoreV1().PersistentVolumes().Get(context.Background(), pv.Name, metav1.GetOptions{})
+				current, err := driver.kubeRuntime.client.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
 				require.NoError(t, err)
-				require.NotContains(t, current.Annotations, annotationAllowCrossNodeUntil)
+				require.Equal(t, mode != "shared=false", injected.Load())
+				switch mode {
+				case "renewed":
+					require.Equal(t, renewed, current.Annotations[annotationAllowCrossNodeUntil])
+				case "replaced":
+					require.Equal(t, types.UID("replacement-pv"), current.UID)
+					require.Equal(t, pv.Annotations[annotationAllowCrossNodeUntil], current.Annotations[annotationAllowCrossNodeUntil])
+				default:
+					require.NotContains(t, current.Annotations, annotationAllowCrossNodeUntil)
+				}
+				if mode == "conflict" {
+					require.Equal(t, "updated", current.Annotations["fixture.example/description"])
+					require.Equal(t, "externally refreshed placement summary", current.Annotations[annotationPlacementSummary])
+				}
 			}
 		})
 	}
@@ -3291,7 +3334,7 @@ func TestControllerPublishMoveClearsStaleAttachmentPinsWhenCensusFails(t *testin
 			probe.failCensus.Store(true)
 			_, err = client.ControllerPublishVolume(ctx, newPublishReq("volume-test", newNode.Name))
 			require.NoError(t, err)
-			require.EqualValues(t, 1, probe.failedCensus.Load())
+			require.EqualValues(t, 4, probe.failedCensus.Load())
 			moved, err := server.readAttachmentHistory(ctx, "volume-test")
 			require.NoError(t, err)
 			require.Equal(t, newNode.Name, moved.LastSuccessfulNodeName)
@@ -8118,7 +8161,7 @@ func TestControllerPublishPinsAdmittedClaim(t *testing.T) {
 
 func TestControllerPublishFreshCephReplacementReader(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"retired", "lost-reply", "separate-reader", "old-attachment", "in-use", "pending"} {
+		for _, mode := range []string{"retired", "retired-in-use", "lost-reply", "lost-reply-same-vm", "lost-reply-same-slot", "separate-reader", "old-attachment", "in-use", "pending"} {
 			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				const volume = "volume-test"
@@ -8133,11 +8176,11 @@ func TestControllerPublishFreshCephReplacementReader(t *testing.T) {
 				if mode == "old-attachment" {
 					va.CreationTimestamp = metav1.NewTime(node.CreationTimestamp.Add(-time.Minute))
 				}
-				if mode == "in-use" {
+				if mode == "in-use" || mode == "retired-in-use" {
 					node.Status.VolumesInUse = []corev1.UniqueVolumeName{corev1.UniqueVolumeName("kubernetes.io/csi/" + pv.Spec.CSI.Driver + "^" + volume)}
 				}
 				objects := []kruntime.Object{pv, pvc, node, va}
-				if mode == "retired" || mode == "lost-reply" || mode == "separate-reader" {
+				if strings.HasPrefix(mode, "retired") || strings.HasPrefix(mode, "lost-reply") || mode == "separate-reader" {
 					pod := activePodForPVC("reader-waiter", pvc.Name, node.Name)
 					pod.UID = "reader-waiter"
 					pod.CreationTimestamp = metav1.NewTime(node.CreationTimestamp.Add(2 * time.Second))
@@ -8163,6 +8206,13 @@ func TestControllerPublishFreshCephReplacementReader(t *testing.T) {
 					if mode == "lost-reply" {
 						state.LastSuccessfulOpenNebulaVMID = 42
 					}
+					if mode == "lost-reply-same-vm" || mode == "lost-reply-same-slot" {
+						oldSlot := 1
+						if mode == "lost-reply-same-slot" {
+							oldSlot = 2
+						}
+						state.LastSuccessfulDiskID = &oldSlot
+					}
 					if mode == "pending" {
 						state.PendingReplacementAttach = &replacementAttachAttempt{Version: 2, Phase: replacementAttachArmed}
 					}
@@ -8172,7 +8222,7 @@ func TestControllerPublishFreshCephReplacementReader(t *testing.T) {
 				wire.mu.Lock()
 				wire.ceph, wire.version, wire.readOnlyAttach, wire.marker = true, "7.4.0", true, 256*1024*1024
 				delete(wire.disks, 41)
-				wire.loseAttachReply = mode == "lost-reply"
+				wire.loseAttachReply = strings.HasPrefix(mode, "lost-reply")
 				if mode == "separate-reader" {
 					wire.disks[43] = 128
 					wire.vmNames = map[int]string{43: "node-remote"}
@@ -8189,7 +8239,7 @@ func TestControllerPublishFreshCephReplacementReader(t *testing.T) {
 				request.Readonly = true
 				client := reviewControllerClient(t, server)
 				reply, err := client.ControllerPublishVolume(ctx, request)
-				if mode == "lost-reply" {
+				if strings.HasPrefix(mode, "lost-reply") {
 					require.Error(t, err)
 					require.Nil(t, reply)
 					wire.mu.Lock()
@@ -8199,7 +8249,7 @@ func TestControllerPublishFreshCephReplacementReader(t *testing.T) {
 				}
 				wire.mu.Lock()
 				defer wire.mu.Unlock()
-				if mode == "retired" || mode == "lost-reply" || mode == "separate-reader" {
+				if strings.HasPrefix(mode, "retired") || mode == "lost-reply" || mode == "lost-reply-same-vm" || mode == "separate-reader" {
 					require.NoError(t, err)
 					require.Equal(t, "7", reply.GetPublishContext()[publishContextOpenNebulaImageID])
 					require.Equal(t, []string{"attach:41:true", "resize:41:256", "marker:268435456"}, wire.mutations)
@@ -8207,7 +8257,11 @@ func TestControllerPublishFreshCephReplacementReader(t *testing.T) {
 				} else {
 					require.Error(t, err)
 					require.Nil(t, reply)
-					require.Empty(t, wire.mutations)
+					if mode == "lost-reply-same-slot" {
+						require.Equal(t, []string{"attach:41:true"}, wire.mutations)
+					} else {
+						require.Empty(t, wire.mutations)
+					}
 				}
 			})
 		}
@@ -8309,7 +8363,7 @@ func TestControllerPublishTimeoutUsesEffectiveSize(t *testing.T) {
 
 func TestControllerPublishRefreshesProtectionAndTarget(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"repair-at-restore", "quarantine-at-restore", "expiry-at-restore", "node-at-size", "vm-at-size"} {
+		for _, mode := range []string{"repair-at-restore", "quarantine-at-restore", "expiry-at-restore", "node-at-size", "vm-at-size", "missing-disk-at-size", "slot-at-size", "target-at-size", "serial-at-size", "unchanged-disk"} {
 			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				const volume = "volume-test"
@@ -8345,15 +8399,22 @@ func TestControllerPublishRefreshesProtectionAndTarget(t *testing.T) {
 					}
 				}
 				wire.mu.Unlock()
-				var changed atomic.Bool
+				var changed, timedProtectionRead atomic.Bool
+				if expiry {
+					driver.kubeRuntime.client.(*fake.Clientset).PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+						if action.(ktesting.GetAction).GetName() == volumeRepairStateConfigMapName && changed.Load() && timedProtectionRead.CompareAndSwap(false, true) {
+							require.True(t, time.Now().Before(expires))
+							expiration := time.NewTimer(time.Until(expires))
+							defer expiration.Stop()
+							<-expiration.C
+						}
+						return false, nil, nil
+					})
+				}
 				if strings.HasSuffix(mode, "at-restore") {
 					probe.beforeRestore = func() {
 						changed.Store(true)
 						switch mode {
-						case "expiry-at-restore":
-							expiration := time.NewTimer(time.Until(expires))
-							defer expiration.Stop()
-							<-expiration.C
 						case "repair-at-restore":
 							_, err := driver.volumeRepairState.Mark(ctx, VolumeRepairState{VolumeID: volume, Classification: repairClassificationWrongDeviceIdentity})
 							require.NoError(t, err)
@@ -8367,14 +8428,31 @@ func TestControllerPublishRefreshesProtectionAndTarget(t *testing.T) {
 					probe.beforeSize = func() {
 						require.True(t, probe.restored.Load())
 						changed.Store(true)
-						if mode == "node-at-size" {
+						switch mode {
+						case "node-at-size":
 							replacement := node.DeepCopy()
 							replacement.UID = "new-node-uid"
 							_, err := kube.Nodes().Update(ctx, replacement, metav1.UpdateOptions{})
 							require.NoError(t, err)
-						} else {
+						case "vm-at-size":
 							wire.mu.Lock()
 							wire.vmNames = map[int]string{41: "retired-vm", 42: node.Name}
+							wire.mu.Unlock()
+						case "missing-disk-at-size":
+							wire.mu.Lock()
+							delete(wire.disks, 41)
+							wire.mu.Unlock()
+						case "slot-at-size":
+							wire.mu.Lock()
+							wire.diskSlot = "3"
+							wire.mu.Unlock()
+						case "target-at-size":
+							wire.mu.Lock()
+							wire.diskTarget = "vdc"
+							wire.mu.Unlock()
+						case "serial-at-size":
+							wire.mu.Lock()
+							wire.attachedDisks[41] = map[string]string{"IMAGE_ID": "7", "SERIAL": "onecsi-8"}
 							wire.mu.Unlock()
 						}
 					}
@@ -8388,6 +8466,11 @@ func TestControllerPublishRefreshesProtectionAndTarget(t *testing.T) {
 				require.NoError(t, err)
 				reply, err := reviewControllerClient(t, server).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
 				require.True(t, changed.Load())
+				if mode == "unchanged-disk" {
+					require.NoError(t, err)
+					require.Equal(t, "vdb", reply.GetPublishContext()["volumeName"])
+					return
+				}
 				require.Error(t, err)
 				publishErr := err
 				require.Nil(t, reply)
@@ -8395,6 +8478,7 @@ func TestControllerPublishRefreshesProtectionAndTarget(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, before.LastSuccessfulPublishTime, history.LastSuccessfulPublishTime)
 				if expiry {
+					require.True(t, timedProtectionRead.Load())
 					require.ErrorContains(t, publishErr, "Publish placement grant expired")
 				}
 				if mode == "quarantine-at-restore" {

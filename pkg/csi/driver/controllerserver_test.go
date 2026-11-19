@@ -1032,7 +1032,7 @@ func TestControllerPublishVolume(t *testing.T) {
 				m.On("NodeExists", mock.Anything, "test-node-id").Return(1, nil)
 				m.On("GetVolumeInNode", mock.Anything, 1, 1).Twice().Return("", fmt.Errorf("volume not attached to node: %w", opennebula.ErrAttachmentNotFound))
 				m.On("AttachVolume", mock.Anything, "1234", "test-node-id", false, mock.Anything).Return(nil)
-				m.On("GetVolumeInNode", mock.Anything, 1, 1).Twice().Return("attached-volume", nil)
+				m.On("GetVolumeInNode", mock.Anything, 1, 1).Times(4).Return("attached-volume", nil)
 			},
 			expectResponse: &csi.ControllerPublishVolumeResponse{
 				PublishContext: map[string]string{
@@ -2239,7 +2239,7 @@ func TestControllerPublishVolumeReusesStickyAttachmentOnSameNode(t *testing.T) {
 	mockProvider.On("VolumeExists", mock.Anything, "vol-reuse").Return(1, 1, nil)
 	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("", fmt.Errorf("not attached: %w", opennebula.ErrAttachmentNotFound)).Once()
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdc", nil).Twice()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdc", nil).Times(5)
 
 	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
 	resp, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-reuse", "node-1"))
@@ -2314,7 +2314,7 @@ func TestControllerPublishVolumeAllowsOverrideForProtectedCrossNodeAttach(t *tes
 	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("vdc", nil).Once()
 	mockProvider.On("DetachVolume", mock.Anything, "vol-move-override", "node-old").Return(nil).Once()
 	mockProvider.On("AttachVolume", mock.Anything, "vol-move-override", "node-new", false, mock.Anything).Return(nil).Once()
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 42).Return("vdd", nil).Twice()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 42).Return("vdd", nil).Times(5)
 
 	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
 	resp, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-move-override", "node-new"))
@@ -2693,8 +2693,8 @@ func TestControllerPublishVolumeSerializesSameNodeHotplug(t *testing.T) {
 	mockProvider.On("ComputeHotplugTimeout", int64(300*1024*1024*1024)).Return(5 * time.Minute).Maybe()
 	mockProvider.On("AttachVolume", mock.Anything, "vol-1", "node-1", false, mock.Anything).Return(nil).Once()
 	mockProvider.On("AttachVolume", mock.Anything, "vol-2", "node-1", false, mock.Anything).Return(nil).Once()
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("sdb", nil).Twice()
-	mockProvider.On("GetVolumeInNode", mock.Anything, 2, 41).Return("sdc", nil).Twice()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("sdb", nil).Times(4)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 2, 41).Return("sdc", nil).Times(4)
 
 	errs := make(chan error, 2)
 	go func() {
@@ -2746,7 +2746,7 @@ func TestControllerExpandVolumeSerializesWithPublishOnSameVolume(t *testing.T) {
 	mockProvider.On("ResolveVolumeSizeBytes", mock.Anything, "vol-1").Return(int64(2*1024*1024*1024), nil).Maybe()
 	mockProvider.On("ComputeHotplugTimeout", int64(2*1024*1024*1024)).Return(3 * time.Minute).Maybe()
 	mockProvider.On("AttachVolume", mock.Anything, "vol-1", "node-1", false, mock.Anything).Return(nil).Once()
-	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("sdb", nil).Twice()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 1, 41).Return("sdb", nil).Times(4)
 
 	errs := make(chan error, 2)
 	go func() {

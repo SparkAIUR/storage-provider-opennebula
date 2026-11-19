@@ -544,7 +544,13 @@ func TestNodeDeviceReportPreservesOutOfOrderObservations(t *testing.T) {
 			case "mount", "conflicting-key":
 				ns.recordLocalDeviceMountFailure(ctx, volume, "sdd", "/dev/sdd", "/stage/vol-1", "ext4", deviceResolutionResult{}, nil, failureErr)
 			case "identity":
-				ns.recordWrongDeviceIdentityReport(ctx, localDiskSession{VolumeID: volume}, nil, failureErr)
+				session := localDiskSession{VolumeID: volume}
+				ns.recordWrongDeviceIdentityRepairState(ctx, session, nil)
+				ns.recordWrongDeviceIdentityReport(ctx, session, nil, failureErr)
+				repair, exists, err := driver.volumeRepairState.GetCurrent(ctx, volume)
+				require.NoError(t, err)
+				require.True(t, exists)
+				require.Equal(t, repairClassificationWrongDeviceIdentity, repair.Classification)
 			}
 			cm, err := kube.CoreV1().ConfigMaps(namespace).Get(ctx, localDeviceStateConfigMapName, metav1.GetOptions{})
 			require.NoError(t, err)
@@ -556,12 +562,6 @@ func TestNodeDeviceReportPreservesOutOfOrderObservations(t *testing.T) {
 			}
 			require.Equal(t, 2, report.Attempts)
 			require.True(t, report.FirstObservedAt.Before(newer))
-			if failure == "identity" {
-				require.True(t, report.LastObservedAt.Before(newer))
-				require.Equal(t, localDeviceFailureClassWrongIdentity, report.FailureClass)
-				require.Equal(t, failureErr.Error(), report.LastError)
-				return
-			}
 			require.True(t, report.LastObservedAt.Equal(newer))
 			require.Equal(t, seeded.FailureClass, report.FailureClass)
 			require.Equal(t, seeded.DeviceSerial, report.DeviceSerial)

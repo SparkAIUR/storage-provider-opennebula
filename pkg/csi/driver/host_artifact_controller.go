@@ -105,17 +105,9 @@ func hostArtifactAttachHoldMessage(target *opennebula.HostArtifactAttachmentTarg
 
 const hostArtifactSlotBlocked = "host artifact quarantine is active for the requested attachment slot"
 
-func (s *ControllerServer) authorizeHostArtifactAttach(ctx context.Context, req *csi.ControllerPublishVolumeRequest, verifyRelease ...func(context.Context) error) context.Context {
+func (s *ControllerServer) authorizeHostArtifactAttach(ctx context.Context, req *csi.ControllerPublishVolumeRequest) context.Context {
 	return opennebula.WithAttachAuthorization(ctx, func(ctx context.Context, target *opennebula.HostArtifactAttachmentTarget) error {
-		if err := s.checkHostArtifactAttachTarget(ctx, req, target); err != nil {
-			return err
-		}
-		for _, verify := range verifyRelease {
-			if err := verify(ctx); err != nil {
-				return err
-			}
-		}
-		return nil
+		return s.checkHostArtifactAttachTarget(ctx, req, target)
 	})
 }
 
@@ -237,22 +229,6 @@ func hostArtifactStateFromConflict(volumeID string, conflict *opennebula.HostArt
 		state.RepairHint = fmt.Sprintf("read-only quarantine: inspect the OpenNebula VM log and host-local LVM artifacts; after an operator confirms the artifact is stale, repair it externally, then delete ConfigMap %s key %s or wait for the TTL before retrying", hostArtifactStateConfigMapName, state.Key)
 	}
 	return state
-}
-
-func (s *ControllerServer) clearHostArtifactQuarantineForVolume(ctx context.Context, volumeID string) {
-	if s == nil || s.driver == nil || s.driver.hostArtifactQuarantine == nil || strings.TrimSpace(volumeID) == "" {
-		return
-	}
-	for key, state := range s.driver.hostArtifactQuarantine.Snapshot() {
-		if strings.TrimSpace(state.VolumeID) != strings.TrimSpace(volumeID) {
-			continue
-		}
-		if err := s.driver.hostArtifactQuarantine.Clear(ctx, key); err != nil {
-			klog.V(2).InfoS("Failed to clear host artifact quarantine after successful attach", "volumeID", volumeID, "key", key, "err", err)
-			continue
-		}
-		s.driver.metrics.RecordHostArtifactQuarantine(state.Classification, "cleared")
-	}
 }
 
 func (s *ControllerServer) recordHostArtifactWarning(ctx context.Context, volumeID string, params map[string]string, reason, message string) {

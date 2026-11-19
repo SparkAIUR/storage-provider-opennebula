@@ -58,11 +58,13 @@ type ObservedAttachment struct {
 }
 
 type VolumeDiskRecord struct {
-	NodeName string `json:"nodeName,omitempty"`
-	NodeID   int    `json:"nodeID,omitempty"`
-	DiskID   int    `json:"diskID,omitempty"`
-	Target   string `json:"target,omitempty"`
-	Serial   string `json:"serial,omitempty"`
+	NodeName          string `json:"nodeName,omitempty"`
+	NodeID            int    `json:"nodeID,omitempty"`
+	DiskID            int    `json:"diskID,omitempty"`
+	Target            string `json:"target,omitempty"`
+	Serial            string `json:"serial,omitempty"`
+	ReadOnly          bool   `json:"-"`
+	ReplacementMarked bool   `json:"-"`
 }
 
 type VolumeAttachmentMetadata struct {

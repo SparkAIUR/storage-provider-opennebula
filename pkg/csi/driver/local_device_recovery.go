@@ -80,13 +80,12 @@ type LocalDeviceMissingReport struct {
 	MetadataTarget         string             `json:"metadataTarget,omitempty"`
 }
 
-func (report *LocalDeviceMissingReport) recordFailureObservation(observedAt time.Time, wrongIdentity bool) bool {
+func (report *LocalDeviceMissingReport) recordFailureObservation(observedAt time.Time) bool {
 	if report.FirstObservedAt.IsZero() || observedAt.Before(report.FirstObservedAt) {
 		report.FirstObservedAt = observedAt
 	}
 	report.Attempts++
-	if !report.LastObservedAt.IsZero() && !observedAt.After(report.LastObservedAt) &&
-		(!wrongIdentity || localDeviceFailureClass(*report) == localDeviceFailureClassWrongIdentity) {
+	if !observedAt.After(report.LastObservedAt) {
 		return false
 	}
 	report.LastObservedAt = observedAt
@@ -137,7 +136,7 @@ func (ns *NodeServer) recordLocalDeviceMissing(ctx context.Context, volumeID, vo
 			return false
 		}
 		if !report.LastObservedAt.IsZero() && !now.After(report.LastObservedAt) {
-			report.recordFailureObservation(now, false)
+			report.recordFailureObservation(now)
 			return true
 		}
 		if report.ConfirmationState == localDeviceConfirmationStateConfirmed && report.LastRecoveryOutcome == localDeviceConfirmationStateConfirmed {
@@ -157,7 +156,7 @@ func (ns *NodeServer) recordLocalDeviceMissing(ctx context.Context, volumeID, vo
 		report.PVCName = identity.PVCName
 		report.PVName = identity.PVName
 		report.StagingTargetPath = strings.TrimSpace(stagingTargetPath)
-		report.recordFailureObservation(now, false)
+		report.recordFailureObservation(now)
 		attempts = report.Attempts
 		if report.ConfirmationState == "" {
 			report.AttachmentState = localDeviceAttachmentStateRuntimeUnconfirmed
@@ -214,7 +213,7 @@ func (ns *NodeServer) recordLocalDeviceMountFailure(ctx context.Context, volumeI
 		if localDeviceFailureClass(*report) == localDeviceFailureClassWrongIdentity || report.ConfirmationState == localDeviceConfirmationStateRepairRequired || report.ConfirmationState == localDeviceConfirmationStateInProgress {
 			return false
 		}
-		if !report.recordFailureObservation(now, false) {
+		if !report.recordFailureObservation(now) {
 			return true
 		}
 		report.Node = node
@@ -276,7 +275,10 @@ func (ns *NodeServer) recordWrongDeviceIdentityReport(ctx context.Context, sessi
 		if report.VolumeID != "" && (report.VolumeID != volumeID || report.Node != node) {
 			return false
 		}
-		if !report.recordFailureObservation(now, true) {
+		if localDeviceFailureClass(*report) == localDeviceFailureClassWrongIdentity {
+			return false
+		}
+		if !report.recordFailureObservation(now) {
 			return true
 		}
 		report.Node = node
@@ -284,9 +286,9 @@ func (ns *NodeServer) recordWrongDeviceIdentityReport(ctx context.Context, sessi
 		report.VolumeName = strings.TrimSpace(session.VolumeName)
 		report.FailureClass = localDeviceFailureClassWrongIdentity
 		report.ResolvedBy = ""
-		report.ExpectedTarget = strings.TrimSpace(localDiskAssertedDiskTarget(session.Identity))
+		report.ExpectedTarget = firstNonEmpty(report.ExpectedTarget, strings.TrimSpace(localDiskAssertedDiskTarget(session.Identity)))
 		report.DevicePath = strings.TrimSpace(session.DevicePath)
-		report.DeviceSerial = strings.TrimSpace(session.DeviceSerial)
+		report.DeviceSerial = firstNonEmpty(report.DeviceSerial, strings.TrimSpace(session.DeviceSerial))
 		report.OpenNebulaImageID = strings.TrimSpace(session.OpenNebulaImageID)
 		report.FsType = strings.TrimSpace(session.FSType)
 		report.PVCNamespace = strings.TrimSpace(session.PVCNamespace)
@@ -947,7 +949,9 @@ func (s *ControllerServer) markLocalDeviceRecoveryPendingConfirmation(ctx contex
 			current.LastRecoveryOutcome = localDeviceConfirmationStatePending
 			current.ConfirmationDeadline = &deadline
 		}
-		current.ExpectedTarget = firstNonEmpty(current.ExpectedTarget, strings.TrimSpace(attempt.ExpectedTarget), strings.TrimSpace(current.VolumeName))
+		if localDeviceFailureClass(*current) != localDeviceFailureClassWrongIdentity {
+			current.ExpectedTarget = firstNonEmpty(current.ExpectedTarget, strings.TrimSpace(attempt.ExpectedTarget), strings.TrimSpace(current.VolumeName))
+		}
 		current.RecoveryMethod = strings.TrimSpace(attempt.Method)
 		current.MetadataAttachedToNode = attempt.MetadataAttached
 		current.MetadataNode = firstNonEmpty(strings.TrimSpace(attempt.MetadataNode), current.Node)

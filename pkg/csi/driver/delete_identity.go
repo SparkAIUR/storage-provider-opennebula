@@ -108,10 +108,16 @@ func (s *ControllerServer) prepareVolumeDeletion(ctx context.Context, volume str
 	}
 	if pv != nil {
 		expectedVersion = pv.ResourceVersion
-		if !marked && history.LastSuccessfulImageID <= 0 {
+		needsImageMarker := !marked && imageID <= 0
+		_, hasImage := pv.Spec.CSI.VolumeAttributes[publishContextOpenNebulaImageID]
+		_, hasSerial := pv.Spec.CSI.VolumeAttributes[publishContextDeviceSerial]
+		if needsImageMarker || (admittedBackend == "" && (marked || history.Backend == "") && (hasImage || hasSerial)) {
 			stage = func(ctx context.Context, actualImageID int) error {
 				if err := verify(ctx, actualImageID, false); err != nil {
 					return err
+				}
+				if !needsImageMarker && admittedBackend == "" {
+					return nil
 				}
 				var err error
 				expectedVersion, raw, err = s.markPVDeletion(ctx, pv, volume, actualImageID, admittedBackend)
@@ -159,11 +165,17 @@ func (s *ControllerServer) markPVDeletion(ctx context.Context, pv *corev1.Persis
 	if len(pv.Annotations) == 0 {
 		path, value = "/metadata/annotations", map[string]string{annotationDeleteVolumeIdentity: raw}
 	}
-	patch, err := json.Marshal([]map[string]any{
+	ops := []map[string]any{
 		{"op": "test", "path": "/metadata/uid", "value": pv.UID},
 		{"op": "test", "path": "/metadata/resourceVersion", "value": pv.ResourceVersion},
-		{"op": "add", "path": path, "value": value},
-	})
+	}
+	write := "add"
+	if existing, marked := pv.Annotations[annotationDeleteVolumeIdentity]; marked {
+		ops = append(ops, map[string]any{"op": "test", "path": path, "value": existing})
+		write = "replace"
+	}
+	ops = append(ops, map[string]any{"op": write, "path": path, "value": value})
+	patch, err := json.Marshal(ops)
 	if err != nil {
 		return "", "", err
 	}
