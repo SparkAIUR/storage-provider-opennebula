@@ -105,9 +105,17 @@ func hostArtifactAttachHoldMessage(target *opennebula.HostArtifactAttachmentTarg
 
 const hostArtifactSlotBlocked = "host artifact quarantine is active for the requested attachment slot"
 
-func (s *ControllerServer) authorizeHostArtifactAttach(ctx context.Context, req *csi.ControllerPublishVolumeRequest) context.Context {
+func (s *ControllerServer) authorizeHostArtifactAttach(ctx context.Context, req *csi.ControllerPublishVolumeRequest, verifyRelease ...func(context.Context) error) context.Context {
 	return opennebula.WithAttachAuthorization(ctx, func(ctx context.Context, target *opennebula.HostArtifactAttachmentTarget) error {
-		return s.checkHostArtifactAttachTarget(ctx, req, target)
+		if err := s.checkHostArtifactAttachTarget(ctx, req, target); err != nil {
+			return err
+		}
+		for _, verify := range verifyRelease {
+			if err := verify(ctx); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 

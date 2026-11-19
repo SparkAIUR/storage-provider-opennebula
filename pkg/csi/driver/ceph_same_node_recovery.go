@@ -493,31 +493,45 @@ func isCephBackend(backend string) bool {
 	return strings.EqualFold(strings.TrimSpace(backend), "ceph")
 }
 
-func (s *ControllerServer) verifyPVImageAssertions(ctx context.Context, pv *corev1.PersistentVolume, imageID int, history VolumeHistoryRecord, imageAbsent bool) error {
+func (s *ControllerServer) verifyPVImageAssertions(ctx context.Context, pv *corev1.PersistentVolume, imageID int, history VolumeHistoryRecord, imageAbsent bool, admittedBackend *string) error {
 	attributes := pv.Spec.CSI.VolumeAttributes
 	_, hasImage := attributes[publishContextOpenNebulaImageID]
 	_, hasSerial := attributes[publishContextDeviceSerial]
 	if !hasImage && !hasSerial {
 		return nil
 	}
-	backend, err := persistentVolumeBackend(pv)
-	if errors.Is(err, errAttachmentBackendUndeclared) {
-		switch {
-		case history.LastSuccessfulImageID == imageID && volumeHistoryHasObservedSuccess(history) && history.Backend != "":
-			backend, err = verifiedAttachmentBackend(history.Backend, "")
-		case imageAbsent:
-			return validatePVImageAssertions(attributes, imageID)
-		default:
-			datastore, lookupErr := s.inspectVolumeDatastore(ctx, pv.Spec.CSI.VolumeHandle, imageID)
-			backend, err = datastore.Backend, lookupErr
-		}
-	}
-	if err != nil || (history.LastSuccessfulImageID == imageID && volumeHistoryHasObservedSuccess(history) &&
-		history.Backend != "" && !strings.EqualFold(history.Backend, backend)) {
+	declared, err := persistentVolumeBackend(pv)
+	if err != nil && !errors.Is(err, errAttachmentBackendUndeclared) {
 		return attachmentEvidenceUnavailable("PV image backend is unverified", err)
 	}
-	if isCephBackend(backend) {
-		return validatePVImageAssertions(attributes, imageID)
+	historical := ""
+	if history.LastSuccessfulImageID == imageID && volumeHistoryHasObservedSuccess(history) && !history.Bootstrapped &&
+		(history.EvidenceSource == "" || history.EvidenceSource == volumeHistoryEvidenceSourceObserved) {
+		historical = history.Backend
+	}
+	var backend string
+	if !imageAbsent {
+		datastore, err := s.inspectVolumeDatastore(ctx, pv.Spec.CSI.VolumeHandle, imageID)
+		if err != nil {
+			return err
+		}
+		backend = datastore.Backend
+	} else if admittedBackend != nil && *admittedBackend != "" {
+		backend = *admittedBackend
+	} else {
+		backend = historical
+	}
+	if backend != "" && ((declared != "" && declared != backend) ||
+		(historical != "" && !strings.EqualFold(historical, backend))) {
+		return attachmentEvidenceUnavailable("PV image backend contradicts verified evidence", nil)
+	}
+	if backend != "local" {
+		if err := validatePVImageAssertions(attributes, imageID); err != nil {
+			return err
+		}
+	}
+	if !imageAbsent && admittedBackend != nil {
+		*admittedBackend = backend
 	}
 	return nil
 }

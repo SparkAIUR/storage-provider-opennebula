@@ -208,6 +208,52 @@ func (p *PersistentDiskVolumeProvider) InspectReplacementRelease(ctx context.Con
 	return deny()
 }
 
+type ReplacementReaderInspector interface {
+	InspectReplacementReaders(ctx context.Context, volume, node string, imageID, vmID int) (*VolumeAttachmentMetadata, error)
+}
+
+func (p *PersistentDiskVolumeProvider) InspectReplacementReaders(ctx context.Context, volume, node string, imageID, vmID int) (*VolumeAttachmentMetadata, error) {
+	deny := func() (*VolumeAttachmentMetadata, error) {
+		return nil, fmt.Errorf("%w: read-only attachment ownership is unverified", ErrConflictingAttachmentEvidence)
+	}
+	version, err := p.ctrl.SystemVersionContext(ctx)
+	if err != nil || version != "7.4.0" {
+		return deny()
+	}
+	datastore, err := p.InspectVolumeDatastore(ctx, volume, imageID)
+	if err != nil || datastore.Backend != "ceph" {
+		return deny()
+	}
+	metadata, err := p.InspectVolumeAttachment(ctx, volume, node)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := attachmentPresence(metadata, volume, imageID, vmID); err != nil {
+		return nil, err
+	}
+	for _, observed := range metadata.DiskRecords {
+		info, err := p.readVMInfo(ctx, observed.NodeID, vmDisks|vmState)
+		if err != nil || info.Name != observed.NodeName {
+			return deny()
+		}
+		state, lcm, err := info.State()
+		if err != nil || state != vm.Active || lcm != vm.Running {
+			return deny()
+		}
+		slot, disk, err := volumeDiskFromVM(info, imageID, observed.NodeID, true)
+		if err != nil || slot != observed.DiskID || len(disk.GetPairs(attachAttemptField)) != 0 {
+			return deny()
+		}
+		readOnly := disk.GetPairs("READONLY")
+		record, err := attachmentDiskRecord(info, info.Template.GetDisks(), *disk)
+		if len(readOnly) != 1 || readOnly[0].Value != "YES" || err != nil || record != observed ||
+			record.Serial != fmt.Sprintf("onecsi-%d", imageID) {
+			return deny()
+		}
+	}
+	return metadata, ctx.Err()
+}
+
 type ReplacementDestinationAbsenceVerifier interface {
 	VerifyReplacementDestinationAbsent(ctx context.Context, volume, node string, imageID, vmID, sourceVMID int) error
 }

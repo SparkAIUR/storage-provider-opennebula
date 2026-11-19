@@ -92,6 +92,9 @@ type VolumeRuntimeContext struct {
 	pvUID                types.UID
 	pvClaimRef           *corev1.ObjectReference
 	pvPhase              corev1.PersistentVolumePhase
+	pvDeleting           bool
+	pvcPhase             corev1.PersistentVolumeClaimPhase
+	pvcDeleting          bool
 	PVCNamespace         string
 	PVCName              string
 	PVCUID               types.UID
@@ -519,6 +522,7 @@ func (r *KubeRuntime) volumeRuntimeContext(ctx context.Context, pv *corev1.Persi
 		pvUID:         pv.UID,
 		pvClaimRef:    pv.Spec.ClaimRef.DeepCopy(),
 		pvPhase:       pv.Status.Phase,
+		pvDeleting:    pv.DeletionTimestamp != nil,
 		PVAnnotations: cloneStringMap(pv.Annotations),
 		AccessModes:   append([]corev1.PersistentVolumeAccessMode(nil), pv.Spec.AccessModes...),
 	}
@@ -545,6 +549,7 @@ func (r *KubeRuntime) volumeRuntimeContext(ctx context.Context, pv *corev1.Persi
 			runtimeCtx.PVCName = ""
 		} else if pvcErr == nil {
 			runtimeCtx.PVCUID = pv.Spec.ClaimRef.UID
+			runtimeCtx.pvcPhase, runtimeCtx.pvcDeleting = pvc.Status.Phase, pvc.DeletionTimestamp != nil
 			runtimeCtx.verifiedClaimBinding = runtimeCtx.PVCUID != "" && pvc.Spec.VolumeName == pv.Name
 			runtimeCtx.PVCAnnotations = cloneStringMap(pvc.Annotations)
 			if runtimeCtx.RestartMode == "" {

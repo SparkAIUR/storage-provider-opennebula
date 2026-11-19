@@ -209,6 +209,9 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 					target = firstNonEmpty(fields["DEV_PREFIX"], "vd") + "b"
 				}
 				disk = fmt.Sprintf(`<DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><SAVE>YES</SAVE><SHAREABLE>YES</SHAREABLE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>ssh</TM_MAD><TM_MAD_SYSTEM>ssh</TM_MAD_SYSTEM><IMAGE_ID>%s</IMAGE_ID><DISK_ID>%s</DISK_ID><TARGET>%s</TARGET><SIZE>%d</SIZE><SERIAL>%s</SERIAL>%s</DISK>`, diskImage, slot, firstNonEmpty(state.diskTarget, target), size, serial, marker)
+				if state.attachedDisks[id]["READONLY"] == "YES" {
+					disk = strings.TrimSuffix(disk, "</DISK>") + "<READONLY>YES</READONLY></DISK>"
+				}
 				if slot == "missing" {
 					disk = strings.Replace(disk, "<DISK_ID>missing</DISK_ID>", "", 1)
 				}
@@ -3453,7 +3456,10 @@ func TestCephStaticPublishStageAndRebindRetainThenReconcile(t *testing.T) {
 			if tc.stage {
 				require.Equal(t, "ceph", published.PublishContext[annotationBackend])
 			} else {
-				require.Positive(t, failedPublishReads.Load())
+				require.Zero(t, failedPublishReads.Load())
+				require.Equal(t, pv.Name, published.GetPublishContext()[paramPVName])
+				require.Equal(t, pvc.Name, published.GetPublishContext()[paramPVCName])
+				require.Equal(t, pvc.Namespace, published.GetPublishContext()[paramPVCNamespace])
 			}
 			publishedHistory, err := server.readAttachmentHistory(ctx, volume)
 			require.NoError(t, err)
@@ -4358,6 +4364,11 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				}
 				driver := newStickyTestDriver(t, pv, pvc, node)
 				kube := driver.kubeRuntime.client.(*fake.Clientset)
+				prependReactor := func(verb, resource string, react ktesting.ReactionFunc) {
+					kube.Lock()
+					defer kube.Unlock()
+					kube.PrependReactor(verb, resource, react)
+				}
 				var pendingWritten, readbackFailed, apiOutage, outageInjected, abandoned atomic.Bool
 				var detachProofs atomic.Int32
 				abandonedPreparation := strings.HasPrefix(mode, "prepared-abandoned")
@@ -4743,7 +4754,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				wire.mu.Unlock()
 				failBeforeDispatch.Store(mode == "pre-dispatch")
 				if mode == "write-conflict" || mode == "lost-write-reply" || mode == "readback-failed" || mode == "readback-unproven" || mode == "pre-dispatch" || interruptedAdmission {
-					kube.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+					prependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
 						cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
 						if cm.Name != volumeHistoryStateConfigMapName {
 							return false, nil, nil
@@ -4840,7 +4851,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						pendingWritten.Store(true)
 						return false, nil, nil
 					})
-					kube.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+					prependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
 						if action.(ktesting.GetAction).GetName() == volumeHistoryStateConfigMapName &&
 							(mode == "readback-failed" && pendingWritten.Load() && readbackFailed.CompareAndSwap(false, true) || mode == "readback-unproven" && pendingWritten.Load() && !readbackFailed.Load() || apiOutage.Load()) {
 							return true, nil, errors.New("independent history read unavailable")
@@ -4976,7 +4987,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							payload, err := json.Marshal(competing)
 							require.NoError(t, err)
 							var attachmentReads atomic.Int32
-							kube.PrependReactor("list", "volumeattachments", func(ktesting.Action) (bool, kruntime.Object, error) {
+							prependReactor("list", "volumeattachments", func(ktesting.Action) (bool, kruntime.Object, error) {
 								if attachmentReads.Add(1) != 2 {
 									return false, nil, nil
 								}
@@ -5177,7 +5188,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 								wire.extendedPoolExtraVM = ""
 								wire.mu.Unlock()
 								var failSourceRead atomic.Bool
-								kube.PrependReactor("get", "nodes", func(action ktesting.Action) (bool, kruntime.Object, error) {
+								prependReactor("get", "nodes", func(action ktesting.Action) (bool, kruntime.Object, error) {
 									if failSourceRead.Load() && action.(ktesting.GetAction).GetName() == node.Name {
 										return true, nil, errors.New("source Node read unavailable")
 									}
@@ -5329,7 +5340,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							}
 							var changeControl atomic.Bool
 							changeControl.Store(true)
-							kube.PrependReactor("get", "volumeattachments", func(action ktesting.Action) (bool, kruntime.Object, error) {
+							prependReactor("get", "volumeattachments", func(action ktesting.Action) (bool, kruntime.Object, error) {
 								if action.(ktesting.GetAction).GetName() == deleting.Name && changeControl.CompareAndSwap(true, false) {
 									gvr := corev1.SchemeGroupVersion.WithResource("persistentvolumes")
 									obj, err := kube.Tracker().Get(gvr, "", pv.Name)
@@ -5354,7 +5365,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 								lastProtectionRead = 5
 							}
 							var protectionReads atomic.Int32
-							kube.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+							prependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
 								if action.(ktesting.GetAction).GetName() == hostArtifactStateConfigMapName && protectionReads.Add(1) == lastProtectionRead {
 									if retiredPinned {
 										reappeared := replacement.DeepCopy()
@@ -5515,7 +5526,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							require.True(t, active)
 						}
 						if mode == "prepared-abandoned-conflict" {
-							kube.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+							prependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
 								cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
 								if cm.Name != volumeHistoryStateConfigMapName {
 									return false, nil, nil
@@ -5840,7 +5851,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					wire.detachReply = invalidDetachReply
 					wire.mu.Unlock()
 					if acceptanceWriteFailed {
-						kube.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+						prependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
 							cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
 							if cm.Name == volumeHistoryStateConfigMapName {
 								var proposed VolumeHistoryRecord
@@ -5886,7 +5897,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					var lostCompletionReply atomic.Bool
 					lostRetirementAck := strings.HasSuffix(mode, "-retirement-lost-ack")
 					if mode == "distinct-vm-abandoned-completion-lost-ack" || lostRetirementAck {
-						kube.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+						prependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
 							cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
 							if cm.Name != volumeHistoryStateConfigMapName || lostCompletionReply.Load() {
 								return false, nil, nil
@@ -5917,7 +5928,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					providerChanged := strings.HasSuffix(mode, "completion-conflict-changed-provider")
 					var conflictInjected atomic.Bool
 					if conflict {
-						kube.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+						prependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
 							cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
 							if cm.Name != volumeHistoryStateConfigMapName {
 								return false, nil, nil
@@ -6133,7 +6144,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							wire.mu.Unlock()
 							var conflict atomic.Bool
 							conflict.Store(true)
-							kube.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+							prependReactor("update", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
 								cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
 								if cm.Name == volumeHistoryStateConfigMapName && conflict.Load() {
 									return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), cm.Name, errors.New("receipt compare-and-swap conflict"))
@@ -6207,7 +6218,20 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 									require.NoError(t, claims.Delete(ctx, currentPVC.Name, metav1.DeleteOptions{}))
 									releasedPV := currentPV.DeepCopy()
 									releasedPV.Status.Phase = corev1.VolumeReleased
+									releasedPV.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimDelete
+									releasedPV.DeletionTimestamp = &now
 									_, err = pvs.Update(ctx, releasedPV, metav1.UpdateOptions{})
+									require.NoError(t, err)
+									reused := currentPVC.DeepCopy()
+									reused.UID, reused.Spec.VolumeName = "independent-rebound-claim", "independent-rebound-pv"
+									_, err = claims.Create(ctx, reused, metav1.CreateOptions{})
+									require.NoError(t, err)
+									_, err = retry.ControllerUnpublishVolume(ctx, cancelRequest)
+									require.Error(t, err)
+									other := currentPV.DeepCopy()
+									other.Name, other.UID, other.Spec.CSI.VolumeHandle = reused.Spec.VolumeName, "independent-rebound-pv", "independent-rebound-volume"
+									other.Spec.ClaimRef.UID = reused.UID
+									_, err = pvs.Create(ctx, other, metav1.CreateOptions{})
 									require.NoError(t, err)
 								}
 								kube.ClearActions()
@@ -6604,7 +6628,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						changed.UID = "changed-orphan-successor"
 						var changeSuccessor atomic.Bool
 						changeSuccessor.Store(true)
-						kube.PrependReactor("get", "volumeattachments", func(action ktesting.Action) (bool, kruntime.Object, error) {
+						prependReactor("get", "volumeattachments", func(action ktesting.Action) (bool, kruntime.Object, error) {
 							if action.(ktesting.GetAction).GetName() == current.PendingReplacementAttach.VAName &&
 								changeSuccessor.CompareAndSwap(true, false) {
 								if err := kube.Tracker().Update(storagev1.SchemeGroupVersion.WithResource("volumeattachments"), changed, ""); err != nil {
@@ -6652,13 +6676,13 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							require.NoError(t, err)
 							var finalPodChange atomic.Pointer[corev1.Pod]
 							var finalPodRead atomic.Bool
-							kube.PrependReactor("get", "volumeattachments", func(action ktesting.Action) (bool, kruntime.Object, error) {
+							prependReactor("get", "volumeattachments", func(action ktesting.Action) (bool, kruntime.Object, error) {
 								if action.(ktesting.GetAction).GetName() == canceled.Name && finalPodChange.Load() != nil {
 									finalPodRead.Store(true)
 								}
 								return false, nil, nil
 							})
-							kube.PrependReactor("list", "pods", func(ktesting.Action) (bool, kruntime.Object, error) {
+							prependReactor("list", "pods", func(ktesting.Action) (bool, kruntime.Object, error) {
 								if finalPodRead.Swap(false) {
 									if changed := finalPodChange.Swap(nil); changed != nil {
 										return false, nil, kube.Tracker().Update(corev1.SchemeGroupVersion.WithResource("pods"), changed, changed.Namespace)
@@ -7083,7 +7107,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							if publishRetires || deleteRetires {
 								var unavailable atomic.Bool
 								unavailable.Store(true)
-								kube.PrependReactor("get", "volumeattachments", func(action ktesting.Action) (bool, kruntime.Object, error) {
+								prependReactor("get", "volumeattachments", func(action ktesting.Action) (bool, kruntime.Object, error) {
 									if unavailable.Load() && action.(ktesting.GetAction).GetName() == replayVA.Name {
 										return true, nil, errors.New("VolumeAttachment read unavailable")
 									}
@@ -7928,17 +7952,20 @@ func TestProviderDetachWaitsForAcceptedOwnershipConvergence(t *testing.T) {
 }
 
 func TestControllerPublishLegacyCephImageAssertions(t *testing.T) {
-	for _, mode := range []string{"absent", "matching", "wrong-image", "blank-image", "wrong-serial", "local"} {
+	for _, mode := range []string{"absent", "matching", "wrong-image", "blank-image", "wrong-serial", "local", "false-local", "false-cephfs"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			const volume = "volume-test"
 			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 			delete(pv.Annotations, annotationBackend)
+			if strings.HasPrefix(mode, "false-") {
+				pv.Annotations[annotationBackend] = strings.TrimPrefix(mode, "false-")
+			}
 			pv.Status.Phase, pvc.Status.Phase = corev1.VolumeBound, corev1.ClaimBound
 			switch mode {
 			case "matching":
 				pv.Spec.CSI.VolumeAttributes = map[string]string{publishContextOpenNebulaImageID: "7", publishContextDeviceSerial: "onecsi-7"}
-			case "wrong-image", "local":
+			case "wrong-image", "local", "false-local", "false-cephfs":
 				pv.Spec.CSI.VolumeAttributes = map[string]string{publishContextOpenNebulaImageID: "8"}
 			case "blank-image":
 				pv.Spec.CSI.VolumeAttributes = map[string]string{publishContextOpenNebulaImageID: ""}
@@ -8040,7 +8067,7 @@ func TestControllerPublishPinsAdmittedClaim(t *testing.T) {
 
 func TestControllerPublishFreshCephReplacementReader(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"retired", "old-attachment", "in-use", "pending"} {
+		for _, mode := range []string{"retired", "lost-reply", "separate-reader", "old-attachment", "in-use", "pending"} {
 			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
 				const volume = "volume-test"
@@ -8058,13 +8085,33 @@ func TestControllerPublishFreshCephReplacementReader(t *testing.T) {
 				if mode == "in-use" {
 					node.Status.VolumesInUse = []corev1.UniqueVolumeName{corev1.UniqueVolumeName("kubernetes.io/csi/" + pv.Spec.CSI.Driver + "^" + volume)}
 				}
-				driver := newStickyTestDriver(t, pv, pvc, node, va)
+				objects := []kruntime.Object{pv, pvc, node, va}
+				if mode == "retired" || mode == "lost-reply" || mode == "separate-reader" {
+					pod := activePodForPVC("reader-waiter", pvc.Name, node.Name)
+					pod.UID = "reader-waiter"
+					pod.CreationTimestamp = metav1.NewTime(node.CreationTimestamp.Add(2 * time.Second))
+					pod.Status.Phase = corev1.PodPending
+					setPremountKubeletFixtureStatus(pod, "ContainerCreating")
+					objects = append(objects, pod)
+				}
+				if mode == "separate-reader" {
+					other := newReadyNode("node-remote", true)
+					other.CreationTimestamp = node.CreationTimestamp
+					otherVA := replacementPublishVA(pv, other)
+					otherVA.Name, otherVA.UID = csiVolumeAttachmentName(volume, pv.Spec.CSI.Driver, other.Name), "other-reader-va"
+					otherVA.Status.Attached = true
+					objects = append(objects, other, otherVA)
+				}
+				driver := newStickyTestDriver(t, objects...)
 				_, err := driver.volumeHistory.Upsert(ctx, volume, func(state *VolumeHistoryRecord) {
 					state.PVName, state.PVCNamespace, state.PVCName = pv.Name, pvc.Namespace, pvc.Name
 					state.Backend = "ceph"
 					state.LastSuccessfulNodeName, state.LastSuccessfulNodeUID = node.Name, "retired-node"
 					state.LastSuccessfulImageID, state.LastSuccessfulOpenNebulaVMID = 7, 41
 					state.LastSuccessfulPublishTime = node.CreationTimestamp.Add(-time.Minute)
+					if mode == "lost-reply" {
+						state.LastSuccessfulOpenNebulaVMID = 42
+					}
 					if mode == "pending" {
 						state.PendingReplacementAttach = &replacementAttachAttempt{Version: 2, Phase: replacementAttachArmed}
 					}
@@ -8074,6 +8121,12 @@ func TestControllerPublishFreshCephReplacementReader(t *testing.T) {
 				wire.mu.Lock()
 				wire.ceph, wire.version, wire.readOnlyAttach, wire.marker = true, "7.4.0", true, 128*1024*1024
 				delete(wire.disks, 41)
+				wire.loseAttachReply = mode == "lost-reply"
+				if mode == "separate-reader" {
+					wire.disks[43] = 128
+					wire.vmNames = map[int]string{43: "node-remote"}
+					wire.attachedDisks[43] = map[string]string{"IMAGE_ID": "7", "SERIAL": "onecsi-7", "READONLY": "YES"}
+				}
 				wire.mu.Unlock()
 				server := NewControllerServer(driver, provider, nil)
 				if queued {
@@ -8083,10 +8136,19 @@ func TestControllerPublishFreshCephReplacementReader(t *testing.T) {
 				request := newPublishReq(volume, node.Name)
 				request.VolumeCapability.AccessMode.Mode = csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
 				request.Readonly = true
-				reply, err := reviewControllerClient(t, server).ControllerPublishVolume(ctx, request)
+				client := reviewControllerClient(t, server)
+				reply, err := client.ControllerPublishVolume(ctx, request)
+				if mode == "lost-reply" {
+					require.Error(t, err)
+					require.Nil(t, reply)
+					wire.mu.Lock()
+					require.Equal(t, []string{"attach:41:true"}, wire.mutations)
+					wire.mu.Unlock()
+					reply, err = client.ControllerPublishVolume(ctx, request)
+				}
 				wire.mu.Lock()
 				defer wire.mu.Unlock()
-				if mode == "retired" {
+				if mode == "retired" || mode == "lost-reply" || mode == "separate-reader" {
 					require.NoError(t, err)
 					require.Equal(t, "7", reply.GetPublishContext()[publishContextOpenNebulaImageID])
 					require.Equal(t, []string{"attach:41:true"}, wire.mutations)
@@ -8099,4 +8161,97 @@ func TestControllerPublishFreshCephReplacementReader(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestControllerPublishRechecksAdmittedMetadata(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, mode := range []string{"manual", "datastore", "harmless"} {
+			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+				node := newReadyNode("node-old", true)
+				driver := newStickyTestDriver(t, pv, pvc, node)
+				kube := driver.kubeRuntime.client.CoreV1()
+				var changed atomic.Bool
+				provider, wire := nodeAttachmentProvider(t, func(method string, _ context.Context) {
+					if method != "one.system.version" || !changed.CompareAndSwap(false, true) {
+						return
+					}
+					if mode == "manual" {
+						current := pvc.DeepCopy()
+						current.Annotations[annotationRecoveryMode] = recoveryModeManual
+						_, err := kube.PersistentVolumeClaims(pvc.Namespace).Update(ctx, current, metav1.UpdateOptions{})
+						require.NoError(t, err)
+					} else {
+						current := pv.DeepCopy()
+						if mode == "datastore" {
+							current.Annotations[annotationDatastoreName] = "updated-datastore"
+						} else {
+							current.Annotations["fixture.example/description"] = "harmless"
+						}
+						_, err := kube.PersistentVolumes().Update(ctx, current, metav1.UpdateOptions{})
+						require.NoError(t, err)
+					}
+				})
+				wire.mu.Lock()
+				wire.ceph, wire.version, wire.disks[41] = true, "7.4.0", 128
+				wire.mu.Unlock()
+				server := NewControllerServer(driver, provider, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+				}
+				client := reviewControllerClient(t, server)
+				req := newPublishReq(volume, node.Name)
+				reply, err := client.ControllerPublishVolume(ctx, req)
+				require.True(t, changed.Load())
+				if mode == "harmless" {
+					require.NoError(t, err)
+					require.NotNil(t, reply)
+					return
+				}
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.Nil(t, reply)
+				history, err := server.readAttachmentHistory(ctx, volume)
+				require.NoError(t, err)
+				require.True(t, history.LastSuccessfulPublishTime.IsZero())
+				wire.mu.Lock()
+				require.Empty(t, wire.mutations)
+				wire.mu.Unlock()
+				if mode == "manual" {
+					_, err = kube.PersistentVolumeClaims(pvc.Namespace).Update(ctx, pvc, metav1.UpdateOptions{})
+					require.NoError(t, err)
+				}
+				reply, err = client.ControllerPublishVolume(ctx, req)
+				require.NoError(t, err)
+				require.NotNil(t, reply)
+			})
+		}
+	}
+}
+
+func TestControllerPublishTimeoutUsesEffectiveSize(t *testing.T) {
+	ctx := context.Background()
+	const volume = "volume-test"
+	pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+	node := newReadyNode("node-old", true)
+	driver := newStickyTestDriver(t, pv, pvc, node)
+	_, wire := nodeAttachmentProvider(t)
+	wire.mu.Lock()
+	wire.ceph, wire.version = true, "7.4.0"
+	wire.imageSizeMiB, wire.disks[41], wire.marker = 100*1024, 200*1024, 200*1024*1024*1024
+	wire.mu.Unlock()
+	provider, err := opennebula.NewPersistentDiskVolumeProvider(
+		opennebula.NewClient(opennebula.OpenNebulaConfig{Endpoint: wire.endpoint, Credentials: "fixture:fixture"}),
+		opennebula.HotplugTimeoutPolicy{BaseTimeout: 30 * time.Second, Per100GiB: 10 * time.Second, MaxTimeout: time.Minute},
+		opennebula.CephBridgeIdentities{},
+	)
+	require.NoError(t, err)
+	reply, err := reviewControllerClient(t, NewControllerServer(driver, provider, nil)).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
+	require.NoError(t, err)
+	require.Equal(t, "50", reply.GetPublishContext()[publishContextHotplugTimeoutSeconds])
+	wire.mu.Lock()
+	defer wire.mu.Unlock()
+	require.Empty(t, wire.mutations)
 }

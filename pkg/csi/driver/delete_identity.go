@@ -100,9 +100,9 @@ func (s *ControllerServer) prepareVolumeDeletion(ctx context.Context, volume str
 		ctx = opennebula.WithExpectedDeletionVMID(ctx, history.LastSuccessfulOpenNebulaVMID)
 	}
 	var stage func(context.Context, int) error
-	var expectedVersion string
+	var expectedVersion, admittedBackend string
 	verify := func(ctx context.Context, actualImageID int, imageAbsent bool) error {
-		return s.verifyPVDeletion(ctx, pv, volume, actualImageID, history, expectedVersion, raw, marked, imageAbsent)
+		return s.verifyPVDeletion(ctx, pv, volume, actualImageID, history, expectedVersion, raw, marked, imageAbsent, &admittedBackend)
 	}
 	if pv != nil {
 		expectedVersion = pv.ResourceVersion
@@ -175,7 +175,7 @@ func (s *ControllerServer) markPVDeletion(ctx context.Context, pv *corev1.Persis
 	return updated.ResourceVersion, raw, nil
 }
 
-func (s *ControllerServer) verifyPVDeletion(ctx context.Context, pv *corev1.PersistentVolume, volume string, imageID int, history VolumeHistoryRecord, expectedVersion, raw string, marked, imageAbsent bool) error {
+func (s *ControllerServer) verifyPVDeletion(ctx context.Context, pv *corev1.PersistentVolume, volume string, imageID int, history VolumeHistoryRecord, expectedVersion, raw string, marked, imageAbsent bool, admittedBackend *string) error {
 	if (pv != nil && imageID < 0) || (history.LastSuccessfulImageID > 0 && history.LastSuccessfulImageID != imageID) {
 		return fmt.Errorf("provider image identity is unverified for deletion")
 	}
@@ -192,7 +192,7 @@ func (s *ControllerServer) verifyPVDeletion(ctx context.Context, pv *corev1.Pers
 			!apiequality.Semantic.DeepEqual(current.Spec.ClaimRef, pv.Spec.ClaimRef) || currentMarked != marked || currentRaw != raw {
 			return fmt.Errorf("PV deletion identity changed during admission")
 		}
-		if err := s.verifyPVImageAssertions(ctx, current, imageID, history, imageAbsent); err != nil {
+		if err := s.verifyPVImageAssertions(ctx, current, imageID, history, imageAbsent, admittedBackend); err != nil {
 			return err
 		}
 	}
@@ -204,7 +204,8 @@ func (s *ControllerServer) verifyPVDeletion(ctx context.Context, pv *corev1.Pers
 		if currentHistory.PendingReplacementAttach != nil || currentHistory.LastSuccessfulImageID != history.LastSuccessfulImageID ||
 			currentHistory.LastSuccessfulOpenNebulaVMID != history.LastSuccessfulOpenNebulaVMID ||
 			currentHistory.LastSuccessfulNodeName != history.LastSuccessfulNodeName ||
-			currentHistory.LastSuccessfulNodeUID != history.LastSuccessfulNodeUID {
+			currentHistory.LastSuccessfulNodeUID != history.LastSuccessfulNodeUID || currentHistory.Backend != history.Backend ||
+			!currentHistory.LastSuccessfulPublishTime.Equal(history.LastSuccessfulPublishTime) || !currentHistory.LastSuccessfulStageTime.Equal(history.LastSuccessfulStageTime) {
 			return fmt.Errorf("deletion history changed during admission")
 		}
 	} else if pv != nil {

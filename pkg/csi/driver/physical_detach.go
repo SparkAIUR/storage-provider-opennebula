@@ -767,7 +767,7 @@ func (s *ControllerServer) checkDetachAbsencePVImage(ctx context.Context, volume
 		return attachmentEvidenceUnavailable("cannot verify detach absence PV identity", err)
 	}
 	if pv != nil {
-		return s.verifyPVImageAssertions(ctx, pv, imageID, history, imageAbsent)
+		return s.verifyPVImageAssertions(ctx, pv, imageID, history, imageAbsent, nil)
 	}
 	return nil
 }

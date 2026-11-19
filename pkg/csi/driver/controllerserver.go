@@ -842,7 +842,6 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	}
 	if pvAdmission.check != nil {
 		runtimeCtx = pvAdmission.binding
-		pvAdmission.sizeBytes = lookup.SizeBytes
 		ctx = context.WithValue(ctx, publishPVImageCheckKey{}, pvAdmission)
 	}
 
@@ -910,7 +909,6 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 				}
 			}
 			s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
-			s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
 			s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonRecoveryAdoptionAccepted, fmt.Sprintf("accepted manual recovery adoption for volume %s on node %s using guest-visible device %s and serial %s", req.VolumeId, req.NodeId, manualTarget, recoveryControl.ConfirmedDeviceSerial))
 			deviceDiscoveryTimeout := s.nodeDeviceDiscoveryTimeout("disk", lookup.SizeBytes, 0)
 			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
@@ -919,6 +917,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			if err := recheckPublishPVImage(ctx); err != nil {
 				return nil, err
 			}
+			s.finishPublishMetadata(ctx, req, &protection)
 			return &csi.ControllerPublishVolumeResponse{PublishContext: publishContext}, nil
 		}
 	}
@@ -987,6 +986,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		priority = hotplugQueuePriorityCritical
 	}
 	var response *csi.ControllerPublishVolumeResponse
+	var updateMetadata bool
 	queueErr := s.withQueuedHotplug(ctx, req.NodeId, "attach", req.VolumeId, priority, func(queueCtx context.Context) error {
 		nodeRelease := s.driver.operationLocks.Acquire(controllerNodeLockKey(req.NodeId))
 		defer nodeRelease()
@@ -1001,13 +1001,8 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		if err != nil {
 			return err
 		}
-		freshReader := replacement && replacementPublishReadOnlyMany(req)
-		if freshReader {
-			if err := s.verifyFreshReplacementReader(queueCtx, history, req.VolumeId, req.NodeId, volumeID, nodeID, publishNode); err != nil {
-				return err
-			}
-			replacement = false
-		}
+		replacementReader := replacement && immutableVolume
+		replacement = replacement && !replacementReader
 		if attempt := history.PendingReplacementAttach; attempt != nil && !attempt.prepared() {
 			if attempt.ImageID != volumeID || attempt.VMID != nodeID {
 				return attachmentEvidenceUnavailable("replacement Ceph attach provider identity changed", nil)
@@ -1020,11 +1015,22 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			return nil
 		}
 		target, err := s.volumeProvider.GetVolumeInNode(queueCtx, volumeID, nodeID)
+		var verifyRelease []func(context.Context) error
+		if replacementReader {
+			attached := err == nil
+			verify := func(ctx context.Context) error {
+				return s.verifyReplacementReader(ctx, history, req.VolumeId, req.NodeId, volumeID, nodeID, publishNode, attached)
+			}
+			if err := verify(queueCtx); err != nil {
+				return err
+			}
+			verifyRelease = append(verifyRelease, verify)
+		}
 		if err == nil {
 			if history.PendingReplacementAttach != nil {
 				return attachmentEvidenceUnavailable("prepared replacement Ceph attach requires settled provider absence", nil)
 			}
-			if err := s.restoreRetainedVolumeCapacity(queueCtx, req, nodeID, volumeID, publishNode); err != nil {
+			if err := s.restoreRetainedVolumeCapacity(queueCtx, req, nodeID, volumeID, publishNode, replacementReader, verifyRelease...); err != nil {
 				return err
 			}
 			if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(queueCtx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), runtimeCtx); localErr != nil {
@@ -1032,9 +1038,14 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 				s.driver.metrics.RecordControllerPublishDuration("disk", "unavailable", time.Since(started))
 				return localErr
 			}
-			observation, err := s.verifyPublishedAttachment(queueCtx, req.VolumeId, req.NodeId, volumeID, nodeID, target, "", publishNode, false)
+			observation, err := s.verifyPublishedAttachment(queueCtx, req.VolumeId, req.NodeId, volumeID, nodeID, target, "", publishNode, replacementReader)
 			if err != nil {
 				return err
+			}
+			for _, verify := range verifyRelease {
+				if err := verify(queueCtx); err != nil {
+					return err
+				}
 			}
 			if err := s.recordSuccessfulLocalVolumePublish(queueCtx, req.VolumeId, observation, req.GetVolumeContext(), runtimeCtx, &protection); err != nil {
 				return err
@@ -1043,7 +1054,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 				_ = s.driver.volumeQuarantine.Clear(queueCtx, req.VolumeId)
 			}
 			s.clearStickyReuseState(queueCtx, req.VolumeId, req.NodeId, "disk")
-			s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
+			updateMetadata = true
 			publishContext := s.publishContextForVolume(queueCtx, req.VolumeId, observation, 0, req.GetVolumeContext())
 			klog.V(1).InfoS("Volume already attached to node",
 				"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
@@ -1062,6 +1073,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 					return freshErr
 				}
 				response = freshResponse
+				updateMetadata = true
 				return nil
 			}
 
@@ -1072,7 +1084,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 				if err := s.recordSuccessfulLocalVolumePublish(queueCtx, req.VolumeId, *observed, req.GetVolumeContext(), runtimeCtx, &protection); err != nil {
 					return err
 				}
-				s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
+				updateMetadata = true
 				response = &csi.ControllerPublishVolumeResponse{PublishContext: s.publishContextForVolume(queueCtx, req.VolumeId, *observed, 0, req.GetVolumeContext())}
 				return nil
 			}
@@ -1097,15 +1109,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		klog.V(3).InfoS("Attaching volume to node",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "sizeBytes", sizeBytes, "hotplugTimeout", hotplugTimeout, "deviceDiscoveryTimeout", deviceDiscoveryTimeout)
 		attachStarted := time.Now()
-		attachCtx := s.authorizeHostArtifactAttach(s.publishMutationContext(queueCtx, req, nodeID, volumeID, publishNode, true), req)
-		if freshReader {
-			attachCtx = opennebula.WithAttachAuthorization(attachCtx, func(ctx context.Context, target *opennebula.HostArtifactAttachmentTarget) error {
-				if err := s.checkHostArtifactAttachTarget(ctx, req, target); err != nil {
-					return err
-				}
-				return s.verifyFreshReplacementReader(ctx, history, req.VolumeId, req.NodeId, volumeID, nodeID, publishNode)
-			})
-		}
+		attachCtx := s.authorizeHostArtifactAttach(s.publishMutationContext(queueCtx, req, nodeID, volumeID, publishNode, true), req, verifyRelease...)
 		var attempt *replacementAttachAttempt
 		var admission *replacementAttachAdmission
 		var dispatch *opennebula.ReplacementAttachDispatch
@@ -1186,7 +1190,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		s.recordPVCEventFromParams(queueCtx, req.GetVolumeContext(), eventReasonAttachValidated, fmt.Sprintf("validated and attached volume %s to node %s", req.GetVolumeId(), req.GetNodeId()))
 		klog.V(1).InfoS("Volume attached successfully",
 			"method", "ControllerPublishVolume", "volumeID", volumeID, "nodeID", nodeID, "volumeName", target)
-		s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
+		updateMetadata = true
 		response = &csi.ControllerPublishVolumeResponse{
 			PublishContext: s.publishContextForVolume(queueCtx, req.VolumeId, observation, deviceDiscoveryTimeout, req.GetVolumeContext()),
 		}
@@ -1235,6 +1239,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	}
 	s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "success", time.Since(started))
 	s.driver.metrics.RecordControllerPublishDuration("disk", "success", time.Since(started))
+	if updateMetadata {
+		s.finishPublishMetadata(ctx, req, &protection)
+	}
 	return response, nil
 }
 
@@ -2097,17 +2104,11 @@ func (s *ControllerServer) publishContextForVolume(ctx context.Context, volumeID
 		}
 	}
 
-	var sizeBytes int64
-	if admission, ok := ctx.Value(publishPVImageCheckKey{}).(publishPVAdmission); ok && admission.sizeBytes > 0 {
-		sizeBytes = admission.sizeBytes
-	} else {
-		var err error
-		sizeBytes, err = s.volumeProvider.ResolveVolumeSizeBytes(ctx, volumeID)
-		if err != nil {
-			klog.V(2).InfoS("Skipping dynamic hotplug timeout in publish context after size resolution failure",
-				"method", "publishContextForVolume", "volumeID", volumeID, "err", err)
-			return publishContext
-		}
+	sizeBytes, err := s.volumeProvider.ResolveVolumeSizeBytes(ctx, volumeID)
+	if err != nil {
+		klog.V(2).InfoS("Skipping dynamic hotplug timeout in publish context after size resolution failure",
+			"method", "publishContextForVolume", "volumeID", volumeID, "err", err)
+		return publishContext
 	}
 
 	hotplugTimeout := s.volumeProvider.ComputeHotplugTimeout(sizeBytes)
@@ -2172,17 +2173,22 @@ func (s *ControllerServer) validateHotplugQueueRequest(ctx context.Context, node
 	return validation
 }
 
-func (s *ControllerServer) restoreRetainedVolumeCapacity(ctx context.Context, req *csi.ControllerPublishVolumeRequest, vmID, imageID int, admittedNode KubernetesNodeIdentity) error {
-	if err := s.checkPublishedAttachmentNode(ctx, req.VolumeId, req.NodeId, admittedNode, false); err != nil {
+func (s *ControllerServer) restoreRetainedVolumeCapacity(ctx context.Context, req *csi.ControllerPublishVolumeRequest, vmID, imageID int, admittedNode KubernetesNodeIdentity, verifiedNewReader bool, verifyRelease ...func(context.Context) error) error {
+	if err := s.checkPublishedAttachmentNode(ctx, req.VolumeId, req.NodeId, admittedNode, verifiedNewReader); err != nil {
 		return err
 	}
-	return s.restoreVolumeCapacity(s.publishMutationContext(ctx, req, vmID, imageID, admittedNode, false), req.VolumeId, vmID, imageID)
+	return s.restoreVolumeCapacity(s.publishMutationContext(ctx, req, vmID, imageID, admittedNode, verifiedNewReader, verifyRelease...), req.VolumeId, vmID, imageID)
 }
 
-func (s *ControllerServer) publishMutationContext(ctx context.Context, req *csi.ControllerPublishVolumeRequest, vmID, imageID int, admittedNode KubernetesNodeIdentity, newAttachment bool) context.Context {
+func (s *ControllerServer) publishMutationContext(ctx context.Context, req *csi.ControllerPublishVolumeRequest, vmID, imageID int, admittedNode KubernetesNodeIdentity, newAttachment bool, verifyRelease ...func(context.Context) error) context.Context {
 	return opennebula.WithPublishMutationAuthorization(ctx, req.VolumeId, req.NodeId, vmID, imageID, func(ctx context.Context) error {
 		if err := s.checkPublishedAttachmentNode(ctx, req.VolumeId, req.NodeId, admittedNode, newAttachment); err != nil {
 			return err
+		}
+		for _, verify := range verifyRelease {
+			if err := verify(ctx); err != nil {
+				return err
+			}
 		}
 		return recheckPublishPVImage(ctx)
 	})
@@ -2224,7 +2230,7 @@ func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.
 			return false, nil, nil
 		}
 		if validation.Reason != queueReasonManualRecoveryAdopted {
-			if err := s.restoreRetainedVolumeCapacity(ctx, req, nodeID, volumeID, publishNode); err != nil {
+			if err := s.restoreRetainedVolumeCapacity(ctx, req, nodeID, volumeID, publishNode, false); err != nil {
 				return true, nil, err
 			}
 		}
@@ -2258,7 +2264,6 @@ func (s *ControllerServer) precheckPublishHotplug(ctx context.Context, req *csi.
 			}
 		}
 		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
-		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
 		var publishContext map[string]string
 		if adopted {
 			publishContext = s.publishContextForRecoveryAdoption(ctx, req.VolumeId, observation, req.GetVolumeContext(), control, 0)
@@ -2892,7 +2897,7 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 			_ = s.driver.stickyAttachments.Clear(req.VolumeId)
 			return false, nil, nil
 		}
-		if err := s.restoreRetainedVolumeCapacity(ctx, req, nodeID, volumeID, publishNode); err != nil {
+		if err := s.restoreRetainedVolumeCapacity(ctx, req, nodeID, volumeID, publishNode, false); err != nil {
 			return true, nil, err
 		}
 		if localErr := s.rejectIfLocalDeviceReportBlocksAttachSuccess(ctx, req.VolumeId, req.NodeId, target, req.GetVolumeContext(), nil); localErr != nil {
@@ -3137,15 +3142,11 @@ func (s *ControllerServer) annotateRestartOptimization(ctx context.Context, runt
 	})
 }
 
-func (s *ControllerServer) annotateRestartOptimizationForVolume(ctx context.Context, volumeID, nodeID string) {
-	if s == nil || s.driver == nil || s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
-		return
+func (s *ControllerServer) finishPublishMetadata(ctx context.Context, req *csi.ControllerPublishVolumeRequest, protection *LocalRWOProtectionDecision) {
+	if admission, ok := ctx.Value(publishPVImageCheckKey{}).(publishPVAdmission); ok {
+		s.consumePublishPlacementOverride(ctx, protection)
+		s.annotateRestartOptimization(ctx, admission.binding, req.NodeId, s.effectiveDetachGraceSeconds(admission.binding))
 	}
-	runtimeCtx, err := s.driver.kubeRuntime.ResolveVolumeRuntimeContext(ctx, volumeID)
-	if err != nil {
-		return
-	}
-	s.annotateRestartOptimization(ctx, runtimeCtx, nodeID, s.effectiveDetachGraceSeconds(runtimeCtx))
 }
 
 func (s *ControllerServer) recordPVCEventFromRuntimeContext(ctx context.Context, runtimeCtx *VolumeRuntimeContext, reason, message string) {

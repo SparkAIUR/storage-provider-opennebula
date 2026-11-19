@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -552,9 +553,23 @@ func (s *ControllerServer) publishNodeIdentity(ctx context.Context, nodeName str
 type publishPVImageCheckKey struct{}
 
 type publishPVAdmission struct {
-	binding   *VolumeRuntimeContext
-	check     func(context.Context) error
-	sizeBytes int64
+	binding *VolumeRuntimeContext
+	check   func(context.Context) error
+}
+
+func samePublishAnnotations(admitted, current map[string]string) bool {
+	for _, key := range []string{
+		annotationBackend, annotationDatastoreID, annotationDatastoreName, annotationSelectionPolicy,
+		annotationRecoveryMode, annotationRecoveryModeUntil, annotationRecoveryTicket, annotationAdoptAttachedDevice,
+		annotationConfirmedDeviceSerial, annotationConfirmedVolumeName, annotationRestartOpt, annotationDetachGrace,
+		annotationRequiredNode, annotationRequiredNodeUntil, annotationPreferredNode, annotationAllowCrossNodeUntil,
+		annotationLastAttachedNode, annotationLegacyLastAttachedNode, annotationLastNodePref, annotationPreferredLastNode,
+	} {
+		if admitted[key] != current[key] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *ControllerServer) publishPVImageCheck(ctx context.Context, volumeID string, imageID int, binding *VolumeRuntimeContext, history VolumeHistoryRecord) (publishPVAdmission, error) {
@@ -582,19 +597,23 @@ func (s *ControllerServer) publishPVImageCheck(ctx context.Context, volumeID str
 		volumes := runtime.client.CoreV1().PersistentVolumes()
 		matches := func(pv *corev1.PersistentVolume) bool {
 			return pv != nil && pv.UID == binding.pvUID && pv.Spec.CSI != nil && pv.Spec.CSI.Driver == s.driver.name &&
-				pv.Spec.CSI.VolumeHandle == volumeID && pv.Status.Phase == binding.pvPhase && reflect.DeepEqual(binding.pvClaimRef, pv.Spec.ClaimRef)
+				pv.Spec.CSI.VolumeHandle == volumeID && pv.Status.Phase == binding.pvPhase &&
+				(pv.DeletionTimestamp != nil) == binding.pvDeleting && reflect.DeepEqual(binding.pvClaimRef, pv.Spec.ClaimRef) &&
+				slices.Equal(pv.Spec.AccessModes, binding.AccessModes) && pv.Spec.CSI.VolumeAttributes[annotationBackend] == binding.backendAttribute &&
+				samePublishAnnotations(binding.PVAnnotations, pv.Annotations)
 		}
 		pv, err := volumes.Get(ctx, binding.PVName, metav1.GetOptions{})
 		if err != nil || !matches(pv) {
 			return attachmentEvidenceUnavailable("Publish PV or claim identity changed", err)
 		}
-		if err := s.verifyPVImageAssertions(ctx, pv, imageID, history, false); err != nil {
+		if err := s.verifyPVImageAssertions(ctx, pv, imageID, history, false, nil); err != nil {
 			return err
 		}
 		if pv.Status.Phase == corev1.VolumeBound || binding.verifiedClaimBinding {
 			pvc, replaced, err := runtime.attachmentClaim(ctx, pv)
 			if err != nil || pvc == nil || replaced || !binding.verifiedClaimBinding || pvc.UID != binding.PVCUID ||
-				pvc.Name != binding.PVCName || pvc.Namespace != binding.PVCNamespace ||
+				pvc.Name != binding.PVCName || pvc.Namespace != binding.PVCNamespace || pvc.Status.Phase != binding.pvcPhase ||
+				(pvc.DeletionTimestamp != nil) != binding.pvcDeleting || !samePublishAnnotations(binding.PVCAnnotations, pvc.Annotations) ||
 				pv.DeletionTimestamp != nil || pvc.DeletionTimestamp != nil {
 				return attachmentEvidenceUnavailable("Publish claim identity is unverified", err)
 			}
@@ -790,13 +809,19 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 	}
 	if err == nil {
 		s.driver.metrics.RecordVolumeHistory("publish", "persisted")
-		if protection != nil && protection.OverrideUsed && protection.RuntimeContext != nil {
-			runtimeCtx := protection.RuntimeContext
-			_ = s.driver.kubeRuntime.DeletePVAnnotation(ctx, runtimeCtx.PVName, annotationAllowCrossNodeUntil)
-			s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonCrossNodeOverrideUsed, protection.Message)
+		if ctx.Value(publishPVImageCheckKey{}) == nil {
+			s.consumePublishPlacementOverride(ctx, protection)
 		}
 	}
 	return nil
+}
+
+func (s *ControllerServer) consumePublishPlacementOverride(ctx context.Context, protection *LocalRWOProtectionDecision) {
+	if protection != nil && protection.OverrideUsed && protection.RuntimeContext != nil {
+		runtimeCtx := protection.RuntimeContext
+		_ = s.driver.kubeRuntime.DeletePVAnnotation(ctx, runtimeCtx.PVName, annotationAllowCrossNodeUntil)
+		s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonCrossNodeOverrideUsed, protection.Message)
+	}
 }
 
 func (s *ControllerServer) publishHistoryBindingVerified(ctx context.Context, volumeID string, imageID int, admitted *VolumeRuntimeContext) bool {

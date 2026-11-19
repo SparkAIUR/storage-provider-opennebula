@@ -272,7 +272,7 @@ func replacementPublishReadOnlyMany(req *csi.ControllerPublishVolumeRequest) boo
 	return req.GetVolumeCapability().GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
 }
 
-func (s *ControllerServer) verifyFreshReplacementReader(ctx context.Context, history VolumeHistoryRecord, volume, nodeName string, imageID, vmID int, admitted KubernetesNodeIdentity) error {
+func (s *ControllerServer) verifyReplacementReader(ctx context.Context, history VolumeHistoryRecord, volume, nodeName string, imageID, vmID int, admitted KubernetesNodeIdentity, attached bool) error {
 	deny := func(err error) error {
 		return attachmentEvidenceUnavailable("read-only replacement release is unverified", err)
 	}
@@ -294,7 +294,7 @@ func (s *ControllerServer) verifyFreshReplacementReader(ctx context.Context, his
 	client := s.driver.kubeRuntime.client.CoreV1()
 	node, err := client.Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil || node == nil || string(node.UID) != admitted.UID || node.DeletionTimestamp != nil ||
-		node.CreationTimestamp.IsZero() || nodeReportsVolumeInUse(node, s.driver.name, volume) ||
+		node.CreationTimestamp.IsZero() ||
 		(!history.LastSuccessfulPublishTime.IsZero() && !history.LastSuccessfulPublishTime.Before(node.CreationTimestamp.Time)) ||
 		(!history.LastSuccessfulStageTime.IsZero() && !history.LastSuccessfulStageTime.Before(node.CreationTimestamp.Time)) {
 		return deny(err)
@@ -305,24 +305,27 @@ func (s *ControllerServer) verifyFreshReplacementReader(ctx context.Context, his
 	attachments, err := s.detachVolumeAttachments(ctx, pv.Name, "")
 	name := csiVolumeAttachmentName(volume, s.driver.name, nodeName)
 	va := attachments[name]
-	if err != nil || len(attachments) != 1 || va.node != nodeName || va.attacher != s.driver.name ||
+	if err != nil || va.node != nodeName || va.attacher != s.driver.name ||
 		va.uid == "" || va.deleting || va.attached || !va.created.After(node.CreationTimestamp.Time) ||
 		validateAttachmentImageAssertions(va.metadata, imageID) != nil ||
 		validateMarkedReplacementMetadata(va, pv, "", fmt.Sprintf("onecsi-%d", imageID)) != nil {
 		return deny(err)
 	}
-	waiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, node, false)
+	inUse := nodeReportsVolumeInUse(node, s.driver.name, volume)
+	waiting, err := s.replacementDestinationConsumers(ctx, pv, pvc, false, true, node, inUse)
 	if err != nil {
 		return err
 	}
-	verifier, ok := s.volumeProvider.(opennebula.ReplacementDestinationAbsenceVerifier)
+	verifier, ok := s.volumeProvider.(opennebula.ReplacementReaderInspector)
 	if !ok {
 		return deny(nil)
 	}
-	if err := verifier.VerifyReplacementDestinationAbsent(ctx, volume, nodeName, imageID, vmID, 0); err != nil {
+	metadata, err := verifier.InspectReplacementReaders(ctx, volume, nodeName, imageID, vmID)
+	if err != nil || metadata == nil || metadata.AttachedToRequestedNode != attached {
 		return deny(err)
 	}
-	if originalVM := history.LastSuccessfulOpenNebulaVMID; originalVM != vmID {
+	originalVM := history.LastSuccessfulOpenNebulaVMID
+	if originalVM != vmID {
 		inspector, ok := s.volumeProvider.(opennebula.ReplacementAttachInspector)
 		if !ok {
 			return deny(nil)
@@ -330,6 +333,33 @@ func (s *ControllerServer) verifyFreshReplacementReader(ctx context.Context, his
 		if _, err := inspector.InspectReplacementRelease(ctx, imageID, originalVM, ""); err != nil {
 			return deny(err)
 		}
+	}
+	owners := make(map[int]bool)
+	for _, disk := range metadata.DiskRecords {
+		if disk.NodeID == vmID && originalVM == vmID &&
+			(history.LastSuccessfulDiskID == nil || *history.LastSuccessfulDiskID == disk.DiskID) {
+			return deny(nil)
+		}
+		owners[disk.NodeID] = true
+	}
+	for otherName, other := range attachments {
+		if otherName == name {
+			continue
+		}
+		if otherName != csiVolumeAttachmentName(volume, s.driver.name, other.node) || other.attacher != s.driver.name ||
+			other.uid == "" || other.uid == va.uid || other.deleting || !other.attached ||
+			validateAttachmentImageAssertions(other.metadata, imageID) != nil {
+			return deny(nil)
+		}
+		otherVM, err := s.volumeProvider.NodeExists(ctx, other.node)
+		if err != nil || otherVM == vmID || !owners[otherVM] {
+			return deny(err)
+		}
+		delete(owners, otherVM)
+	}
+	delete(owners, vmID)
+	if len(owners) != 0 {
+		return deny(nil)
 	}
 	runtimeCtx := &VolumeRuntimeContext{PVName: pv.Name, PVAnnotations: pv.Annotations, Backend: "ceph", AccessModes: pv.Spec.AccessModes,
 		PVCNamespace: pvc.Namespace, PVCName: pvc.Name, PVCUID: pvc.UID, PVCAnnotations: pvc.Annotations, verifiedClaimBinding: true}
@@ -344,7 +374,7 @@ func (s *ControllerServer) verifyFreshReplacementReader(ctx context.Context, his
 	if err != nil || currentHistory.PendingReplacementAttach != nil || replacementHistoryGeneration(currentHistory) != replacementHistoryGeneration(history) {
 		return deny(err)
 	}
-	currentWaiting, err := s.replacementWaitingConsumers(ctx, pv, pvc, node, false)
+	currentWaiting, err := s.replacementDestinationConsumers(ctx, pv, pvc, false, true, node, inUse)
 	if err != nil || !sameWaitingConsumers(waiting, currentWaiting) {
 		return deny(err)
 	}
