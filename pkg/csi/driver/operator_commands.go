@@ -1296,16 +1296,16 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 			demandSnapshot[pv.Spec.CSI.VolumeHandle] = desiredState
 		}
 		decision, err := (&ControllerServer{driver: driver}).localRWOProtectionProjection(ctx, pv.Spec.CSI.VolumeHandle, "", runtimeCtx, false, false)
+		decision.History.PendingReplacementAttach = nil
+		if decision.History.VolumeID != "" {
+			historySnapshot[pv.Spec.CSI.VolumeHandle] = decision.History
+		}
 		if err != nil {
 			protectionSnapshot[pv.Spec.CSI.VolumeHandle] = LocalRWOProtectionDecision{
 				Reason:  "evaluation_error",
 				Message: err.Error(),
 			}
 			continue
-		}
-		decision.History.PendingReplacementAttach = nil
-		if decision.History.VolumeID != "" {
-			historySnapshot[pv.Spec.CSI.VolumeHandle] = decision.History
 		}
 		if decision.Protected || strings.TrimSpace(decision.Reason) != "" || strings.TrimSpace(decision.PreferredNode) != "" || strings.TrimSpace(decision.ExplicitRequiredNode) != "" || strings.TrimSpace(decision.ExplicitPreferredNode) != "" || strings.TrimSpace(decision.PlacementDecision) != "" || len(decision.Warnings) > 0 {
 			protectionSnapshot[pv.Spec.CSI.VolumeHandle] = decision

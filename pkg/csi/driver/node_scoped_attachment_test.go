@@ -4244,6 +4244,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 			"prepared-abandoned-retired-pinned", "prepared-abandoned-retired-pinned-distinct-vm",
 			"distinct-vm-abandoned-replay-retired-completed", "distinct-vm-abandoned-replay-retired-accepted",
 			"same-vm-abandoned-replay-wire-retired", "distinct-vm-abandoned-replay-wire-retired",
+			"distinct-vm-orphan-wire-retired", "distinct-vm-orphan-retired-accepted", "distinct-vm-orphan-lost-wire-retired",
 			"prepared-abandoned-waiting-remote-retired-publish", "prepared-abandoned-waiting-remote-retired-reconcile-distinct-vm",
 			"prepared-abandoned-retired-without-va", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
 			"distinct-vm-inflight", "same-vm-abandoned-replay",
@@ -4332,6 +4333,8 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				wireRetired := strings.HasSuffix(mode, "-wire-retired")
 				retiredAccepted := strings.HasSuffix(mode, "-retired-accepted")
 				retiredCompleted := strings.HasSuffix(mode, "-retired-completed")
+				orphanRetirement := orphan && (wireRetired || retiredAccepted)
+				orphanLostReply := mode == "distinct-vm-orphan-lost-wire-retired"
 				wireClaimGone := strings.HasSuffix(mode, "-wire-claim-gone")
 				wireClaimChanged := strings.HasSuffix(mode, "-wire-claim-changed")
 				wireClaimRebound := strings.HasSuffix(mode, "-wire-claim-reuse")
@@ -4361,7 +4364,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				var replacement *corev1.Node
 				provider, protocol := nodeAttachmentProvider(t, func(method string, _ context.Context) {
 					if method == "one.vm.detach" && (wireObserve || wireNodeChange || wireRetired || retiredAccepted || claimTurnover || wireClaimChanged || wireClaimConflict || orphanRepublish) && postDetachChange.CompareAndSwap(false, true) {
-						if wireObserve || retiredAccepted {
+						if wireObserve || retiredAccepted || orphanRetirement {
 							setObserve(true)
 						}
 						if wireRetired {
@@ -5767,7 +5770,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							return true, nil, errors.New("completion update committed and reply lost")
 						})
 					}
-					if mode == "distinct-vm-abandoned-detach-reply" {
+					if mode == "distinct-vm-abandoned-detach-reply" || orphanLostReply {
 						wire.mu.Lock()
 						wire.loseDetachReply = true
 						wire.mu.Unlock()
@@ -5838,6 +5841,96 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					unpublish := func(client csi.ControllerClient) error {
 						_, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volume, NodeId: node.Name})
 						return err
+					}
+					if orphanRetirement {
+						reconcile()
+						s := NewControllerServer(driver, provider, nil)
+						received, err := s.readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.NotNil(t, received.PendingReplacementAttach)
+						if orphanLostReply {
+							require.Equal(t, stored, received)
+						} else {
+							require.True(t, received.PendingReplacementAttach.acceptedOrphan())
+							require.Equal(t, "2", received.PendingReplacementAttach.DetachAcceptance.DiskID)
+						}
+						if !wireRetired {
+							require.NoError(t, nodes.Delete(ctx, node.Name, metav1.DeleteOptions{}))
+							wire.mu.Lock()
+							wire.omitVMID, wire.missingVMID = vmID, vmID
+							wire.mu.Unlock()
+						}
+						fresh := newStickyTestDriver(t)
+						fresh.kubeRuntime.client = kube
+						retry := makeClient(fresh)
+						require.Error(t, unpublish(retry), "the active observe control still holds retirement")
+						setObserve(false)
+						deletion := &csi.DeleteVolumeRequest{VolumeId: volume}
+						_, err = retry.DeleteVolume(ctx, deletion)
+						require.ErrorContains(t, err, "replacement attachment holds volume deletion")
+						if orphanLostReply {
+							require.Error(t, unpublish(retry), "settled absence cannot supply a missing provider reply")
+							reconcileDriver(fresh)
+						} else {
+							now := metav1.Now()
+							otherVA := publishVA.DeepCopy()
+							otherVA.UID, otherVA.DeletionTimestamp = "unrelated-deleting-attachment", &now
+							_, err = vas.Create(ctx, otherVA, metav1.CreateOptions{})
+							require.NoError(t, err)
+							require.Error(t, unpublish(retry))
+							require.NoError(t, vas.Delete(ctx, otherVA.Name, metav1.DeleteOptions{}))
+							pods := kube.CoreV1().Pods(pvc.Namespace)
+							_, err = pods.Create(ctx, latePod, metav1.CreateOptions{})
+							require.NoError(t, err)
+							require.Error(t, unpublish(retry), "an old-node Pod blocks orphan retirement")
+							require.NoError(t, pods.Delete(ctx, latePod.Name, metav1.DeleteOptions{}))
+							pvs := kube.CoreV1().PersistentVolumes()
+							originalPV, err := pvs.Get(ctx, pv.Name, metav1.GetOptions{})
+							require.NoError(t, err)
+							changedPV := originalPV.DeepCopy()
+							changedPV.Spec.ClaimRef.UID = "changed-claim"
+							_, err = pvs.Update(ctx, changedPV, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							require.Error(t, unpublish(retry))
+							_, err = pvs.Update(ctx, originalPV, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							wire.mu.Lock()
+							wire.failMethod = "one.vm.info"
+							wire.mu.Unlock()
+							require.Error(t, unpublish(retry), "a provider read failure is not retired VM proof")
+							wire.mu.Lock()
+							wire.failMethod, wire.missingVMID = "", 0
+							wire.mu.Unlock()
+							require.Error(t, unpublish(retry), "a VM pool miss is not a typed response for the pinned VM")
+							wire.mu.Lock()
+							wire.missingVMID = vmID
+							wire.mu.Unlock()
+							unsettled, err := s.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.Equal(t, received, unsettled)
+							kube.ClearActions()
+							if wireRetired {
+								reconcileDriver(fresh)
+							} else {
+								require.NoError(t, unpublish(retry))
+							}
+							for _, action := range kube.Actions() {
+								if action.GetVerb() == "get" || action.GetVerb() == "list" {
+									continue
+								}
+								require.Equal(t, "update", action.GetVerb())
+								require.Equal(t, volumeHistoryStateConfigMapName, action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap).Name)
+							}
+							received.PendingReplacementAttach = nil
+						}
+						settled, err := s.readAttachmentHistory(ctx, volume)
+						require.NoError(t, err)
+						require.Equal(t, received, settled)
+						wire.mu.Lock()
+						defer wire.mu.Unlock()
+						require.Equal(t, 1, wire.detachAttempts)
+						require.Equal(t, []string{"attach:42:false", "detach:42"}, wire.mutations)
+						return
 					}
 					if retiredAccepted || retiredCompleted || wireRetired {
 						server := NewControllerServer(driver, provider, nil)

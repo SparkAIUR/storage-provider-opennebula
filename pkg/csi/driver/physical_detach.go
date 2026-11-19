@@ -194,12 +194,13 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		}
 		localVAName, localVA = name, va
 	}
-	canceledSuccessor := check == detachCanceledOrphanReadback && accepted && attempt.acceptedOrphan() && localVAName != ""
+	acceptedOrphan := accepted && attempt.acceptedOrphan()
+	canceledSuccessor := check == detachCanceledOrphanReadback && acceptedOrphan && localVAName != ""
 	preparedDeletion := preparedReadback && localVAName != ""
 	preparedSuccessor := preparedDeletion && string(localVA.uid) != attempt.VAUID
 	preparedRemote := preparedReadback && destinationVAName != ""
 	retiredRequired := check == detachRetiredReadback
-	if retiredRequired && !receipt && (!preparedDeletion || preparedSuccessor) {
+	if retiredRequired && !receipt && !acceptedOrphan && (!preparedDeletion || preparedSuccessor) {
 		return attachmentEvidenceUnavailable("retired replacement source lacks its pinned deleting VolumeAttachment", nil)
 	}
 	if check == detachPreparedRetirement && (!preparedReadback || preparedDeletion) {
@@ -284,7 +285,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			}
 			identity.diskID, _ = strconv.Atoi(completion.DiskID)
 		}
-		if check == detachPreparedRetirement || retiredRequired || receipt {
+		if check == detachPreparedRetirement || retiredRequired || receipt || acceptedOrphan {
 			_, err := runtime.client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 			if err != nil && !apierrors.IsNotFound(err) {
 				return attachmentEvidenceUnavailable("replacement source Node identity is unverified", err)
@@ -295,6 +296,9 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			}
 			if retiredSource && receipt && localVAName == "" {
 				return attachmentEvidenceUnavailable("retired replacement source lacks its receipt VolumeAttachment", nil)
+			}
+			if retiredSource && acceptedOrphan && len(attachments) != 0 {
+				return attachmentEvidenceUnavailable("retired replacement orphan has a current VolumeAttachment", nil)
 			}
 		}
 		var disk *opennebula.VolumeDiskRecord
@@ -819,7 +823,7 @@ func (s *ControllerServer) finishVerifiedReplacementAbsence(ctx context.Context,
 		return true, attachmentEvidenceUnavailable("detach history is unreadable", err)
 	}
 	attempt := history.PendingReplacementAttach
-	if retiredRequired && (attempt == nil || (!attempt.prepared() && !attempt.hasDetachReceipt()) || attempt.Node != node) {
+	if retiredRequired && (attempt == nil || !attempt.canReadbackRetiredSource() || attempt.Node != node) {
 		return false, nil
 	}
 	if attempt == nil {
@@ -931,8 +935,14 @@ func (s *ControllerServer) checkAcceptedDetachIdentity(ctx context.Context, volu
 	}
 	attempt := identity.replacement
 	if retiredSource {
-		va, pinned := source[attempt.VAName]
-		if !pinned || len(source) != 1 || string(identity.nodeUID) != attempt.ReplacementUID ||
+		if string(identity.nodeUID) != attempt.ReplacementUID {
+			return unavailable(nil)
+		}
+		if len(source) == 0 {
+			if identity.attachments == nil || len(identity.attachments) != 0 || len(currentAttachments) != 0 {
+				return unavailable(nil)
+			}
+		} else if va, pinned := source[attempt.VAName]; !pinned || len(source) != 1 ||
 			va.uid == "" || !va.deleting || va.attacher != attempt.Driver {
 			return unavailable(nil)
 		}
@@ -973,6 +983,10 @@ func (s *ControllerServer) checkAcceptedDetachIdentity(ctx context.Context, volu
 	if va, present := source[attempt.VAName]; present {
 		currentVA, err := runtime.client.StorageV1().VolumeAttachments().Get(ctx, attempt.VAName, metav1.GetOptions{})
 		if err != nil || currentVA == nil || !matchesVolumeAttachment(pv.Name, currentVA) || !reflect.DeepEqual(va, detachAttachmentSnapshot(currentVA)) {
+			return unavailable(err)
+		}
+	} else if retiredSource {
+		if _, err := runtime.client.StorageV1().VolumeAttachments().Get(ctx, attempt.VAName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 			return unavailable(err)
 		}
 	} else if gone, err := s.replacementVAGone(ctx, attempt.VAName, attempt.VAUID); err != nil || !gone {

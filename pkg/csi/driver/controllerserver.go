@@ -1249,7 +1249,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		if errors.As(err, &missingNode) && history.LastSuccessfulNodeName == req.NodeId &&
 			history.LastSuccessfulImageID == volumeID && history.LastSuccessfulOpenNebulaVMID > 0 {
 			vmID := history.LastSuccessfulOpenNebulaVMID
-			if attempt := history.PendingReplacementAttach; attempt != nil && (attempt.prepared() || attempt.hasDetachReceipt()) && attempt.matchesHistory(history) {
+			if attempt := history.PendingReplacementAttach; attempt != nil && attempt.canReadbackRetiredSource() && attempt.matchesHistory(history) {
 				vmID = attempt.VMID
 			}
 			return s.confirmUnpublishAbsence(ctx, req, volumeID, vmID, true)

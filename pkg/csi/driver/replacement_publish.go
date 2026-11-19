@@ -105,6 +105,10 @@ func (attempt replacementAttachAttempt) hasDetachReceipt() bool {
 	return attempt.detached() || (attempt.detachAccepted() && attempt.DetachAcceptance.VAUID != "")
 }
 
+func (attempt replacementAttachAttempt) canReadbackRetiredSource() bool {
+	return attempt.prepared() || attempt.detachAccepted() || attempt.detached()
+}
+
 func (attempt replacementAttachAttempt) matchesHistory(history VolumeHistoryRecord) bool {
 	originalVM := attempt.VMID
 	if attempt.OriginalVMID != 0 || attempt.OriginalVMName != "" {

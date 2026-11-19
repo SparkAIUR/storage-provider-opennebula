@@ -234,12 +234,13 @@ func TestCollectVolumeHealthReportsFlagsStaleLastAttachedNodeAnnotation(t *testi
 
 func TestSupportBundleLocalRWOSnapshotIsReadOnly(t *testing.T) {
 	for _, tc := range []struct {
-		name               string
-		active, hasHistory bool
+		name                                string
+		active, hasHistory, malformedDevice bool
 	}{
 		{name: "maintenance-active", active: true, hasHistory: true},
 		{name: "maintenance-inactive", hasHistory: true},
 		{name: "missing-history", active: true},
+		{name: "bootstrap-with-protection-error", malformedDevice: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pv, pvc := newLocalPVAndPVC("volume-test", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
@@ -257,7 +258,15 @@ func TestSupportBundleLocalRWOSnapshotIsReadOnly(t *testing.T) {
 					Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name}},
 				Status: storagev1.VolumeAttachmentStatus{Attached: true},
 			}
-			objects := []kruntime.Object{pv, pvc, node, held, maintenance, va}
+			objects := []kruntime.Object{pv, pvc, node, maintenance, va}
+			if tc.malformedDevice {
+				objects = append(objects, &corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{Name: localDeviceStateConfigMapName, Namespace: held.Namespace},
+					Data:       map[string]string{localDeviceReportKey(node.Name, pv.Spec.CSI.VolumeHandle): `{"volumeID":`},
+				})
+			} else {
+				objects = append(objects, held)
+			}
 			var persistedHistory string
 			if tc.hasHistory {
 				record := VolumeHistoryRecord{VolumeID: "volume-test", Version: stateObjectVersion, Backend: "local",
@@ -324,6 +333,17 @@ func TestSupportBundleLocalRWOSnapshotIsReadOnly(t *testing.T) {
 			require.Equal(t, !tc.hasHistory, history["volume-test"].Bootstrapped)
 			require.Equal(t, "node-old", history["volume-test"].LastSuccessfulNodeName)
 			require.Contains(t, demand, "volume-test")
+			if tc.malformedDevice {
+				record := history["volume-test"]
+				require.Equal(t, volumeHistoryEvidenceSourceBootstrap, record.EvidenceSource)
+				require.True(t, record.LastSuccessfulPublishTime.IsZero())
+				require.True(t, record.LastSuccessfulStageTime.IsZero())
+				require.Nil(t, record.PendingReplacementAttach)
+				require.False(t, protection["volume-test"].Protected)
+				require.Equal(t, "evaluation_error", protection["volume-test"].Reason)
+				require.Contains(t, protection["volume-test"].Message, "node device report is malformed")
+				return
+			}
 			require.True(t, protection["volume-test"].Protected)
 			require.Equal(t, "node-old", protection["volume-test"].RequiredNode)
 			if tc.hasHistory {

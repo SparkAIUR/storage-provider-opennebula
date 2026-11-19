@@ -137,7 +137,10 @@ still be recorded against the exact admitted deleting attachment. To settle
 or replay that receipt after retirement, the controller must independently
 verify that the source Node and pinned VM are absent, the original VM has
 released the disk, and the image has no owners. The receipt remains until
-the recorded attachment UID is gone.
+the recorded attachment UID is gone. For an orphan detach issued without
+a VolumeAttachment, the same settled absence checks and confirmation that
+the pinned attachment is gone let reconciliation retire the accepted record
+after a restart.
 It refreshes protection, confirms Pod, Node and attachment evidence, and
 checks the binding and recovery annotations once more. These bounded
 observations do not fence provider or Kubernetes changes.
