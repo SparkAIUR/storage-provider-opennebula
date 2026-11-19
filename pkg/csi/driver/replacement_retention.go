@@ -221,5 +221,5 @@ func (s *ControllerServer) completeRetainedReplacement(ctx context.Context, req 
 		return observation, attachmentEvidenceUnavailable("marked replacement attachment changed during completion", err)
 	}
 	observation.replacementAttempt = &attempt
-	return observation, s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, observation, req.GetVolumeContext(), runtimeCtx, nil)
+	return observation, nil
 }

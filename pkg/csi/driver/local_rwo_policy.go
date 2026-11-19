@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"k8s.io/klog/v2"
@@ -595,15 +596,8 @@ func (s *ControllerServer) publishPVImageCheck(ctx context.Context, volumeID str
 			return ctx.Err()
 		}
 		volumes := runtime.client.CoreV1().PersistentVolumes()
-		matches := func(pv *corev1.PersistentVolume) bool {
-			return pv != nil && pv.UID == binding.pvUID && pv.Spec.CSI != nil && pv.Spec.CSI.Driver == s.driver.name &&
-				pv.Spec.CSI.VolumeHandle == volumeID && pv.Status.Phase == binding.pvPhase &&
-				(pv.DeletionTimestamp != nil) == binding.pvDeleting && reflect.DeepEqual(binding.pvClaimRef, pv.Spec.ClaimRef) &&
-				slices.Equal(pv.Spec.AccessModes, binding.AccessModes) && pv.Spec.CSI.VolumeAttributes[annotationBackend] == binding.backendAttribute &&
-				samePublishAnnotations(binding.PVAnnotations, pv.Annotations)
-		}
 		pv, err := volumes.Get(ctx, binding.PVName, metav1.GetOptions{})
-		if err != nil || !matches(pv) {
+		if err != nil || !publishPVMatches(pv, binding, s.driver.name, volumeID) {
 			return attachmentEvidenceUnavailable("Publish PV or claim identity changed", err)
 		}
 		if err := s.verifyPVImageAssertions(ctx, pv, imageID, history, false, nil); err != nil {
@@ -619,7 +613,7 @@ func (s *ControllerServer) publishPVImageCheck(ctx context.Context, volumeID str
 			}
 		}
 		current, err := volumes.Get(ctx, binding.PVName, metav1.GetOptions{})
-		if err != nil || !matches(current) || !reflect.DeepEqual(current.Spec.CSI.VolumeAttributes, pv.Spec.CSI.VolumeAttributes) {
+		if err != nil || !publishPVMatches(current, binding, s.driver.name, volumeID) || !reflect.DeepEqual(current.Spec.CSI.VolumeAttributes, pv.Spec.CSI.VolumeAttributes) {
 			return attachmentEvidenceUnavailable("Publish PV or claim identity changed", err)
 		}
 		return ctx.Err()
@@ -627,11 +621,122 @@ func (s *ControllerServer) publishPVImageCheck(ctx context.Context, volumeID str
 	return publishPVAdmission{binding: binding, check: check}, check(ctx)
 }
 
+func publishPVMatches(pv *corev1.PersistentVolume, binding *VolumeRuntimeContext, driver, volumeID string) bool {
+	return pv != nil && pv.UID == binding.pvUID && pv.Spec.CSI != nil && pv.Spec.CSI.Driver == driver &&
+		pv.Spec.CSI.VolumeHandle == volumeID && pv.Status.Phase == binding.pvPhase &&
+		(pv.DeletionTimestamp != nil) == binding.pvDeleting && reflect.DeepEqual(binding.pvClaimRef, pv.Spec.ClaimRef) &&
+		slices.Equal(pv.Spec.AccessModes, binding.AccessModes) && pv.Spec.CSI.VolumeAttributes[annotationBackend] == binding.backendAttribute &&
+		samePublishAnnotations(binding.PVAnnotations, pv.Annotations)
+}
+
+type publishProtectionCheckKey struct{}
+
 func recheckPublishPVImage(ctx context.Context) error {
 	if admission, ok := ctx.Value(publishPVImageCheckKey{}).(publishPVAdmission); ok {
-		return admission.check(ctx)
+		if err := admission.check(ctx); err != nil {
+			return err
+		}
 	}
-	return nil
+	if check, ok := ctx.Value(publishProtectionCheckKey{}).(func(context.Context) error); ok {
+		return check(ctx)
+	}
+	return ctx.Err()
+}
+
+func (s *ControllerServer) publishProtectionCheck(ctx context.Context, volume, node string, binding *VolumeRuntimeContext, placement LocalRWOProtectionDecision, control VolumeRecoveryControlState, vmID, imageID int) (func(context.Context) error, error) {
+	target := opennebula.HostArtifactAttachmentTarget{NodeName: node, VMID: vmID, ImageID: imageID, DiskID: -1}
+	type activeProtection struct {
+		repair VolumeRepairState
+		volume VolumeQuarantineState
+		hosts  map[string]HostArtifactQuarantineState
+	}
+	readAdoptionProtection := func(ctx context.Context) (activeProtection, error) {
+		state := activeProtection{}
+		if manager := s.driver.volumeRepairState; manager != nil {
+			repair, active, err := manager.GetCurrent(ctx, volume)
+			if err != nil {
+				return state, err
+			}
+			if active {
+				state.repair = repair
+			}
+		}
+		now := time.Now().UTC()
+		if manager := s.driver.volumeQuarantine; manager != nil {
+			if err := manager.RefreshEntry(ctx, volume); err != nil {
+				return state, err
+			}
+			state.volume, _ = manager.GetActive(volume, now)
+		}
+		if manager := s.driver.hostArtifactQuarantine; manager != nil {
+			if err := manager.RefreshVolume(ctx, volume); err != nil {
+				return state, err
+			}
+			if manager.runtime != nil && manager.runtime.enabled {
+				cm, err := manager.runtime.GetConfigMap(ctx, manager.namespace, hostArtifactStateConfigMapName)
+				if err != nil && !apierrors.IsNotFound(err) {
+					return state, err
+				}
+				persisted := map[string]string{}
+				if cm != nil {
+					persisted = cm.Data
+				}
+				if _, _, err := manager.activeForTarget(target, persisted, now); err != nil {
+					return state, err
+				}
+			}
+			state.hosts = make(map[string]HostArtifactQuarantineState)
+			keys := hostArtifactTargetQuarantineKeys(target)
+			for _, entry := range manager.Snapshot() {
+				if entry.ExpiresAt.After(now) && (entry.VolumeID == volume || slices.Contains(keys, entry.Key)) {
+					state.hosts[entry.Key] = entry
+				}
+			}
+		}
+		return state, nil
+	}
+	var adoptedProtection activeProtection
+	if control.AdoptionRequested() {
+		var err error
+		adoptedProtection, err = readAdoptionProtection(ctx)
+		if err != nil {
+			return nil, attachmentEvidenceUnavailable("Publish adoption protection is unverified", err)
+		}
+	}
+	return func(ctx context.Context) error {
+		now := time.Now().UTC()
+		if (placement.OverrideUsed && !placement.OverrideExpiresAt.After(now)) ||
+			(placement.Source == protectionSourceExplicitRequiredNode && placement.ExplicitRequiredNodeUntil != nil && !placement.ExplicitRequiredNodeUntil.After(now)) {
+			return attachmentEvidenceUnavailable("Publish placement grant expired during admission", nil)
+		}
+		if control.Active() && control.ExpiresAt != nil && !control.ExpiresAt.After(now) {
+			return attachmentEvidenceUnavailable("Publish recovery grant expired during admission", nil)
+		}
+		if control.AdoptionRequested() {
+			current, err := readAdoptionProtection(ctx)
+			if err != nil || !reflect.DeepEqual(adoptedProtection, current) {
+				return attachmentEvidenceUnavailable("Publish adoption protection changed or is unreadable", err)
+			}
+			return ctx.Err()
+		}
+		if s.driver.kubeRuntime == nil || !s.driver.kubeRuntime.enabled {
+			return ctx.Err()
+		}
+		if s.driver.volumeRepairState != nil && s.driver.volumeQuarantine != nil && s.driver.hostArtifactQuarantine != nil {
+			if err := s.attachmentProtectionChecks(ctx, volume, binding, target); err != nil {
+				return err
+			}
+		} else {
+			if err := s.rejectIfActiveRepairState(ctx, volume, binding); err != nil {
+				return err
+			}
+			current, err := readAdoptionProtection(ctx)
+			if err != nil || current.volume.VolumeID != "" || len(current.hosts) != 0 {
+				return attachmentEvidenceUnavailable("Publish quarantine is active or unreadable", err)
+			}
+		}
+		return ctx.Err()
+	}, nil
 }
 
 func (s *ControllerServer) verifyPublishedAttachment(ctx context.Context, volumeID, requestedNode string, imageID, vmID int, target, adoptedSerial string, admittedNode KubernetesNodeIdentity, newAttachment bool) (successfulAttachmentObservation, error) {
@@ -741,13 +846,13 @@ func (s *ControllerServer) checkPublishedAttachmentNode(ctx context.Context, vol
 	return ctx.Err()
 }
 
-func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID string, observation successfulAttachmentObservation, sourceContext map[string]string, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision) error {
+func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Context, volumeID string, observation successfulAttachmentObservation, sourceContext map[string]string, runtimeCtx *VolumeRuntimeContext, verify func() error) error {
 	if s == nil || s.driver == nil || s.driver.volumeHistory == nil || strings.TrimSpace(volumeID) == "" {
 		return nil
 	}
 	now := time.Now().UTC()
 	_, err := s.driver.volumeHistory.updateHistory(ctx, volumeID, observation.replacementAttempt != nil, func(state *VolumeHistoryRecord) error {
-		if err := recheckPublishPVImage(ctx); err != nil {
+		if err := verify(); err != nil {
 			return err
 		}
 		if err := state.checkAttachmentNode(observation); err != nil {
@@ -809,19 +914,8 @@ func (s *ControllerServer) recordSuccessfulLocalVolumePublish(ctx context.Contex
 	}
 	if err == nil {
 		s.driver.metrics.RecordVolumeHistory("publish", "persisted")
-		if ctx.Value(publishPVImageCheckKey{}) == nil {
-			s.consumePublishPlacementOverride(ctx, protection)
-		}
 	}
 	return nil
-}
-
-func (s *ControllerServer) consumePublishPlacementOverride(ctx context.Context, protection *LocalRWOProtectionDecision) {
-	if protection != nil && protection.OverrideUsed && protection.RuntimeContext != nil {
-		runtimeCtx := protection.RuntimeContext
-		_ = s.driver.kubeRuntime.DeletePVAnnotation(ctx, runtimeCtx.PVName, annotationAllowCrossNodeUntil)
-		s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonCrossNodeOverrideUsed, protection.Message)
-	}
 }
 
 func (s *ControllerServer) publishHistoryBindingVerified(ctx context.Context, volumeID string, imageID int, admitted *VolumeRuntimeContext) bool {

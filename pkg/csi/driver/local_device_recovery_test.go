@@ -503,7 +503,7 @@ func TestNodeRecordsNewMissingDeviceEpisodeAfterConfirmation(t *testing.T) {
 }
 
 func TestNodeDeviceReportPreservesOutOfOrderObservations(t *testing.T) {
-	for _, failure := range []string{"missing", "mount", "identity"} {
+	for _, failure := range []string{"missing", "mount", "identity", "conflicting-key"} {
 		t.Run(failure, func(t *testing.T) {
 			ctx := context.Background()
 			const volume, node, namespace = "vol-1", "node-a", "default"
@@ -515,15 +515,22 @@ func TestNodeDeviceReportPreservesOutOfOrderObservations(t *testing.T) {
 			kube := driver.kubeRuntime.client.(*fake.Clientset)
 			key := localDeviceReportKey(node, volume)
 			var newer time.Time
+			var seeded LocalDeviceMissingReport
 			kube.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
 				if action.(ktesting.GetAction).GetName() != localDeviceStateConfigMapName || !newer.IsZero() {
 					return false, nil, nil
 				}
 				newer = time.Now().UTC().Add(time.Second)
-				payload, err := json.Marshal(LocalDeviceMissingReport{
+				seeded = LocalDeviceMissingReport{
 					Node: node, VolumeID: volume, FailureClass: localDeviceFailureClassRuntimeAttachmentMissing,
 					FirstObservedAt: newer, LastObservedAt: newer, Attempts: 1,
-				})
+					DeviceSerial: "newer-serial", LastError: "newer missing device",
+					AttachmentState: localDeviceAttachmentStateRuntimeUnconfirmed,
+				}
+				if failure == "conflicting-key" {
+					seeded.VolumeID = "other-volume"
+				}
+				payload, err := json.Marshal(seeded)
 				require.NoError(t, err)
 				return false, nil, kube.Tracker().Update(corev1.SchemeGroupVersion.WithResource("configmaps"), &corev1.ConfigMap{
 					ObjectMeta: metav1.ObjectMeta{Name: localDeviceStateConfigMapName, Namespace: namespace},
@@ -534,7 +541,7 @@ func TestNodeDeviceReportPreservesOutOfOrderObservations(t *testing.T) {
 			switch failure {
 			case "missing":
 				ns.recordLocalDeviceMissing(ctx, volume, "sdd", "/stage/vol-1", nil, failureErr)
-			case "mount":
+			case "mount", "conflicting-key":
 				ns.recordLocalDeviceMountFailure(ctx, volume, "sdd", "/dev/sdd", "/stage/vol-1", "ext4", deviceResolutionResult{}, nil, failureErr)
 			case "identity":
 				ns.recordWrongDeviceIdentityReport(ctx, localDiskSession{VolumeID: volume}, nil, failureErr)
@@ -543,9 +550,25 @@ func TestNodeDeviceReportPreservesOutOfOrderObservations(t *testing.T) {
 			require.NoError(t, err)
 			var report LocalDeviceMissingReport
 			require.NoError(t, json.Unmarshal([]byte(cm.Data[key]), &report))
+			if failure == "conflicting-key" {
+				require.Equal(t, seeded, report)
+				return
+			}
 			require.Equal(t, 2, report.Attempts)
 			require.True(t, report.FirstObservedAt.Before(newer))
+			if failure == "identity" {
+				require.True(t, report.LastObservedAt.Before(newer))
+				require.Equal(t, localDeviceFailureClassWrongIdentity, report.FailureClass)
+				require.Equal(t, failureErr.Error(), report.LastError)
+				return
+			}
 			require.True(t, report.LastObservedAt.Equal(newer))
+			require.Equal(t, seeded.FailureClass, report.FailureClass)
+			require.Equal(t, seeded.DeviceSerial, report.DeviceSerial)
+			require.Equal(t, seeded.LastError, report.LastError)
+			require.Equal(t, seeded.AttachmentState, report.AttachmentState)
+			require.Empty(t, report.DevicePath)
+			require.Empty(t, report.ConfirmationState)
 		})
 	}
 }

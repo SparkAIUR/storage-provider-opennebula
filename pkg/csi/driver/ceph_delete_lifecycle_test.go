@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"net/http"
@@ -614,7 +615,7 @@ func TestMissingImageRejectsMalformedOrUnpinnedOwnedHistory(t *testing.T) {
 }
 
 func TestControllerDeleteCephPVImageAssertions(t *testing.T) {
-	for _, mode := range []string{"absent", "matching", "wrong-image", "blank-image", "wrong-serial", "marked-conflict", "late-conflict", "legacy-absent", "legacy-matching", "legacy-wrong-image", "legacy-blank-image", "legacy-marked-conflict", "false-local", "false-cephfs", "legacy-local-unknown", "legacy-local-history"} {
+	for _, mode := range []string{"absent", "matching", "wrong-image", "blank-image", "wrong-serial", "marked-conflict", "late-conflict", "legacy-absent", "legacy-matching", "legacy-wrong-image", "legacy-blank-image", "legacy-marked-conflict", "false-local", "false-cephfs", "legacy-local-unknown", "legacy-local-history", "legacy-local-old-marker", "legacy-local-invalid-backend", "legacy-local-contradictory-backend"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			const volume = "volume-test"
@@ -637,12 +638,19 @@ func TestControllerDeleteCephPVImageAssertions(t *testing.T) {
 				attrs[publishContextOpenNebulaImageID] = "8"
 			case "blank-image":
 				attrs[publishContextOpenNebulaImageID] = ""
-			case "wrong-serial", "marked-conflict", "false-local", "false-cephfs", "local-unknown", "local-history":
+			case "wrong-serial", "marked-conflict", "false-local", "false-cephfs", "local-unknown", "local-history", "local-old-marker", "local-invalid-backend", "local-contradictory-backend":
 				attrs[publishContextDeviceSerial] = "onecsi-8"
 			}
-			if mode == "marked-conflict" {
+			switch mode {
+			case "marked-conflict", "local-old-marker", "local-invalid-backend", "local-contradictory-backend":
+				backend := ""
+				if mode == "local-invalid-backend" {
+					backend = `,"backend":"unrecognized"`
+				} else if mode == "local-contradictory-backend" {
+					backend = `,"backend":"ceph"`
+				}
 				pv.Annotations[annotationDeleteVolumeIdentity] = fmt.Sprintf(
-					`{"version":1,"pvUID":%q,"driver":%q,"handle":%q,"imageID":7}`, pv.UID, DefaultDriverName, volume)
+					`{"version":1,"pvUID":%q,"driver":%q,"handle":%q,"imageID":7%s}`, pv.UID, DefaultDriverName, volume, backend)
 			}
 			pv.Spec.CSI.VolumeAttributes = attrs
 			driver := newStickyTestDriver(t, pv)
@@ -667,26 +675,32 @@ func TestControllerDeleteCephPVImageAssertions(t *testing.T) {
 			wire.mu.Lock()
 			wire.ceph, wire.allowImageDelete = !strings.HasPrefix(mode, "local-"), true
 			delete(wire.disks, 41)
+			wire.loseDeleteReply = mode == "local-unknown"
+			wire.missingImage = mode == "local-old-marker"
 			wire.mu.Unlock()
 
 			client := reviewControllerClient(t, NewControllerServer(driver, provider, nil))
 			request := &csi.DeleteVolumeRequest{VolumeId: volume}
 			reply, err := client.DeleteVolume(ctx, request)
-			if strings.HasPrefix(mode, "local-") {
+			if mode == "local-unknown" {
+				require.Error(t, err)
+				require.Nil(t, reply)
+				restarted := newStickyTestDriver(t)
+				restarted.kubeRuntime.client = kube
+				reply, err = reviewControllerClient(t, NewControllerServer(restarted, provider, nil)).DeleteVolume(ctx, request)
+			} else if mode == "local-history" {
 				require.NoError(t, err)
 				require.NotNil(t, reply)
-				retry, err := client.DeleteVolume(ctx, request)
-				if mode == "local-history" {
-					require.NoError(t, err)
-					require.NotNil(t, retry)
-				} else {
-					require.Error(t, err)
-					require.Nil(t, retry)
-				}
+				reply, err = client.DeleteVolume(ctx, request)
 			}
 			current, getErr := kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
 			require.NoError(t, getErr)
 			require.Equal(t, pv.Finalizers, current.Finalizers)
+			if mode == "local-unknown" {
+				var identity volumeDeletionIdentity
+				require.NoError(t, json.Unmarshal([]byte(current.Annotations[annotationDeleteVolumeIdentity]), &identity))
+				require.Equal(t, "local", identity.Backend)
+			}
 			wire.mu.Lock()
 			defer wire.mu.Unlock()
 			switch mode {
@@ -695,7 +709,11 @@ func TestControllerDeleteCephPVImageAssertions(t *testing.T) {
 				require.NotNil(t, reply)
 				require.Equal(t, []string{"image-delete:7"}, wire.mutations)
 			default:
-				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				want := codes.FailedPrecondition
+				if mode == "local-invalid-backend" {
+					want = codes.Unavailable
+				}
+				require.Equal(t, want, status.Code(err))
 				require.Nil(t, reply)
 				require.Empty(t, wire.mutations)
 				if mode == "late-conflict" {

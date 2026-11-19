@@ -15,9 +15,10 @@ import (
 )
 
 type reboundReplacementBinding struct {
-	pv   *corev1.PersistentVolume
-	pvc  *corev1.PersistentVolumeClaim
-	node *corev1.Node
+	pv           *corev1.PersistentVolume
+	pvc          *corev1.PersistentVolumeClaim
+	reusedOldPVC *corev1.PersistentVolumeClaim
+	node         *corev1.Node
 
 	attachments map[string]reboundAttachment
 	waiting     waitingConsumers
@@ -40,6 +41,10 @@ func (s *ControllerServer) retireReboundOrphanReceipt(ctx context.Context, histo
 		}
 		if err := s.recheckReboundBinding(ctx, second.pv, second.pvc); err != nil {
 			return err
+		}
+		oldPVC, err := s.verifyReboundHistoricalClaim(ctx, history, attempt, second.pv)
+		if err != nil || !reflect.DeepEqual(oldPVC, second.reusedOldPVC) {
+			return attachmentEvidenceUnavailable("original static claim changed before retirement", err)
 		}
 		current.PendingReplacementAttach = nil
 		return nil
@@ -73,7 +78,8 @@ func reboundOrphanPV(pv *corev1.PersistentVolume, attempt replacementAttachAttem
 func (s *ControllerServer) verifyReboundOrphanBinding(ctx context.Context, history VolumeHistoryRecord, attempt replacementAttachAttempt, pv *corev1.PersistentVolume) (*corev1.PersistentVolumeClaim, error) {
 	client := s.driver.kubeRuntime.client.CoreV1()
 	if pv == nil || (string(pv.UID) == attempt.PVUID &&
-		(pv.Name != history.PVName || pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain)) ||
+		(pv.Name != history.PVName || (pv.Status.Phase != corev1.VolumeReleased &&
+			pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain))) ||
 		pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.UID == "" ||
 		pv.Spec.ClaimRef.Namespace == "" || pv.Spec.ClaimRef.Name == "" || string(pv.Spec.ClaimRef.UID) == attempt.PVCUID ||
 		pv.Annotations["pv.kubernetes.io/provisioned-by"] != "" ||
@@ -101,15 +107,31 @@ func (s *ControllerServer) verifyReboundOrphanBinding(ctx context.Context, histo
 	if !apierrors.IsNotFound(err) && (err != nil || history.PVName != pv.Name || oldPV == nil || oldPV.UID != pv.UID || (string(oldPV.UID) == attempt.PVUID && !reflect.DeepEqual(oldPV.Spec.ClaimRef, pv.Spec.ClaimRef))) {
 		return nil, attachmentEvidenceUnavailable("original static binding retirement is unverified", err)
 	}
-	oldPVC, err := client.PersistentVolumeClaims(history.PVCNamespace).Get(ctx, history.PVCName, metav1.GetOptions{})
-	if !apierrors.IsNotFound(err) && (err != nil || pvc == nil || history.PVCNamespace != pvc.Namespace || history.PVCName != pvc.Name ||
-		oldPVC == nil || oldPVC.UID != pvc.UID || string(oldPVC.UID) == attempt.PVCUID) {
-		return nil, attachmentEvidenceUnavailable("original static binding retirement is unverified", err)
-	}
 	if err := s.recheckReboundBinding(ctx, pv, pvc); err != nil {
 		return nil, err
 	}
 	return pvc, nil
+}
+
+func (s *ControllerServer) verifyReboundHistoricalClaim(ctx context.Context, history VolumeHistoryRecord, attempt replacementAttachAttempt, pv *corev1.PersistentVolume) (*corev1.PersistentVolumeClaim, error) {
+	runtime := s.driver.kubeRuntime
+	oldPVC, err := runtime.client.CoreV1().PersistentVolumeClaims(history.PVCNamespace).Get(ctx, history.PVCName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil || oldPVC == nil || oldPVC.Name != history.PVCName || oldPVC.Namespace != history.PVCNamespace ||
+		oldPVC.UID == "" || string(oldPVC.UID) == attempt.PVCUID {
+		return nil, attachmentEvidenceUnavailable("original static binding retirement is unverified", err)
+	}
+	claim := pv.Spec.ClaimRef
+	if oldPVC.UID == claim.UID && oldPVC.Namespace == claim.Namespace && oldPVC.Name == claim.Name {
+		return nil, nil
+	}
+	if oldPVC.UID == claim.UID || oldPVC.DeletionTimestamp != nil ||
+		runtime.verifyIndependentClaimBinding(ctx, pv, oldPVC) != nil {
+		return nil, attachmentEvidenceUnavailable("original static claim name reuse is unverified", nil)
+	}
+	return oldPVC, nil
 }
 
 func reboundClaimReused(pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim) bool {
@@ -138,6 +160,10 @@ func (s *ControllerServer) observeReboundOrphanRelease(ctx context.Context, hist
 		return deny(err)
 	}
 	pvc, err := s.verifyReboundOrphanBinding(ctx, history, attempt, pv)
+	if err != nil {
+		return deny(err)
+	}
+	reusedOldPVC, err := s.verifyReboundHistoricalClaim(ctx, history, attempt, pv)
 	if err != nil {
 		return deny(err)
 	}
@@ -240,8 +266,11 @@ func (s *ControllerServer) observeReboundOrphanRelease(ctx context.Context, hist
 		oldClaim := pod.Namespace == history.PVCNamespace && slices.ContainsFunc(pod.Spec.Volumes, func(volume corev1.Volume) bool {
 			return podVolumeClaimName(pod, volume) == history.PVCName
 		})
-		if !currentClaim && (!oldClaim || (reboundClaimReused(pv, pvc) &&
-			history.PVCNamespace == pv.Spec.ClaimRef.Namespace && history.PVCName == pv.Spec.ClaimRef.Name)) {
+		if oldClaim && reusedOldPVC != nil && !reusedOldPVC.CreationTimestamp.IsZero() &&
+			pod.CreationTimestamp.After(reusedOldPVC.CreationTimestamp.Time) && !pod.CreationTimestamp.After(time.Now()) {
+			oldClaim = false
+		}
+		if !currentClaim && !oldClaim {
 			continue
 		}
 		if !currentClaim || (oldClaim && history.PVCName != pv.Spec.ClaimRef.Name) || destination.node == nil || pvc == nil ||
@@ -281,7 +310,11 @@ func (s *ControllerServer) observeReboundOrphanRelease(ctx context.Context, hist
 	if err := s.recheckReboundBinding(ctx, pv, pvc); err != nil {
 		return deny(err)
 	}
-	return reboundReplacementBinding{pv: pv, pvc: pvc, node: node, attachments: attachments, waiting: waiting}, nil
+	currentOldPVC, err := s.verifyReboundHistoricalClaim(ctx, history, attempt, pv)
+	if err != nil || !reflect.DeepEqual(currentOldPVC, reusedOldPVC) {
+		return deny(err)
+	}
+	return reboundReplacementBinding{pv: pv, pvc: pvc, reusedOldPVC: reusedOldPVC, node: node, attachments: attachments, waiting: waiting}, nil
 }
 
 func (s *ControllerServer) verifyReboundAttachmentNode(ctx context.Context, attempt replacementAttachAttempt, source *corev1.Node, observed detachAttachmentAuthority) (reboundAttachment, error) {

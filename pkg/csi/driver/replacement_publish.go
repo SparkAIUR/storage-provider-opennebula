@@ -272,7 +272,7 @@ func replacementPublishReadOnlyMany(req *csi.ControllerPublishVolumeRequest) boo
 	return req.GetVolumeCapability().GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
 }
 
-func (s *ControllerServer) verifyReplacementReader(ctx context.Context, history VolumeHistoryRecord, volume, nodeName string, imageID, vmID int, admitted KubernetesNodeIdentity, attached bool) error {
+func (s *ControllerServer) verifyReadOnlyPublishTurnover(ctx context.Context, history VolumeHistoryRecord, volume, nodeName string, imageID, vmID int, admitted KubernetesNodeIdentity, requireAbsent, releaseObserved bool) error {
 	deny := func(err error) error {
 		return attachmentEvidenceUnavailable("read-only replacement release is unverified", err)
 	}
@@ -316,12 +316,13 @@ func (s *ControllerServer) verifyReplacementReader(ctx context.Context, history 
 	if err != nil {
 		return err
 	}
-	verifier, ok := s.volumeProvider.(opennebula.ReplacementReaderInspector)
+	verifier, ok := s.volumeProvider.(opennebula.VolumeAttachmentInspector)
 	if !ok {
 		return deny(nil)
 	}
-	metadata, err := verifier.InspectReplacementReaders(ctx, volume, nodeName, imageID, vmID)
-	if err != nil || metadata == nil || metadata.AttachedToRequestedNode != attached {
+	metadata, err := verifier.InspectVolumeAttachment(opennebula.WithReadOnlyAttachmentVerification(ctx), volume, nodeName)
+	if err != nil || metadata == nil || metadata.ImageID != imageID || metadata.RequestedNodeID != vmID ||
+		(requireAbsent && metadata.AttachedToRequestedNode) {
 		return deny(err)
 	}
 	originalVM := history.LastSuccessfulOpenNebulaVMID
@@ -336,7 +337,7 @@ func (s *ControllerServer) verifyReplacementReader(ctx context.Context, history 
 	}
 	owners := make(map[int]bool)
 	for _, disk := range metadata.DiskRecords {
-		if disk.NodeID == vmID && originalVM == vmID &&
+		if disk.NodeID == vmID && originalVM == vmID && !releaseObserved &&
 			(history.LastSuccessfulDiskID == nil || *history.LastSuccessfulDiskID == disk.DiskID) {
 			return deny(nil)
 		}
@@ -797,7 +798,7 @@ func (s *ControllerServer) checkReplacementAttemptReadback(ctx context.Context, 
 	return nil
 }
 
-func (s *ControllerServer) completeReplacementAttach(ctx context.Context, req *csi.ControllerPublishVolumeRequest, attempt replacementAttachAttempt, node KubernetesNodeIdentity, runtimeCtx *VolumeRuntimeContext, protection *LocalRWOProtectionDecision) (successfulAttachmentObservation, error) {
+func (s *ControllerServer) completeReplacementAttach(ctx context.Context, req *csi.ControllerPublishVolumeRequest, attempt replacementAttachAttempt, node KubernetesNodeIdentity, runtimeCtx *VolumeRuntimeContext) (successfulAttachmentObservation, error) {
 	var observation successfulAttachmentObservation
 	if !attempt.dispatchPossible() || !replacementPublishCanWrite(req) || attempt.Driver != s.driver.name ||
 		attempt.VolumeID != req.VolumeId || attempt.Node != req.NodeId || attempt.ReplacementUID != node.UID {
@@ -821,7 +822,10 @@ func (s *ControllerServer) completeReplacementAttach(ctx context.Context, req *c
 		if err == nil && *current != *disk {
 			return attachmentEvidenceUnavailable("replacement Ceph attach disk changed", nil)
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		return recheckPublishPVImage(ctx)
 	})
 	if err := s.restoreVolumeCapacity(restoreCtx, req.VolumeId, attempt.VMID, attempt.ImageID); err != nil {
 		return observation, err
@@ -838,5 +842,5 @@ func (s *ControllerServer) completeReplacementAttach(ctx context.Context, req *c
 		return observation, attachmentEvidenceUnavailable("replacement Ceph attach disk changed", err)
 	}
 	observation.replacementAttempt = &attempt
-	return observation, s.recordSuccessfulLocalVolumePublish(ctx, req.VolumeId, observation, req.GetVolumeContext(), runtimeCtx, protection)
+	return observation, nil
 }

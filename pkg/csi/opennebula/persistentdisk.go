@@ -2678,12 +2678,59 @@ func attachmentDiskRecord(info *vm.VM, disks []shared.Disk, disk shared.Disk) (V
 	return VolumeDiskRecord{NodeName: info.Name, NodeID: info.ID, DiskID: slot, Target: target, Serial: serial}, nil
 }
 
+type readOnlyAttachmentVerificationKey struct{}
+
+func WithReadOnlyAttachmentVerification(ctx context.Context) context.Context {
+	return context.WithValue(ctx, readOnlyAttachmentVerificationKey{}, true)
+}
+
 func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Context, volume string, node string) (*VolumeAttachmentMetadata, error) {
 	metadata, err := p.inspectVolumeAttachment(ctx, volume, node, 0, false)
 	if err != nil {
 		return nil, err
 	}
+	if ctx.Value(readOnlyAttachmentVerificationKey{}) == true {
+		if err := p.verifyReadOnlyAttachment(ctx, volume, metadata); err != nil {
+			return nil, err
+		}
+	}
 	return metadata, nil
+}
+
+func (p *PersistentDiskVolumeProvider) verifyReadOnlyAttachment(ctx context.Context, volume string, metadata *VolumeAttachmentMetadata) error {
+	deny := func() error {
+		return fmt.Errorf("%w: read-only attachment ownership is unverified", ErrConflictingAttachmentEvidence)
+	}
+	version, err := p.ctrl.SystemVersionContext(ctx)
+	if err != nil || version != "7.4.0" {
+		return deny()
+	}
+	imageID := metadata.ImageID
+	datastore, err := p.InspectVolumeDatastore(ctx, volume, imageID)
+	if err != nil || datastore.Backend != "ceph" {
+		return deny()
+	}
+	for _, observed := range metadata.DiskRecords {
+		info, err := p.readVMInfo(ctx, observed.NodeID, vmDisks|vmState)
+		if err != nil || info.Name != observed.NodeName {
+			return deny()
+		}
+		state, lcm, err := info.State()
+		if err != nil || state != vm.Active || lcm != vm.Running {
+			return deny()
+		}
+		slot, disk, err := volumeDiskFromVM(info, imageID, observed.NodeID, true)
+		if err != nil || slot != observed.DiskID || len(disk.GetPairs(attachAttemptField)) != 0 {
+			return deny()
+		}
+		readOnly := disk.GetPairs("READONLY")
+		record, err := attachmentDiskRecord(info, info.Template.GetDisks(), *disk)
+		if len(readOnly) != 1 || readOnly[0].Value != "YES" || err != nil || record != observed ||
+			record.Serial != fmt.Sprintf("onecsi-%d", imageID) {
+			return deny()
+		}
+	}
+	return ctx.Err()
 }
 
 func (p *PersistentDiskVolumeProvider) inspectVolumeAttachment(ctx context.Context, volume, node string, expectedAbsentVMID int, acceptedDetach bool) (*VolumeAttachmentMetadata, error) {

@@ -47,6 +47,7 @@ type nodeAttachmentProtocol struct {
 	alterDirectImage    func(string) string
 	loseAttachReply     bool
 	loseDetachReply     bool
+	loseDeleteReply     bool
 	detachReply         string
 	attachFields        map[string]string
 	attachedDisks       map[int]map[string]string
@@ -443,6 +444,9 @@ func nodeAttachmentProvider(t *testing.T, observe ...func(string, context.Contex
 				require.Equal(t, imageID, number(1))
 				state.missingImage = true
 				state.mutations = append(state.mutations, fmt.Sprintf("image-delete:%d", imageID))
+				if state.loseDeleteReply {
+					panic(http.ErrAbortHandler)
+				}
 				body = strconv.Itoa(imageID)
 			case "one.image.update":
 				require.Equal(t, imageID, number(1))
@@ -3311,10 +3315,22 @@ func TestControllerPublishMoveClearsStaleAttachmentPinsWhenCensusFails(t *testin
 
 type publishRestoreProbe struct {
 	*opennebula.PersistentDiskVolumeProvider
-	restored atomic.Bool
+	restored      atomic.Bool
+	beforeRestore func()
+	beforeSize    func()
+}
+
+func (p *publishRestoreProbe) ResolveVolumeSizeBytes(ctx context.Context, volume string) (int64, error) {
+	if p.beforeSize != nil {
+		p.beforeSize()
+	}
+	return p.PersistentDiskVolumeProvider.ResolveVolumeSizeBytes(ctx, volume)
 }
 
 func (p *publishRestoreProbe) RestoreVolumeCapacity(ctx context.Context, volume string, nodeID, imageID int) error {
+	if p.beforeRestore != nil {
+		p.beforeRestore()
+	}
 	err := p.PersistentDiskVolumeProvider.RestoreVolumeCapacity(ctx, volume, nodeID, imageID)
 	if err == nil {
 		p.restored.Store(true)
@@ -4326,6 +4342,8 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 			"distinct-vm-orphan-static-waiting-retired-accepted", "distinct-vm-orphan-static-same-name-reused-pv-waiting-retired-accepted",
 			"distinct-vm-orphan-static-same-node-waiting-retired-accepted", "distinct-vm-orphan-static-same-node-rescheduled-waiting-retired-accepted",
 			"distinct-vm-orphan-static-released-waiting-retired-accepted",
+			"distinct-vm-orphan-static-same-name-reused-pv-released-waiting-retired-accepted",
+			"distinct-vm-orphan-static-released-waiting-old-name-reused-retired-accepted",
 			"distinct-vm-orphan-rebound-wire-retired", "distinct-vm-orphan-rebound-lost-wire-retired",
 			"distinct-vm-orphan-rebound-unbound-wire-retired",
 			"prepared-abandoned-waiting-remote-retired-publish", "prepared-abandoned-waiting-remote-retired-reconcile-distinct-vm",
@@ -4652,8 +4670,26 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 				}
 				client := makeClient(driver)
 				publish := newPublishReq(volume, node.Name)
-				_, err := client.ControllerPublishVolume(ctx, publish)
+				placementWatch, err := kube.CoreV1().PersistentVolumes().Watch(ctx, metav1.ListOptions{})
 				require.NoError(t, err)
+				_, err = client.ControllerPublishVolume(ctx, publish)
+				require.NoError(t, err)
+				deadline := time.NewTimer(10 * time.Second)
+			placementObserved:
+				for {
+					select {
+					case event, open := <-placementWatch.ResultChan():
+						require.True(t, open, "placement watch closed before the seed Publish updated the PV")
+						annotated, ok := event.Object.(*corev1.PersistentVolume)
+						if ok && annotated.UID == pv.UID && annotated.Annotations[annotationLastAttachedNode] == node.Name {
+							break placementObserved
+						}
+					case <-deadline.C:
+						t.Fatal("initial Publish placement update did not complete")
+					}
+				}
+				deadline.Stop()
+				placementWatch.Stop()
 				setReplacementHistoryVersion(t, driver)
 				require.NoError(t, nodes.Delete(ctx, node.Name, metav1.DeleteOptions{}))
 				replacement = node.DeepCopy()
@@ -4860,6 +4896,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					})
 				}
 				reply, err := client.ControllerPublishVolume(publishCtx, publish)
+				publishErr := err
 				if mode == "distinct-vm" {
 					require.NoError(t, err)
 					require.Equal(t, "onecsi-7", reply.GetPublishContext()[publishContextDeviceSerial])
@@ -5680,7 +5717,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 					}
 					return
 				}
-				require.NotNil(t, stored.PendingReplacementAttach)
+				require.NotNil(t, stored.PendingReplacementAttach, "replacement Publish returned %v", publishErr)
 				require.Equal(t, 41, stored.LastSuccessfulOpenNebulaVMID)
 				require.Equal(t, vmID, stored.PendingReplacementAttach.VMID)
 				if vmID == 42 {
@@ -6233,6 +6270,20 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 									other.Spec.ClaimRef.UID = reused.UID
 									_, err = pvs.Create(ctx, other, metav1.CreateOptions{})
 									require.NoError(t, err)
+									if strings.Contains(mode, "-old-name-reused-") {
+										reusedOld := pvc.DeepCopy()
+										reusedOld.UID, reusedOld.Spec.VolumeName = "independent-old-claim", "independent-old-pv"
+										reusedOld.CreationTimestamp = currentPVC.CreationTimestamp
+										_, err = claims.Create(ctx, reusedOld, metav1.CreateOptions{})
+										require.NoError(t, err)
+										_, err = retry.ControllerUnpublishVolume(ctx, cancelRequest)
+										require.Error(t, err)
+										oldOther := other.DeepCopy()
+										oldOther.Name, oldOther.UID, oldOther.Spec.CSI.VolumeHandle = reusedOld.Spec.VolumeName, "independent-old-pv", "independent-old-volume"
+										oldOther.Spec.ClaimRef.Name, oldOther.Spec.ClaimRef.UID = reusedOld.Name, reusedOld.UID
+										_, err = pvs.Create(ctx, oldOther, metav1.CreateOptions{})
+										require.NoError(t, err)
+									}
 								}
 								kube.ClearActions()
 								_, err = retry.ControllerUnpublishVolume(ctx, cancelRequest)
@@ -8119,7 +8170,7 @@ func TestControllerPublishFreshCephReplacementReader(t *testing.T) {
 				require.NoError(t, err)
 				provider, wire := nodeAttachmentProvider(t)
 				wire.mu.Lock()
-				wire.ceph, wire.version, wire.readOnlyAttach, wire.marker = true, "7.4.0", true, 128*1024*1024
+				wire.ceph, wire.version, wire.readOnlyAttach, wire.marker = true, "7.4.0", true, 256*1024*1024
 				delete(wire.disks, 41)
 				wire.loseAttachReply = mode == "lost-reply"
 				if mode == "separate-reader" {
@@ -8151,7 +8202,7 @@ func TestControllerPublishFreshCephReplacementReader(t *testing.T) {
 				if mode == "retired" || mode == "lost-reply" || mode == "separate-reader" {
 					require.NoError(t, err)
 					require.Equal(t, "7", reply.GetPublishContext()[publishContextOpenNebulaImageID])
-					require.Equal(t, []string{"attach:41:true"}, wire.mutations)
+					require.Equal(t, []string{"attach:41:true", "resize:41:256", "marker:268435456"}, wire.mutations)
 					require.NotContains(t, wire.attachFields, "CSI_ATTACH_ATTEMPT")
 				} else {
 					require.Error(t, err)
@@ -8254,4 +8305,162 @@ func TestControllerPublishTimeoutUsesEffectiveSize(t *testing.T) {
 	wire.mu.Lock()
 	defer wire.mu.Unlock()
 	require.Empty(t, wire.mutations)
+}
+
+func TestControllerPublishRefreshesProtectionAndTarget(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, mode := range []string{"repair-at-restore", "quarantine-at-restore", "expiry-at-restore", "node-at-size", "vm-at-size"} {
+			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
+				ctx := context.Background()
+				const volume = "volume-test"
+				pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+				node := newReadyNode("node-old", true)
+				expiry := mode == "expiry-at-restore"
+				var expires time.Time
+				if expiry {
+					expires = time.Now().Add(2 * time.Second)
+					pv.Annotations[annotationBackend] = "local"
+					pvc.Annotations[annotationBackend] = "local"
+					pv.Annotations[annotationAllowCrossNodeUntil] = expires.Format(time.RFC3339Nano)
+				}
+				driver := newStickyTestDriver(t, pv, pvc, node)
+				if expiry {
+					_, err := driver.volumeHistory.Upsert(ctx, volume, func(record *VolumeHistoryRecord) {
+						record.Backend, record.LastSuccessfulNodeName = "local", "retired-node"
+						record.LastSuccessfulPublishTime = time.Now().Add(-time.Minute)
+					})
+					require.NoError(t, err)
+				}
+				kube := driver.kubeRuntime.client.CoreV1()
+				provider, wire := nodeAttachmentProvider(t)
+				probe := &publishRestoreProbe{PersistentDiskVolumeProvider: provider}
+				wire.mu.Lock()
+				wire.ceph, wire.version, wire.disks[41], wire.marker = !expiry, "7.4.0", 128, 128*1024*1024
+				if strings.HasSuffix(mode, "at-restore") {
+					wire.marker = 256 * 1024 * 1024
+				}
+				if expiry {
+					wire.alterDirectVM = func(vm string) string {
+						return strings.Replace(vm, "<LN_TARGET>SYSTEM</LN_TARGET>", "<LN_TARGET>NONE</LN_TARGET>", 1)
+					}
+				}
+				wire.mu.Unlock()
+				var changed atomic.Bool
+				if strings.HasSuffix(mode, "at-restore") {
+					probe.beforeRestore = func() {
+						changed.Store(true)
+						switch mode {
+						case "expiry-at-restore":
+							expiration := time.NewTimer(time.Until(expires))
+							defer expiration.Stop()
+							<-expiration.C
+						case "repair-at-restore":
+							_, err := driver.volumeRepairState.Mark(ctx, VolumeRepairState{VolumeID: volume, Classification: repairClassificationWrongDeviceIdentity})
+							require.NoError(t, err)
+						case "quarantine-at-restore":
+							_, active, err := driver.volumeQuarantine.MarkFailure(ctx, VolumeQuarantineState{VolumeID: volume, Reason: "late quarantine"}, 1, time.Hour)
+							require.NoError(t, err)
+							require.True(t, active)
+						}
+					}
+				} else {
+					probe.beforeSize = func() {
+						require.True(t, probe.restored.Load())
+						changed.Store(true)
+						if mode == "node-at-size" {
+							replacement := node.DeepCopy()
+							replacement.UID = "new-node-uid"
+							_, err := kube.Nodes().Update(ctx, replacement, metav1.UpdateOptions{})
+							require.NoError(t, err)
+						} else {
+							wire.mu.Lock()
+							wire.vmNames = map[int]string{41: "retired-vm", 42: node.Name}
+							wire.mu.Unlock()
+						}
+					}
+				}
+				server := NewControllerServer(driver, probe, nil)
+				if queued {
+					driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+					driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+				}
+				before, err := server.readAttachmentHistory(ctx, volume)
+				require.NoError(t, err)
+				reply, err := reviewControllerClient(t, server).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
+				require.True(t, changed.Load())
+				require.Error(t, err)
+				publishErr := err
+				require.Nil(t, reply)
+				history, err := server.readAttachmentHistory(ctx, volume)
+				require.NoError(t, err)
+				require.Equal(t, before.LastSuccessfulPublishTime, history.LastSuccessfulPublishTime)
+				if expiry {
+					require.ErrorContains(t, publishErr, "Publish placement grant expired")
+				}
+				if mode == "quarantine-at-restore" {
+					_, active, err := server.activeVolumeQuarantine(ctx, volume)
+					require.NoError(t, err)
+					require.True(t, active)
+				}
+				wire.mu.Lock()
+				defer wire.mu.Unlock()
+				require.Empty(t, wire.mutations)
+			})
+		}
+	}
+}
+
+func TestControllerPublishPlacementPatchRejectsChangedPV(t *testing.T) {
+	for _, mode := range []string{"renewed-grant", "replaced-pv", "unchanged"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			const volume = "volume-test"
+			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "ceph"})
+			pv.ResourceVersion = "1"
+			pv.Annotations[annotationAllowCrossNodeUntil] = "2099-01-01T00:00:00Z"
+			node := newReadyNode("node-old", true)
+			driver := newStickyTestDriver(t, pv, pvc, node)
+			kube := driver.kubeRuntime.client.(*fake.Clientset)
+			attempted := make(chan struct{})
+			kube.PrependReactor("patch", "persistentvolumes", func(action ktesting.Action) (bool, kruntime.Object, error) {
+				defer close(attempted)
+				if mode != "unchanged" {
+					changedPV := pv.DeepCopy()
+					changedPV.ResourceVersion = "2"
+					if mode == "renewed-grant" {
+						changedPV.Annotations[annotationAllowCrossNodeUntil] = "2099-02-01T00:00:00Z"
+					} else {
+						changedPV.UID = "different-pv-uid"
+					}
+					require.NoError(t, kube.Tracker().Update(corev1.SchemeGroupVersion.WithResource("persistentvolumes"), changedPV, ""))
+				}
+				return false, nil, nil
+			})
+			provider, wire := nodeAttachmentProvider(t)
+			wire.mu.Lock()
+			wire.ceph, wire.version, wire.disks[41] = true, "7.4.0", 128
+			wire.mu.Unlock()
+			reply, err := reviewControllerClient(t, NewControllerServer(driver, provider, nil)).ControllerPublishVolume(ctx, newPublishReq(volume, node.Name))
+			require.NoError(t, err)
+			require.NotNil(t, reply)
+			select {
+			case <-attempted:
+			case <-time.After(10 * time.Second):
+				t.Fatal("Publish never attempted the placement patch")
+			}
+			current, err := kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			switch mode {
+			case "renewed-grant":
+				require.Equal(t, "2099-02-01T00:00:00Z", current.Annotations[annotationAllowCrossNodeUntil])
+				require.Empty(t, current.Annotations[annotationLastAttachedNode])
+			case "replaced-pv":
+				require.Equal(t, types.UID("different-pv-uid"), current.UID)
+				require.Empty(t, current.Annotations[annotationLastAttachedNode])
+			case "unchanged":
+				require.Equal(t, node.Name, current.Annotations[annotationLastAttachedNode])
+				require.Equal(t, "2099-01-01T00:00:00Z", current.Annotations[annotationAllowCrossNodeUntil])
+			}
+		})
+	}
 }

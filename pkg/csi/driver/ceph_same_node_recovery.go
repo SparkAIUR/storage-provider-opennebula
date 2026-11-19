@@ -497,7 +497,7 @@ func (s *ControllerServer) verifyPVImageAssertions(ctx context.Context, pv *core
 	attributes := pv.Spec.CSI.VolumeAttributes
 	_, hasImage := attributes[publishContextOpenNebulaImageID]
 	_, hasSerial := attributes[publishContextDeviceSerial]
-	if !hasImage && !hasSerial {
+	if !hasImage && !hasSerial && (admittedBackend == nil || *admittedBackend == "") {
 		return nil
 	}
 	declared, err := persistentVolumeBackend(pv)
@@ -516,6 +516,9 @@ func (s *ControllerServer) verifyPVImageAssertions(ctx context.Context, pv *core
 			return err
 		}
 		backend = datastore.Backend
+		if admittedBackend != nil && *admittedBackend != "" && *admittedBackend != backend {
+			return attachmentEvidenceUnavailable("PV deletion backend changed", nil)
+		}
 	} else if admittedBackend != nil && *admittedBackend != "" {
 		backend = *admittedBackend
 	} else {

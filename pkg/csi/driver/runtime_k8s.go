@@ -247,6 +247,69 @@ func (r *KubeRuntime) AnnotatePVAsync(ctx context.Context, pvName string, report
 	}()
 }
 
+func (r *KubeRuntime) annotatePublishedPVAsync(binding *VolumeRuntimeContext, driver, volume string, report PlacementReport) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := r.annotatePublishedPV(ctx, binding, driver, volume, report, false); err != nil {
+			klog.V(2).InfoS("Failed to annotate published PV", "pvName", binding.PVName, "err", err)
+		}
+	}()
+}
+
+func (r *KubeRuntime) annotatePublishedPV(ctx context.Context, binding *VolumeRuntimeContext, driver, volume string, report PlacementReport, consumeGrant bool) error {
+	if binding.pvUID == "" || binding.pvDeleting {
+		return nil
+	}
+	pvs := r.client.CoreV1().PersistentVolumes()
+	pv, err := pvs.Get(ctx, binding.PVName, metav1.GetOptions{})
+	if err != nil || !publishPVMatches(pv, binding, driver, volume) ||
+		pv.Annotations[annotationPlacementSummary] != binding.PVAnnotations[annotationPlacementSummary] {
+		return err
+	}
+	if binding.verifiedClaimBinding {
+		pvc, reused, err := r.attachmentClaim(ctx, pv)
+		if err != nil || reused || pvc == nil || pvc.UID != binding.PVCUID || pvc.Status.Phase != binding.pvcPhase ||
+			pvc.DeletionTimestamp != nil || !samePublishAnnotations(binding.PVCAnnotations, pvc.Annotations) {
+			return err
+		}
+	}
+	updates, err := placementAnnotations(report)
+	if err != nil {
+		return err
+	}
+	annotations := cloneStringMap(pv.Annotations)
+	for key, value := range updates {
+		annotations[key] = value
+	}
+	if consumeGrant {
+		delete(annotations, annotationAllowCrossNodeUntil)
+	}
+	patch := []map[string]any{
+		{"op": "test", "path": "/metadata/uid", "value": pv.UID},
+		{"op": "test", "path": "/spec/csi/driver", "value": driver},
+		{"op": "test", "path": "/spec/csi/volumeHandle", "value": volume},
+	}
+	if pv.ResourceVersion != "" {
+		patch = append(patch, map[string]any{"op": "test", "path": "/metadata/resourceVersion", "value": pv.ResourceVersion})
+	}
+	if len(pv.Annotations) != 0 {
+		patch = append(patch, map[string]any{"op": "test", "path": "/metadata/annotations", "value": pv.Annotations})
+	} else if pv.ResourceVersion == "" {
+		return fmt.Errorf("PV annotation update requires resourceVersion when annotations are absent")
+	}
+	if pv.Spec.ClaimRef != nil {
+		patch = append(patch, map[string]any{"op": "test", "path": "/spec/claimRef", "value": pv.Spec.ClaimRef})
+	}
+	patch = append(patch, map[string]any{"op": "add", "path": "/metadata/annotations", "value": annotations})
+	payload, err := json.Marshal(patch)
+	if err != nil {
+		return err
+	}
+	_, err = pvs.Patch(ctx, pv.Name, types.JSONPatchType, payload, metav1.PatchOptions{})
+	return err
+}
+
 func (r *KubeRuntime) GetNodeLabel(ctx context.Context, nodeName, labelKey string) (string, error) {
 	if r == nil || !r.enabled {
 		return "", fmt.Errorf("kubernetes runtime is not enabled")
@@ -801,7 +864,7 @@ func (r *KubeRuntime) emitNamespacedEvent(ctx context.Context, namespace, name s
 	}
 }
 
-func buildPVAnnotationPatch(report PlacementReport) ([]byte, error) {
+func placementAnnotations(report PlacementReport) (map[string]string, error) {
 	summary, err := json.Marshal(report)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal placement summary: %w", err)
@@ -824,12 +887,15 @@ func buildPVAnnotationPatch(report PlacementReport) ([]byte, error) {
 		annotations[annotationDetachGrace] = strconv.Itoa(report.DetachGraceSeconds)
 	}
 
-	patch := map[string]any{
-		"metadata": map[string]any{
-			"annotations": annotations,
-		},
+	return annotations, nil
+}
+
+func buildPVAnnotationPatch(report PlacementReport) ([]byte, error) {
+	annotations, err := placementAnnotations(report)
+	if err != nil {
+		return nil, err
 	}
-	return json.Marshal(patch)
+	return json.Marshal(map[string]any{"metadata": map[string]any{"annotations": annotations}})
 }
 
 func namespaceFromServiceAccount() string {

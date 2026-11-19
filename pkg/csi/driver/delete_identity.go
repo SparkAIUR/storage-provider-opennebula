@@ -24,6 +24,7 @@ type volumeDeletionIdentity struct {
 	Driver  string    `json:"driver"`
 	Handle  string    `json:"handle"`
 	ImageID *int      `json:"imageID"`
+	Backend string    `json:"backend,omitempty"`
 }
 
 func (s *ControllerServer) ownedDeletionPV(ctx context.Context, volume string) (*corev1.PersistentVolume, error) {
@@ -76,7 +77,7 @@ func (s *ControllerServer) prepareVolumeDeletion(ctx context.Context, volume str
 		return ctx, attachmentEvidenceUnavailable("deletion PV identity is unverified", err)
 	}
 	imageID := history.LastSuccessfulImageID
-	var raw string
+	var raw, admittedBackend string
 	var marked bool
 	if pv != nil {
 		raw, marked = pv.Annotations[annotationDeleteVolumeIdentity]
@@ -85,10 +86,11 @@ func (s *ControllerServer) prepareVolumeDeletion(ctx context.Context, volume str
 		var record volumeDeletionIdentity
 		err := decodeCephRetentionProtection(raw, &record)
 		if err != nil || record.Version != 1 || record.PVUID != pv.UID || record.Driver != s.driver.name ||
+			(record.Backend != "" && record.Backend != "local" && record.Backend != "ceph") ||
 			record.Handle != volume || record.ImageID == nil || *record.ImageID < 0 || (imageID > 0 && *record.ImageID != imageID) {
 			return ctx, attachmentEvidenceUnavailable("PV deletion identity is unverified", err)
 		}
-		imageID = *record.ImageID
+		imageID, admittedBackend = *record.ImageID, record.Backend
 	}
 	if err := s.verifyVolumeDeletionProtection(ctx, volume, imageID, history.LastSuccessfulOpenNebulaVMID, pv != nil); err != nil {
 		return ctx, err
@@ -100,7 +102,7 @@ func (s *ControllerServer) prepareVolumeDeletion(ctx context.Context, volume str
 		ctx = opennebula.WithExpectedDeletionVMID(ctx, history.LastSuccessfulOpenNebulaVMID)
 	}
 	var stage func(context.Context, int) error
-	var expectedVersion, admittedBackend string
+	var expectedVersion string
 	verify := func(ctx context.Context, actualImageID int, imageAbsent bool) error {
 		return s.verifyPVDeletion(ctx, pv, volume, actualImageID, history, expectedVersion, raw, marked, imageAbsent, &admittedBackend)
 	}
@@ -112,7 +114,7 @@ func (s *ControllerServer) prepareVolumeDeletion(ctx context.Context, volume str
 					return err
 				}
 				var err error
-				expectedVersion, raw, err = s.markPVDeletion(ctx, pv, volume, actualImageID)
+				expectedVersion, raw, err = s.markPVDeletion(ctx, pv, volume, actualImageID, admittedBackend)
 				if err != nil {
 					return err
 				}
@@ -143,11 +145,11 @@ func (s *ControllerServer) verifyVolumeDeletionProtection(ctx context.Context, v
 	return nil
 }
 
-func (s *ControllerServer) markPVDeletion(ctx context.Context, pv *corev1.PersistentVolume, volume string, imageID int) (string, string, error) {
+func (s *ControllerServer) markPVDeletion(ctx context.Context, pv *corev1.PersistentVolume, volume string, imageID int, backend string) (string, string, error) {
 	if imageID < 0 || pv.ResourceVersion == "" {
 		return "", "", fmt.Errorf("provider image identity or PV resourceVersion is unavailable")
 	}
-	identity, err := json.Marshal(volumeDeletionIdentity{Version: 1, PVUID: pv.UID, Driver: s.driver.name, Handle: volume, ImageID: &imageID})
+	identity, err := json.Marshal(volumeDeletionIdentity{Version: 1, PVUID: pv.UID, Driver: s.driver.name, Handle: volume, ImageID: &imageID, Backend: backend})
 	if err != nil {
 		return "", "", err
 	}
