@@ -111,7 +111,11 @@ The authoritative discovery location is the asset named `release-compatibility-<
 
   asset_id=$(lookup_asset)
   if [ -z "$asset_id" ]; then
-    if ! rtk proxy gh release upload "$csi_tag" --repo "github.com/$repo" "$record_path"; then
+    if ! (
+      record_dir=$(dirname -- "$record_path") &&
+        CDPATH= cd -P -- "$record_dir/." &&
+        rtk proxy gh release upload "$csi_tag" --repo "github.com/$repo" "$record_name"
+    ); then
       printf '%s\n' 'Upload failed. Checking whether an identical asset was published.' >&2
     fi
     asset_id=$(lookup_asset)

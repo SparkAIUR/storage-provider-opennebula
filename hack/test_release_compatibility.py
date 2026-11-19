@@ -11,14 +11,32 @@ from pathlib import Path
 
 import test_upgrade_evidence as fixtures
 from release_compatibility import build_record, store_record
-from upgrade_evidence import TARGETS
 
 
 RUNS_URL = "https://github.com/SparkAIUR/storage-provider-opennebula/actions/runs"
+NATIVE_CLUSTER_SCOPE = (
+    ("hpldb", 3, "1.36"),
+    ("hplsvc", 10, "1.35"),
+    ("bravo", 13, "1.35"),
+)
 
 
 def raw_sha256(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def set_node_count(bundle, count):
+    bundle["daemonset"]["status"].update(
+        desiredNumberScheduled=count,
+        updatedNumberScheduled=count,
+        numberReady=count,
+        numberAvailable=count,
+    )
+    template = bundle["nodePods"]["items"][0]
+    pods = [copy.deepcopy(template) for _ in range(count)]
+    for index, pod in enumerate(pods):
+        pod["spec"]["nodeName"] = str(index)
+    bundle["nodePods"]["items"] = pods
 
 
 class ReleaseCompatibilityTest(unittest.TestCase):
@@ -95,7 +113,7 @@ class ReleaseCompatibilityTest(unittest.TestCase):
             "approval": {"operator": "OFFLINE FIXTURE", "changeReference": "TEST ONLY"},
             "clusters": {},
         }
-        for i, (cluster, (count, minor)) in enumerate(TARGETS.items(), start=1):
+        for i, (cluster, count, minor) in enumerate(NATIVE_CLUSTER_SCOPE, start=1):
             stamp = f"2026-01-{i + 1:02d}T00:00:00+00:00"
             bundle = copy.deepcopy(self.bundle)
             bundle.update(
@@ -106,14 +124,7 @@ class ReleaseCompatibilityTest(unittest.TestCase):
                 kubernetesVersion=f"v{minor}.0",
             )
             bundle["helmRelease"]["status"]["lastAttemptedRevision"] = "0.6.0-rc.4"
-            for key in (
-                "desiredNumberScheduled", "updatedNumberScheduled", "numberReady", "numberAvailable",
-            ):
-                bundle["daemonset"]["status"][key] = count
-            pod = bundle["nodePods"]["items"][0]
-            bundle["nodePods"]["items"] = [copy.deepcopy(pod) for _ in range(count)]
-            for n, item in enumerate(bundle["nodePods"]["items"]):
-                item["spec"]["nodeName"] = str(n)
+            set_node_count(bundle, count)
             self.receipt["clusters"][cluster] = {
                 "result": "passed",
                 "observationStartedAt": f"2026-01-{i:02d}T00:00:00+00:00",
@@ -234,6 +245,14 @@ class ReleaseCompatibilityTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "native receipt hash differs"):
             (self.qualification / "native.json").write_text(json.dumps(self.receipt))
             self.record(self.qualification)
+        self.write_receipt()
+        with self.assertRaisesRegex(ValueError, "complete stable contract"):
+            self.record(self.qualification)
+
+    def test_stable_rejects_nine_node_hplsvc(self):
+        self.stable_assets()
+        bundle = self.receipt["clusters"]["hplsvc"]["readback"]
+        set_node_count(bundle, 9)
         self.write_receipt()
         with self.assertRaisesRegex(ValueError, "complete stable contract"):
             self.record(self.qualification)
