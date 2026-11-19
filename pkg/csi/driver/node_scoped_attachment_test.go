@@ -553,11 +553,12 @@ func TestProviderRequestedVMCapacityWithMultipleAttachments(t *testing.T) {
 func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 	for _, queued := range []bool{false, true} {
 		for _, mode := range []string{
-			"consumed", "reserved", "detach-reply-lost", "acceptance-reply-lost", "acceptance-not-committed",
+			"consumed", "reserved", "detach-reply-lost", "acceptance-reply-lost", "acceptance-not-committed", "acceptance-conflict", "acceptance-conflict-changed",
 			"retirement-reply-lost", "retirement-not-committed", "reconciled", "terminating",
 			"held-va", "held-receipt", "held-pv", "held-claim", "held-source", "held-vm", "held-disk", "held-generation", "held-quarantine", "held-successor", "held-demand", "held-unknown-release",
 			"sticky", "sticky-release-reply-lost", "waiting-same-uid", "waiting-attached", "waiting-running", "waiting-terminating", "waiting-mounted", "waiting-multiple",
-			"maintenance", "overlap", "overlap-on-wire", "overlap-before-dispatch", "overlap-third", "overlap-history-changed", "overlap-release-changed",
+			"maintenance", "maintenance-custody-changed", "overlap", "overlap-on-wire", "overlap-before-dispatch", "overlap-before-terminating",
+			"overlap-before-third", "overlap-third", "overlap-history-changed", "overlap-release-changed",
 		} {
 			t.Run(fmt.Sprintf("queued=%t/%s", queued, mode), func(t *testing.T) {
 				ctx := context.Background()
@@ -577,8 +578,9 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 				grant := time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano)
 				pv.Annotations[annotationAllowCrossNodeUntil] = grant
 				sticky := strings.HasPrefix(mode, "sticky")
-				maintenance := mode == "maintenance"
+				maintenance := strings.HasPrefix(mode, "maintenance")
 				overlap := strings.HasPrefix(mode, "overlap")
+				beforeDispatch := strings.HasPrefix(mode, "overlap-before-")
 				if sticky || maintenance {
 					pv.Annotations[annotationRestartOpt] = restartOptimizationAnnotationValue
 				}
@@ -639,6 +641,25 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 					retire := proposed.PendingPublishMove == nil && proposed.LastPublishMoveReceipt != "" && proposed.LastSuccessfulNodeName == "node-old"
 					if (accept && strings.HasPrefix(mode, "acceptance-") || retire && strings.HasPrefix(mode, "retirement-")) &&
 						interruptedHistory.CompareAndSwap(false, true) {
+						if strings.HasPrefix(mode, "acceptance-conflict") {
+							gvr := corev1.SchemeGroupVersion.WithResource("configmaps")
+							object, err := kube.Tracker().Get(gvr, cm.Namespace, cm.Name)
+							require.NoError(t, err)
+							current := object.(*corev1.ConfigMap).DeepCopy()
+							current.ResourceVersion = "2"
+							payload, err := json.Marshal(VolumeHistoryRecord{Version: stateObjectVersion, VolumeID: "other-volume", Backend: "local"})
+							require.NoError(t, err)
+							current.Data["other-volume"] = string(payload)
+							if mode == "acceptance-conflict-changed" {
+								proposed.PendingPublishMove.Detach = nil
+								proposed.LastSuccessfulStageTime = time.Now().UTC()
+								payload, err = json.Marshal(proposed)
+								require.NoError(t, err)
+								current.Data[volume] = string(payload)
+							}
+							require.NoError(t, kube.Tracker().Update(gvr, current, cm.Namespace))
+							return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), cm.Name, errors.New("history changed"))
+						}
 						if !strings.HasSuffix(mode, "-not-committed") {
 							require.NoError(t, kube.Tracker().Update(corev1.SchemeGroupVersion.WithResource("configmaps"), cm, cm.Namespace))
 						}
@@ -722,6 +743,9 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 					waiter.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "app", State: corev1.ContainerState{
 						Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"},
 					}}}
+					if mode == "overlap-before-terminating" {
+						waiter.DeletionTimestamp = &stamp
+					}
 					node := oldNode.DeepCopy()
 					node.Status.VolumesInUse = []corev1.UniqueVolumeName{corev1.UniqueVolumeName("kubernetes.io/csi/" + driver.name + "^" + volume)}
 					_, err := kube.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
@@ -730,10 +754,17 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 					require.NoError(t, err)
 					_, err = pods.Create(ctx, waiter, metav1.CreateOptions{})
 					require.NoError(t, err)
+					if mode == "overlap-before-third" || mode == "overlap-third" {
+						third := va.DeepCopy()
+						third.Name, third.UID, third.Spec.NodeName = "third-va", "third-va-uid", "node-other"
+						_, err := vas.Create(ctx, third, metav1.CreateOptions{})
+						require.NoError(t, err)
+					}
 				}
-				if mode == "overlap-before-dispatch" {
+				switch mode {
+				case "overlap-before-dispatch", "overlap-before-terminating", "overlap-before-third":
 					createOverlap()
-				} else if mode == "overlap-on-wire" {
+				case "overlap-on-wire":
 					successorOnDetach.Store(&createOverlap)
 				}
 				wire.mu.Lock()
@@ -772,8 +803,8 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 					require.NoError(t, err)
 					require.NoError(t, d.maintenanceMode.Reconcile(ctx))
 					reply, err := csiClient.ControllerUnpublishVolume(ctx, unpublish)
-					require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
-					require.Nil(t, reply)
+					require.NoError(t, err)
+					require.NotNil(t, reply)
 					hold, ok := d.stickyAttachments.Get(volume)
 					require.True(t, ok)
 					require.Equal(t, "node-new", hold.NodeID)
@@ -786,6 +817,13 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 					require.Equal(t, va.UID, heldVA.UID)
 					require.Equal(t, va.Finalizers, heldVA.Finalizers)
 					expectMutations(before, 1, 1)
+					require.NoError(t, vas.Delete(ctx, va.Name, metav1.DeleteOptions{}))
+					elapsed := time.Since(hold.ExpiresAt) - time.Second
+					hold.StartedAt, hold.ExpiresAt = hold.StartedAt.Add(elapsed), hold.ExpiresAt.Add(elapsed)
+					require.NoError(t, d.stickyAttachments.Update(hold))
+					controller.expireStickyDetach(ctx, hold)
+					require.Nil(t, readHistory().PendingPublishMove.Detach)
+					expectMutations(before, 1, 1)
 					cm, err = cms.Get(ctx, cm.Name, metav1.GetOptions{})
 					require.NoError(t, err)
 					cm.Data[maintenanceModeKey] = "false"
@@ -795,8 +833,40 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 					release, ok := d.stickyAttachments.Get(volume)
 					require.True(t, ok)
 					require.Equal(t, maintenanceReleaseReason, release.Reason)
+					if mode == "maintenance-custody-changed" {
+						release.PVCUID = "different-claim"
+						require.NoError(t, d.stickyAttachments.Update(release))
+					}
 					controller.expireStickyDetach(ctx, release)
-					require.NotNil(t, readHistory().PendingPublishMove.Detach)
+					released := readHistory()
+					if mode == "maintenance-custody-changed" {
+						require.NotNil(t, released.PendingPublishMove)
+						require.Nil(t, released.PendingPublishMove.Detach)
+						expectMutations(before, 1, 1)
+						return
+					}
+					require.Nil(t, released.PendingPublishMove)
+					require.Equal(t, marker, released.LastPublishMoveReceipt)
+					require.Equal(t, "node-new", released.LastSafeDetachNodeName)
+					_, held := d.stickyAttachments.Get(volume)
+					require.False(t, held)
+					expectMutations(append(before, "detach:42"), 1, 2)
+					successor := activePodForPVC("successor", pvc.Name, "node-old")
+					successor.UID = "successor-uid"
+					_, err = pods.Create(ctx, successor, metav1.CreateOptions{})
+					require.NoError(t, err)
+					csiClient = reviewControllerClient(t, restart())
+					published, err := csiClient.ControllerPublishVolume(ctx, newPublishReq(volume, "node-old"))
+					require.NoError(t, err)
+					require.Equal(t, "vdb", published.GetPublishContext()["volumeName"])
+					_, err = csiClient.ControllerUnpublishVolume(ctx, unpublish)
+					require.NoError(t, err)
+					wire.mu.Lock()
+					defer wire.mu.Unlock()
+					require.Equal(t, 2, wire.attachAttempts)
+					require.Equal(t, 2, wire.detachAttempts)
+					require.Contains(t, wire.disks, 41)
+					return
 				}
 				reply, err := csiClient.ControllerUnpublishVolume(ctx, unpublish)
 				if sticky {
@@ -806,7 +876,7 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 					require.True(t, ok)
 					require.Equal(t, "node-new", grace.NodeID)
 					require.Equal(t, 90, grace.GraceSeconds)
-					require.WithinDuration(t, grace.StartedAt.Add(90*time.Second), grace.ExpiresAt, time.Millisecond)
+					require.Equal(t, 90*time.Second, grace.ExpiresAt.Sub(grace.StartedAt))
 					require.Nil(t, readHistory().PendingPublishMove.Detach)
 					controller = restart()
 					csiClient = reviewControllerClient(t, controller)
@@ -828,7 +898,7 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 					require.NotNil(t, readHistory().PendingPublishMove.Detach)
 					reply, err = csiClient.ControllerUnpublishVolume(ctx, unpublish)
 				}
-				if mode == "terminating" || mode == "overlap-before-dispatch" {
+				if mode == "terminating" || mode == "overlap-before-terminating" || mode == "overlap-before-third" {
 					require.Error(t, err)
 					require.Nil(t, reply)
 					require.Nil(t, readHistory().PendingPublishMove.Detach)
@@ -838,7 +908,7 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 				detached := append(before, "detach:42")
 				expectMutations(detached, 1, 2)
 				switch mode {
-				case "detach-reply-lost", "acceptance-not-committed":
+				case "detach-reply-lost", "acceptance-not-committed", "acceptance-conflict-changed":
 					require.Error(t, err)
 					require.Nil(t, reply)
 					controller = restart()
@@ -860,17 +930,18 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 					require.NotNil(t, reply)
 				}
 				require.NotNil(t, readHistory().PendingPublishMove.Detach)
+				if mode == "acceptance-conflict" {
+					require.True(t, interruptedHistory.Load())
+					other, err := controller.readAttachmentHistory(ctx, "other-volume")
+					require.NoError(t, err)
+					require.Equal(t, "local", other.Backend)
+				}
 				controller = restart()
 				csiClient = reviewControllerClient(t, controller)
-				if overlap && mode != "overlap-on-wire" {
+				if overlap && !beforeDispatch && mode != "overlap-on-wire" {
 					createOverlap()
 				}
 				switch mode {
-				case "overlap-third":
-					third := va.DeepCopy()
-					third.Name, third.UID, third.Spec.NodeName = "third-va", "third-va-uid", "node-other"
-					_, err := vas.Create(ctx, third, metav1.CreateOptions{})
-					require.NoError(t, err)
 				case "overlap-history-changed":
 					_, err := controller.driver.volumeHistory.Upsert(ctx, volume, func(history *VolumeHistoryRecord) {
 						history.LastSuccessfulStageTime = time.Now().UTC()
@@ -1042,7 +1113,7 @@ func TestControllerRetiresDetachedPublishMove(t *testing.T) {
 					return
 				}
 				require.Nil(t, retired.PendingPublishMove)
-				if sticky || maintenance {
+				if sticky {
 					_, held := controller.driver.stickyAttachments.Get(volume)
 					require.False(t, held)
 				}

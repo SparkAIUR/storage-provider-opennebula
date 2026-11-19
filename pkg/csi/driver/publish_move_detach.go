@@ -13,11 +13,13 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 )
 
 type publishMoveDetach struct {
 	VAName, Marker, Grant string
 	VAUID                 types.UID
+	MaintenanceRelease    string `json:"maintenanceRelease,omitempty"`
 }
 
 func publishMoveGrantSnapshot(binding *VolumeRuntimeContext) string {
@@ -25,11 +27,11 @@ func publishMoveGrantSnapshot(binding *VolumeRuntimeContext) string {
 	return publishMoveDigest([]any{present, raw})
 }
 
-func (s *ControllerServer) checkPublishMoveScope(ctx context.Context, volume string, move *pendingPublishMove, history VolumeHistoryRecord, maintenanceHold bool) (publishPVAdmission, error) {
+func (s *ControllerServer) checkPublishMoveScope(ctx context.Context, volume string, move *pendingPublishMove, history VolumeHistoryRecord) (publishPVAdmission, error) {
 	deny := attachmentEvidenceUnavailable("pending Publish move scope is unverified", nil)
 	runtime := s.driver.kubeRuntime
 	if runtime == nil || !runtime.enabled || history.PendingReplacementAttach != nil || !move.matchesHistory(history) ||
-		(!maintenanceHold && s.driver.maintenanceMode != nil && s.driver.maintenanceMode.Active()) {
+		(s.driver.maintenanceMode != nil && s.driver.maintenanceMode.Active()) {
 		return publishPVAdmission{}, deny
 	}
 	binding, err := runtime.ResolveVolumeRuntimeContext(ctx, volume)
@@ -79,20 +81,17 @@ func (s *ControllerServer) verifyPublishMoveRelease(ctx context.Context, image i
 	return ctx.Err()
 }
 
-func (s *ControllerServer) publishMoveDeletingVA(ctx context.Context, volume string, move *pendingPublishMove, binding *VolumeRuntimeContext) (*publishMoveDetach, error) {
+func (s *ControllerServer) checkPublishMoveDeletingVA(ctx context.Context, volume string, move *pendingPublishMove, binding *VolumeRuntimeContext) error {
 	name := csiVolumeAttachmentName(volume, s.driver.name, move.Destination.Name)
-	attachments, err := s.detachVolumeAttachments(ctx, binding.PVName, "")
+	attachments, err := s.detachVolumeAttachments(ctx, binding.PVName, move.Destination.Name)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	observed := attachments[name]
 	if len(attachments) != 1 || observed.uid == "" {
-		return nil, attachmentEvidenceUnavailable("pending Publish destination VolumeAttachment is unverified", nil)
+		return attachmentEvidenceUnavailable("pending Publish destination VolumeAttachment is unverified", nil)
 	}
-	if err := s.recheckPublishMoveOldVA(ctx, move, binding.PVName, name, observed); err != nil {
-		return nil, err
-	}
-	return &publishMoveDetach{VAName: name, VAUID: observed.uid, Marker: binding.PVAnnotations[annotationPublishMoveReceipt], Grant: publishMoveGrantSnapshot(binding)}, nil
+	return s.recheckPublishMoveOldVA(ctx, move, binding.PVName, name, observed)
 }
 
 func (s *ControllerServer) recheckPublishMoveOldVA(ctx context.Context, move *pendingPublishMove, pvName, name string, observed detachAttachmentAuthority) error {
@@ -130,7 +129,7 @@ func (s *ControllerServer) preparePublishMoveDetach(ctx context.Context, volume,
 	if err != nil || !samePendingPublishMove(history.PendingPublishMove, move) {
 		return nil, nil, deny
 	}
-	admission, err := s.checkPublishMoveScope(ctx, volume, move, history, false)
+	admission, err := s.checkPublishMoveScope(ctx, volume, move, history)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -160,14 +159,27 @@ func (s *ControllerServer) preparePublishMoveDetach(ctx context.Context, volume,
 	if err := s.checkPhysicalDetachAuthority(ctx, volume, node, &identity, detachDispatch); err != nil {
 		return nil, nil, err
 	}
-	proof, err := s.publishMoveDeletingVA(ctx, volume, move, admission.binding)
-	if err != nil {
+	if err := admission.check(ctx, admission.binding); err != nil {
 		return nil, nil, err
 	}
-	if proof.VAUID != identity.attachments[proof.VAName].uid {
-		return nil, nil, deny
+	name := csiVolumeAttachmentName(volume, s.driver.name, node)
+	binding := admission.binding
+	proof := &publishMoveDetach{VAName: name, VAUID: identity.attachments[name].uid,
+		Marker: binding.PVAnnotations[annotationPublishMoveReceipt], Grant: publishMoveGrantSnapshot(binding)}
+	if proof.VAUID == "" {
+		release := identity.stickyRelease
+		if release == nil || !release.maintenanceHold() {
+			return nil, nil, deny
+		}
+		if err := s.driver.stickyAttachments.recheckReleasedPublishMoveGrace(ctx, volume, node, binding, *release); err != nil {
+			return nil, nil, err
+		}
+		proof.MaintenanceRelease = publishMoveDigest(*release)
 	}
-	if err := admission.check(ctx, admission.binding); err != nil {
+	if err := s.recheckPublishMoveOldVA(ctx, move, binding.PVName, name, identity.attachments[name]); err != nil {
+		return nil, nil, err
+	}
+	if err := s.recheckDetachVolumeAttachments(ctx, binding.PVName, "", identity.attachments); err != nil {
 		return nil, nil, err
 	}
 	if s.driver.maintenanceMode != nil && s.driver.maintenanceMode.Active() {
@@ -178,14 +190,17 @@ func (s *ControllerServer) preparePublishMoveDetach(ctx context.Context, volume,
 
 func (s *ControllerServer) recordPublishMoveDetach(ctx context.Context, volume string, move *pendingPublishMove, proof *publishMoveDetach) error {
 	deny := attachmentEvidenceUnavailable("pending Publish detach acceptance could not be persisted", nil)
-	_, err := s.driver.volumeHistory.updateHistory(ctx, volume, true, func(history *VolumeHistoryRecord) error {
-		if !samePendingPublishMove(history.PendingPublishMove, move) || !move.matchesHistory(*history) {
-			return deny
-		}
-		updated := *move
-		updated.Detach = proof
-		history.PendingPublishMove = &updated
-		return nil
+	err := retryOnConflict(retry.DefaultRetry, func() error {
+		_, err := s.driver.volumeHistory.updateHistory(ctx, volume, true, func(history *VolumeHistoryRecord) error {
+			if !samePendingPublishMove(history.PendingPublishMove, move) || !move.matchesHistory(*history) {
+				return deny
+			}
+			updated := *move
+			updated.Detach = proof
+			history.PendingPublishMove = &updated
+			return nil
+		})
+		return err
 	})
 	if err != nil {
 		return deny
@@ -244,7 +259,7 @@ func (s *ControllerServer) settlePublishMoveDetach(ctx context.Context, volume s
 		if !samePendingPublishMove(history.PendingPublishMove, move) {
 			return false, deny
 		}
-		admission, err := s.checkPublishMoveScope(ctx, volume, move, history, false)
+		admission, err := s.checkPublishMoveScope(ctx, volume, move, history)
 		if err != nil {
 			return false, err
 		}
@@ -273,12 +288,12 @@ func (s *ControllerServer) settlePublishMoveDetach(ctx context.Context, volume s
 		if err := s.checkPhysicalDetachAuthority(ctx, volume, move.Destination.Name, &identity, detachPublishMoveReadback); err != nil {
 			return false, err
 		}
-		gone := identity.attachments[move.Detach.VAName].uid != move.Detach.VAUID
+		gone := move.Detach.VAUID == "" || identity.attachments[move.Detach.VAName].uid != move.Detach.VAUID
 		if gone && len(identity.attachments) != 0 && !requireRetired {
 			return false, deny
 		}
 		if gone && retiring {
-			if err := s.driver.stickyAttachments.clearReleasedPublishMoveGrace(ctx, volume, move.Destination.Name, binding); err != nil {
+			if err := s.driver.stickyAttachments.clearReleasedPublishMoveGrace(ctx, volume, move.Destination.Name, binding, move.Detach.MaintenanceRelease); err != nil {
 				return false, err
 			}
 		}

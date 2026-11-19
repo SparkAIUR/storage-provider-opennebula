@@ -283,15 +283,31 @@ func testUnpinnedDeleteRetryAfterLostReplyUsesPVIdentity(t *testing.T, imageID i
 	const volume = "volume-test"
 	driver := newStickyTestDriver(t)
 	driver.PluginConfig.OverrideVal(config.AllowedDatastoreTypesVar, "ceph")
-	provider, wire := nodeAttachmentProvider(t)
+	pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv.Annotations[annotationBackend] = "ceph"
+	kube := driver.kubeRuntime.client
+	var pinAtSend atomic.Pointer[corev1.PersistentVolume]
+	var retrying atomic.Bool
+	var imageReadbacks atomic.Int32
+	provider, wire := nodeAttachmentProvider(t, func(method string, ctx context.Context) {
+		switch method {
+		case "one.image.delete":
+			if current, err := kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{}); err == nil {
+				pinAtSend.Store(current)
+			}
+		case "one.image.info":
+			if retrying.Load() {
+				imageReadbacks.Add(1)
+			}
+		}
+	})
 	wire.mu.Lock()
-	wire.ceph, wire.ready, wire.allowImageDelete = true, true, true
+	wire.ceph, wire.ready, wire.allowImageDelete, wire.loseDeleteReply = true, true, true, true
 	wire.zeroImage = imageID == 0
 	delete(wire.disks, 41)
 	wire.marker = 128 * 1024 * 1024
 	wire.mu.Unlock()
 	client := reviewControllerClient(t, NewControllerServer(driver, provider, nil))
-	pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 	provisioned, err := client.CreateVolume(ctx, &csi.CreateVolumeRequest{
 		Name:               volume,
 		CapacityRange:      &csi.CapacityRange{RequiredBytes: 128 * 1024 * 1024},
@@ -307,25 +323,36 @@ func testUnpinnedDeleteRetryAfterLostReplyUsesPVIdentity(t *testing.T, imageID i
 	pv.ResourceVersion = "1"
 	pv.Spec.CSI.VolumeHandle = provisioned.Volume.VolumeId
 	pv.Spec.CSI.VolumeAttributes = provisioned.Volume.VolumeContext
-	kube := driver.kubeRuntime.client
 	_, err = kube.CoreV1().PersistentVolumes().Create(ctx, pv, metav1.CreateOptions{})
 	require.NoError(t, err)
 	_, err = kube.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(ctx, pvc, metav1.CreateOptions{})
 	require.NoError(t, err)
 	request := &csi.DeleteVolumeRequest{VolumeId: provisioned.Volume.VolumeId}
-	_, err = client.DeleteVolume(ctx, request)
-	require.NoError(t, err)
+	response, err := client.DeleteVolume(ctx, request)
+	require.Error(t, err)
+	require.Nil(t, response)
+	wantPin := fmt.Sprintf(`{"version":1,"pvUID":%q,"driver":%q,"handle":%q,"imageID":%d}`, pv.UID, DefaultDriverName, volume, imageID)
+	atSend := pinAtSend.Load()
+	require.NotNil(t, atSend)
+	require.Equal(t, pv.Spec.ClaimRef, atSend.Spec.ClaimRef)
+	require.Equal(t, "ceph", atSend.Annotations[annotationBackend])
+	require.JSONEq(t, wantPin, atSend.Annotations[annotationDeleteVolumeIdentity])
+	wire.mu.Lock()
+	require.True(t, wire.missingImage)
+	wire.mu.Unlock()
 
 	restarted := newStickyTestDriver(t)
 	restarted.kubeRuntime.client = kube
 	server := NewControllerServer(restarted, provider, nil)
-	response, err := reviewControllerClient(t, server).DeleteVolume(ctx, request)
+	retrying.Store(true)
+	response, err = reviewControllerClient(t, server).DeleteVolume(ctx, request)
 	require.NoError(t, err)
 	require.NotNil(t, response)
+	require.Positive(t, imageReadbacks.Load())
 	current, err := kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Equal(t, pv.Finalizers, current.Finalizers)
-	require.JSONEq(t, fmt.Sprintf(`{"version":1,"pvUID":%q,"driver":%q,"handle":%q,"imageID":%d}`, pv.UID, DefaultDriverName, volume, imageID), current.Annotations[annotationDeleteVolumeIdentity])
+	require.JSONEq(t, wantPin, current.Annotations[annotationDeleteVolumeIdentity])
 	history, err := server.readAttachmentHistory(ctx, volume)
 	require.NoError(t, err)
 	require.Zero(t, history)

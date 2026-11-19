@@ -1020,7 +1020,7 @@ func (s *ControllerServer) recordSafeDetachReadback(ctx context.Context, volumeI
 			if err := s.verifyPublishMoveRelease(ctx, imageID, move.Source); err != nil {
 				return err
 			}
-			if _, err := s.checkPublishMoveScope(ctx, volumeID, move, *state, false); err != nil {
+			if _, err := s.checkPublishMoveScope(ctx, volumeID, move, *state); err != nil {
 				return err
 			}
 			sourceReadback = true

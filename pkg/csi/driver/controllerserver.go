@@ -1385,7 +1385,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 				}
 			}
 			if maintenance {
-				if held, response, holdErr := s.startMaintenanceDetachHold(ctx, req, volumeID, nodeID); held {
+				if held, response, holdErr := s.startMaintenanceDetachHold(ctx, req); held {
 					return response, holdErr
 				}
 			}
@@ -1493,14 +1493,14 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 				if err != nil || node != move.Destination || move.Image != volumeID || node.VM != nodeID {
 					return attachmentEvidenceUnavailable("pending Publish destination identity changed", nil)
 				}
-				admission, err := s.checkPublishMoveScope(queueCtx, req.VolumeId, move, current, false)
+				admission, err := s.checkPublishMoveScope(queueCtx, req.VolumeId, move, current)
 				if err != nil {
 					return err
 				}
 				if stickyState.PVCUID != admission.binding.PVCUID || admission.binding.RestartMode != restartOptimizationAnnotationValue {
 					return attachmentEvidenceUnavailable("pending Publish destination detach grace binding changed", nil)
 				}
-				if _, err := s.publishMoveDeletingVA(queueCtx, req.VolumeId, move, admission.binding); err != nil {
+				if err := s.checkPublishMoveDeletingVA(queueCtx, req.VolumeId, move, admission.binding); err != nil {
 					return err
 				}
 				if err := admission.check(queueCtx, admission.binding); err != nil {
@@ -2932,7 +2932,7 @@ func (s *ControllerServer) maintenanceBlocksPublish(ctx context.Context, req *cs
 	return true, maintenanceModeError(req.VolumeId, req.NodeId, lastNode).Error()
 }
 
-func (s *ControllerServer) startMaintenanceDetachHold(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest, imageID, vmID int) (bool, *csi.ControllerUnpublishVolumeResponse, error) {
+func (s *ControllerServer) startMaintenanceDetachHold(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (bool, *csi.ControllerUnpublishVolumeResponse, error) {
 	if s == nil || s.driver == nil || s.driver.maintenanceMode == nil || !s.driver.maintenanceMode.Active() {
 		return false, nil, nil
 	}
@@ -2953,28 +2953,6 @@ func (s *ControllerServer) startMaintenanceDetachHold(ctx context.Context, req *
 	history, err := s.readAttachmentHistory(ctx, req.VolumeId)
 	if err != nil {
 		return true, nil, attachmentEvidenceUnavailable("maintenance detach history is unreadable", err)
-	}
-	move := history.publishMoveDestination(req.NodeId)
-	if move != nil {
-		node, err := s.publishMoveNode(ctx, req.NodeId)
-		if err != nil || node != move.Destination || move.Image != imageID || node.VM != vmID || move.Detach != nil {
-			return true, nil, attachmentEvidenceUnavailable("pending Publish destination identity changed", nil)
-		}
-		admission, err := s.checkPublishMoveScope(ctx, req.VolumeId, move, history, true)
-		if err != nil {
-			return true, nil, err
-		}
-		target, err := s.volumeProvider.GetVolumeInNode(opennebula.WithExpectedImageID(ctx, imageID), imageID, vmID)
-		if err != nil || target != move.Target {
-			return true, nil, attachmentEvidenceUnavailable("pending Publish destination attachment is unverified", err)
-		}
-		if _, err := s.publishMoveDeletingVA(ctx, req.VolumeId, move, admission.binding); err != nil {
-			return true, nil, err
-		}
-		if err := admission.check(ctx, admission.binding); err != nil {
-			return true, nil, err
-		}
-		runtimeCtx = admission.binding
 	}
 	graceSeconds := maintenanceStickyGraceSeconds(s.driver.PluginConfig)
 	now := time.Now().UTC()
@@ -3000,10 +2978,9 @@ func (s *ControllerServer) startMaintenanceDetachHold(ctx context.Context, req *
 	s.driver.metrics.RecordStickyDetach("started", state.Reason)
 	s.driver.metrics.RecordMaintenance("hold", "started")
 	s.recordPVCEventFromRuntimeContext(ctx, runtimeCtx, eventReasonMaintenanceModePrepared, fmt.Sprintf("maintenance mode is holding local RWO volume %s on node %s without detaching", req.VolumeId, req.NodeId))
-	if move != nil {
-		return true, nil, attachmentEvidenceUnavailable("maintenance mode is holding the pending Publish destination", nil)
+	if history.PendingPublishMove == nil {
+		s.annotateRestartOptimization(ctx, runtimeCtx, req.NodeId, graceSeconds)
 	}
-	s.annotateRestartOptimization(ctx, runtimeCtx, req.NodeId, graceSeconds)
 	return true, &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
@@ -3072,6 +3049,7 @@ func (s *ControllerServer) shouldDelayDetach(ctx context.Context, req *csi.Contr
 	}
 
 	graceSeconds := s.effectiveDetachGraceSeconds(runtimeCtx)
+	now := time.Now().UTC()
 	state := StickyAttachmentState{
 		VolumeID:           req.VolumeId,
 		NodeID:             req.NodeId,
@@ -3080,8 +3058,8 @@ func (s *ControllerServer) shouldDelayDetach(ctx context.Context, req *csi.Contr
 		PVCNamespace:       runtimeCtx.PVCNamespace,
 		PVCName:            runtimeCtx.PVCName,
 		PVCUID:             runtimeCtx.PVCUID,
-		StartedAt:          time.Now().UTC(),
-		ExpiresAt:          time.Now().UTC().Add(time.Duration(graceSeconds) * time.Second),
+		StartedAt:          now,
+		ExpiresAt:          now.Add(time.Duration(graceSeconds) * time.Second),
 		GraceSeconds:       graceSeconds,
 		Reason:             "stateful_restart",
 		LastKnownNodeReady: true,
@@ -3321,7 +3299,9 @@ func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyA
 		}
 
 		detachStarted := time.Now()
-		accepted, err := s.detachVolumeWithAuthority(queueCtx, confirmed.VolumeID, confirmed.NodeID, physicalDetachIdentity{imageID: volumeID, vmID: nodeID, diskID: -1, backend: confirmed.Backend})
+		accepted, err := s.detachVolumeWithAuthority(queueCtx, confirmed.VolumeID, confirmed.NodeID, physicalDetachIdentity{
+			imageID: volumeID, vmID: nodeID, diskID: -1, backend: confirmed.Backend, stickyRelease: &confirmed,
+		})
 		if err != nil {
 			if status.Code(err) != codes.Unknown || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return err
