@@ -218,7 +218,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 		unknownConsumer := false
 		if claim := pv.Spec.ClaimRef; claim != nil {
 			for _, pod := range podsByClaim[claim.Namespace+"/"+claim.Name] {
-				referencesPVC, err := podMayUseAttachmentClaim(pod, claim, pvc, replacement)
+				referencesPVC, err := podMayUseAttachmentClaim(pod, pv, pvc, replacement, false)
 				if err != nil {
 					unknownConsumer = true
 					break
@@ -363,9 +363,12 @@ func (r *AttachmentReconciler) reconcileReleasedReplacementAttempts(ctx context.
 		successor := slices.ContainsFunc(vas[volume], func(va storagev1.VolumeAttachment) bool {
 			return va.Spec.NodeName == attempt.Node && va.DeletionTimestamp == nil && string(va.UID) != attempt.VAUID
 		})
+		pinned := slices.ContainsFunc(vas[volume], func(va storagev1.VolumeAttachment) bool {
+			return string(va.UID) == attempt.VAUID
+		})
 		if (attempt.prepared() || attempt.detachAccepted()) && attempt.matchesHistory(history) && attempt.Driver == s.driver.name &&
 			pv != nil && attempt.PVUID == string(pv.UID) && len(disks[volume]) == 0 &&
-			(attempt.detachAccepted() || len(vas[volume]) == 0 || successor) && !unresolved[volume] && !r.skipDiskAttachmentReconcile(ctx, volume, pv) {
+			(attempt.detachAccepted() || !pinned) && !unresolved[volume] && !r.skipDiskAttachmentReconcile(ctx, volume, pv) {
 			key := volume + "@" + attempt.Node + "@" + string(pv.UID) + "@" + attempt.ID
 			currentOrphans[key] = struct{}{}
 			if r.due(r.orphanSeen, key, now, r.orphanGrace) {

@@ -463,6 +463,17 @@ func TestControllerMarkedReplacementWithRenewedDemand(t *testing.T) {
 							require.NoError(t, err)
 							denyDestination()
 							require.NoError(t, pods.Delete(ctx, mountedPending.Name, metav1.DeleteOptions{}))
+							pendingWaiter := mountedPending.DeepCopy()
+							pendingWaiter.Spec.NodeName = ""
+							pendingWaiter.Status = corev1.PodStatus{Phase: corev1.PodPending}
+							_, err = pods.Create(ctx, pendingWaiter, metav1.CreateOptions{})
+							require.NoError(t, err)
+							acknowledgeDestination()
+							pendingWaiter.Spec.NodeName = remote.Name
+							_, err = pods.Update(ctx, pendingWaiter, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							denyDestination()
+							require.NoError(t, pods.Delete(ctx, pendingWaiter.Name, metav1.DeleteOptions{}))
 							require.NoError(t, pvcs.Delete(ctx, pending.Name, metav1.DeleteOptions{}))
 							other, _ := newLocalPVAndPVC("separate-destination-handle", pv.Spec.AccessModes, nil)
 							other.Status.Phase = corev1.VolumeBound

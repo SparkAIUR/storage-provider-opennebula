@@ -169,9 +169,10 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 	}
 	accepted := readback && replacementDetach && attempt.detachAccepted()
 	receipt := readback && replacementDetach && (attempt.detached() || (accepted && attempt.DetachAcceptance.VAUID != ""))
-	remoteScope := replacementDetach && ((identity.background && attempt.dispatchPossible()) || receipt || accepted)
+	preparedReadback := readback && replacementDetach && attempt.prepared()
+	remoteScope := replacementDetach && ((identity.background && attempt.dispatchPossible()) || receipt || accepted || preparedReadback)
 	if replacementDetach && (len(attachments) > 2 || (!remoteScope && len(attachments) > 1) ||
-		(readback && attempt.prepared() && identity.background && len(attachments) != 0)) {
+		(preparedReadback && len(attachments) > 1)) {
 		return attachmentEvidenceUnavailable("replacement detach has conflicting VolumeAttachments", nil)
 	}
 	var localVAName, destinationVAName string
@@ -193,8 +194,10 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		localVAName, localVA = name, va
 	}
 	canceledSuccessor := check == detachCanceledOrphanReadback && accepted && attempt.acceptedOrphan() && localVAName != ""
-	preparedDeletion := readback && replacementDetach && attempt.prepared() && localVAName != ""
-	strictWaiting := canceledSuccessor || preparedDeletion
+	preparedDeletion := preparedReadback && localVAName != ""
+	preparedSuccessor := preparedDeletion && string(localVA.uid) != attempt.VAUID
+	preparedRemote := preparedReadback && destinationVAName != ""
+	strictWaiting := canceledSuccessor || preparedDeletion || preparedRemote
 	if canceledSuccessor && destinationVAName != "" && (destinationVA.uid == localVA.uid || string(destinationVA.uid) == attempt.VAUID) {
 		return attachmentEvidenceUnavailable("canceled orphan successor has conflicting VolumeAttachments", nil)
 	}
@@ -236,13 +239,21 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 				return err
 			}
 		}
+		if preparedRemote {
+			if string(destinationVA.uid) == attempt.VAUID {
+				return attachmentEvidenceUnavailable("prepared replacement destination identity changed", nil)
+			}
+			if err := validateMarkedReplacementMetadata(destinationVA, pv, "", fmt.Sprintf("onecsi-%d", attempt.ImageID)); err != nil {
+				return err
+			}
+		}
 		if replacement {
 			if err := runtime.verifyReleasedClaimNameReuse(ctx, pv, pvc, readback); err != nil {
 				return err
 			}
 		}
 		if preparedDeletion {
-			if localVAName != attempt.VAName || string(localVA.uid) != attempt.VAUID || localVA.attached {
+			if localVAName != attempt.VAName || localVA.attached || (identity.background && !preparedSuccessor) {
 				return attachmentEvidenceUnavailable("prepared replacement detach attachment identity changed", nil)
 			}
 			if err := validateMarkedReplacementMetadata(localVA, pv, "", fmt.Sprintf("onecsi-%d", attempt.ImageID)); err != nil {
@@ -308,6 +319,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		return attachmentEvidenceUnavailable("current volume release is unverified", err)
 	}
 	remoteReplacement := remoteScope &&
+		(!preparedReadback || preparedRemote) &&
 		pv.Status.Phase == corev1.VolumeBound && pv.DeletionTimestamp == nil && pvc != nil && !replacement &&
 		pvc.Status.Phase == corev1.ClaimBound && pvc.DeletionTimestamp == nil &&
 		desired.Desired && !desired.MultipleNodes && desired.DemandSource == volumeDemandSourceActivePod &&
@@ -341,7 +353,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 				return false, "", attachmentEvidenceUnavailable("cannot verify Pod release", err)
 			}
 			for _, pod := range pods.Items {
-				referencesPVC, err := podMayUseAttachmentClaim(&pod, claim, pvc, replacement)
+				referencesPVC, err := podMayUseAttachmentClaim(&pod, pv, pvc, replacement, readback && replacementDetach)
 				if err != nil {
 					return false, "", attachmentEvidenceUnavailable("cannot verify Pod claim ownership", err)
 				}
@@ -418,13 +430,16 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 		if canceledSuccessor && (string(destination.UID) == attempt.OriginalNodeUID || destination.UID == node.UID) {
 			return attachmentEvidenceUnavailable("orphan successor destination node is unverified", nil)
 		}
+		if preparedRemote && !replacementDestinationReleased(destination, remoteConsumerNode, destinationVA, *attempt) {
+			return attachmentEvidenceUnavailable("prepared replacement destination node is unverified", nil)
+		}
 		identity.remoteNodeUID, identity.remoteNodeName = destination.UID, destination.Name
 	}
 	var waitingNode *corev1.Node
 	switch {
 	case waitingOnSource:
 		waitingNode = node
-	case canceledSuccessor && remoteReplacement:
+	case (canceledSuccessor || preparedRemote) && remoteReplacement:
 		waitingNode = destination
 	}
 	var waiting waitingConsumers
@@ -438,7 +453,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			(strictWaiting && (pvc.Status.Phase != corev1.ClaimBound || pv.DeletionTimestamp != nil))) {
 			return attachmentEvidenceUnavailable("replacement detach binding is unverified", nil)
 		}
-		if canceledSuccessor && remoteReplacement && len(waiting) == 0 {
+		if strictWaiting && remoteReplacement && len(waiting) == 0 {
 			return attachmentEvidenceUnavailable("orphan successor destination demand is unverified", nil)
 		}
 	}
@@ -458,7 +473,7 @@ func (s *ControllerServer) checkPhysicalDetachAuthority(ctx context.Context, vol
 			return err
 		}
 	}
-	if canceledSuccessor {
+	if canceledSuccessor || preparedSuccessor {
 		if err := s.checkReplacementSuccessor(ctx, *attempt, pv, localVAName, localVA); err != nil {
 			return err
 		}
@@ -750,7 +765,7 @@ func (s *ControllerServer) finishVerifiedReplacementAbsence(ctx context.Context,
 	if attempt.detached() {
 		return true, nil
 	}
-	if len(identity.attachments) != 0 {
+	if string(identity.attachments[attempt.VAName].uid) == attempt.VAUID {
 		return true, s.checkReplacementAttemptReadback(ctx, *attempt)
 	}
 	return true, s.retireVerifiedReplacement(ctx, *attempt)

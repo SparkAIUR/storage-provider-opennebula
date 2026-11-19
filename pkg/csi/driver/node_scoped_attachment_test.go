@@ -4233,7 +4233,7 @@ func fixtureDetachImageOwner(body string, vmID int) string {
 
 func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 	for _, queued := range []bool{false, true} {
-		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "safe-detach-updated", "unknown", "final-refusal", "authorization-refusal", "authorization-text", "authorization-malformed", "authentication-refusal", "authentication-text", "write-conflict", "lost-write-reply", "readback-failed", "readback-unproven", "prepared-outage", "armed-outage", "armed-lost-ack", "armed-lost-ack-canceled", "armed-lost-ack-consumer-gone", "armed-lost-ack-retire-conflict", "armed-lost-ack-one-conflict", "armed-lost-ack-conflict-competing", "competing-arm", "prepared-abandoned", "prepared-abandoned-quarantine", "prepared-abandoned-conflict", "prepared-abandoned-orphan", "prepared-abandoned-destination", "prepared-abandoned-waiting", "prepared-abandoned-waiting-distinct-vm", "prepared-abandoned-waiting-arm-race", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
+		for _, mode := range []string{"lost-reply", "foreign-marker", "duplicate-marker", "ambiguous-target", "malformed-target", "external-disk", "node-changed", "pv-changed", "history-changed", "safe-detach-updated", "unknown", "final-refusal", "authorization-refusal", "authorization-text", "authorization-malformed", "authentication-refusal", "authentication-text", "write-conflict", "lost-write-reply", "readback-failed", "readback-unproven", "prepared-outage", "armed-outage", "armed-lost-ack", "armed-lost-ack-canceled", "armed-lost-ack-consumer-gone", "armed-lost-ack-retire-conflict", "armed-lost-ack-one-conflict", "armed-lost-ack-conflict-competing", "competing-arm", "prepared-abandoned", "prepared-abandoned-quarantine", "prepared-abandoned-conflict", "prepared-abandoned-orphan", "prepared-abandoned-destination", "prepared-abandoned-waiting", "prepared-abandoned-waiting-distinct-vm", "prepared-abandoned-waiting-arm-race", "prepared-abandoned-waiting-remote-publish", "prepared-abandoned-waiting-remote-reconcile", "prepared-abandoned-waiting-deleting-successor", "concurrent-prepared", "pre-dispatch", "terminating-old-consumer", "ambiguous-old-consumer", "distinct-vm", "distinct-vm-lost-reply", "distinct-vm-original-gone-at-admission", "distinct-vm-original-gone-before-retry",
 			"distinct-vm-inflight", "same-vm-abandoned-replay",
 			"no-publish-va", "attached-publish-va", "deleting-publish-va", "foreign-publish-va", "removed-publish-va", "replaced-publish-va",
 			"current-runtime-consumer", "current-terminated-container", "current-restarted-container", "current-sandbox-ready",
@@ -4768,6 +4768,7 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						deleting.Finalizers = []string{"external-attacher/" + driver.name}
 						wrong := deleting.DeepCopy()
 						wrong.UID = "unadmitted-attachment"
+						wrong.CreationTimestamp = metav1.NewTime(replacement.CreationTimestamp.Add(-time.Second))
 						_, err = vas.Update(ctx, wrong, metav1.UpdateOptions{})
 						require.NoError(t, err)
 						require.Error(t, unpublish())
@@ -4881,10 +4882,79 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						require.NoError(t, vas.Delete(ctx, deleting.Name, metav1.DeleteOptions{}))
 						next := publishVA.DeepCopy()
 						next.UID = "later-publication"
+						publishVM := vmID
+						remote := strings.HasPrefix(mode, "prepared-abandoned-waiting-remote-")
+						if remote {
+							released := replacement.DeepCopy()
+							released.Status.VolumesInUse = nil
+							_, err = nodes.UpdateStatus(ctx, released, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							destination := newReadyNode("remote-node", true)
+							destination.UID = "prepared-destination"
+							destination.CreationTimestamp = replacement.CreationTimestamp
+							_, err = nodes.Create(ctx, destination, metav1.CreateOptions{})
+							require.NoError(t, err)
+							next = replacementPublishVA(pv, destination)
+							next.Name, next.UID = remoteFixtureVAName, "prepared-remote-successor"
+							waiting.Spec.NodeName = destination.Name
+							_, err = pods.Update(ctx, waiting, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							publish, publishVM = newPublishReq(volume, destination.Name), 43
+							wire.mu.Lock()
+							wire.vmNames = map[int]string{41: node.Name, 43: destination.Name}
+							wire.expectedAttachNonce = nil
+							wire.mu.Unlock()
+							wrongDestination := next.DeepCopy()
+							wrongDestination.Spec.Attacher = "foreign.example"
+							_, err = vas.Create(ctx, wrongDestination, metav1.CreateOptions{})
+							require.NoError(t, err)
+							_, err = restarted.ControllerPublishVolume(ctx, publish)
+							require.Error(t, err)
+							require.NoError(t, vas.Delete(ctx, wrongDestination.Name, metav1.DeleteOptions{}))
+						}
+						if mode == "prepared-abandoned-waiting-deleting-successor" {
+							canceled := next.DeepCopy()
+							canceled.DeletionTimestamp = &now
+							canceled.Finalizers = deleting.Finalizers
+							_, err = vas.Create(ctx, canceled, metav1.CreateOptions{})
+							require.NoError(t, err)
+							_, err = restarted.ControllerPublishVolume(ctx, publish)
+							require.Error(t, err, "a deleting successor cannot be published")
+							active := waiting.DeepCopy()
+							active.Status.ContainerStatuses[0].ContainerID = "containerd://running"
+							_, err = pods.UpdateStatus(ctx, active, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							require.Error(t, unpublish())
+							_, err = pods.UpdateStatus(ctx, waiting, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							require.NoError(t, unpublish())
+							retired, err := server.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.Nil(t, retired.PendingReplacementAttach)
+							unchanged, err := vas.Get(ctx, canceled.Name, metav1.GetOptions{})
+							require.NoError(t, err)
+							require.Equal(t, canceled, unchanged)
+							require.NoError(t, vas.Delete(ctx, canceled.Name, metav1.DeleteOptions{}))
+							next.UID = "publication-after-cancellation"
+						}
 						_, err = vas.Create(ctx, next, metav1.CreateOptions{})
 						require.NoError(t, err)
-						require.Error(t, unpublish(), "a late Unpublish cannot acknowledge the successor")
-						if vmID != 41 {
+						if remote {
+							active := waiting.DeepCopy()
+							active.Status.ContainerStatuses[0].ContainerID = "containerd://running"
+							_, err = pods.UpdateStatus(ctx, active, metav1.UpdateOptions{})
+							require.NoError(t, err)
+							_, err = restarted.ControllerPublishVolume(ctx, publish)
+							require.Error(t, err)
+							preserved, err := server.readAttachmentHistory(ctx, volume)
+							require.NoError(t, err)
+							require.Equal(t, stored, preserved)
+							_, err = pods.UpdateStatus(ctx, waiting, metav1.UpdateOptions{})
+							require.NoError(t, err)
+						} else {
+							require.Error(t, unpublish(), "a late Unpublish cannot acknowledge the nondeleting source successor")
+						}
+						if vmID != 41 || mode == "prepared-abandoned-waiting-remote-reconcile" {
 							reconciler := NewAttachmentReconciler(NewControllerServer(fresh, provider, nil))
 							reconciler.orphanGrace = 0
 							require.NoError(t, reconciler.ReconcileOnce(ctx))
@@ -4893,12 +4963,15 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 							require.NoError(t, err)
 							require.Nil(t, retired.PendingReplacementAttach)
 						}
+						wire.mu.Lock()
+						require.Empty(t, wire.mutations)
+						wire.mu.Unlock()
 						reply, err := restarted.ControllerPublishVolume(ctx, publish)
 						require.NoError(t, err)
 						require.Equal(t, "onecsi-7", reply.GetPublishContext()[publishContextDeviceSerial])
 						wire.mu.Lock()
 						defer wire.mu.Unlock()
-						require.Equal(t, []string{fmt.Sprintf("attach:%d:false", vmID)}, wire.mutations)
+						require.Equal(t, []string{fmt.Sprintf("attach:%d:false", publishVM)}, wire.mutations)
 						require.Zero(t, wire.detachAttempts)
 						return
 					}
@@ -5758,6 +5831,17 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 								require.NoError(t, err)
 								require.Error(t, unpublish(restarted), "a newer Pod using the same-name Pending claim still blocks release")
 								require.NoError(t, pods.Delete(ctx, active.Name, metav1.DeleteOptions{}))
+								waiter := active.DeepCopy()
+								waiter.Spec.NodeName = ""
+								waiter.Status = corev1.PodStatus{Phase: corev1.PodPending}
+								old := waiter.DeepCopy()
+								old.CreationTimestamp = pending.CreationTimestamp
+								_, err = pods.Create(ctx, old, metav1.CreateOptions{})
+								require.NoError(t, err)
+								require.Error(t, unpublish(restarted), "ambiguous claim lineage cannot release the old VA")
+								require.NoError(t, pods.Delete(ctx, old.Name, metav1.DeleteOptions{}))
+								_, err = pods.Create(ctx, waiter, metav1.CreateOptions{})
+								require.NoError(t, err)
 							}
 						}
 
@@ -5795,6 +5879,9 @@ func TestControllerPublishReplacementAttachRetry(t *testing.T) {
 						require.NoError(t, err)
 						require.True(t, settled.PendingReplacementAttach.detached())
 						require.Equal(t, string(replayVA.UID), settled.PendingReplacementAttach.DetachCompletion.VAUID)
+						if wireClaimPending {
+							require.NoError(t, kube.CoreV1().Pods(pvc.Namespace).Delete(ctx, latePod.Name, metav1.DeleteOptions{}))
+						}
 						if wirePendingBinding {
 							core := kube.CoreV1()
 							claims := core.PersistentVolumeClaims(pvc.Namespace)

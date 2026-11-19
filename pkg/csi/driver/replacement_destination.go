@@ -102,7 +102,7 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 		return status.Error(codes.FailedPrecondition, "replacement destination release is blocked by recovery controls")
 	}
 	inUse := nodeReportsVolumeInUse(node, s.driver.name, volume)
-	waiting, err := s.replacementDestinationConsumers(ctx, claim, pvc, replaced, liveBinding, node, inUse)
+	waiting, err := s.replacementDestinationConsumers(ctx, pv, pvc, replaced, liveBinding, node, inUse)
 	if err != nil {
 		return unavailable(err)
 	}
@@ -129,7 +129,7 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 		!current.CreationTimestamp.Equal(&node.CreationTimestamp) || nodeReportsVolumeInUse(current, s.driver.name, volume) != inUse {
 		return unavailable(err)
 	}
-	verifiedWaiting, err := s.replacementDestinationConsumers(ctx, claim, pvc, replaced, liveBinding, current, inUse)
+	verifiedWaiting, err := s.replacementDestinationConsumers(ctx, pv, pvc, replaced, liveBinding, current, inUse)
 	if err != nil || !sameWaitingConsumers(waiting, verifiedWaiting) {
 		return unavailable(err)
 	}
@@ -144,7 +144,7 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 	if err := s.checkReplacementAttemptReadback(ctx, attempt); err != nil {
 		return err
 	}
-	finalWaiting, err := s.replacementDestinationConsumers(ctx, claim, pvc, replaced, liveBinding, current, inUse)
+	finalWaiting, err := s.replacementDestinationConsumers(ctx, pv, pvc, replaced, liveBinding, current, inUse)
 	if err != nil || !sameWaitingConsumers(waiting, finalWaiting) {
 		return unavailable(err)
 	}
@@ -157,17 +157,17 @@ func (s *ControllerServer) verifyCanceledReplacementDestination(ctx context.Cont
 	return s.recheckAttachmentBinding(ctx, pv, pvc, replaced)
 }
 
-func (s *ControllerServer) replacementDestinationConsumers(ctx context.Context, claim *corev1.ObjectReference, pvc *corev1.PersistentVolumeClaim,
+func (s *ControllerServer) replacementDestinationConsumers(ctx context.Context, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim,
 	replaced, liveBinding bool, node *corev1.Node, inUse bool,
 ) (waitingConsumers, error) {
-	pods, err := s.driver.kubeRuntime.client.CoreV1().Pods(claim.Namespace).List(ctx, metav1.ListOptions{})
+	pods, err := s.driver.kubeRuntime.client.CoreV1().Pods(pv.Spec.ClaimRef.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
 	waiting := make(waitingConsumers)
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		usesClaim, err := podMayUseAttachmentClaim(pod, claim, pvc, replaced)
+		usesClaim, err := podMayUseAttachmentClaim(pod, pv, pvc, replaced, true)
 		if err != nil {
 			return nil, err
 		}
@@ -178,7 +178,7 @@ func (s *ControllerServer) replacementDestinationConsumers(ctx context.Context, 
 			pod.CreationTimestamp.After(time.Now()) || (inUse && pod.Status.StartTime == nil) {
 			return nil, fmt.Errorf("destination consumer may already be using the volume")
 		}
-		waiting[pod.UID] = observeWaitingConsumer(pod, claim.Name)
+		waiting[pod.UID] = observeWaitingConsumer(pod, pv.Spec.ClaimRef.Name)
 	}
 	if inUse && len(waiting) == 0 {
 		return nil, fmt.Errorf("destination node still reports the volume in use")

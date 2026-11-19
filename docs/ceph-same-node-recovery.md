@@ -129,7 +129,9 @@ original detach scope. It can record the reply while the original claim is
 absent and the PV still says Bound, including while a distinct same-name
 claim is Pending without a binding to the original PV. After the original PV
 is Released, settlement checks the original claim lineage and any Pod use
-even if the replacement claim is still Pending.
+even if the replacement claim is still Pending. A verified newer, unscheduled
+pre-mount Pod waiting for the distinct Pending claim does not hold the old
+attachment open.
 It refreshes protection, confirms Pod, Node and attachment evidence, and
 checks the binding and recovery annotations once more. These bounded
 observations do not fence provider or Kubernetes changes.
@@ -150,9 +152,10 @@ exact deleting and unattached VolumeAttachment after verifying provider
 absence and any waiting-only Pod demand on the admitted node. The preparation
 remains available for retries until its VolumeAttachment UID is gone.
 An attach that definitively did not take effect can restore that same
-preparation through a conditional update. A successor VolumeAttachment
-requires fresh attach authorization after verified retirement of the
-old preparation.
+preparation through a conditional update. Once the original attachment UID
+is gone, verified release can retire the preparation even when a canonical
+remote destination or a deleting same-node successor is present. Publishing
+the successor requires fresh attach authorization.
 
 An attached VolumeAttachment that predates a verified same-name Node
 replacement can converge after the controller proves release on both the pinned

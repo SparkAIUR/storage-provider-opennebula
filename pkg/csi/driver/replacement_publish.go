@@ -186,6 +186,21 @@ func (s *ControllerServer) replacementPublishHistory(ctx context.Context, req *c
 			retired = true
 		}
 	}
+	if attempt := history.PendingReplacementAttach; attempt != nil && attempt.prepared() &&
+		attempt.Node != req.NodeId && replacementPublishCanWrite(req) {
+		identity := physicalDetachIdentity{pvUID: types.UID(attempt.PVUID), nodeUID: types.UID(attempt.ReplacementUID), imageID: attempt.ImageID,
+			vmID: attempt.VMID, diskID: -1, replacement: attempt, remoteNodeUID: types.UID(node.UID), remoteNodeName: req.NodeId}
+		if err := s.checkPhysicalDetachAuthority(ctx, req.VolumeId, attempt.Node, &identity, detachReadback); err != nil {
+			return history, false, err
+		}
+		if identity.attachments[csiVolumeAttachmentName(req.VolumeId, s.driver.name, req.NodeId)].node != req.NodeId {
+			return history, false, attachmentEvidenceUnavailable("prepared replacement destination is unverified", nil)
+		}
+		if err := s.retireVerifiedReplacement(ctx, *attempt); err != nil {
+			return history, false, err
+		}
+		retired = true
+	}
 	if retired {
 		history, err = s.readAttachmentHistory(ctx, req.VolumeId)
 		if err != nil {

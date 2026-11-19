@@ -77,12 +77,23 @@ func podReferencesClaim(pod *corev1.Pod, claimName string, pvc *corev1.Persisten
 	return false, nil
 }
 
-func podMayUseAttachmentClaim(pod *corev1.Pod, claim *corev1.ObjectReference, pvc *corev1.PersistentVolumeClaim, replacement bool) (bool, error) {
-	if !replacement || pvc.Status.Phase == corev1.ClaimPending {
+func podMayUseAttachmentClaim(pod *corev1.Pod, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, replacement, settledReadback bool) (bool, error) {
+	claim := pv.Spec.ClaimRef
+	if !replacement {
 		return podReferencesClaim(pod, claim.Name, pvc)
 	}
 	owner := metav1.GetControllerOfNoCopy(pvc)
 	newer := !pvc.CreationTimestamp.IsZero() && pod.CreationTimestamp.After(pvc.CreationTimestamp.Time)
+	if settledReadback && pv.Status.Phase == corev1.VolumeReleased && pendingReplacementClaim(pv, pvc) {
+		usesClaim, err := podReferencesClaim(pod, claim.Name, pvc)
+		if err != nil || !usesClaim {
+			return usesClaim, err
+		}
+		independent := newer && pod.UID != "" && pod.Namespace == pvc.Namespace &&
+			pod.Spec.NodeName == "" && pod.DeletionTimestamp == nil && pod.Status.StartTime == nil &&
+			replacementPodPendingBeforeMount(pod)
+		return !independent, nil
+	}
 	for _, volume := range pod.Spec.Volumes {
 		if podVolumeClaimName(pod, volume) != claim.Name {
 			continue
