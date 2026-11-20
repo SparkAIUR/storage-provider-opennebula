@@ -6,6 +6,7 @@ Current source target is OpenNebula 7.4.0, with no direct OpenNebula host action
 
 - Require observed Ceph publish or stage history for same-node logical retention, reject unknown backend and repair evidence, and preserve explicit manual recovery behavior.
 - Restrict attachment cleanup to owned resources, condition stale-VA deletion on fresh identity and provider absence, and block physical detach until current consumers, node use and protection controls permit it. Report cleanup only after provider readback.
+- Add a separate, single-writer Ceph Publish path after verified same-name Node replacement. It records an exact pending attempt and selected-disk marker for one independently admitted attach, proves that attempt on recovery without replaying it, and preserves ordinary orphan/detach settlement. Same-node automatic retention remains zero-write. See [scope](docs/ceph-same-node-recovery.md#scope).
 - Keep support-bundle collection read-only and validate the StorageClass reconciliation render through typed resources and its executable consumer. RC3 artifacts remain frozen; publication and native qualification remain separate gates.
 
 ## v0.6.0-rc.3, unreleased

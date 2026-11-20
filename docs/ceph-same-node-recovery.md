@@ -2,6 +2,15 @@
 
 This source correction addresses a restart loop in which a replacement Pod is scheduled on the original node, its Ceph RBD disk is still attached to that VM, and the previous `VolumeAttachment` is deleting. The queue previously rejected detach because Kubernetes still desired the volume there; Kubernetes could not complete publication while that attachment object was deleting. Disabling the queue also produced misleading safe-detach history for a retained disk.
 
+## Scope
+
+This document covers two separate behaviors:
+
+1. Same-node automatic retention (below) keeps the very same physical disk on the same VM with zero provider writes.
+2. [Publish after Node replacement](#publish-after-node-replacement) is a separate, ordinary single-writer Ceph Publish after a verified same-name Node replacement. It uses an exact pending record and a selected-disk marker on one independently admitted attach, and only after proof of original release and current target identity. Recovery proves that exact attempt and never blindly replays it. Conditional ordinary orphan/detach settlement and original VolumeAttachment proof are preserved. It adds no generic adoption, scheduling, provider privilege, live authorization or new object.
+
+The recorded decisions for the second behavior are in [DECISIONS.md](../DECISIONS.md#2026-11-18-ceph-publish-after-node-replacement-scope).
+
 ## Automatic retention contract
 
 The controller can acknowledge logical deletion of that attachment while retaining the existing disk on the same VM. This permits external-attacher to remove its finalizer normally and Kubernetes to create a replacement attachment. The correction does not remove finalizers itself.
