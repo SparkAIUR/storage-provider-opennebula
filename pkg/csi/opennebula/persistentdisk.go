@@ -1293,12 +1293,15 @@ func (p *PersistentDiskVolumeProvider) DetachVolumeWithAuthority(ctx context.Con
 		if err := ctx.Err(); err != nil {
 			return deny(status.FromContextError(err).Err())
 		}
+		if replacement && readback.recordAccepted == nil {
+			return deny(detachEvidenceError(ctx, "detach acceptance recording is unavailable", nil))
+		}
 		reply, err := p.ctrl.Client.VMDiskDetach(ctx, nodeID, diskID)
 		if err != nil {
 			return err
 		}
 		if replacement {
-			if reply == nil || reply.BodyInt() != nodeID || readback.recordAccepted == nil {
+			if reply == nil || reply.BodyInt() != nodeID {
 				return deny(detachEvidenceError(ctx, "detach success reply is unverified", nil))
 			}
 			if err := readback.recordAccepted(ctx, vmName, volumeID, nodeID, diskID); err != nil {

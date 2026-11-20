@@ -131,6 +131,7 @@ func TestControllerManualUnpublishPreservesUnobservedProvenance(t *testing.T) {
 			t.Run(fmt.Sprintf("queued=%t/%s", queued, source), func(t *testing.T) {
 				ctx := context.Background()
 				f := newCephRestartTestFixture(t, queued)
+				f.restore.Unset()
 				f.pvc.Annotations[annotationRecoveryMode] = recoveryModeManual
 				f.syncObjects(t)
 				driver := f.server.driver
@@ -210,6 +211,15 @@ func TestControllerUnpublishCephRejectsBackendAndRepairUnknowns(t *testing.T) {
 				f.syncObjects(t)
 				response, err := f.unpublish(t)
 				require.Error(t, err)
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				switch mode {
+				case "missing-backend":
+					require.ErrorContains(t, err, "(active_pod)")
+				case "changed-backend", "conflicting-backend-attribute":
+					require.ErrorContains(t, err, "cannot verify unpublish backend")
+				default:
+					require.ErrorContains(t, err, "cannot verify current volume repair state")
+				}
 				require.Nil(t, response)
 				after, _ := f.server.driver.volumeHistory.Get(cephRestartVolume)
 				require.Equal(t, before, after)
@@ -245,6 +255,8 @@ func TestControllerUnpublishCephDelayedRPCWithoutActiveDemand(t *testing.T) {
 				}
 				response, err := f.unpublish(t)
 				require.Error(t, err)
+				require.Equal(t, codes.Unavailable, status.Code(err))
+				require.ErrorContains(t, err, "current VolumeAttachment does not authorize physical detach")
 				require.Nil(t, response)
 				f.requireNoProviderMutation(t)
 			})
@@ -1402,4 +1414,85 @@ func TestControllerUnpublishCephRechecksNodeAfterProtectionReads(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestProtectionReadsFailClosedOnUnreadableEvidence(t *testing.T) {
+	const volume = "volume-test"
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	newServer := func(t *testing.T) (*ControllerServer, *fake.Clientset) {
+		pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{annotationBackend: "local"})
+		driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true))
+		provider, _ := nodeAttachmentProvider(t)
+		return NewControllerServer(driver, provider, nil), driver.kubeRuntime.client.(*fake.Clientset)
+	}
+	failReads := func(kube *fake.Clientset, configMap string) *atomic.Bool {
+		var read atomic.Bool
+		kube.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, kruntime.Object, error) {
+			if action.(ktesting.GetAction).GetName() != configMap {
+				return false, nil, nil
+			}
+			read.Store(true)
+			return true, nil, fmt.Errorf("configmap unavailable")
+		})
+		return &read
+	}
+
+	t.Run("volume quarantine read failure", func(t *testing.T) {
+		server, kube := newServer(t)
+		read := failReads(kube, volumeQuarantineStateConfigMapName)
+		_, active, err := server.activeVolumeQuarantine(context.Background(), volume)
+		require.True(t, read.Load())
+		require.Equal(t, codes.Unavailable, status.Code(err))
+		require.False(t, active)
+	})
+	t.Run("volume quarantine malformed expiry", func(t *testing.T) {
+		server, _ := newServer(t)
+		require.NoError(t, server.driver.kubeRuntime.UpsertConfigMapData(context.Background(), "default", volumeQuarantineStateConfigMapName,
+			map[string]string{volume: `{"volumeID":"volume-test","reason":"metadata drift","failureCount":1,"expiresAt":"bad"}`}))
+		_, _, err := server.activeVolumeQuarantine(context.Background(), volume)
+		require.Equal(t, codes.Unavailable, status.Code(err))
+	})
+	t.Run("volume quarantine absent", func(t *testing.T) {
+		server, _ := newServer(t)
+		_, active, err := server.activeVolumeQuarantine(context.Background(), volume)
+		require.NoError(t, err)
+		require.False(t, active)
+	})
+	t.Run("device reports read failure", func(t *testing.T) {
+		server, kube := newServer(t)
+		read := failReads(kube, localDeviceStateConfigMapName)
+		_, found, err := server.latestLocalDeviceReport(context.Background(), volume)
+		require.True(t, read.Load())
+		require.Equal(t, codes.Unavailable, status.Code(err))
+		require.False(t, found)
+	})
+	t.Run("device reports absent", func(t *testing.T) {
+		server, _ := newServer(t)
+		_, found, err := server.latestLocalDeviceReport(context.Background(), volume)
+		require.NoError(t, err)
+		require.False(t, found)
+	})
+	for name, record := range map[string]string{
+		"malformed attempts":       fmt.Sprintf(`{"node":"node-old","volumeID":"volume-test","attempts":"x","firstObservedAt":%q,"lastObservedAt":%q}`, now, now),
+		"missing observation time": `{"node":"node-old","volumeID":"volume-test","attempts":1}`,
+		"unknown failure class":    fmt.Sprintf(`{"node":"node-old","volumeID":"volume-test","attempts":1,"failureClass":"bogus","firstObservedAt":%q,"lastObservedAt":%q}`, now, now),
+	} {
+		t.Run("device report "+name, func(t *testing.T) {
+			server, _ := newServer(t)
+			require.NoError(t, server.driver.kubeRuntime.UpsertConfigMapData(context.Background(), "default", localDeviceStateConfigMapName,
+				map[string]string{localDeviceReportKey("node-old", volume): record}))
+			_, found, err := server.latestLocalDeviceReport(context.Background(), volume)
+			require.Equal(t, codes.Unavailable, status.Code(err))
+			require.False(t, found)
+		})
+	}
+	t.Run("valid device report", func(t *testing.T) {
+		server, _ := newServer(t)
+		require.NoError(t, server.driver.kubeRuntime.UpsertConfigMapData(context.Background(), "default", localDeviceStateConfigMapName,
+			map[string]string{localDeviceReportKey("node-old", volume): fmt.Sprintf(`{"node":"node-old","volumeID":"volume-test","attempts":1,"firstObservedAt":%q,"lastObservedAt":%q}`, now, now)}))
+		report, found, err := server.latestLocalDeviceReport(context.Background(), volume)
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, volume, report.VolumeID)
+	})
 }

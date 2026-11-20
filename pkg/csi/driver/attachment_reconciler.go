@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -70,6 +71,7 @@ func (r *AttachmentReconciler) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if r.server.driver.controllerLeadership != nil && !r.server.driver.controllerLeadership.IsLeader() {
+				r.resetSeen()
 				continue
 			}
 			if err := r.ReconcileOnce(ctx); err != nil {
@@ -79,7 +81,28 @@ func (r *AttachmentReconciler) Run(ctx context.Context) {
 	}
 }
 
+func (r *AttachmentReconciler) resetSeen() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	clear(r.orphanSeen)
+	clear(r.staleVASeen)
+	clear(r.divergentSeen)
+	clear(r.multiAttachSeen)
+}
+
+func orphanAttachmentKey(volumeHandle, nodeName string, pvUID, nodeUID types.UID, vmID int) string {
+	return volumeHandle + "@" + nodeName + "@" + string(pvUID) + "@" + string(nodeUID) + "@" + strconv.Itoa(vmID)
+}
+
 func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
+	err := r.reconcileOnce(ctx)
+	if err != nil {
+		r.resetSeen()
+	}
+	return err
+}
+
+func (r *AttachmentReconciler) reconcileOnce(ctx context.Context) error {
 	client := r.server.driver.kubeRuntime.client
 	if client == nil {
 		return nil
@@ -243,7 +266,7 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 		}
 
 		for _, attachment := range observed {
-			key := volumeHandle + "@" + attachment.NodeName + "@" + string(pv.UID)
+			key := orphanAttachmentKey(volumeHandle, attachment.NodeName, pv.UID, nodesByVM[attachment.NodeID].UID, attachment.NodeID)
 			remoteCephDemand := cephSingleWriter &&
 				!users[""] && !users[attachment.NodeName] && len(users) == 1
 			matchingAttachedVA := slices.IndexFunc(vas, func(va storagev1.VolumeAttachment) bool {

@@ -1143,7 +1143,9 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			binding, err := s.reservePublishMove(queueCtx, req, admission)
 			if err != nil {
 				if binding != nil {
-					s.releaseUnsentPublishMove(queueCtx, req, originalMoveAdmission, binding, publishNode, nodeID, volumeID)
+					if releaseErr := s.releaseUnsentPublishMove(queueCtx, req, originalMoveAdmission, binding, publishNode, nodeID, volumeID); releaseErr != nil {
+						return unsentCleanupFailure(err, releaseErr)
+					}
 				}
 				return err
 			}
@@ -1175,30 +1177,40 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			})
 		}
 		err = s.volumeProvider.AttachVolume(attachCtx, req.VolumeId, req.NodeId, immutableVolume, params)
+		var cleanupErr error
 		if err != nil && dispatch.DefinitelyIdle() {
 			if attempt != nil {
-				s.restoreUnsentReplacement(queueCtx, admission.prepared, *attempt)
+				cleanupErr = s.restoreUnsentReplacement(queueCtx, admission.prepared, *attempt)
 			} else if reservation != nil {
-				s.releaseUnsentPublishMove(queueCtx, req, originalMoveAdmission, reservation, publishNode, nodeID, volumeID)
+				cleanupErr = s.releaseUnsentPublishMove(queueCtx, req, originalMoveAdmission, reservation, publishNode, nodeID, volumeID)
 			}
 		}
 		if ctxErr := queueCtx.Err(); ctxErr != nil {
+			if cleanupErr != nil {
+				klog.Warningf("Unsent Ceph attach preparation was retained because cleanup could not be proven: cause=%v cleanup=%v", ctxErr, cleanupErr)
+			}
 			return ctxErr
 		}
 		if err != nil {
+			attachFailure := func(failure error) error {
+				if cleanupErr != nil {
+					return unsentCleanupFailure(failure, cleanupErr)
+				}
+				return failure
+			}
 			if conflict, ok := opennebula.AsHostArtifactConflictError(err); ok {
-				return s.handleHostArtifactConflict(queueCtx, req, conflict)
+				return attachFailure(s.handleHostArtifactConflict(queueCtx, req, conflict))
 			}
 			s.handleHotplugTimeout(queueCtx, req.NodeId, req.VolumeId, params, "attach", "disk", err)
 			switch {
 			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), status.Code(err) == codes.Unavailable, status.Code(err) == codes.FailedPrecondition:
-				return err
+				return attachFailure(err)
 			case opennebula.IsDatastoreConfigError(err):
-				return status.Error(codes.FailedPrecondition, err.Error())
+				return attachFailure(status.Error(codes.FailedPrecondition, err.Error()))
 			case opennebula.IsDatastoreCapacityError(err):
-				return status.Error(codes.ResourceExhausted, err.Error())
+				return attachFailure(status.Error(codes.ResourceExhausted, err.Error()))
 			}
-			return status.Errorf(codes.Internal, "failed to attach volume: %v", err)
+			return attachFailure(status.Errorf(codes.Internal, "failed to attach volume: %v", err))
 		}
 		if attempt != nil {
 			observation, err := s.completeReplacementAttach(queueCtx, req, *attempt, publishNode, runtimeCtx)

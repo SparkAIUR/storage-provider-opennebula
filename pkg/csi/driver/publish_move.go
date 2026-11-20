@@ -13,8 +13,11 @@ import (
 
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/opennebula"
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/klog/v2"
 )
 
 const annotationPublishMoveReceipt = "opennebula.csi/publish-move-receipt"
@@ -190,39 +193,55 @@ func (s *ControllerServer) reservePublishMove(ctx context.Context, req *csi.Cont
 	return &reserved, nil
 }
 
-func (s *ControllerServer) releaseUnsentPublishMove(ctx context.Context, req *csi.ControllerPublishVolumeRequest, original publishPVAdmission, reserved *VolumeRuntimeContext, node KubernetesNodeIdentity, vmID, imageID int) {
+func (s *ControllerServer) releaseUnsentPublishMove(ctx context.Context, req *csi.ControllerPublishVolumeRequest, original publishPVAdmission, reserved *VolumeRuntimeContext, node KubernetesNodeIdentity, vmID, imageID int) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
+	denied := func(reason string, err error) error {
+		if err != nil {
+			return fmt.Errorf("%s: %w", reason, err)
+		}
+		return errors.New(reason)
+	}
 	move, ok := ctx.Value(publishMoveSourceKey{}).(publishMoveAdmission)
 	if !ok || move.err != nil {
-		return
+		return denied("Publish move source admission is unavailable", move.err)
 	}
 	pvs := s.driver.kubeRuntime.client.CoreV1().PersistentVolumes()
 	pv, err := pvs.Get(ctx, reserved.PVName, metav1.GetOptions{})
 	if err != nil || pv.ResourceVersion == "" || !publishPVMatches(pv, reserved, s.driver.name, req.VolumeId) {
-		return
+		return denied("reserved PersistentVolume is not the admitted object", err)
 	}
 	history, err := s.readAttachmentHistory(ctx, req.VolumeId)
 	if err != nil || history.PendingPublishMove != nil || history.PendingReplacementAttach != nil ||
 		publishMoveGenerationBeforeRelease(history, req.VolumeId) != move.generation {
-		return
+		return denied("volume history no longer matches the reservation", err)
 	}
 	destination, err := s.publishMoveNode(ctx, req.NodeId)
-	if err != nil || destination.UID != node.UID || destination.VM != vmID ||
-		s.verifyPublishMoveSource(ctx, req, move.source, imageID, reserved, false) != nil {
-		return
+	if err != nil || destination.UID != node.UID || destination.VM != vmID {
+		return denied("destination identity changed", err)
+	}
+	if err := s.verifyPublishMoveSource(ctx, req, move.source, imageID, reserved, false); err != nil {
+		return denied("source release is unverified", err)
 	}
 	originalReceipt := original.binding.PVAnnotations[annotationPublishMoveReceipt]
 	original.binding = reserved
 	if err := recheckPublishPVImage(context.WithValue(ctx, publishPVImageCheckKey{}, original)); err != nil {
-		return
+		return denied("PersistentVolume admission changed", err)
 	}
 	if originalReceipt == "" {
 		delete(pv.Annotations, annotationPublishMoveReceipt)
 	} else {
 		pv.Annotations[annotationPublishMoveReceipt] = originalReceipt
 	}
-	_, _ = pvs.Update(ctx, pv, metav1.UpdateOptions{})
+	if _, err := pvs.Update(ctx, pv, metav1.UpdateOptions{}); err != nil {
+		return denied("reservation could not be released", err)
+	}
+	return nil
+}
+
+func unsentCleanupFailure(cause, cleanup error) error {
+	klog.Warningf("Unsent Ceph attach preparation was retained because cleanup could not be proven: cause=%v cleanup=%v", cause, cleanup)
+	return status.Errorf(codes.Unavailable, "%s; the unsent reservation was retained because cleanup is unverified: %v", status.Convert(cause).Message(), cleanup)
 }
 
 func (s *ControllerServer) startPublishMove(ctx context.Context, req *csi.ControllerPublishVolumeRequest, disk successfulAttachmentObservation, binding *VolumeRuntimeContext, protection *LocalRWOProtectionDecision, verify func() error) (*pendingPublishMove, error) {

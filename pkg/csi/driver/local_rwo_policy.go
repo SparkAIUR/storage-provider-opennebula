@@ -388,8 +388,11 @@ func (s *ControllerServer) latestLocalDeviceReport(ctx context.Context, volumeID
 		return LocalDeviceMissingReport{}, false, nil
 	}
 	cm, err := s.driver.kubeRuntime.GetConfigMap(ctx, namespaceFromServiceAccount(), localDeviceStateConfigMapName)
-	if err != nil || len(cm.Data) == 0 {
+	if apierrors.IsNotFound(err) {
 		return LocalDeviceMissingReport{}, false, nil
+	}
+	if err != nil {
+		return LocalDeviceMissingReport{}, false, attachmentEvidenceUnavailable("node device reports are unreadable", err)
 	}
 	var latest LocalDeviceMissingReport
 	for key, raw := range cm.Data {
@@ -403,12 +406,9 @@ func (s *ControllerServer) latestLocalDeviceReport(ctx context.Context, volumeID
 			}
 			continue
 		}
-		var report LocalDeviceMissingReport
-		if err := unmarshalAuthorityJSON(raw, &report); err != nil {
-			if errors.Is(err, errDuplicateAuthorityKey) {
-				return LocalDeviceMissingReport{}, false, attachmentEvidenceUnavailable("node device report is malformed", err)
-			}
-			continue
+		report, err := decodeLocalDeviceReport(key, raw, volumeID)
+		if err != nil {
+			return LocalDeviceMissingReport{}, false, attachmentEvidenceUnavailable("node device report is malformed", err)
 		}
 		if strings.TrimSpace(report.VolumeID) != strings.TrimSpace(volumeID) {
 			continue
@@ -1026,12 +1026,10 @@ func (s *ControllerServer) recordSafeDetachReadback(ctx context.Context, volumeI
 			sourceReadback = true
 		}
 		ordinaryWrite = !sourceReadback
-		now := time.Now().UTC()
-		if !now.After(state.LastSafeDetachTime) {
-			return nil
+		if now := time.Now().UTC(); now.After(state.LastSafeDetachTime) {
+			state.LastSafeDetachNodeName = nodeID
+			state.LastSafeDetachTime = now
 		}
-		state.LastSafeDetachNodeName = nodeID
-		state.LastSafeDetachTime = now
 		if sourceReadback {
 			updated := *move
 			updated.SourceReadback = publishMoveGeneration(*state)
@@ -1274,6 +1272,12 @@ func (s *ControllerServer) lookupVolumeForPublish(ctx context.Context, volumeID,
 	return result, history, runtimeCtx, err
 }
 
+func lookupProvesImageZero(result *opennebula.VolumeLookupResult, volumeID string) bool {
+	metadata := result.AttachmentMetadata
+	return metadata != nil && metadata.ImageID == 0 && strings.TrimSpace(volumeID) != "" &&
+		metadata.VolumeHandle == volumeID && metadata.ImageName == volumeID
+}
+
 func (s *ControllerServer) lookupVolumeForAttachment(ctx context.Context, volumeID, requestedNode string) (*opennebula.VolumeLookupResult, VolumeHistoryRecord, *VolumeRuntimeContext, error) {
 	history := s.currentVolumeHistory(volumeID)
 	var runtimeCtx *VolumeRuntimeContext
@@ -1302,7 +1306,7 @@ func (s *ControllerServer) lookupVolumeForAttachment(ctx context.Context, volume
 		}
 		switch result.Status {
 		case opennebula.VolumeLookupPresent:
-			if result.ImageID < 0 {
+			if result.ImageID < 0 || (result.ImageID == 0 && !lookupProvesImageZero(result, volumeID)) {
 				return result, history, runtimeCtx, status.Error(codes.Unavailable, "volume identity is unknown")
 			}
 			return result, history, runtimeCtx, nil
@@ -1432,10 +1436,7 @@ func (s *ControllerServer) activeVolumeQuarantine(ctx context.Context, volumeID 
 		return VolumeQuarantineState{}, false, nil
 	}
 	if err := s.driver.volumeQuarantine.RefreshEntry(ctx, volumeID); err != nil {
-		if errors.Is(err, errDuplicateAuthorityKey) {
-			return VolumeQuarantineState{}, false, attachmentEvidenceUnavailable("volume quarantine is malformed", err)
-		}
-		klog.V(3).InfoS("Failed to refresh volume quarantine state", "volumeID", volumeID, "err", err)
+		return VolumeQuarantineState{}, false, attachmentEvidenceUnavailable("volume quarantine is unverified", err)
 	}
 	state, active := s.driver.volumeQuarantine.GetActive(volumeID, time.Now().UTC())
 	return state, active, nil

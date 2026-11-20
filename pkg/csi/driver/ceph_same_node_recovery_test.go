@@ -70,6 +70,7 @@ type cephRestartTestFixture struct {
 	node     *corev1.Node
 	va       *storagev1.VolumeAttachment
 	detach   *mock.Call
+	restore  *mock.Call
 }
 
 func newCephRestartTestFixture(t *testing.T, queued bool) *cephRestartTestFixture {
@@ -112,6 +113,7 @@ func newCephRestartTestFixture(t *testing.T, queued bool) *cephRestartTestFixtur
 	require.NoError(t, err)
 	base := new(MockOpenNebulaVolumeProviderTestify)
 	detach := base.On("DetachVolume", mock.Anything, mock.Anything, mock.Anything).Return(errors.New("unexpected physical detach")).Maybe()
+	restore := base.On("RestoreVolumeCapacity", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(errors.New("unexpected capacity restore")).Maybe()
 	base.On("VolumeExists", mock.Anything, cephRestartVolume).Return(3137, 1024*1024*1024, nil)
 	base.On("NodeExists", mock.Anything, "node-a").Return(575, nil)
 	base.On("GetVolumeInNode", mock.Anything, 3137, 575).Return("vdb", nil)
@@ -127,7 +129,7 @@ func newCephRestartTestFixture(t *testing.T, queued bool) *cephRestartTestFixtur
 		driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
 		driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
 	}
-	return &cephRestartTestFixture{server: server, provider: provider, pv: pv, pvc: pvc, pod: pod, node: node, va: va, detach: detach}
+	return &cephRestartTestFixture{server: server, provider: provider, pv: pv, pvc: pvc, pod: pod, node: node, va: va, detach: detach, restore: restore}
 }
 
 func validCephRetentionTestEvidence() *opennebula.SameNodeRetentionEvidence {

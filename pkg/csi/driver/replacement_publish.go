@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -21,7 +22,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
-	"k8s.io/klog/v2"
 )
 
 const (
@@ -686,11 +686,15 @@ func (s *ControllerServer) verifyRetiredReplacementSource(ctx context.Context, a
 	return nil
 }
 
-func (s *ControllerServer) restoreUnsentReplacement(ctx context.Context, prepared, armed replacementAttachAttempt) {
+func (s *ControllerServer) restoreUnsentReplacement(ctx context.Context, prepared, armed replacementAttachAttempt) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
-	if err := retryOnConflict(retry.DefaultRetry, func() error {
+	errAlreadyPrepared := errors.New("replacement Ceph preparation is already restored")
+	err := retryOnConflict(retry.DefaultRetry, func() error {
 		_, err := s.driver.volumeHistory.updateHistory(ctx, armed.VolumeID, true, func(current *VolumeHistoryRecord) error {
+			if current.PendingReplacementAttach != nil && *current.PendingReplacementAttach == prepared && prepared.matchesHistory(*current) {
+				return errAlreadyPrepared
+			}
 			if current.PendingReplacementAttach == nil || *current.PendingReplacementAttach != armed || !armed.matchesHistory(*current) {
 				return fmt.Errorf("replacement Ceph attach dispatch state changed")
 			}
@@ -698,9 +702,11 @@ func (s *ControllerServer) restoreUnsentReplacement(ctx context.Context, prepare
 			return nil
 		})
 		return err
-	}); err != nil {
-		klog.V(2).InfoS("Could not restore unsent replacement Ceph preparation", "volumeID", armed.VolumeID, "err", err)
+	})
+	if errors.Is(err, errAlreadyPrepared) {
+		return nil
 	}
+	return err
 }
 
 func (s *ControllerServer) retireReplacementAttach(ctx context.Context, attempt replacementAttachAttempt) error {
@@ -792,11 +798,16 @@ func (s *ControllerServer) beginReplacementAttach(ctx context.Context, req *csi.
 		return nil
 	})
 	if err != nil {
-		s.restoreUnsentReplacement(ctx, attempt, armed)
-		return nil, attachmentEvidenceUnavailable("replacement Ceph dispatch authorization is unverified", err)
+		denied := attachmentEvidenceUnavailable("replacement Ceph dispatch authorization is unverified", err)
+		if restoreErr := s.restoreUnsentReplacement(ctx, attempt, armed); restoreErr != nil {
+			return nil, unsentCleanupFailure(denied, restoreErr)
+		}
+		return nil, denied
 	}
 	if err := s.checkReplacementAttemptReadback(ctx, armed); err != nil {
-		s.restoreUnsentReplacement(ctx, attempt, armed)
+		if restoreErr := s.restoreUnsentReplacement(ctx, attempt, armed); restoreErr != nil {
+			return nil, unsentCleanupFailure(err, restoreErr)
+		}
 		return nil, err
 	}
 	return &replacementAttachAdmission{prepared: attempt, armed: armed}, nil

@@ -506,3 +506,57 @@ func TestControllerUnpublishRejectsFailedNodeLookup(t *testing.T) {
 	provider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
 	provider.AssertExpectations(t)
 }
+
+func TestControllerUnpublishImageZeroRequiresProviderObservedIdentity(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		for _, proven := range []bool{false, true} {
+			t.Run(fmt.Sprintf("queued=%v/proven=%v", queued, proven), func(t *testing.T) {
+				controller, provider, before := attachmentEvidenceFixture(t, queued, false)
+				result := &opennebula.VolumeLookupResult{
+					Status: opennebula.VolumeLookupPresent, VolumeHandle: before.VolumeID, RequestedNode: before.NodeID, ImageID: 0,
+				}
+				if proven {
+					result.AttachmentMetadata = &opennebula.VolumeAttachmentMetadata{VolumeHandle: before.VolumeID, ImageName: before.VolumeID, ImageID: 0}
+				}
+				provider.On("InspectVolumeLookup", mock.Anything, before.VolumeID, before.NodeID).Return(result, nil).Maybe()
+				provider.On("GetVolumeInNode", mock.Anything, 0, 11).Return("", opennebula.ErrAttachmentNotFound).Maybe()
+				provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("vdb", nil).Maybe()
+				client := reviewControllerClient(t, controller)
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				response, err := client.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: before.VolumeID, NodeId: before.NodeID})
+				probes := 0
+				for _, call := range provider.Calls {
+					if call.Method == "GetVolumeInNode" && call.Arguments.Int(1) == 0 {
+						probes++
+					}
+				}
+				provider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+				if !proven {
+					require.Zero(t, probes, "an unproven zero image identity must not be probed or acted on")
+					require.Equal(t, codes.Unavailable, status.Code(err))
+					require.Nil(t, response)
+					requireAttachmentHoldPreserved(t, controller, before)
+					return
+				}
+				require.Positive(t, probes, "a provider-observed image 0 identity must reach the attachment check")
+			})
+		}
+	}
+}
+
+func TestProviderDetachWithoutAcceptanceRecorderSendsNothing(t *testing.T) {
+	provider, wire := nodeAttachmentProvider(t)
+	ctx := opennebula.WithReplacementDetachReadback(context.Background(), 11, "node-old", nil)
+	var authorized bool
+	accepted, err := provider.DetachVolumeWithAuthority(ctx, "volume-test", "node-old", -1, "",
+		func(context.Context, int, int, int) (string, error) { return "vdb", nil },
+		func(context.Context, int, int, int) error { authorized = true; return nil })
+	require.True(t, authorized, "the detach must be refused at the dispatch boundary, after authorization")
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.ErrorContains(t, err, "acceptance recording is unavailable")
+	require.False(t, accepted)
+	wire.mu.Lock()
+	defer wire.mu.Unlock()
+	require.Empty(t, wire.mutations, "a detach that cannot be recorded must not be dispatched")
+}

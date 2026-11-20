@@ -613,6 +613,7 @@ func TestControllerDeleteVolumeRejectsUnverifiedPVIdentity(t *testing.T) {
 
 			kube := driver.kubeRuntime.client.(*fake.Clientset)
 			patchAttempted := false
+			readbackRefused := false
 			kube.PrependReactor("patch", "persistentvolumes", func(action ktesting.Action) (bool, kruntime.Object, error) {
 				patchAttempted = true
 				switch mode {
@@ -644,6 +645,7 @@ func TestControllerDeleteVolumeRejectsUnverifiedPVIdentity(t *testing.T) {
 			})
 			kube.PrependReactor("list", "persistentvolumes", func(ktesting.Action) (bool, kruntime.Object, error) {
 				if mode == "readback-refused" && patchAttempted {
+					readbackRefused = true
 					return true, nil, fmt.Errorf("readback refused")
 				}
 				return false, nil, nil
@@ -651,8 +653,20 @@ func TestControllerDeleteVolumeRejectsUnverifiedPVIdentity(t *testing.T) {
 
 			response, err := reviewControllerClient(t, NewControllerServer(driver, provider, nil)).DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: volume})
 			require.Error(t, err)
-			if mode == "marker-duplicate-image-id" {
+			patchModes := map[string]bool{"uid-drift": true, "resource-version-drift": true, "binding-drift": true, "patch-refused": true,
+				"readback-refused": true, "wrong-readback": true, "provider-identity-drift": true, "provider-ownership-drift": true}
+			require.Equal(t, patchModes[mode], patchAttempted, "the injected condition must be exercised at its own boundary")
+			if mode == "readback-refused" {
+				require.True(t, readbackRefused)
+			}
+			switch mode {
+			case "malformed-marker", "marker-other-pv", "marker-without-image-id", "marker-duplicate-image-id", "marker-conflicts-with-history":
+				require.Equal(t, codes.Unavailable, status.Code(err))
 				require.ErrorContains(t, err, "PV deletion identity is unverified")
+			case "repair-required":
+				require.ErrorContains(t, err, "volume repair is required")
+			default:
+				require.Equal(t, codes.FailedPrecondition, status.Code(err))
 			}
 			require.Nil(t, response)
 			current, err := kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})

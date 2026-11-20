@@ -82,7 +82,7 @@ func TestAttachmentReconcilerDetachesOrphanAttachment(t *testing.T) {
 
 	server := NewControllerServer(driver, physical, &MockSharedFilesystemProviderTestify{})
 	reconciler := NewAttachmentReconciler(server)
-	reconciler.orphanSeen["vol-1@node-a@pv-owned"] = time.Now().Add(-2 * reconciler.orphanGrace)
+	reconciler.orphanSeen[orphanAttachmentKey("vol-1", "node-a", "pv-owned", "node-owned", 101)] = time.Now().Add(-2 * reconciler.orphanGrace)
 
 	require.NoError(t, reconciler.ReconcileOnce(context.Background()))
 	mockProvider.AssertExpectations(t)
@@ -504,4 +504,47 @@ func TestAttachmentReconcilerPreservesMalformedAndReplacedDeviceReports(t *testi
 			base.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
 		})
 	}
+}
+
+func TestAttachmentReconcilerDropsGraceTimersAfterFailedCycle(t *testing.T) {
+	driver := newAttachmentTestDriver()
+	provider := &MockOpenNebulaVolumeProviderTestify{}
+	provider.On("ListCurrentAttachments", mock.Anything).Return(nil, nil, fmt.Errorf("provider inventory unavailable")).Once()
+	reconciler := NewAttachmentReconciler(NewControllerServer(driver, provider, &MockSharedFilesystemProviderTestify{}))
+	past := time.Now().Add(-2 * reconciler.orphanGrace)
+	reconciler.orphanSeen["orphan"] = past
+	reconciler.divergentSeen["divergent"] = past
+	reconciler.staleVASeen["stale"] = past
+	reconciler.multiAttachSeen["multi"] = past
+
+	require.Error(t, reconciler.ReconcileOnce(context.Background()))
+	require.Empty(t, reconciler.orphanSeen)
+	require.Empty(t, reconciler.divergentSeen)
+	require.Empty(t, reconciler.staleVASeen)
+	require.Empty(t, reconciler.multiAttachSeen)
+	provider.AssertExpectations(t)
+}
+
+func TestAttachmentReconcilerGraceIsBoundToNodeAndVMIdentity(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-1", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+	pv.UID = "pv-owned"
+	pvc.UID = "pvc-owned"
+	pv.Spec.ClaimRef.UID = pvc.UID
+	pvc.Spec.VolumeName = pv.Name
+	node := newReadyNode("node-a", true)
+	node.UID = "node-replacement"
+	driver := newAttachmentTestDriver(pv, pvc, node)
+	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
+	mockProvider.On("ListCurrentAttachments", mock.Anything).Return([]opennebula.ObservedAttachment{{
+		VolumeHandle: "vol-1", ImageID: 1, NodeName: "node-a", NodeID: 101, Backend: "local",
+	}}, opennebula.VMNameInventory{"node-a": {101}}, nil).Once()
+	mockProvider.On("NodeExists", mock.Anything, "node-a").Return(101, nil).Maybe()
+	reconciler := NewAttachmentReconciler(NewControllerServer(driver, mockProvider, &MockSharedFilesystemProviderTestify{}))
+	reconciler.orphanSeen[orphanAttachmentKey("vol-1", "node-a", "pv-owned", "node-previous", 101)] = time.Now().Add(-2 * reconciler.orphanGrace)
+
+	require.NoError(t, reconciler.ReconcileOnce(context.Background()))
+	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+	require.Len(t, reconciler.orphanSeen, 1)
+	require.Contains(t, reconciler.orphanSeen, orphanAttachmentKey("vol-1", "node-a", "pv-owned", "node-replacement", 101))
+	require.WithinDuration(t, time.Now(), reconciler.orphanSeen[orphanAttachmentKey("vol-1", "node-a", "pv-owned", "node-replacement", 101)], time.Minute)
 }

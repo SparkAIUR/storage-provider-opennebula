@@ -10149,3 +10149,58 @@ func TestControllerPublishManualAdoptionSeparatesDeviceNames(t *testing.T) {
 		}
 	}
 }
+
+func TestPublishMoveSurfacesFailedCleanupOfUnsentReservation(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queued=%t", queued), func(t *testing.T) {
+			ctx := context.Background()
+			const volume = "volume-test"
+			pv, pvc := newLocalPVAndPVC(volume, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
+			pv.ResourceVersion = "1"
+			pv.Annotations[annotationAllowCrossNodeUntil] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+			driver := newStickyTestDriver(t, pv, pvc, newReadyNode("node-old", true), newReadyNode("node-new", true),
+				activePodForPVC("move-consumer", pvc.Name, "node-new"))
+			require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
+				VolumeID: volume, NodeID: "node-old", Backend: "local", StartedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute),
+			}))
+			provider, wire := nodeAttachmentProvider(t)
+			wire.mu.Lock()
+			wire.disks[41], wire.marker = 128, 128*1024*1024
+			wire.rejectFirstAttach = true
+			wire.mu.Unlock()
+
+			kube := driver.kubeRuntime.client.(*fake.Clientset)
+			var reserved, refusedRelease atomic.Bool
+			kube.PrependReactor("update", "persistentvolumes", func(action ktesting.Action) (bool, kruntime.Object, error) {
+				proposal := action.(ktesting.UpdateAction).GetObject().(*corev1.PersistentVolume)
+				if strings.HasPrefix(proposal.Annotations[annotationPublishMoveReceipt], publishMoveReservationPrefix) {
+					reserved.Store(true)
+					return false, nil, nil
+				}
+				if reserved.Load() {
+					refusedRelease.Store(true)
+					return true, nil, fmt.Errorf("release refused")
+				}
+				return false, nil, nil
+			})
+			server := NewControllerServer(driver, provider, nil)
+			if queued {
+				driver.hotplugQueue = NewHotplugQueueManager(nil, "default", driver.metrics, 5*time.Second, time.Second)
+				driver.hotplugQueue.Configure(true, 0, 0, 0, server.validateHotplugQueueRequest)
+			}
+
+			req := newPublishReq(volume, "node-new")
+			reply, err := reviewControllerClient(t, server).ControllerPublishVolume(ctx, req)
+			require.Nil(t, reply)
+			require.Equal(t, codes.Unavailable, status.Code(err))
+			require.ErrorContains(t, err, "cleanup is unverified")
+			require.True(t, refusedRelease.Load(), "the conditional release must have been attempted and refused")
+			current, getErr := kube.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+			require.NoError(t, getErr)
+			require.True(t, strings.HasPrefix(current.Annotations[annotationPublishMoveReceipt], publishMoveReservationPrefix))
+			wire.mu.Lock()
+			defer wire.mu.Unlock()
+			require.Equal(t, 1, wire.attachAttempts)
+		})
+	}
+}
