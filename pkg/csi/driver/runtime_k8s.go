@@ -88,19 +88,29 @@ type PlacementReport struct {
 }
 
 type VolumeRuntimeContext struct {
-	PVName          string
-	PVCNamespace    string
-	PVCName         string
-	PVAnnotations   map[string]string
-	PVCAnnotations  map[string]string
-	AccessModes     []corev1.PersistentVolumeAccessMode
-	Backend         string
-	DatastoreID     int
-	RestartMode     string
-	DetachGraceHint int
+	PVName               string
+	pvUID                types.UID
+	pvClaimRef           *corev1.ObjectReference
+	pvPhase              corev1.PersistentVolumePhase
+	pvDeleting           bool
+	pvcPhase             corev1.PersistentVolumeClaimPhase
+	pvcDeleting          bool
+	PVCNamespace         string
+	PVCName              string
+	PVCUID               types.UID
+	verifiedClaimBinding bool
+	PVAnnotations        map[string]string
+	PVCAnnotations       map[string]string
+	AccessModes          []corev1.PersistentVolumeAccessMode
+	Backend              string
+	backendAttribute     string
+	DatastoreID          int
+	RestartMode          string
+	DetachGraceHint      int
 }
 
 type KubeRuntime struct {
+	driverName      string
 	client          kubernetes.Interface
 	inventoryClient ctrlclient.Client
 	recorder        record.EventRecorder
@@ -144,6 +154,7 @@ func NewKubeRuntime(component string, pluginConfig config.CSIPluginConfig) *Kube
 	recorder := broadcaster.NewRecorder(clientgoscheme.Scheme, corev1.EventSource{Component: component})
 
 	return &KubeRuntime{
+		driverName:      component,
 		client:          client,
 		inventoryClient: inventoryClient,
 		recorder:        recorder,
@@ -166,8 +177,15 @@ func newInventoryRuntimeClient(cfg *rest.Config) ctrlclient.Client {
 	return client
 }
 
-func (r *KubeRuntime) EmitPVCEvent(ctx context.Context, namespace, name, reason, message string) {
+func (r *KubeRuntime) EmitPVCEvent(ctx context.Context, namespace, name, reason, message string, expectedUID ...types.UID) {
+	r.emitPVCEvent(ctx, namespace, name, corev1.EventTypeNormal, reason, message, expectedUID...)
+}
+
+func (r *KubeRuntime) emitPVCEvent(ctx context.Context, namespace, name, eventType, reason, message string, expectedUID ...types.UID) {
 	if r == nil || !r.enabled || namespace == "" || name == "" {
+		return
+	}
+	if len(expectedUID) != 0 && expectedUID[0] == "" {
 		return
 	}
 	pvc, err := r.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
@@ -175,7 +193,10 @@ func (r *KubeRuntime) EmitPVCEvent(ctx context.Context, namespace, name, reason,
 		klog.V(2).InfoS("Skipping PVC event emission", "namespace", namespace, "name", name, "reason", reason, "err", err)
 		return
 	}
-	r.emitNamespacedEvent(ctx, pvc.Namespace, pvc.Name, pvc.UID, "PersistentVolumeClaim", corev1.EventTypeNormal, reason, message)
+	if len(expectedUID) != 0 && pvc.UID != expectedUID[0] {
+		return
+	}
+	r.emitNamespacedEvent(ctx, pvc.Namespace, pvc.Name, pvc.UID, "PersistentVolumeClaim", eventType, reason, message)
 }
 
 func (r *KubeRuntime) EmitPVEvent(ctx context.Context, name, reason, message string) {
@@ -190,16 +211,8 @@ func (r *KubeRuntime) EmitPVEvent(ctx context.Context, name, reason, message str
 	r.recorder.Eventf(pv, corev1.EventTypeNormal, reason, "%s", message)
 }
 
-func (r *KubeRuntime) EmitWarningEventOnPVC(ctx context.Context, namespace, name, reason, message string) {
-	if r == nil || !r.enabled || namespace == "" || name == "" {
-		return
-	}
-	pvc, err := r.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		klog.V(2).InfoS("Skipping PVC warning emission", "namespace", namespace, "name", name, "reason", reason, "err", err)
-		return
-	}
-	r.emitNamespacedEvent(ctx, pvc.Namespace, pvc.Name, pvc.UID, "PersistentVolumeClaim", corev1.EventTypeWarning, reason, message)
+func (r *KubeRuntime) EmitWarningEventOnPVC(ctx context.Context, namespace, name, reason, message string, expectedUID ...types.UID) {
+	r.emitPVCEvent(ctx, namespace, name, corev1.EventTypeWarning, reason, message, expectedUID...)
 }
 
 func (r *KubeRuntime) AnnotatePVAsync(ctx context.Context, pvName string, report PlacementReport) {
@@ -232,6 +245,70 @@ func (r *KubeRuntime) AnnotatePVAsync(ctx context.Context, pvName string, report
 			klog.V(2).InfoS("Failed to annotate PV", "pvName", pvName, "err", err)
 		}
 	}()
+}
+
+func (r *KubeRuntime) annotatePublishedPVAsync(binding *VolumeRuntimeContext, driver, volume string, report PlacementReport) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := r.annotatePublishedPV(ctx, binding, driver, volume, report); err != nil {
+			if binding.PVAnnotations[annotationPublishMoveReceipt] != "" || binding.PVAnnotations[annotationAllowCrossNodeUntil] != "" {
+				klog.V(2).InfoS("Failed to annotate published PV", "pvName", binding.PVName)
+				return
+			}
+			klog.V(2).InfoS("Failed to annotate published PV", "pvName", binding.PVName, "err", err)
+		}
+	}()
+}
+
+func (r *KubeRuntime) annotatePublishedPV(ctx context.Context, binding *VolumeRuntimeContext, driver, volume string, report PlacementReport) error {
+	if binding.pvUID == "" || binding.pvDeleting {
+		return nil
+	}
+	pvs := r.client.CoreV1().PersistentVolumes()
+	pv, err := pvs.Get(ctx, binding.PVName, metav1.GetOptions{})
+	if err != nil || !publishPVMatches(pv, binding, driver, volume) ||
+		pv.Annotations[annotationPlacementSummary] != binding.PVAnnotations[annotationPlacementSummary] {
+		return err
+	}
+	if binding.verifiedClaimBinding {
+		pvc, reused, err := r.attachmentClaim(ctx, pv)
+		if err != nil || reused || pvc == nil || pvc.UID != binding.PVCUID || pvc.Status.Phase != binding.pvcPhase ||
+			pvc.DeletionTimestamp != nil || !samePublishAnnotations(binding.PVCAnnotations, pvc.Annotations) {
+			return err
+		}
+	}
+	updates, err := placementAnnotations(report)
+	if err != nil {
+		return err
+	}
+	annotations := cloneStringMap(pv.Annotations)
+	for key, value := range updates {
+		annotations[key] = value
+	}
+	patch := []map[string]any{
+		{"op": "test", "path": "/metadata/uid", "value": pv.UID},
+		{"op": "test", "path": "/spec/csi/driver", "value": driver},
+		{"op": "test", "path": "/spec/csi/volumeHandle", "value": volume},
+	}
+	if pv.ResourceVersion != "" {
+		patch = append(patch, map[string]any{"op": "test", "path": "/metadata/resourceVersion", "value": pv.ResourceVersion})
+	}
+	if len(pv.Annotations) != 0 {
+		patch = append(patch, map[string]any{"op": "test", "path": "/metadata/annotations", "value": pv.Annotations})
+	} else if pv.ResourceVersion == "" {
+		return fmt.Errorf("PV annotation update requires resourceVersion when annotations are absent")
+	}
+	if pv.Spec.ClaimRef != nil {
+		patch = append(patch, map[string]any{"op": "test", "path": "/spec/claimRef", "value": pv.Spec.ClaimRef})
+	}
+	patch = append(patch, map[string]any{"op": "add", "path": "/metadata/annotations", "value": annotations})
+	payload, err := json.Marshal(patch)
+	if err != nil {
+		return err
+	}
+	_, err = pvs.Patch(ctx, pv.Name, types.JSONPatchType, payload, metav1.PatchOptions{})
+	return err
 }
 
 func (r *KubeRuntime) GetNodeLabel(ctx context.Context, nodeName, labelKey string) (string, error) {
@@ -356,6 +433,25 @@ func (r *KubeRuntime) DeleteConfigMapKey(ctx context.Context, namespace, name, k
 	return err
 }
 
+func (r *KubeRuntime) deleteConfigMapKeyIfCurrent(ctx context.Context, observed *corev1.ConfigMap, key, value string) error {
+	client := r.client.CoreV1().ConfigMaps(observed.Namespace)
+	return retryOnConflict(retry.DefaultRetry, func() error {
+		current, err := client.Get(ctx, observed.Name, metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if raw, present := current.Data[key]; current.UID != observed.UID || !present || raw != value {
+			return nil
+		}
+		delete(current.Data, key)
+		_, err = client.Update(ctx, current, metav1.UpdateOptions{})
+		return err
+	})
+}
+
 func (r *KubeRuntime) DeletePVAnnotation(ctx context.Context, pvName, key string) error {
 	if r == nil || !r.enabled {
 		return fmt.Errorf("kubernetes runtime is not enabled")
@@ -393,6 +489,62 @@ func (r *KubeRuntime) GetConfigMap(ctx context.Context, namespace, name string) 
 	return r.client.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
 }
 
+func (r *KubeRuntime) attachmentClaim(ctx context.Context, pv *corev1.PersistentVolume) (*corev1.PersistentVolumeClaim, bool, error) {
+	claim := pv.Spec.ClaimRef
+	if claim == nil {
+		return nil, false, nil
+	}
+	if claim.UID == "" {
+		return nil, false, fmt.Errorf("PV claim UID is unavailable")
+	}
+	pvc, err := r.client.CoreV1().PersistentVolumeClaims(claim.Namespace).Get(ctx, claim.Name, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if pvc.UID != "" && pvc.UID != claim.UID && pv.Status.Phase == corev1.VolumeReleased && pvc.Spec.VolumeName != pv.Name {
+		return pvc, true, nil
+	}
+	if pvc.UID != claim.UID || pvc.Spec.VolumeName != pv.Name {
+		return nil, false, fmt.Errorf("PV claim identity is unverified")
+	}
+	return pvc, false, nil
+}
+
+func (r *KubeRuntime) verifyReleasedClaimNameReuse(ctx context.Context, original *corev1.PersistentVolume, reused *corev1.PersistentVolumeClaim, readback bool) error {
+	if original.Status.Phase != corev1.VolumeReleased {
+		return attachmentEvidenceUnavailable("reused claim name has no verified independent binding", nil)
+	}
+	if readback && pendingReplacementClaim(original, reused) {
+		return ctx.Err()
+	}
+	return r.verifyIndependentClaimBinding(ctx, original, reused)
+}
+
+func pendingReplacementClaim(original *corev1.PersistentVolume, reused *corev1.PersistentVolumeClaim) bool {
+	claim := original.Spec.ClaimRef
+	return claim != nil && claim.UID != "" && reused.UID != "" && reused.UID != claim.UID &&
+		reused.Name == claim.Name && reused.Namespace == claim.Namespace &&
+		reused.Status.Phase == corev1.ClaimPending && reused.Spec.VolumeName != original.Name
+}
+
+func (r *KubeRuntime) verifyIndependentClaimBinding(ctx context.Context, original *corev1.PersistentVolume, reused *corev1.PersistentVolumeClaim) error {
+	if reused.UID == "" || reused.Status.Phase != corev1.ClaimBound ||
+		reused.Spec.VolumeName == "" || reused.Spec.VolumeName == original.Name {
+		return attachmentEvidenceUnavailable("reused claim name has no verified independent binding", nil)
+	}
+	other, err := r.client.CoreV1().PersistentVolumes().Get(ctx, reused.Spec.VolumeName, metav1.GetOptions{})
+	if err != nil || other.Status.Phase != corev1.VolumeBound || other.DeletionTimestamp != nil || other.UID == "" || other.UID == original.UID ||
+		other.Spec.ClaimRef == nil || other.Spec.ClaimRef.UID != reused.UID ||
+		other.Spec.ClaimRef.Namespace != reused.Namespace || other.Spec.ClaimRef.Name != reused.Name ||
+		(other.Spec.CSI != nil && other.Spec.CSI.Driver == original.Spec.CSI.Driver && other.Spec.CSI.VolumeHandle == original.Spec.CSI.VolumeHandle) {
+		return attachmentEvidenceUnavailable("reused claim name has no verified independent binding", err)
+	}
+	return ctx.Err()
+}
+
 func (r *KubeRuntime) ResolveVolumeRuntimeContext(ctx context.Context, volumeHandle string) (*VolumeRuntimeContext, error) {
 	if r == nil || !r.enabled {
 		return nil, fmt.Errorf("kubernetes runtime is not enabled")
@@ -406,53 +558,77 @@ func (r *KubeRuntime) ResolveVolumeRuntimeContext(ctx context.Context, volumeHan
 		return nil, err
 	}
 
+	driverName := firstNonEmpty(r.driverName, DefaultDriverName)
+	matches := 0
+	for _, pv := range pvs.Items {
+		if pv.Spec.CSI != nil && pv.Spec.CSI.Driver == driverName && pv.Spec.CSI.VolumeHandle == volumeHandle {
+			matches++
+		}
+	}
+	if matches > 1 {
+		return nil, fmt.Errorf("multiple owned persistent volumes for handle %s", volumeHandle)
+	}
 	for i := range pvs.Items {
 		pv := &pvs.Items[i]
-		if pv.Spec.CSI == nil || pv.Spec.CSI.VolumeHandle != volumeHandle {
+		if pv.Spec.CSI == nil || pv.Spec.CSI.Driver != driverName || pv.Spec.CSI.VolumeHandle != volumeHandle {
 			continue
 		}
 
-		runtimeCtx := &VolumeRuntimeContext{
-			PVName:        pv.Name,
-			PVAnnotations: cloneStringMap(pv.Annotations),
-			AccessModes:   append([]corev1.PersistentVolumeAccessMode(nil), pv.Spec.AccessModes...),
-		}
-		runtimeCtx.Backend = strings.TrimSpace(runtimeCtx.PVAnnotations[annotationBackend])
-		runtimeCtx.RestartMode = strings.TrimSpace(runtimeCtx.PVAnnotations[annotationRestartOpt])
-		if rawGrace := strings.TrimSpace(runtimeCtx.PVAnnotations[annotationDetachGrace]); rawGrace != "" {
-			if parsed, convErr := strconv.Atoi(rawGrace); convErr == nil {
-				runtimeCtx.DetachGraceHint = parsed
-			}
-		}
-		if rawDatastoreID := strings.TrimSpace(runtimeCtx.PVAnnotations[annotationDatastoreID]); rawDatastoreID != "" {
-			if parsed, convErr := strconv.Atoi(rawDatastoreID); convErr == nil {
-				runtimeCtx.DatastoreID = parsed
-			}
-		}
+		return r.volumeRuntimeContext(ctx, pv), nil
+	}
 
-		if pv.Spec.ClaimRef != nil {
-			runtimeCtx.PVCNamespace = pv.Spec.ClaimRef.Namespace
-			runtimeCtx.PVCName = pv.Spec.ClaimRef.Name
-			pvc, pvcErr := r.client.CoreV1().PersistentVolumeClaims(runtimeCtx.PVCNamespace).Get(ctx, runtimeCtx.PVCName, metav1.GetOptions{})
-			if pvcErr == nil {
-				runtimeCtx.PVCAnnotations = cloneStringMap(pvc.Annotations)
-				if runtimeCtx.RestartMode == "" {
-					runtimeCtx.RestartMode = strings.TrimSpace(runtimeCtx.PVCAnnotations[annotationRestartOpt])
-				}
-				if runtimeCtx.DetachGraceHint == 0 {
-					if rawGrace := strings.TrimSpace(runtimeCtx.PVCAnnotations[annotationDetachGrace]); rawGrace != "" {
-						if parsed, convErr := strconv.Atoi(rawGrace); convErr == nil {
-							runtimeCtx.DetachGraceHint = parsed
-						}
+	return nil, fmt.Errorf("persistent volume for handle %s not found", volumeHandle)
+}
+
+func (r *KubeRuntime) volumeRuntimeContext(ctx context.Context, pv *corev1.PersistentVolume) *VolumeRuntimeContext {
+	runtimeCtx := &VolumeRuntimeContext{
+		PVName:        pv.Name,
+		pvUID:         pv.UID,
+		pvClaimRef:    pv.Spec.ClaimRef.DeepCopy(),
+		pvPhase:       pv.Status.Phase,
+		pvDeleting:    pv.DeletionTimestamp != nil,
+		PVAnnotations: cloneStringMap(pv.Annotations),
+		AccessModes:   append([]corev1.PersistentVolumeAccessMode(nil), pv.Spec.AccessModes...),
+	}
+	runtimeCtx.Backend = strings.TrimSpace(pv.Annotations[annotationBackend])
+	runtimeCtx.backendAttribute = pv.Spec.CSI.VolumeAttributes[annotationBackend]
+	runtimeCtx.RestartMode = strings.TrimSpace(runtimeCtx.PVAnnotations[annotationRestartOpt])
+	if rawGrace := strings.TrimSpace(runtimeCtx.PVAnnotations[annotationDetachGrace]); rawGrace != "" {
+		if parsed, convErr := strconv.Atoi(rawGrace); convErr == nil {
+			runtimeCtx.DetachGraceHint = parsed
+		}
+	}
+	if rawDatastoreID := strings.TrimSpace(runtimeCtx.PVAnnotations[annotationDatastoreID]); rawDatastoreID != "" {
+		if parsed, convErr := strconv.Atoi(rawDatastoreID); convErr == nil {
+			runtimeCtx.DatastoreID = parsed
+		}
+	}
+
+	if pv.Spec.ClaimRef != nil {
+		runtimeCtx.PVCNamespace = pv.Spec.ClaimRef.Namespace
+		runtimeCtx.PVCName = pv.Spec.ClaimRef.Name
+		pvc, pvcErr := r.client.CoreV1().PersistentVolumeClaims(runtimeCtx.PVCNamespace).Get(ctx, runtimeCtx.PVCName, metav1.GetOptions{})
+		if pvcErr == nil && pv.Spec.ClaimRef.UID != "" && pvc.UID != pv.Spec.ClaimRef.UID {
+			runtimeCtx.PVCNamespace = ""
+			runtimeCtx.PVCName = ""
+		} else if pvcErr == nil {
+			runtimeCtx.PVCUID = pv.Spec.ClaimRef.UID
+			runtimeCtx.pvcPhase, runtimeCtx.pvcDeleting = pvc.Status.Phase, pvc.DeletionTimestamp != nil
+			runtimeCtx.verifiedClaimBinding = runtimeCtx.PVCUID != "" && pvc.Spec.VolumeName == pv.Name
+			runtimeCtx.PVCAnnotations = cloneStringMap(pvc.Annotations)
+			if runtimeCtx.RestartMode == "" {
+				runtimeCtx.RestartMode = strings.TrimSpace(runtimeCtx.PVCAnnotations[annotationRestartOpt])
+			}
+			if runtimeCtx.DetachGraceHint == 0 {
+				if rawGrace := strings.TrimSpace(runtimeCtx.PVCAnnotations[annotationDetachGrace]); rawGrace != "" {
+					if parsed, convErr := strconv.Atoi(rawGrace); convErr == nil {
+						runtimeCtx.DetachGraceHint = parsed
 					}
 				}
 			}
 		}
-
-		return runtimeCtx, nil
 	}
-
-	return nil, fmt.Errorf("persistent volume for handle %s not found", volumeHandle)
+	return runtimeCtx
 }
 
 func (r *KubeRuntime) PodUIDExists(ctx context.Context, uid string) (bool, error) {
@@ -689,7 +865,7 @@ func (r *KubeRuntime) emitNamespacedEvent(ctx context.Context, namespace, name s
 	}
 }
 
-func buildPVAnnotationPatch(report PlacementReport) ([]byte, error) {
+func placementAnnotations(report PlacementReport) (map[string]string, error) {
 	summary, err := json.Marshal(report)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal placement summary: %w", err)
@@ -712,12 +888,15 @@ func buildPVAnnotationPatch(report PlacementReport) ([]byte, error) {
 		annotations[annotationDetachGrace] = strconv.Itoa(report.DetachGraceSeconds)
 	}
 
-	patch := map[string]any{
-		"metadata": map[string]any{
-			"annotations": annotations,
-		},
+	return annotations, nil
+}
+
+func buildPVAnnotationPatch(report PlacementReport) ([]byte, error) {
+	annotations, err := placementAnnotations(report)
+	if err != nil {
+		return nil, err
 	}
-	return json.Marshal(patch)
+	return json.Marshal(map[string]any{"metadata": map[string]any{"annotations": annotations}})
 }
 
 func namespaceFromServiceAccount() string {

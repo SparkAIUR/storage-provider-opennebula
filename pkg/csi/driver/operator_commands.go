@@ -302,7 +302,11 @@ func RunVolumeHealthCommand(ctx context.Context, cfg config.CSIPluginConfig, opt
 	if err != nil {
 		return err
 	}
-	reports, err := collectVolumeHealthReports(ctx, kubeClient, cfg, opts)
+	var invClient ctrlclient.Client
+	if restConfig, err := loadKubeRestConfig(); err == nil {
+		invClient = newInventoryRuntimeClient(restConfig)
+	}
+	reports, err := collectVolumeHealthReports(ctx, kubeClient, invClient, cfg, opts)
 	if err != nil {
 		return err
 	}
@@ -386,6 +390,10 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 		return err
 	}
 
+	return writeSupportBundle(ctx, cfg, kubeClient, invClient, w)
+}
+
+func writeSupportBundle(ctx context.Context, cfg config.CSIPluginConfig, kubeClient kubernetes.Interface, invClient ctrlclient.Client, w io.Writer) error {
 	var dsList inventoryv1alpha1.OpenNebulaDatastoreList
 	if err := invClient.List(ctx, &dsList); err != nil {
 		return err
@@ -411,7 +419,7 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 	if err != nil {
 		return err
 	}
-	volumeHealth, _ := collectVolumeHealthReports(ctx, kubeClient, cfg, VolumeHealthOptions{})
+	volumeHealth := projectVolumeHealthReports(ctx, kubeClient, invClient, cfg, VolumeHealthOptions{}, pvList.Items, vaList.Items)
 	eventList, err := kubeClient.CoreV1().Events("").List(ctx, metav1.ListOptions{Limit: 50})
 	if err != nil {
 		return err
@@ -442,7 +450,7 @@ func RunSupportBundleCommand(ctx context.Context, cfg config.CSIPluginConfig, w 
 	hotplugDiagnostics := hotplugDiagnosticSnapshot(ctx, kubeClient, cfg)
 	adaptiveSnapshot := configMapJSONSnapshot(ctx, kubeClient, adaptiveTimeoutObservationsConfigMapName)
 	adaptiveRecommendations := adaptiveRecommendationSnapshot(cfg, adaptiveSnapshot)
-	volumeHistorySnapshot, volumeRepairSnapshot, volumeRecoverySnapshot, volumeDemandSnapshot, protectionSnapshot := collectSupportBundleLocalRWOSnapshot(ctx, cfg, kubeClient, pvList.Items)
+	volumeHistorySnapshot, volumeRepairSnapshot, volumeRecoverySnapshot, volumeDemandSnapshot, protectionSnapshot := collectSupportBundleLocalRWOSnapshot(ctx, cfg, kubeClient, invClient, pvList.Items, vaList)
 	nodeLocalDiskSessions, nodeLocalSessionReference := supportBundleLocalDiskSessionDiagnostics(ctx, kubeClient)
 	volumeRecoverySnapshot = enrichRecoveryControlSupportSnapshot(volumeRecoverySnapshot, volumeDemandSnapshot, nodeLocalDiskSessions, volumeQuarantineSnapshot, hostArtifactSnapshot)
 
@@ -539,7 +547,7 @@ func findDatastoreByID(ctx context.Context, client ctrlclient.Client, datastoreI
 	return nil, fmt.Errorf("opennebuladatastore with ID %d was not found", datastoreID)
 }
 
-func collectVolumeHealthReports(ctx context.Context, kubeClient kubernetes.Interface, cfg config.CSIPluginConfig, opts VolumeHealthOptions) ([]VolumeHealthReport, error) {
+func collectVolumeHealthReports(ctx context.Context, kubeClient kubernetes.Interface, invClient ctrlclient.Client, cfg config.CSIPluginConfig, opts VolumeHealthOptions) ([]VolumeHealthReport, error) {
 	pvs, err := kubeClient.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
@@ -548,17 +556,18 @@ func collectVolumeHealthReports(ctx context.Context, kubeClient kubernetes.Inter
 	if err != nil {
 		return nil, err
 	}
+	return projectVolumeHealthReports(ctx, kubeClient, invClient, cfg, opts, pvs.Items, vas.Items), nil
+}
+
+func projectVolumeHealthReports(ctx context.Context, kubeClient kubernetes.Interface, invClient ctrlclient.Client, cfg config.CSIPluginConfig, opts VolumeHealthOptions, pvs []corev1.PersistentVolume, vas []storagev1.VolumeAttachment) []VolumeHealthReport {
 	localSessions, _ := newLocalDiskSessionStore(localDiskSessionRootPath).List()
 	sharedSessions, _ := newSharedFilesystemSessionStore(sharedFilesystemSessionRootPath).List()
 	mountSources := currentMountSources()
-	openNebulaMetadata := openNebulaAttachmentMetadataSnapshot(ctx, cfg, pvs.Items, vas.Items)
-	auditRuntime := &KubeRuntime{client: kubeClient, enabled: true}
-	if restConfig, err := loadKubeRestConfig(); err == nil {
-		auditRuntime.inventoryClient = newInventoryRuntimeClient(restConfig)
-	}
+	openNebulaMetadata := openNebulaAttachmentMetadataSnapshot(ctx, cfg, pvs, vas)
+	auditRuntime := &KubeRuntime{client: kubeClient, inventoryClient: invClient, enabled: true}
 
 	reports := make([]VolumeHealthReport, 0)
-	for _, pv := range pvs.Items {
+	for _, pv := range pvs {
 		if pv.Spec.CSI == nil || !volumeHealthMatches(pv, opts) {
 			continue
 		}
@@ -581,7 +590,7 @@ func collectVolumeHealthReports(ctx context.Context, kubeClient kubernetes.Inter
 			report.AnnotationAudit = append(report.AnnotationAudit, auditSoftPlacementAnnotations(ctx, auditRuntime, &pv, nil)...)
 		}
 		report.AnnotationAudit = append(report.AnnotationAudit, auditVolumeAnnotations("pv", pv.Annotations)...)
-		for _, va := range vas.Items {
+		for _, va := range vas {
 			if va.Spec.Source.PersistentVolumeName == nil || *va.Spec.Source.PersistentVolumeName != pv.Name {
 				continue
 			}
@@ -637,7 +646,7 @@ func collectVolumeHealthReports(ctx context.Context, kubeClient kubernetes.Inter
 		}
 		reports = append(reports, report)
 	}
-	return reports, nil
+	return reports
 }
 
 func volumeHealthMatches(pv corev1.PersistentVolume, opts VolumeHealthOptions) bool {
@@ -1185,7 +1194,7 @@ func localDeviceReportSnapshot(ctx context.Context, kubeClient kubernetes.Interf
 	}
 	for key, raw := range cm.Data {
 		var report LocalDeviceMissingReport
-		if err := json.Unmarshal([]byte(raw), &report); err != nil {
+		if err := unmarshalAuthorityJSON(raw, &report); err != nil {
 			continue
 		}
 		if strings.TrimSpace(report.VolumeID) == "" {
@@ -1218,11 +1227,8 @@ func typedHotplugQueueSnapshot(ctx context.Context, kubeClient kubernetes.Interf
 	return snapshot
 }
 
-func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPluginConfig, kubeClient kubernetes.Interface, pvs []corev1.PersistentVolume) (map[string]VolumeHistoryRecord, map[string]VolumeRepairState, map[string]VolumeRecoveryControlState, map[string]VolumeDesiredState, map[string]LocalRWOProtectionDecision) {
-	runtime := &KubeRuntime{client: kubeClient, enabled: true, staleVAGrace: loadStaleVolumeAttachmentGrace(cfg)}
-	if restConfig, err := loadKubeRestConfig(); err == nil {
-		runtime.inventoryClient = newInventoryRuntimeClient(restConfig)
-	}
+func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPluginConfig, kubeClient kubernetes.Interface, invClient ctrlclient.Client, pvs []corev1.PersistentVolume, vaSnapshot *storagev1.VolumeAttachmentList) (map[string]VolumeHistoryRecord, map[string]VolumeRepairState, map[string]VolumeRecoveryControlState, map[string]VolumeDesiredState, map[string]LocalRWOProtectionDecision) {
+	runtime := &KubeRuntime{client: kubeClient, inventoryClient: invClient, enabled: true, staleVAGrace: loadStaleVolumeAttachmentGrace(cfg)}
 	driver := &Driver{
 		PluginConfig: cfg,
 		kubeRuntime:  runtime,
@@ -1237,13 +1243,20 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 	_ = driver.volumeRepairState.LoadFromConfigMap(ctx)
 	_ = driver.volumeRecoveryControl.LoadFromConfigMap(ctx)
 	driver.maintenanceMode = NewMaintenanceModeManager(driver, "")
-	if driver.maintenanceMode != nil {
-		_ = driver.maintenanceMode.Reconcile(ctx)
+	if cm, err := runtime.GetConfigMap(ctx, namespaceFromServiceAccount(), hotplugStateConfigMapName); err == nil && driver.maintenanceMode != nil {
+		active, alias := maintenanceModeActive(cm.Data)
+		driver.maintenanceMode.setState(active, parseMaintenanceBool(cm.Data[maintenanceReadyKey]), alias)
 	}
 
 	historySnapshot := map[string]VolumeHistoryRecord{}
 	if driver.volumeHistory != nil {
 		historySnapshot = driver.volumeHistory.Snapshot()
+		for volume, history := range historySnapshot {
+			history.PendingReplacementAttach = nil
+			history.PendingPublishMove = nil
+			history.LastPublishMoveReceipt = ""
+			historySnapshot[volume] = history
+		}
 	}
 	repairSnapshot := map[string]VolumeRepairState{}
 	if driver.volumeRepairState != nil {
@@ -1253,6 +1266,11 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 	if driver.volumeRecoveryControl != nil {
 		recoverySnapshot = driver.volumeRecoveryControl.Snapshot()
 	}
+	var attached map[string]string
+	var conflicts map[string]struct{}
+	if driver.maintenanceMode.Active() {
+		attached, conflicts = maintenanceAttachedNodesByPV(vaSnapshot.Items)
+	}
 	demandSnapshot := map[string]VolumeDesiredState{}
 	protectionSnapshot := map[string]LocalRWOProtectionDecision{}
 	for _, pv := range pvs {
@@ -1261,24 +1279,37 @@ func collectSupportBundleLocalRWOSnapshot(ctx context.Context, cfg config.CSIPlu
 		}
 		runtimeCtx, _ := runtime.ResolveVolumeRuntimeContext(ctx, pv.Spec.CSI.VolumeHandle)
 		if runtimeCtx != nil {
-			existingHistory := historySnapshot[pv.Spec.CSI.VolumeHandle]
-			if !volumeHistoryHasObservedSuccess(existingHistory) {
-				if seed, ok := buildVolumeHistoryBootstrapEvidence(ctx, runtime, pv.Spec.CSI.VolumeHandle, runtimeCtx); ok {
-					mergeVolumeHistoryBootstrap(&existingHistory, seed)
-					normalizeVolumeHistoryRecord(&existingHistory)
-					historySnapshot[pv.Spec.CSI.VolumeHandle] = existingHistory
+			if attached != nil {
+				if node, _ := driver.maintenanceMode.projectMaintenanceNode(ctx, &pv, runtimeCtx, attached, conflicts, nil); node != "" {
+					if runtimeCtx.PVAnnotations == nil {
+						runtimeCtx.PVAnnotations = map[string]string{}
+					}
+					runtimeCtx.PVAnnotations[annotationLastAttachedNode] = node
 				}
 			}
+
 		}
 		existingRecoveryState := recoverySnapshot[pv.Spec.CSI.VolumeHandle]
 		recoveryState := resolvedRecoveryControlState(pv.Spec.CSI.VolumeHandle, runtimeCtx, existingRecoveryState)
 		if recoveryState.Active() || recoveryState.Expired || recoveryState.Invalid || recoveryState.Adopted || strings.TrimSpace(recoveryState.Mode) != "" || strings.TrimSpace(recoveryState.Warning) != "" || strings.TrimSpace(recoveryState.Message) != "" {
 			recoverySnapshot[pv.Spec.CSI.VolumeHandle] = recoveryState
 		}
-		if desiredState, err := runtime.DesiredNodeForVolume(ctx, pv.Spec.CSI.VolumeHandle); err == nil {
+		if desiredState, err := runtime.desiredNodeForVolume(ctx, pv.Spec.CSI.VolumeHandle, vaSnapshot); err == nil {
 			demandSnapshot[pv.Spec.CSI.VolumeHandle] = desiredState
 		}
-		decision, err := localRWOProtectionDecisionForDriver(ctx, driver, pv.Spec.CSI.VolumeHandle, "")
+		decision, err := (&ControllerServer{driver: driver}).localRWOProtectionProjection(ctx, pv.Spec.CSI.VolumeHandle, "", runtimeCtx, false, false)
+		decision.History.PendingReplacementAttach = nil
+		decision.History.PendingPublishMove = nil
+		decision.History.LastPublishMoveReceipt = ""
+		if decision.RuntimeContext != nil {
+			delete(decision.RuntimeContext.PVAnnotations, annotationPublishMoveReceipt)
+			delete(decision.RuntimeContext.PVAnnotations, annotationAllowCrossNodeUntil)
+			delete(decision.RuntimeContext.PVCAnnotations, annotationPublishMoveReceipt)
+			delete(decision.RuntimeContext.PVCAnnotations, annotationAllowCrossNodeUntil)
+		}
+		if decision.History.VolumeID != "" {
+			historySnapshot[pv.Spec.CSI.VolumeHandle] = decision.History
+		}
 		if err != nil {
 			protectionSnapshot[pv.Spec.CSI.VolumeHandle] = LocalRWOProtectionDecision{
 				Reason:  "evaluation_error",

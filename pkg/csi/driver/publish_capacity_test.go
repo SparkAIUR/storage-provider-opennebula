@@ -51,10 +51,10 @@ func (p *cancelableCapacityAttachProvider) AttachVolume(ctx context.Context, vol
 	return p.PersistentDiskVolumeProvider.AttachVolume(ctx, volume, node, immutable, params)
 }
 
-func reviewControllerClient(t *testing.T, controller *ControllerServer) csi.ControllerClient {
+func reviewControllerClient(t *testing.T, controller *ControllerServer, options ...grpc.ServerOption) csi.ControllerClient {
 	t.Helper()
 	listener := bufconn.Listen(1024 * 1024)
-	server := grpc.NewServer()
+	server := grpc.NewServer(options...)
 	csi.RegisterControllerServer(server, controller)
 	go func() {
 		if err := server.Serve(listener); err != nil {
@@ -76,8 +76,12 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 			size.Store(128)
 			var reject atomic.Bool
 			reject.Store(true)
-			var resizes atomic.Int32
-			image := fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, desired)
+			var resizes, metadataWrites atomic.Int32
+			var marker atomic.Int64
+			marker.Store(desired)
+			image := func() string {
+				return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><RUNNING_VMS>1</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS><ID>11</ID></VMS><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, marker.Load())
+			}
 			vmXML := func() string {
 				return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE></DISK></TEMPLATE></VM>`, size.Load())
 			}
@@ -95,12 +99,13 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 				}
 				require.NoError(t, xml.NewDecoder(r.Body).Decode(&call))
 				ok, body, code := 1, "", 0
+				number := func(i int) int { v := call.Params[i].Value; return v.Int + v.I4 + v.I8 }
 				switch call.Method {
 				case "one.image.info":
-					body = image
+					body = image()
 				case "one.imagepool.info":
-					body = "<IMAGE_POOL>" + image + "</IMAGE_POOL>"
-				case "one.vmpool.info":
+					body = "<IMAGE_POOL>" + image() + "</IMAGE_POOL>"
+				case "one.vmpool.info", "one.vmpool.infoextended":
 					body = "<VM_POOL>" + vmXML() + "</VM_POOL>"
 				case "one.vm.info":
 					body = vmXML()
@@ -108,18 +113,35 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 					body = "7.4.1"
 				case "one.vm.diskresize":
 					require.Len(t, call.Params, 4)
-					number := func(i int) int { v := call.Params[i].Value; return v.Int + v.I4 + v.I8 }
 					require.Equal(t, 11, number(1))
 					require.Equal(t, 2, number(2))
-					require.Equal(t, "256", call.Params[3].Value.String)
+					sizeMiB, err := strconv.ParseInt(call.Params[3].Value.String, 10, 64)
+					require.NoError(t, err)
+					require.EqualValues(t, 256, sizeMiB)
 					resizes.Add(1)
 					if reject.Load() {
 						ok, body, code = 0, "resize unavailable", 0x800
 					} else {
-						size.Store(256)
+						size.Store(sizeMiB)
+						marker.Store(128 * 1024 * 1024)
 						body = "11"
 					}
 				case "one.image.update":
+					require.Len(t, call.Params, 4)
+					require.Equal(t, 7, number(1))
+					require.Equal(t, 1, number(3))
+					key, raw, found := strings.Cut(strings.TrimSpace(call.Params[2].Value.String), "=")
+					require.True(t, found)
+					require.Equal(t, "CSI_REQUESTED_SIZE_BYTES", strings.TrimSpace(key))
+					value, err := strconv.Unquote(strings.TrimSpace(raw))
+					require.NoError(t, err)
+					bytes, err := strconv.ParseInt(value, 10, 64)
+					require.NoError(t, err)
+					require.EqualValues(t, desired, bytes)
+					require.Equal(t, bytes, size.Load()*1024*1024)
+					require.EqualValues(t, 2, resizes.Load())
+					marker.Store(bytes)
+					metadataWrites.Add(1)
 					body = "7"
 				default:
 					t.Errorf("unexpected XML-RPC method %s", call.Method)
@@ -163,15 +185,19 @@ func TestControllerPublishCapacityRestorationRetries(t *testing.T) {
 			require.Nil(t, response)
 			require.EqualValues(t, 128, size.Load())
 			require.EqualValues(t, 1, resizes.Load())
+			require.Zero(t, metadataWrites.Load())
 			reject.Store(false)
 			response, err = client.ControllerPublishVolume(ctx, req)
 			require.NoError(t, err)
 			require.Equal(t, "vdb", response.PublishContext["volumeName"])
 			require.EqualValues(t, 256, size.Load())
 			require.EqualValues(t, 2, resizes.Load())
+			require.EqualValues(t, 1, metadataWrites.Load())
+			require.EqualValues(t, desired, marker.Load())
 			_, err = client.ControllerPublishVolume(ctx, req)
 			require.NoError(t, err)
 			require.EqualValues(t, 2, resizes.Load())
+			require.EqualValues(t, 1, metadataWrites.Load())
 			provider.AssertExpectations(t)
 		})
 	}
@@ -182,20 +208,24 @@ func TestStickyCapacityFailurePreservesReuseState(t *testing.T) {
 	require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{VolumeID: "volume-test", NodeID: "node-test", Backend: "local", StartedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute), GraceSeconds: 60}))
 	provider := &MockOpenNebulaVolumeProviderTestify{}
 	provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("vdb", nil)
+	provider.On("VolumeExists", mock.Anything, "volume-test").Return(7, 128*1024*1024, nil)
+	provider.On("NodeExists", mock.Anything, "node-test").Return(11, nil)
 	provider.On("RestoreVolumeCapacity", mock.Anything, "volume-test", 11, 7).Return(fmt.Errorf("resize unavailable")).Once()
 	provider.On("RestoreVolumeCapacity", mock.Anything, "volume-test", 11, 7).Return(nil).Once()
 	controller := NewControllerServer(driver, provider, &MockSharedFilesystemProviderTestify{})
 	req := newPublishReq("volume-test", "node-test")
-	handled, response, err := controller.reuseStickyAttachment(context.Background(), req, 7, 11)
+	publishNode, err := controller.publishNodeIdentity(context.Background(), req.NodeId)
+	require.NoError(t, err)
+	handled, response, err := controller.reuseStickyAttachment(context.Background(), req, 7, 11, publishNode)
 	require.True(t, handled)
 	require.Error(t, err)
 	require.Nil(t, response)
 	_, exists := driver.stickyAttachments.Get(req.VolumeId)
 	require.True(t, exists)
-	handled, response, err = controller.reuseStickyAttachment(context.Background(), req, 7, 11)
+	handled, response, err = controller.reuseStickyAttachment(context.Background(), req, 7, 11, publishNode)
 	require.True(t, handled)
 	require.NoError(t, err)
-	require.Equal(t, "vdb", response.PublishContext["volumeName"])
+	require.Equal(t, "vdb", response.target)
 	_, exists = driver.stickyAttachments.Get(req.VolumeId)
 	require.False(t, exists)
 	provider.AssertExpectations(t)
@@ -216,7 +246,7 @@ func TestControllerPublishAndExpandSerializeVerifiedCapacity(t *testing.T) {
 				defer resume()
 				var paused atomic.Bool
 				imageXML := func() string {
-					return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, marker.Load())
+					return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><RUNNING_VMS>1</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS><ID>11</ID></VMS><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, marker.Load())
 				}
 				vmXML := func() string {
 					return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE></DISK></TEMPLATE></VM>`, size.Load())
@@ -241,7 +271,7 @@ func TestControllerPublishAndExpandSerializeVerifiedCapacity(t *testing.T) {
 						body = imageXML()
 					case "one.imagepool.info":
 						body = "<IMAGE_POOL>" + imageXML() + "</IMAGE_POOL>"
-					case "one.vmpool.info":
+					case "one.vmpool.info", "one.vmpool.infoextended":
 						body = "<VM_POOL>" + vmXML() + "</VM_POOL>"
 					case "one.vm.info":
 						body = vmXML()
@@ -385,7 +415,7 @@ func TestControllerProviderGrowthCompatibilityFailedPrecondition(t *testing.T) {
 				if path != "expand" {
 					imageCapacity = "268435456"
 				}
-				image := `<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>` + imageCapacity + `</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`
+				image := `<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><RUNNING_VMS>1</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS><ID>11</ID></VMS><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>` + imageCapacity + `</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`
 				vmXML := `<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>128</SIZE><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>` + target + `</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM></DISK></TEMPLATE></VM>`
 				endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					var call struct {
@@ -399,7 +429,7 @@ func TestControllerProviderGrowthCompatibilityFailedPrecondition(t *testing.T) {
 						body = "<IMAGE_POOL>" + image + "</IMAGE_POOL>"
 					case "one.image.info":
 						body = image
-					case "one.vmpool.info":
+					case "one.vmpool.info", "one.vmpool.infoextended":
 						body = "<VM_POOL>" + vmXML + "</VM_POOL>"
 					case "one.vm.info":
 						body = vmXML
@@ -513,11 +543,7 @@ func TestControllerPublishCapacityRestorationContextErrors(t *testing.T) {
 					response, err := reviewControllerClient(t, controller).ControllerPublishVolume(ctx, newPublishReq("volume-test", "node-test"))
 					require.Nil(t, response)
 					require.Equal(t, failure.code, status.Code(err))
-					if queued && failure.code == codes.DeadlineExceeded {
-						require.ErrorContains(t, err, "executing hotplug queue request")
-					} else {
-						require.ErrorContains(t, err, failure.err.Error())
-					}
+					require.ErrorContains(t, err, failure.err.Error())
 					if path == "sticky_reuse" {
 						_, exists := driver.stickyAttachments.Get("volume-test")
 						require.True(t, exists)

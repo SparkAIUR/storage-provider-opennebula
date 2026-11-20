@@ -9,9 +9,11 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 )
 
@@ -27,11 +29,16 @@ type StickyAttachmentState struct {
 	DatastoreID        int       `json:"datastoreID"`
 	PVCNamespace       string    `json:"pvcNamespace"`
 	PVCName            string    `json:"pvcName"`
+	PVCUID             types.UID `json:"pvcUID,omitempty"`
 	StartedAt          time.Time `json:"startedAt"`
 	ExpiresAt          time.Time `json:"expiresAt"`
 	GraceSeconds       int       `json:"graceSeconds"`
 	Reason             string    `json:"reason"`
 	LastKnownNodeReady bool      `json:"lastKnownNodeReady"`
+}
+
+func (s StickyAttachmentState) pvcEventContext() *VolumeRuntimeContext {
+	return &VolumeRuntimeContext{PVCNamespace: s.PVCNamespace, PVCName: s.PVCName, PVCUID: s.PVCUID}
 }
 
 type StickyAttachmentManager struct {
@@ -99,6 +106,104 @@ func (m *StickyAttachmentManager) Clear(volumeID string) error {
 	delete(m.entries, volumeID)
 	m.mu.Unlock()
 	return m.deleteEntry(context.Background(), volumeID)
+}
+
+func (state StickyAttachmentState) maintenanceHold() bool {
+	return state.Reason == maintenanceStickyReason || state.Reason == maintenanceReleaseReason
+}
+
+func (state StickyAttachmentState) matchesExpiredPublishMoveGrace(volume, node string, binding *VolumeRuntimeContext) bool {
+	return state.VolumeID == volume && state.NodeID == node && state.Backend == "local" &&
+		state.PVCUID == binding.PVCUID && state.PVCName == binding.PVCName && state.PVCNamespace == binding.PVCNamespace &&
+		!state.StartedAt.IsZero() && !state.ExpiresAt.Before(state.StartedAt) && !state.ExpiresAt.After(time.Now())
+}
+
+func (m *StickyAttachmentManager) recheckReleasedPublishMoveGrace(ctx context.Context, volume, node string, binding *VolumeRuntimeContext, expected StickyAttachmentState) error {
+	deny := attachmentEvidenceUnavailable("pending Publish destination detach custody is unverified", nil)
+	if m == nil || m.runtime == nil || !m.runtime.enabled || expected.Reason != maintenanceReleaseReason || !expected.LastKnownNodeReady ||
+		!expected.matchesExpiredPublishMoveGrace(volume, node, binding) || expected.DatastoreID != binding.DatastoreID ||
+		expected.GraceSeconds < 0 || expected.ExpiresAt.Sub(expected.StartedAt) != time.Duration(expected.GraceSeconds)*time.Second {
+		return deny
+	}
+	if !m.publishMoveMaintenanceInactive(ctx) {
+		return deny
+	}
+	cm, err := m.runtime.GetConfigMap(ctx, m.namespace, stickyAttachmentStateConfigMapName)
+	var current StickyAttachmentState
+	if err != nil || unmarshalAuthorityJSON(cm.Data[volume], &current) != nil || current != expected {
+		return deny
+	}
+	return ctx.Err()
+}
+
+func (m *StickyAttachmentManager) publishMoveMaintenanceInactive(ctx context.Context) bool {
+	cm, err := m.runtime.GetConfigMap(ctx, m.namespace, hotplugStateConfigMapName)
+	if err != nil {
+		return errors.IsNotFound(err)
+	}
+	active, _ := maintenanceModeActive(cm.Data)
+	return !active
+}
+
+func (m *StickyAttachmentManager) clearReleasedPublishMoveGrace(ctx context.Context, volume, node string, binding *VolumeRuntimeContext, maintenanceRelease string) error {
+	deny := attachmentEvidenceUnavailable("pending Publish destination detach grace is unverified", nil)
+	if m == nil || m.runtime == nil || !m.runtime.enabled {
+		if maintenanceRelease != "" {
+			return deny
+		}
+		return nil
+	}
+	if maintenanceRelease != "" && !m.publishMoveMaintenanceInactive(ctx) {
+		return deny
+	}
+	matches := func(state StickyAttachmentState) bool {
+		releasedHold := (state.Reason == "stateful_restart" && binding.RestartMode == restartOptimizationAnnotationValue) ||
+			state.maintenanceHold()
+		return releasedHold && state.matchesExpiredPublishMoveGrace(volume, node, binding) &&
+			(maintenanceRelease == "" || publishMoveDigest(state) == maintenanceRelease)
+	}
+	read := func() (*corev1.ConfigMap, string, error) {
+		cm, err := m.runtime.GetConfigMap(ctx, m.namespace, stickyAttachmentStateConfigMapName)
+		if errors.IsNotFound(err) {
+			return nil, "", nil
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		raw, present := cm.Data[volume]
+		if present && raw == "" {
+			return nil, "", deny
+		}
+		return cm, raw, nil
+	}
+	cm, raw, err := read()
+	if err != nil {
+		return deny
+	}
+	var released StickyAttachmentState
+	if raw != "" {
+		if err := unmarshalAuthorityJSON(raw, &released); err != nil || released.VolumeID != volume {
+			return deny
+		}
+		if released.NodeID != node {
+			if maintenanceRelease != "" {
+				return deny
+			}
+			return nil
+		}
+		if !matches(released) || m.runtime.deleteConfigMapKeyIfCurrent(ctx, cm, volume, raw) != nil {
+			return deny
+		}
+		if _, remaining, err := read(); err != nil || remaining != "" {
+			return deny
+		}
+	}
+	m.mu.Lock()
+	if cached := m.entries[volume]; matches(cached) && (raw == "" || cached == released) {
+		delete(m.entries, volume)
+	}
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *StickyAttachmentManager) Update(state StickyAttachmentState) error {

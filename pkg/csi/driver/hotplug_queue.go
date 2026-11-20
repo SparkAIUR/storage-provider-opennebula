@@ -15,6 +15,8 @@ import (
 
 const hotplugQueueStateConfigMapName = "opennebula-csi-hotplug-queue-state"
 
+var errHotplugQueueActiveLimit = errors.New("hotplug queue active limit reached")
+
 type HotplugQueueTimeoutError struct {
 	Node      string
 	Operation string
@@ -228,6 +230,9 @@ func (m *HotplugQueueManager) SetSnapshotDebounce(debounce time.Duration) {
 }
 
 func (m *HotplugQueueManager) Run(ctx context.Context, node, operation, volume string, priority HotplugQueuePriority, fn func(context.Context) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if m == nil || node == "" {
 		return fn(ctx)
 	}
@@ -253,9 +258,18 @@ func (m *HotplugQueueManager) Run(ctx context.Context, node, operation, volume s
 		defer cancel()
 	}
 
+	waitError := func() (string, error) {
+		if err := ctx.Err(); err != nil {
+			return "caller_done", err
+		}
+		return "timeout", &HotplugQueueTimeoutError{Node: node, Operation: operation, Volume: volume, Timeout: waitLimit}
+	}
 	if coalesced {
 		select {
 		case <-req.done:
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			outcome := "coalesced_success"
 			if req.err != nil {
 				outcome = "coalesced_error"
@@ -264,36 +278,30 @@ func (m *HotplugQueueManager) Run(ctx context.Context, node, operation, volume s
 			m.metrics.RecordHotplugQueueDispatch(operation, string(priority), outcome)
 			return req.err
 		case <-waitCtx.Done():
-			m.metrics.RecordHotplugQueueWait(operation, "coalesced_timeout", time.Since(req.enqueuedAt))
-			m.metrics.RecordHotplugQueueDispatch(operation, string(priority), "coalesced_timeout")
-			return &HotplugQueueTimeoutError{
-				Node:      node,
-				Operation: operation,
-				Volume:    volume,
-				Timeout:   waitLimit,
-			}
+			outcome, err := waitError()
+			m.metrics.RecordHotplugQueueWait(operation, "coalesced_"+outcome, time.Since(req.enqueuedAt))
+			m.metrics.RecordHotplugQueueDispatch(operation, string(priority), "coalesced_"+outcome)
+			return err
 		}
 	}
 
 	select {
 	case <-req.started:
 	case <-req.done:
-		return req.err
 	case <-waitCtx.Done():
-		if m.cancel(req.id, node) {
-			m.metrics.RecordHotplugQueueWait(operation, "timeout", time.Since(req.enqueuedAt))
-			m.metrics.RecordHotplugQueueDispatch(operation, string(priority), "timeout")
-			return &HotplugQueueTimeoutError{
-				Node:      node,
-				Operation: operation,
-				Volume:    volume,
-				Timeout:   waitLimit,
-			}
+		outcome, err := waitError()
+		if m.cancel(req.id, node, err) {
+			m.metrics.RecordHotplugQueueWait(operation, outcome, time.Since(req.enqueuedAt))
+			m.metrics.RecordHotplugQueueDispatch(operation, string(priority), outcome)
+			return err
 		}
 	}
 
 	<-req.done
 	err := req.err
+	if callerErr := ctx.Err(); callerErr != nil {
+		err = callerErr
+	}
 	outcome := "success"
 	if err != nil {
 		outcome = "error"
@@ -317,6 +325,10 @@ func (m *HotplugQueueManager) Snapshot() map[string]HotplugQueueNodeSnapshot {
 }
 
 func (m *HotplugQueueManager) HasVolume(volume string) bool {
+	return m.hasVolume(volume, "")
+}
+
+func (m *HotplugQueueManager) hasVolume(volume, cleanupNode string) bool {
 	if m == nil || volume == "" {
 		return false
 	}
@@ -330,7 +342,7 @@ func (m *HotplugQueueManager) HasVolume(volume string) bool {
 			return true
 		}
 		for _, req := range nodeQueue.pending {
-			if req.volume == volume {
+			if req.volume == volume && (cleanupNode == "" || req.node == cleanupNode || req.operation != "attach") {
 				return true
 			}
 		}
@@ -373,7 +385,7 @@ func (m *HotplugQueueManager) enqueue(req *hotplugQueueRequest) (*hotplugQueueRe
 	return req, false
 }
 
-func (m *HotplugQueueManager) cancel(id uint64, node string) bool {
+func (m *HotplugQueueManager) cancel(id uint64, node string, err error) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	nodeQueue := m.nodes[node]
@@ -388,12 +400,7 @@ func (m *HotplugQueueManager) cancel(id uint64, node string) bool {
 		snapshot := m.snapshotLocked(node)
 		m.recordDepthMetricsLocked()
 		go m.persistSnapshot(snapshot)
-		req.complete(&HotplugQueueTimeoutError{
-			Node:      node,
-			Operation: req.operation,
-			Volume:    req.volume,
-			Timeout:   req.waitLimit,
-		})
+		req.complete(err)
 		return true
 	}
 	return false
@@ -416,8 +423,14 @@ func (m *HotplugQueueManager) runRequest(req *hotplugQueueRequest) error {
 	if m == nil || req == nil {
 		return nil
 	}
+	if err := req.ctx.Err(); err != nil {
+		return err
+	}
 	if m.validator != nil {
 		validation := m.validator(req.ctx, req.node, req.operation, req.volume)
+		if err := req.ctx.Err(); err != nil {
+			return err
+		}
 		switch validation.Decision {
 		case HotplugQueueValidationCompleted:
 			m.metrics.RecordHotplugQueueDispatch(req.operation, string(req.priority), "completed")
@@ -449,22 +462,14 @@ func (m *HotplugQueueManager) runRequest(req *hotplugQueueRequest) error {
 	runCtx := req.ctx
 	var cancel context.CancelFunc
 	if m.maxActive > 0 {
-		runCtx, cancel = context.WithTimeout(req.ctx, m.maxActive)
+		runCtx, cancel = context.WithTimeoutCause(req.ctx, m.maxActive, errHotplugQueueActiveLimit)
 		defer cancel()
 	}
 	err := req.fn(runCtx)
-	if err != nil {
-		if m.maxActive > 0 && errors.Is(err, context.DeadlineExceeded) {
-			return &HotplugQueueActiveTimeoutError{
-				Node:      req.node,
-				Operation: req.operation,
-				Volume:    req.volume,
-				Timeout:   m.maxActive,
-			}
-		}
-		return err
+	if callerErr := req.ctx.Err(); callerErr != nil {
+		return callerErr
 	}
-	if runCtx.Err() == context.DeadlineExceeded {
+	if context.Cause(runCtx) == errHotplugQueueActiveLimit {
 		return &HotplugQueueActiveTimeoutError{
 			Node:      req.node,
 			Operation: req.operation,
@@ -472,7 +477,7 @@ func (m *HotplugQueueManager) runRequest(req *hotplugQueueRequest) error {
 			Timeout:   m.maxActive,
 		}
 	}
-	return nil
+	return err
 }
 
 func (m *HotplugQueueManager) next(node string) *hotplugQueueRequest {

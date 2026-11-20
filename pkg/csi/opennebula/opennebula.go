@@ -58,11 +58,13 @@ type ObservedAttachment struct {
 }
 
 type VolumeDiskRecord struct {
-	NodeName string `json:"nodeName,omitempty"`
-	NodeID   int    `json:"nodeID,omitempty"`
-	DiskID   int    `json:"diskID,omitempty"`
-	Target   string `json:"target,omitempty"`
-	Serial   string `json:"serial,omitempty"`
+	NodeName          string `json:"nodeName,omitempty"`
+	NodeID            int    `json:"nodeID,omitempty"`
+	DiskID            int    `json:"diskID,omitempty"`
+	Target            string `json:"target,omitempty"`
+	Serial            string `json:"serial,omitempty"`
+	ReadOnly          bool   `json:"-"`
+	ReplacementMarked bool   `json:"-"`
 }
 
 type VolumeAttachmentMetadata struct {
@@ -77,6 +79,7 @@ type VolumeAttachmentMetadata struct {
 	RequestedNodeID         int                `json:"requestedNodeID,omitempty"`
 	AttachedToRequestedNode bool               `json:"attachedToRequestedNode,omitempty"`
 	DiskRecords             []VolumeDiskRecord `json:"diskRecords,omitempty"`
+	requestedVMName         string
 }
 
 type VolumeLookupStatus string
@@ -122,12 +125,58 @@ func (m VolumeAttachmentMetadata) ConflictingOwnerVMIDs() []int {
 	return ids
 }
 
+type DetachAuthorization func(ctx context.Context, imageID, vmID, diskID int) error
+
+type DetachOwnerCheck func(ctx context.Context, imageID, vmID, diskID int) (target string, err error)
+
+type AuthorizedVolumeDetacher interface {
+	DetachVolumeWithAuthority(ctx context.Context, volume, node string, expectedVMID int, expectedBackend string, verifyOwner DetachOwnerCheck, authorize DetachAuthorization) (accepted bool, err error)
+}
+
+type AttachmentBackendVerifier interface {
+	VerifyAttachmentBackend(ctx context.Context, volume, node string, imageID, vmID int, expected string) error
+}
+
+type VolumeDatastoreInspector interface {
+	InspectVolumeDatastore(ctx context.Context, volume string, imageID int) (Datastore, error)
+}
+
+type VolumeAbsenceVerifier interface {
+	VerifyVolumeAbsent(ctx context.Context, volume string, imageID int, vmIDs ...int) error
+}
+
+type VMVolumeAbsenceVerifier interface {
+	VerifyVolumeAbsentFromVM(ctx context.Context, volume string, imageID, vmID int) error
+}
+
 type VolumeAttachmentInspector interface {
 	InspectVolumeAttachment(ctx context.Context, volume string, node string) (*VolumeAttachmentMetadata, error)
 }
 
+type VolumeDiskInspector interface {
+	InspectVolumeDisk(ctx context.Context, imageID, vmID int) (VolumeDiskRecord, error)
+}
+
 type VolumeLookupInspector interface {
 	InspectVolumeLookup(ctx context.Context, volume string, requestedNode string) (*VolumeLookupResult, error)
+}
+
+// SameNodeRetentionEvidence is a positive, read-only observation of one stable
+// persistent Ceph disk owned by the requested VM. Missing or uncertain facts do
+// not produce evidence. Kubernetes demand and identity must be checked by the
+// caller separately before retaining an attachment.
+type SameNodeRetentionEvidence struct {
+	VolumeID     string
+	ImageID      int
+	NodeID       int
+	DiskID       int
+	Target       string
+	DeviceSerial string
+	SizeBytes    int64
+}
+
+type SameNodeRetentionInspector interface {
+	InspectSameNodeRetention(ctx context.Context, volume string, node string) (*SameNodeRetentionEvidence, error)
 }
 
 type HotplugCooldownState struct {
@@ -210,7 +259,7 @@ type OpenNebulaVolumeProvider interface {
 	NodeExists(ctx context.Context, node string) (int, error)
 	GetVolumeInNode(ctx context.Context, volumeID int, nodeID int) (string, error)
 	VolumeReadyWithTimeout(ctx context.Context, volumeID int) (bool, error)
-	ListCurrentAttachments(ctx context.Context) ([]ObservedAttachment, error)
+	ListCurrentAttachments(ctx context.Context) ([]ObservedAttachment, VMNameInventory, error)
 }
 
 type SharedFilesystemProvider interface {

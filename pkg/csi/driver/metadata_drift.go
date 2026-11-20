@@ -37,7 +37,10 @@ func (s *ControllerServer) rejectIfOpenNebulaMetadataDrift(ctx context.Context, 
 		return nil
 	}
 
-	activeState, quarantined := s.activeVolumeQuarantine(ctx, req.VolumeId)
+	activeState, quarantined, err := s.activeVolumeQuarantine(ctx, req.VolumeId)
+	if err != nil {
+		return err
+	}
 	metadata, inspectErr := inspector.InspectVolumeAttachment(ctx, req.VolumeId, req.NodeId)
 	if inspectErr != nil {
 		if recoveryControl.Active() && recoveryControl.SuppressRepairActions {
@@ -99,7 +102,7 @@ func (s *ControllerServer) rejectIfOpenNebulaMetadataDrift(ctx context.Context, 
 	return status.Error(codes.FailedPrecondition, message)
 }
 
-func (s *ControllerServer) detachMetadataDriftError(ctx context.Context, volumeID, nodeID string, cause error) error {
+func (s *ControllerServer) detachMetadataDriftError(ctx context.Context, volumeID, nodeID string, cause error, eventClaim *VolumeRuntimeContext) error {
 	if opennebula.IsDatastoreConfigError(cause) {
 		return status.Error(codes.FailedPrecondition, cause.Error())
 	}
@@ -112,7 +115,7 @@ func (s *ControllerServer) detachMetadataDriftError(ctx context.Context, volumeI
 	}
 	recoveryControl, recoveryErr := s.recoveryControlState(ctx, volumeID, runtimeCtx)
 	if recoveryErr == nil {
-		s.recordRecoveryModeExpiryWarning(ctx, runtimeCtx, recoveryControl)
+		s.recordRecoveryModeExpiryWarning(ctx, eventClaim, recoveryControl)
 	}
 	if recoveryControl.Active() && recoveryControl.SuppressRepairActions {
 		return nil
@@ -146,10 +149,10 @@ func (s *ControllerServer) detachMetadataDriftError(ctx context.Context, volumeI
 	s.driver.metrics.RecordMetadataDrift(metadataDriftClassification, "detach_failed")
 	if active {
 		s.driver.metrics.RecordVolumeQuarantine(state.Reason, "active")
-		s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonVolumeQuarantined, volumeQuarantineMessage(state))
+		s.recordPVCWarningFromRuntimeContext(ctx, eventClaim, eventReasonVolumeQuarantined, volumeQuarantineMessage(state))
 	} else {
 		s.driver.metrics.RecordVolumeQuarantine(state.Reason, "observed")
-		s.recordPVCWarningFromRuntimeContext(ctx, runtimeCtx, eventReasonOpenNebulaMetadataDrift, message)
+		s.recordPVCWarningFromRuntimeContext(ctx, eventClaim, eventReasonOpenNebulaMetadataDrift, message)
 	}
 	return status.Error(codes.FailedPrecondition, message)
 }

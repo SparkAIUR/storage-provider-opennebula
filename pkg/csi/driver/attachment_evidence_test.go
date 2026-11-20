@@ -75,7 +75,11 @@ func TestControllerUnpublishRejectsUnknownAttachmentRecheck(t *testing.T) {
 				if absent {
 					recheckErr = fmt.Errorf("confirmed absent: %w", opennebula.ErrAttachmentNotFound)
 				}
-				provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("", recheckErr).Once()
+				checks := 1
+				if queued && absent {
+					checks++
+				}
+				provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("", recheckErr).Times(checks)
 				client := reviewControllerClient(t, controller)
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
@@ -83,6 +87,8 @@ func TestControllerUnpublishRejectsUnknownAttachmentRecheck(t *testing.T) {
 				if absent {
 					require.NoError(t, err)
 					require.NotNil(t, response)
+					record, _ := controller.driver.volumeHistory.Get(before.VolumeID)
+					require.False(t, record.LastSafeDetachTime.IsZero())
 				} else {
 					require.Equal(t, codes.Unavailable, status.Code(err))
 					require.Nil(t, response)
@@ -112,7 +118,7 @@ func TestControllerPublishPreservesUnknownStickyAttachment(t *testing.T) {
 				}
 				provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("", recheckErr).Once()
 				if absent {
-					provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("vdb", nil).Once()
+					provider.On("GetVolumeInNode", mock.Anything, 7, 11).Return("vdb", nil).Times(5)
 				}
 				client := reviewControllerClient(t, controller)
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

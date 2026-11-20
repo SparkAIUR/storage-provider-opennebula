@@ -120,3 +120,27 @@ The first0.6.0 RC carries safety and dependency changes together. XML-RPC, CSI i
 
 - AI: Capture the actual operation context at the first capacity command and await its cancellation before injecting the deadline observation error. Waiting for the caller context alone does not synchronize child cancellation. Retain all filesystem formats, command boundaries, deadline status and mutation assertions; production context handling is unchanged.
 - AI: Preserve the independent Plan007 runtime failure receipt alongside the corrected fixture results. Local validation does not qualify native expansion or reattach, waive acceptance, or start the 24-hour observation. The current OpenNebula 7.4.0/no-direct-host instruction remains in force.
+
+## 2026-11-13, RC3 qualification metadata
+
+- HUMAN: Proceed with validation for hpldb. OpenNebula 7.4.0 remains the target, with no direct OpenNebula host actions and no hplsvc/bravo activation.
+- AI: Prepare the unused v0.6.0-rc.3 candidate by aligning chart version, appVersion and the default driver image tag. Package the reviewed merged source without changing code, dependencies, runtime configuration or Helm behavior beyond those version defaults. Preserve all earlier candidate artifacts and receipts.
+- AI: Bind later build metadata to the exact frozen source commit and tree. Local packaging checks do not claim publication, deployment or native acceptance. Protected publication, artifact freeze, reviewed hpldb-only GitOps and fresh node UID approvals remain later gates; affected LVM growth/reattach and the 24-hour observation remain open, with no feature waiver.
+
+## 2026-11-17, RC4 attachment recovery corrections
+
+- HUMAN: Include the approved attachment safety, repair evidence and read-only diagnostics corrections in RC4, retaining the v0.5.x integration target and frozen RC3 ancestry.
+- AI: Centralize physical-detach authority, bind cleanup grace to PV/VA identities, condition stale-VA deletion on fresh provider absence, and require successful detach readback. Diagnostics use in-memory projections without running maintenance operations or persisting bootstrap history.
+- AI: Bound orphan cleanup to the owned PV identity lifetime. Public DeleteVolume must refuse retained or unknown provider ownership until ordinary deletion can establish absence. Local behavioral and XML-RPC tests do not grant publication or native acceptance.
+
+## 2026-11-18, Ceph Publish after Node replacement scope
+
+This entry records the scope of the separate Publish path in [Publish after Node replacement](docs/ceph-same-node-recovery.md#publish-after-node-replacement). Same-node automatic retention remains a distinct, zero-provider-write behavior.
+
+- HUMAN: Approve an exact single-writer Ceph optional versioned pending-attempt and selected-disk marker for Publish after same-name replacement-Node (Orca reply msg_750782a24271).
+- HUMAN: Extend the pending-attempt record to a verified replacement VM, limited to the exact original-release-to-current-target case. This is not generic placement or adoption (msg_8cd11bd9f8dd).
+- HUMAN: Approve the bounded prepared-to-dispatch phase and the ordinary abandoned-disk cleanup transitions (msg_34c0b2d485bf).
+- HUMAN: Approve a fresh per-contender transition ID in the phase-advance conditional update (msg_149d8c382cdf).
+- HUMAN: Approve retaining verified detach completion in the existing pending record until the original deleting VolumeAttachment is gone. The CSI reply replays against that proof with no second provider mutation, and the record retires only after authoritative VolumeAttachment retirement (msg_aa5b294bd7d2).
+- AI: Coordinator/standing-authority correctness safeguard, not an explicit HUMAN approval of a new local workflow (round 72, msg_705e81691e5e). For existing operator-granted local Publish placement, the existing-record handoff separates exact admitted physical movement from independently proven consumption of the exact grant. Revocation, a missing grant, changed identity or uncertain writes confer no ownership. It adds no second attach, new object, permission or live action, and existing local maintenance and grant checks are preserved.
+- AI: The scope adds no generic adoption, scheduling, provider privilege or live authorization. If later review finds unrelated scope, narrow it rather than treating it as approved.

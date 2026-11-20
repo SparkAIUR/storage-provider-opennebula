@@ -1,8 +1,15 @@
 package driver
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -15,6 +22,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/yaml"
 )
 
@@ -132,4 +141,132 @@ func TestChartPreservesExplicitBooleanSettings(t *testing.T) {
 			})
 		}
 	}
+}
+
+const (
+	reconcileTestDriverRepository = "registry.example.test/fixture/csi-driver"
+	reconcileTestDriverTag        = "fixture-tag"
+)
+
+func parseStorageClassJobArgs(args []string) (string, StorageClassReconcileOptions, error) {
+	flags := flag.NewFlagSet("storageclass-reconcile", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	klog.InitFlags(flags)
+	mode, opts := BindStorageClassReconcileCLI(flags)
+	err := flags.Parse(args)
+	if err == nil && flags.NArg() != 0 {
+		err = fmt.Errorf("unexpected positional arguments: %v", flags.Args())
+	}
+	return *mode, *opts, err
+}
+
+func TestStorageClassReconcileRenderContract(t *testing.T) {
+	helm := os.Getenv("STORAGECLASS_RECONCILE_HELM")
+	if helm == "" {
+		t.Skip("set STORAGECLASS_RECONCILE_HELM to run the Helm CLI integration")
+	}
+	version, err := exec.Command(helm, "version", "--template", "{{.Version}}").Output()
+	require.NoError(t, err)
+	require.Equal(t, "v3.21.4", strings.TrimSpace(string(version)))
+	chartDir := os.Getenv("STORAGECLASS_RECONCILE_CHART_DIR")
+	if chartDir == "" {
+		chartDir = "../../../helm/opennebula-csi"
+	}
+	for _, mode := range []string{"default", "disabled", "enabled", "no-classes"} {
+		t.Run(mode, func(t *testing.T) {
+			rendered := renderStorageClassReconcileContract(t, helm, chartDir, mode)
+			var jobs []batchv1.Job
+			var inputs []corev1.ConfigMap
+			decoder := k8syaml.NewYAMLOrJSONDecoder(strings.NewReader(rendered), 4096)
+			for {
+				var raw json.RawMessage
+				err := decoder.Decode(&raw)
+				if err == io.EOF {
+					break
+				}
+				require.NoError(t, err)
+				if len(bytes.TrimSpace(raw)) == 0 {
+					continue
+				}
+				var meta metav1.TypeMeta
+				require.NoError(t, json.Unmarshal(raw, &meta))
+				switch meta.Kind {
+				case "Job":
+					var job batchv1.Job
+					require.NoError(t, json.Unmarshal(raw, &job))
+					reconcile := job.Labels["app.kubernetes.io/component"] == "storageclass-reconcile" ||
+						job.Spec.Template.Labels["app.kubernetes.io/component"] == "storageclass-reconcile"
+					for _, container := range job.Spec.Template.Spec.Containers {
+						argv := append(append([]string(nil), container.Command...), container.Args...)
+						runMode, _, _ := parseStorageClassJobArgs(argv)
+						reconcile = reconcile || runMode == "storageclass-reconcile"
+					}
+					if reconcile {
+						jobs = append(jobs, job)
+					}
+				case "ConfigMap":
+					var cm corev1.ConfigMap
+					require.NoError(t, json.Unmarshal(raw, &cm))
+					_, hasInput := cm.Data["storageclasses.json"]
+					if hasInput || cm.Labels["app.kubernetes.io/component"] == "storageclass-reconcile" {
+						inputs = append(inputs, cm)
+					}
+				}
+			}
+			if mode != "enabled" {
+				require.Empty(t, jobs)
+				require.Empty(t, inputs)
+				return
+			}
+			require.Len(t, jobs, 1)
+			require.Len(t, inputs, 1)
+			job, input := jobs[0], inputs[0]
+			require.Equal(t, job.Namespace, input.Namespace)
+			require.Len(t, job.Spec.Template.Spec.Containers, 1)
+			container := job.Spec.Template.Spec.Containers[0]
+			require.Equal(t, reconcileTestDriverRepository+":"+reconcileTestDriverTag, container.Image)
+			require.Empty(t, container.Command, "the Job must use the CSI driver image entrypoint")
+			args := container.Args
+			runMode, opts, err := parseStorageClassJobArgs(args)
+			require.NoError(t, err)
+			require.Equal(t, "storageclass-reconcile", runMode)
+			invalid := append(append([]string(nil), args...), "--storageclass-reconcile-configmap-unknown=input")
+			_, _, err = parseStorageClassJobArgs(invalid)
+			require.Error(t, err)
+			require.Equal(t, input.Name, opts.ConfigMapName)
+			require.Equal(t, input.Namespace, opts.Namespace)
+			require.Equal(t, "pre-upgrade", job.Annotations["helm.sh/hook"])
+			require.Equal(t, "pre-upgrade", input.Annotations["helm.sh/hook"])
+			jobWeight, err := strconv.Atoi(job.Annotations["helm.sh/hook-weight"])
+			require.NoError(t, err)
+			inputWeight, err := strconv.Atoi(input.Annotations["helm.sh/hook-weight"])
+			require.NoError(t, err)
+			require.Less(t, inputWeight, jobWeight)
+			client := fake.NewSimpleClientset(&input)
+			var result bytes.Buffer
+			require.NoError(t, RunStorageClassReconcile(context.Background(), client, opts, &result))
+			class, err := client.StorageV1().StorageClasses().Get(context.Background(), "opennebula-local", metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, DefaultDriverName, class.Provisioner)
+			require.Equal(t, "100", class.Parameters["datastoreIDs"])
+		})
+	}
+}
+
+func renderStorageClassReconcileContract(t *testing.T, helm, chartDir, mode string) string {
+	t.Helper()
+	args := []string{"template", "reconcile", chartDir, "--namespace", "default", "--is-upgrade",
+		"--set", "credentials.existingSecret.name=dummy,credentials.existingSecret.userKey=user,credentials.existingSecret.passwordKey=pass",
+		"--set-string", "image.repository=" + reconcileTestDriverRepository + ",image.tag=" + reconcileTestDriverTag + ",image.digest="}
+	if mode != "no-classes" {
+		args = append(args, "--set", "storageClasses[0].name=opennebula-local,storageClasses[0].parameters.datastoreIDs=100")
+	} else {
+		args = append(args, "--set-json", "storageClasses=[]")
+	}
+	if mode != "default" {
+		args = append(args, "--set", fmt.Sprintf("storageClassReconcile.enabled=%t", mode != "disabled"))
+	}
+	output, err := exec.Command(helm, args...).Output()
+	require.NoError(t, err)
+	return string(output)
 }

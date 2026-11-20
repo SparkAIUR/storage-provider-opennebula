@@ -29,11 +29,57 @@ func effectiveImageSize(info *img.Image) (int64, error) {
 }
 
 // A disk's requested SIZE is optimistic while RESIZE/SIZE_PREV or resize LCM state remains.
-func (p *PersistentDiskVolumeProvider) completedDiskSize(ctx context.Context, vmID, diskID, imageID int) (int64, error) {
-	info, err := p.ctrl.VM(vmID).InfoContext(ctx, true)
+func (p *PersistentDiskVolumeProvider) completedDiskSize(ctx context.Context, vmID, diskID, imageID int, vmName string) (int64, error) {
+	info, err := p.readResizeVM(ctx, vmID, vmName != "")
 	if err != nil {
 		return 0, err
 	}
+	if vmName != "" {
+		if err := verifyVMName(info, vmName); err != nil {
+			return 0, err
+		}
+		selectedID, disk, err := publishDiskFromVM(info, imageID, vmID)
+		if err != nil {
+			return 0, err
+		}
+		if selectedID != diskID {
+			return 0, fmt.Errorf("restoration disk slot changed from %d to %d", diskID, selectedID)
+		}
+		return completedSelectedDiskSize(info, *disk)
+	}
+	return completedDiskSizeFromVM(info, diskID, imageID)
+}
+
+func (p *PersistentDiskVolumeProvider) readResizeVM(ctx context.Context, vmID int, restoring bool) (*vm.VM, error) {
+	if restoring {
+		return p.readVMInfo(ctx, vmID, vmDisks|vmState)
+	}
+	return p.ctrl.VM(vmID).InfoContext(ctx, true)
+}
+
+func (p *PersistentDiskVolumeProvider) readResizeImage(ctx context.Context, imageID int, restoring bool) (*img.Image, error) {
+	if restoring {
+		return p.readImageInfo(ctx, imageID)
+	}
+	return p.readOrdinaryImageInfo(ctx, imageID)
+}
+
+func completedDiskSizeFromVM(info *vm.VM, diskID, imageID int) (int64, error) {
+	for _, disk := range info.Template.GetDisks() {
+		iid, err := disk.GetI(shared.ImageID)
+		if err != nil || iid != imageID {
+			continue
+		}
+		did, e := disk.GetI(shared.DiskID)
+		if e != nil || did != diskID {
+			continue
+		}
+		return completedSelectedDiskSize(info, disk)
+	}
+	return 0, fmt.Errorf("resize identity changed: image %d vm %d disk %d", imageID, info.ID, diskID)
+}
+
+func completedSelectedDiskSize(info *vm.VM, disk shared.Disk) (int64, error) {
 	state, lcm, err := info.State()
 	if err != nil {
 		return 0, err
@@ -44,35 +90,30 @@ func (p *PersistentDiskVolumeProvider) completedDiskSize(ctx context.Context, vm
 	if (state != vm.Active || lcm != vm.Running) && (state != vm.Poweroff || lcm != vm.LcmInit) {
 		return 0, fmt.Errorf("VM is not in an eligible resize-completion state: %s/%s", state, lcm)
 	}
-	for _, disk := range info.Template.GetDisks() {
-		iid, e := disk.GetI(shared.ImageID)
-		if e != nil || iid != imageID {
-			continue
-		}
-		did, e := disk.GetI(shared.DiskID)
-		if e != nil || did != diskID {
-			continue
-		}
-		if prev, e := disk.Get("SIZE_PREV"); e == nil && strings.TrimSpace(prev) != "" {
-			return 0, nil
-		}
-		if marker, e := disk.Get("RESIZE"); e == nil && marker != "" && marker != "NO" && marker != "0" && marker != "false" {
-			return 0, nil
-		}
-		return diskSizeBytesFromTemplate(disk)
+	if prev, e := disk.Get("SIZE_PREV"); e == nil && strings.TrimSpace(prev) != "" {
+		return 0, nil
 	}
-	return 0, fmt.Errorf("resize identity changed: image %d vm %d disk %d", imageID, vmID, diskID)
+	if marker, e := disk.Get("RESIZE"); e == nil && marker != "" && marker != "NO" && marker != "0" && marker != "false" {
+		return 0, nil
+	}
+	return diskSizeBytesFromTemplate(disk)
 }
 
-func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, id int, size int64) error {
-	info, err := p.ctrl.Image(id).InfoContext(ctx, true)
+func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, identity attachmentVMIdentity, diskID, id int, size int64) error {
+	vmID, vmName := identity.id, identity.name
+	restoring := vmName != ""
+	info, err := p.readResizeImage(ctx, id, restoring)
 	if err != nil {
 		return err
+	}
+	if info.ID != id {
+		return fmt.Errorf("image identity changed before recording verified capacity")
 	}
 	existing, err := effectiveImageSize(info)
 	if err != nil {
 		return err
 	}
+	completed := size
 	if existing > size {
 		size = existing
 	}
@@ -80,22 +121,46 @@ func (p *PersistentDiskVolumeProvider) persistVerifiedSize(ctx context.Context, 
 	if err := tpl.AddPair(requestedSizeTag, strconv.FormatInt(size, 10)); err != nil {
 		return err
 	}
+	if restoring {
+		err := p.verifyPublishMutation(ctx, vmID, id, vmName, func() error {
+			_, disk, err := p.observeGrowthTarget(ctx, identity, diskID, id)
+			if err != nil {
+				return err
+			}
+			actual, err := diskSizeBytesFromTemplate(*disk)
+			if err != nil {
+				return err
+			}
+			if actual != completed {
+				return fmt.Errorf("restoration completed capacity changed before recording it")
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
 	if err := p.ctrl.Image(id).UpdateContext(ctx, tpl.String(), parameters.Merge); err != nil {
 		return err
 	}
-	info, err = p.ctrl.Image(id).InfoContext(ctx, true)
+	info, err = p.readResizeImage(ctx, id, restoring)
 	if err != nil {
 		return err
 	}
-	raw, err := info.Template.GetStr(requestedSizeTag)
-	if err != nil || raw != strconv.FormatInt(size, 10) {
+	markers := info.Template.GetStrs(requestedSizeTag)
+	if info.ID != id || len(markers) != 1 || markers[0] != strconv.FormatInt(size, 10) {
 		return fmt.Errorf("verified size metadata readback failed for image %d", id)
 	}
 	return nil
 }
 
 func (p *PersistentDiskVolumeProvider) RestoreVolumeCapacity(ctx context.Context, volume string, vmID, imageID int) error {
-	info, err := p.ctrl.Image(imageID).InfoContext(ctx, true)
+	admitted, _ := ctx.Value(publishMutationKey{}).(publishMutationAdmission)
+	return p.restoreVolumeCapacity(ctx, volume, imageID, attachmentVMIdentity{id: vmID, lookupName: admitted.node})
+}
+
+func (p *PersistentDiskVolumeProvider) restoreVolumeCapacity(ctx context.Context, volume string, imageID int, identity attachmentVMIdentity) error {
+	info, err := p.readImageInfo(ctx, imageID)
 	if err != nil {
 		return err
 	}
@@ -110,16 +175,36 @@ func (p *PersistentDiskVolumeProvider) RestoreVolumeCapacity(ctx context.Context
 	if err != nil {
 		return err
 	}
-	disk, _, err := p.volumeDiskInVM(ctx, imageID, vmID)
+	vmID := identity.id
+	if identity.name == "" && identity.lookupName != "" {
+		resolvedID, name, _, err := resolveNodeVM(ctx, p.ctrl, identity.lookupName)
+		if err != nil {
+			return err
+		}
+		if resolvedID != vmID {
+			return fmt.Errorf("%w: restoration VM identity changed", ErrConflictingAttachmentEvidence)
+		}
+		identity.name = name
+	}
+	vmInfo, err := p.readVMInfo(ctx, vmID, vmDisks|vmState)
 	if err != nil {
 		return err
 	}
-	actual, err := p.completedDiskSize(ctx, vmID, disk, imageID)
+	if identity.name == "" {
+		identity.name = vmInfo.Name
+	} else if err := verifyVMName(vmInfo, identity.name); err != nil {
+		return err
+	}
+	slot, _, err := publishDiskFromVM(vmInfo, imageID, vmID)
+	if err != nil {
+		return err
+	}
+	actual, err := p.completedDiskSize(ctx, vmID, slot, imageID, vmInfo.Name)
 	if err != nil {
 		return err
 	}
 	if actual < desired {
-		_, err = p.expandAttachedDisk(ctx, vmID, disk, imageID, desired)
+		_, err = p.expandAttachedDisk(ctx, identity, slot, imageID, desired)
 		return err
 	}
 	return nil

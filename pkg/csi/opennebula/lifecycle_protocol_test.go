@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -83,7 +84,7 @@ func TestLifecycleHistoricalForceNeverDeletes(t *testing.T) {
 		case "one.imagepool.info":
 			return true, `<IMAGE_POOL><IMAGE><ID>7</ID><NAME>volume-test</NAME></IMAGE></IMAGE_POOL>`, 0
 		case "one.image.info":
-			return true, `<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>1</STATE><SIZE>128</SIZE><SOURCE>/fixture/disk</SOURCE><TEMPLATE><FORCE_DELETE>YES</FORCE_DELETE></TEMPLATE></IMAGE>`, 0
+			return true, `<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>1</STATE><SIZE>128</SIZE><SOURCE>/fixture/disk</SOURCE><RUNNING_VMS>0</RUNNING_VMS><VMS/><CLONING_OPS>0</CLONING_OPS><TEMPLATE><FORCE_DELETE>YES</FORCE_DELETE></TEMPLATE></IMAGE>`, 0
 		default:
 			mutations++
 			return false, "unexpected mutation", 0x800
@@ -109,8 +110,11 @@ func TestLifecycleDeleteUsesPinnedIDAndNonforce(t *testing.T) {
 	p := lifecycleFixture(t, func(method string) (bool, string, int) {
 		switch method {
 		case "one.imagepool.info":
+			if deleted {
+				return true, "<IMAGE_POOL/>", 0
+			}
 			return true, `<IMAGE_POOL><IMAGE><ID>7</ID><NAME>volume-test</NAME></IMAGE></IMAGE_POOL>`, 0
-		case "one.vmpool.info":
+		case "one.vmpool.info", "one.vmpool.infoextended":
 			return true, `<VM_POOL/>`, 0
 		case "one.image.info":
 			if deleted {
@@ -119,7 +123,7 @@ func TestLifecycleDeleteUsesPinnedIDAndNonforce(t *testing.T) {
 					return false, "not present", 0x400
 				}
 			}
-			return true, `<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>1</STATE><SIZE>128</SIZE><SOURCE>/fixture/disk</SOURCE><RUNNING_VMS>0</RUNNING_VMS></IMAGE>`, 0
+			return true, `<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>1</STATE><SIZE>128</SIZE><SOURCE>/fixture/disk</SOURCE><RUNNING_VMS>0</RUNNING_VMS><VMS/><CLONING_OPS>0</CLONING_OPS></IMAGE>`, 0
 		case "one.image.delete":
 			deleted = true
 			return true, "7", 0
@@ -144,7 +148,7 @@ func TestLifecycleResizeOptimisticMetadataIsPending(t *testing.T) {
 			p := lifecycleFixture(t, func(string) (bool, string, int) {
 				return true, `<VM><ID>11</ID><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><SIZE>256</SIZE>` + marker + `</DISK></TEMPLATE></VM>`, 0
 			})
-			size, err := p.completedDiskSize(context.Background(), 11, 2, 7)
+			size, err := p.completedDiskSize(context.Background(), 11, 2, 7, "")
 			require.NoError(t, err)
 			require.Zero(t, size)
 		})
@@ -154,7 +158,7 @@ func TestLifecycleResizeOptimisticMetadataIsPending(t *testing.T) {
 func TestLifecycleResizeRejectsWrongStateOrIdentity(t *testing.T) {
 	for _, vmXML := range []string{`<VM><ID>11</ID><STATE>3</STATE><LCM_STATE>16</LCM_STATE></VM>`, `<VM><ID>11</ID><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>8</IMAGE_ID><DISK_ID>2</DISK_ID><SIZE>256</SIZE></DISK></TEMPLATE></VM>`} {
 		p := lifecycleFixture(t, func(string) (bool, string, int) { return true, vmXML, 0 })
-		size, err := p.completedDiskSize(context.Background(), 11, 2, 7)
+		size, err := p.completedDiskSize(context.Background(), 11, 2, 7, "")
 		require.Error(t, err)
 		require.Zero(t, size)
 	}
@@ -163,30 +167,32 @@ func TestLifecycleResizeRejectsWrongStateOrIdentity(t *testing.T) {
 func TestLifecycleReattachRestoresVerifiedCapacityAndWaitsPending(t *testing.T) {
 	for _, pending := range []bool{false, true} {
 		t.Run(fmt.Sprint(pending), func(t *testing.T) {
-			desired := int64(256 * sizeConversion)
-			resized := 0
-			reads := 0
-			image := fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, desired)
+			const desired = int64(256 * sizeConversion)
+			resized, writes, reads := 0, 0, 0
+			marker, diskSize := desired, 128
+			image := func() string {
+				return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><RUNNING_VMS>1</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS><ID>11</ID></VMS><PERSISTENT>1</PERSISTENT><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES></TEMPLATE></IMAGE>`, marker)
+			}
 			vmXML := func(marker string, size int) string {
-				return fmt.Sprintf(`<VM><ID>11</ID><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><SIZE>%d</SIZE>%s</DISK></TEMPLATE></VM>`, size, marker)
+				return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><PERSISTENT>YES</PERSISTENT><CLONE>NO</CLONE><LN_TARGET>SYSTEM</LN_TARGET><TM_MAD>fs_lvm_ssh</TM_MAD><TM_MAD_SYSTEM>fs_lvm_ssh</TM_MAD_SYSTEM><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE>%s</DISK></TEMPLATE></VM>`, size, marker)
 			}
 			p := lifecycleFixture(t, func(method string) (bool, string, int) {
 				switch method {
 				case "one.image.info":
-					return true, image, 0
+					return true, image(), 0
 				case "one.imagepool.info":
-					return true, "<IMAGE_POOL>" + image + "</IMAGE_POOL>", 0
-				case "one.vmpool.info":
+					return true, "<IMAGE_POOL>" + image() + "</IMAGE_POOL>", 0
+				case "one.vmpool.info", "one.vmpool.infoextended":
 					return true, "<VM_POOL>" + vmXML("", 128) + "</VM_POOL>", 0
 				case "one.vm.info":
 					reads++
 					if pending && reads <= 3 {
 						return true, vmXML("<RESIZE>YES</RESIZE><SIZE_PREV>128</SIZE_PREV>", 256), 0
 					}
-					if resized > 0 || pending {
-						return true, vmXML("", 256), 0
+					if pending {
+						diskSize = 256
 					}
-					return true, vmXML("", 128), 0
+					return true, vmXML("", diskSize), 0
 				case "one.system.version":
 					return true, "7.4.1", 0
 				case "one.vm.diskresize":
@@ -198,9 +204,52 @@ func TestLifecycleReattachRestoresVerifiedCapacityAndWaitsPending(t *testing.T) 
 					t.Errorf("unexpected %s", method)
 					return false, "unexpected", 0x800
 				}
+			}, func(method string, raw []byte) {
+				if method != "one.vm.diskresize" && method != "one.image.update" {
+					return
+				}
+				var call struct {
+					Params []struct {
+						Value struct {
+							Int  int    `xml:"int"`
+							I4   int    `xml:"i4"`
+							I8   int    `xml:"i8"`
+							Text string `xml:"string"`
+						} `xml:"value"`
+					} `xml:"params>param"`
+				}
+				require.NoError(t, xml.Unmarshal(raw, &call))
+				require.Len(t, call.Params, 4)
+				number := func(i int) int {
+					value := call.Params[i].Value
+					return value.Int + value.I4 + value.I8
+				}
+				if method == "one.vm.diskresize" {
+					require.Equal(t, 11, number(1))
+					require.Equal(t, 2, number(2))
+					size, err := strconv.Atoi(call.Params[3].Value.Text)
+					require.NoError(t, err)
+					require.Equal(t, 256, size)
+					diskSize = size
+					return
+				}
+				require.Equal(t, 7, number(1))
+				require.Equal(t, 1, number(3))
+				key, value, found := strings.Cut(strings.TrimSpace(call.Params[2].Value.Text), "=")
+				require.True(t, found)
+				require.Equal(t, "CSI_REQUESTED_SIZE_BYTES", strings.TrimSpace(key))
+				unquoted, err := strconv.Unquote(strings.TrimSpace(value))
+				require.NoError(t, err)
+				capacity, err := strconv.ParseInt(unquoted, 10, 64)
+				require.NoError(t, err)
+				require.Equal(t, desired, capacity)
+				require.EqualValues(t, capacity, int64(diskSize)*sizeConversion)
+				marker = capacity
+				writes++
 			})
 			require.NoError(t, p.RestoreVolumeCapacity(context.Background(), "volume-test", 11, 7))
 			require.GreaterOrEqual(t, reads, 3)
+			require.Equal(t, 1, writes)
 			if pending {
 				require.Zero(t, resized)
 			} else {
@@ -212,7 +261,7 @@ func TestLifecycleReattachRestoresVerifiedCapacityAndWaitsPending(t *testing.T) 
 
 func TestLifecycleMalformedVMImageCannotEstablishAbsence(t *testing.T) {
 	p := lifecycleFixture(t, func(string) (bool, string, int) {
-		return true, `<VM><ID>11</ID><TEMPLATE><DISK><IMAGE_ID>broken</IMAGE_ID></DISK></TEMPLATE></VM>`, 0
+		return true, `<VM><ID>11</ID><NAME>node-test</NAME><TEMPLATE><DISK><IMAGE_ID>broken</IMAGE_ID></DISK></TEMPLATE></VM>`, 0
 	})
 	_, err := p.GetVolumeInNode(context.Background(), 7, 11)
 	require.ErrorContains(t, err, "malformed")
@@ -225,7 +274,7 @@ func TestLifecycleExistingSnapshotDeleteWaitsAndUsesSnapshotCapacity(t *testing.
 	mutations := 0
 	snapshot := `<SNAPSHOTS><SNAPSHOT><ID>3</ID><NAME>old</NAME><SIZE>64</SIZE><DATE>1</DATE></SNAPSHOT></SNAPSHOTS>`
 	image := func(snap string) string {
-		return `<IMAGE><ID>7</ID><NAME>source</NAME><STATE>1</STATE><SIZE>256</SIZE><RUNNING_VMS>0</RUNNING_VMS>` + snap + `</IMAGE>`
+		return `<IMAGE><ID>7</ID><NAME>source</NAME><STATE>1</STATE><SIZE>256</SIZE><RUNNING_VMS>0</RUNNING_VMS><VMS/><CLONING_OPS>0</CLONING_OPS>` + snap + `</IMAGE>`
 	}
 	p := lifecycleFixture(t, func(method string) (bool, string, int) {
 		switch method {
@@ -239,7 +288,7 @@ func TestLifecycleExistingSnapshotDeleteWaitsAndUsesSnapshotCapacity(t *testing.
 			return true, image(snapshot), 0
 		case "one.imagepool.info":
 			return true, "<IMAGE_POOL>" + image(snapshot) + "</IMAGE_POOL>", 0
-		case "one.vmpool.info":
+		case "one.vmpool.info", "one.vmpool.infoextended":
 			return true, "<VM_POOL/>", 0
 		case "one.image.snapshotdelete":
 			deleted = true

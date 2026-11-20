@@ -126,13 +126,24 @@ func (s *ControllerServer) evaluateVolumeReconcile(ctx context.Context, node, op
 		return decision
 	}
 
-	lookup, history, runtimeCtx, lookupErr := s.lookupVolumeForPublish(ctx, evidence.VolumeID, evidence.NodeID)
+	lookupVolume := s.lookupVolumeForPublish
+	if evidence.Operation == VolumeReconcileDetach {
+		lookupVolume = s.lookupVolumeForAttachment
+	}
+	lookup, history, runtimeCtx, lookupErr := lookupVolume(ctx, evidence.VolumeID, evidence.NodeID)
 	evidence.Lookup = lookup
 	evidence.LookupErr = lookupErr
 	evidence.History = history
 	evidence.RuntimeCtx = runtimeCtx
 	if lookupErr != nil {
 		decision.Evidence = evidence
+		if evidence.Operation == VolumeReconcileDetach && !errors.Is(lookupErr, opennebula.ErrVolumeNotFound) {
+			klog.V(2).InfoS("Detach image lookup failed", "err", lookupErr)
+			if status.Code(lookupErr) == codes.FailedPrecondition {
+				return decision.with(VolumeReconcileReject, queueReasonRepairRequired, codes.FailedPrecondition, "cannot verify detach image identity")
+			}
+			return decision.with(VolumeReconcilePause, "volume_lookup_unknown", codes.Unavailable, "cannot verify detach image identity")
+		}
 		switch status.Code(lookupErr) {
 		case codes.NotFound:
 			if !errors.Is(lookupErr, opennebula.ErrVolumeNotFound) {
@@ -155,7 +166,12 @@ func (s *ControllerServer) evaluateVolumeReconcile(ctx context.Context, node, op
 	evidence.NodeLookupErr = nodeErr
 	if nodeErr != nil {
 		decision.Evidence = evidence
-		return decision.with(VolumeReconcilePause, "node_lookup_unknown", codes.Unavailable, nodeErr.Error())
+		message := nodeErr.Error()
+		if evidence.Operation == VolumeReconcileDetach {
+			klog.V(2).InfoS("Detach node identity lookup failed", "err", nodeErr)
+			message = "attachment node identity is unavailable"
+		}
+		return decision.with(VolumeReconcilePause, "node_lookup_unknown", codes.Unavailable, message)
 	}
 	if nodeID == -1 {
 		decision.Evidence = evidence
@@ -180,14 +196,19 @@ func (s *ControllerServer) evaluateVolumeReconcile(ctx context.Context, node, op
 		return decision.with(VolumeReconcileReject, queueReasonRecoveryControlInvalid, codes.FailedPrecondition, recoveryControl.Message)
 	}
 
-	if evidence.OpenNebulaImageID > 0 && evidence.OpenNebulaNodeID > 0 {
+	if lookup != nil && evidence.OpenNebulaImageID >= 0 && evidence.OpenNebulaNodeID > 0 {
 		target, attachedErr := s.volumeProvider.GetVolumeInNode(ctx, evidence.OpenNebulaImageID, evidence.OpenNebulaNodeID)
 		evidence.AttachedTarget = strings.TrimSpace(target)
 		evidence.AttachedErr = attachedErr
 		evidence.Attached = attachedErr == nil
 		if attachedErr != nil && !errors.Is(attachedErr, opennebula.ErrAttachmentNotFound) {
-			return decision.withEvidence(evidence).with(VolumeReconcilePause, "attachment_unknown", codes.Unavailable,
-				fmt.Sprintf("attachment state is unknown for volume %s on node %s: %v", evidence.VolumeID, evidence.NodeID, attachedErr))
+			message := fmt.Sprintf("attachment state is unknown for volume %s on node %s", evidence.VolumeID, evidence.NodeID)
+			if evidence.Operation == VolumeReconcileDetach {
+				klog.V(2).InfoS(message, "err", attachedErr)
+			} else {
+				message = fmt.Sprintf("%s: %v", message, attachedErr)
+			}
+			return decision.withEvidence(evidence).with(VolumeReconcilePause, "attachment_unknown", codes.Unavailable, message)
 		}
 	} else {
 		return decision.withEvidence(evidence).with(VolumeReconcilePause, "attachment_unknown", codes.Unavailable,
@@ -239,12 +260,16 @@ func (s *ControllerServer) evaluateVolumeAttachDecision(ctx context.Context, dec
 		return decision.with(VolumeReconcileReject, queueReasonRepairRequired, codes.FailedPrecondition,
 			firstNonEmpty(state.Message, fmt.Sprintf("repair-required state %s is active for volume %s", state.Classification, evidence.VolumeID)))
 	}
-	if quarantine, ok := s.activeVolumeQuarantine(ctx, evidence.VolumeID); ok {
+	if quarantine, ok, err := s.activeVolumeQuarantine(ctx, evidence.VolumeID); err != nil {
+		return decision.with(VolumeReconcilePause, queueReasonVolumeQuarantined, status.Code(err), status.Convert(err).Message())
+	} else if ok {
 		evidence.VolumeQuarantine = &quarantine
 		decision = decision.withEvidence(evidence)
 		return decision.with(VolumeReconcileReject, queueReasonVolumeQuarantined, codes.FailedPrecondition, volumeQuarantineMessage(quarantine))
 	}
-	if s.activeHostArtifactQuarantine(ctx, evidence.VolumeID) {
+	if active, err := s.activeHostArtifactQuarantine(ctx, evidence.VolumeID); err != nil {
+		return decision.with(VolumeReconcilePause, queueReasonRepairRequired, status.Code(err), status.Convert(err).Message())
+	} else if active {
 		evidence.HostArtifactQuarantined = true
 		decision = decision.withEvidence(evidence)
 		return decision.with(VolumeReconcileReject, queueReasonRepairRequired, codes.FailedPrecondition,
@@ -274,15 +299,32 @@ func (s *ControllerServer) evaluateVolumeDetachDecision(ctx context.Context, dec
 			recoveryControl.QueueBlockMessage(evidence.VolumeID, evidence.NodeID, string(evidence.Operation)))
 	}
 	if !evidence.Attached {
+		if err := s.verifyDetachAbsenceTarget(ctx, evidence.VolumeID, evidence.NodeID, evidence.OpenNebulaImageID, evidence.OpenNebulaNodeID, ""); err != nil {
+			if errors.Is(err, errReplacementDetachPending) {
+				return decision
+			}
+			return decision.with(VolumeReconcilePause, "attachment_absence_unverified", status.Code(err), status.Convert(err).Message())
+		}
 		return decision.with(VolumeReconcileComplete, "already_detached", codes.OK,
 			fmt.Sprintf("volume %s is already detached from node %s", evidence.VolumeID, evidence.NodeID))
 	}
-	if s.driver != nil && s.driver.kubeRuntime != nil {
+	if recoveryControl.Invalid || recoveryControl.ObserveActive() {
+		return decision.with(VolumeReconcilePause, queueReasonRecoveryModeObserve, codes.Unavailable, "physical detach is blocked by recovery controls")
+	}
+	if s.driver != nil && s.driver.kubeRuntime != nil && s.driver.kubeRuntime.enabled {
+		if err := s.attachmentProtectionChecks(ctx, evidence.VolumeID, evidence.RuntimeCtx, opennebula.HostArtifactAttachmentTarget{
+			NodeName: evidence.NodeID, VMID: evidence.OpenNebulaNodeID, ImageID: evidence.OpenNebulaImageID,
+		}); err != nil {
+			return decision.with(VolumeReconcilePause, "detach_protection_blocked", status.Code(err), err.Error())
+		}
 		desiredState, desiredErr := s.driver.kubeRuntime.DesiredNodeForVolume(ctx, evidence.VolumeID)
 		evidence.DesiredState = desiredState
 		evidence.DesiredErr = desiredErr
 		decision = decision.withEvidence(evidence)
-		if desiredErr == nil && desiredState.Desired && !desiredState.MultipleNodes && strings.TrimSpace(desiredState.NodeName) == strings.TrimSpace(evidence.NodeID) {
+		if desiredErr != nil {
+			return decision.with(VolumeReconcilePause, "desired_state_unknown", codes.Unavailable, fmt.Sprintf("cannot verify volume release: %v", desiredErr))
+		}
+		if desiredState.desiresNode(evidence.NodeID) {
 			return decision.with(VolumeReconcilePause, queueReasonSameNodeReuseRequired, codes.Unavailable,
 				fmt.Sprintf("queued detach for volume %s on node %s is paused because Kubernetes still desires the volume there (%s)", evidence.VolumeID, evidence.NodeID, desiredState.Reason))
 		}
@@ -292,13 +334,16 @@ func (s *ControllerServer) evaluateVolumeDetachDecision(ctx context.Context, dec
 	if orphanTeardown {
 		evidence.History = s.refreshVolumeHistory(ctx, evidence.VolumeID)
 	}
-	protection, protectionErr := s.localRWOProtectionDecision(ctx, evidence.VolumeID, evidence.NodeID)
+	protection, protectionErr := s.localRWOProtectionProjection(ctx, evidence.VolumeID, evidence.NodeID, evidence.RuntimeCtx, true, true)
 	evidence.Protection = protection
 	evidence.ProtectionErr = protectionErr
 	decision = decision.withEvidence(evidence)
 	if protectionErr == nil && protection.Protected && strings.TrimSpace(protection.RequiredNode) == strings.TrimSpace(evidence.NodeID) && !bypassProtectionForOrphanTeardown(protection, orphanTeardown) {
 		return decision.with(VolumeReconcilePause, protection.Reason, codes.Unavailable,
 			fmt.Sprintf("queued detach for volume %s on node %s is paused while local RWO protection is active (%s)", evidence.VolumeID, evidence.NodeID, protection.Reason))
+	}
+	if protectionErr != nil || protection.Invalid {
+		return decision.with(VolumeReconcilePause, "detach_protection_unknown", codes.Unavailable, fmt.Sprintf("cannot verify detach protection: %v", protectionErr))
 	}
 	return decision
 }
@@ -323,18 +368,4 @@ func (d VolumeReconcileDecision) withAttachment(action VolumeReconcileAction, re
 	d = d.with(action, reason, code, message)
 	d.AttachmentTarget = strings.TrimSpace(target)
 	return d
-}
-
-func (s *ControllerServer) backgroundDetachAllowedByDecision(ctx context.Context, volume, node string) (bool, string) {
-	decision := s.evaluateVolumeReconcile(ctx, node, string(VolumeReconcileDetach), volume)
-	switch decision.Action {
-	case VolumeReconcileProceed:
-		return true, ""
-	case VolumeReconcileComplete, VolumeReconcileStale:
-		return false, decision.Reason
-	case VolumeReconcilePause, VolumeReconcileReject:
-		return false, firstNonEmpty(decision.Message, decision.Reason)
-	default:
-		return false, decision.Reason
-	}
 }

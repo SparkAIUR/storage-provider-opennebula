@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	gocaerrors "github.com/OpenNebula/one/src/oca/go/src/goca/errors"
 	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/shared"
 	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/vm"
 	"github.com/SparkAIUR/storage-provider-opennebula/pkg/csi/config"
@@ -308,7 +309,7 @@ func TestComputeHotplugTimeoutClampsToMax(t *testing.T) {
 func TestWaitForAttachStateReturnsHotplugTimeoutError(t *testing.T) {
 	provider := &PersistentDiskVolumeProvider{}
 
-	err := provider.waitForAttachState(context.Background(), 5*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForAttachState(context.Background(), 5*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		return false, false, nil
 	}, nil, "vol-a", "node-a")
 
@@ -323,7 +324,7 @@ func TestWaitForAttachStateReturnsHotplugTimeoutError(t *testing.T) {
 func TestWaitForDetachStateReturnsHotplugTimeoutError(t *testing.T) {
 	provider := &PersistentDiskVolumeProvider{}
 
-	err := provider.waitForDetachState(context.Background(), 5*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForDetachState(context.Background(), 5*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		return true, false, nil
 	}, nil, "vol-a", "node-a")
 
@@ -338,7 +339,7 @@ func TestWaitForDetachStateReturnsHotplugTimeoutError(t *testing.T) {
 func TestWaitForDetachStateSucceedsWhenVolumeAbsentAndNodeNotReady(t *testing.T) {
 	provider := &PersistentDiskVolumeProvider{}
 
-	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		return false, false, nil
 	}, nil, "vol-a", "node-a")
 
@@ -350,7 +351,7 @@ func TestWaitForAttachStateRetriesAfterNodeBecomesReady(t *testing.T) {
 	retryCount := 0
 	attached := false
 
-	err := provider.waitForAttachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForAttachState(context.Background(), 50*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		if retryCount == 0 {
 			return false, true, nil
 		}
@@ -358,7 +359,7 @@ func TestWaitForAttachStateRetriesAfterNodeBecomesReady(t *testing.T) {
 			return true, true, nil
 		}
 		return false, false, nil
-	}, func() error {
+	}, func(context.Context) error {
 		retryCount++
 		attached = true
 		return nil
@@ -372,12 +373,12 @@ func TestWaitForAttachStateRetriesHotplugUntilSuccess(t *testing.T) {
 	provider := &PersistentDiskVolumeProvider{}
 	retryCount := 0
 
-	err := provider.waitForAttachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForAttachState(context.Background(), 50*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		if retryCount >= 2 {
 			return true, true, nil
 		}
 		return false, true, nil
-	}, func() error {
+	}, func(context.Context) error {
 		retryCount++
 		if retryCount == 1 {
 			return fmt.Errorf("wrong state HOTPLUG")
@@ -392,9 +393,9 @@ func TestWaitForAttachStateRetriesHotplugUntilSuccess(t *testing.T) {
 func TestWaitForAttachStateFailsOnNonHotplugRetryError(t *testing.T) {
 	provider := &PersistentDiskVolumeProvider{}
 
-	err := provider.waitForAttachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForAttachState(context.Background(), 50*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		return false, true, nil
-	}, func() error {
+	}, func(context.Context) error {
 		return fmt.Errorf("permission denied")
 	}, "vol-a", "node-a")
 
@@ -407,7 +408,7 @@ func TestWaitForDetachStateRetriesAfterNodeBecomesReady(t *testing.T) {
 	retryCount := 0
 	attached := true
 
-	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		if retryCount == 0 {
 			return true, true, nil
 		}
@@ -415,7 +416,7 @@ func TestWaitForDetachStateRetriesAfterNodeBecomesReady(t *testing.T) {
 			return false, true, nil
 		}
 		return true, false, nil
-	}, func() error {
+	}, func(context.Context) error {
 		retryCount++
 		attached = false
 		return nil
@@ -429,15 +430,15 @@ func TestWaitForDetachStateRetriesHotplugUntilSuccess(t *testing.T) {
 	provider := &PersistentDiskVolumeProvider{}
 	retryCount := 0
 
-	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		if retryCount >= 2 {
 			return false, true, nil
 		}
 		return true, true, nil
-	}, func() error {
+	}, func(context.Context) error {
 		retryCount++
 		if retryCount == 1 {
-			return fmt.Errorf("wrong state HOTPLUG")
+			return &gocaerrors.ResponseError{Code: gocaerrors.OneActionError, Msg: "wrong state HOTPLUG"}
 		}
 		return nil
 	}, "vol-a", "node-a")
@@ -449,9 +450,9 @@ func TestWaitForDetachStateRetriesHotplugUntilSuccess(t *testing.T) {
 func TestWaitForDetachStateFailsOnNonHotplugRetryError(t *testing.T) {
 	provider := &PersistentDiskVolumeProvider{}
 
-	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func() (bool, bool, error) {
+	err := provider.waitForDetachState(context.Background(), 50*time.Millisecond, time.Millisecond, func(context.Context) (bool, bool, error) {
 		return true, true, nil
-	}, func() error {
+	}, func(context.Context) error {
 		return fmt.Errorf("permission denied")
 	}, "vol-a", "node-a")
 

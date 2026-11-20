@@ -202,7 +202,7 @@ func TestVolumeHistoryBlockedWriteDoesNotBlockUnrelatedCacheRead(t *testing.T) {
 		}
 		return base.Update(ctx, cm, opts)
 	}}), "default")
-	_, err := manager.Upsert(ctx, "healthy", func(state *VolumeHistoryRecord) { state.LastSuccessfulDiskID = 7 })
+	_, err := manager.Upsert(ctx, "healthy", func(state *VolumeHistoryRecord) { state.LastSuccessfulDiskID = new(7) })
 	require.NoError(t, err)
 	writeCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -213,7 +213,7 @@ func TestVolumeHistoryBlockedWriteDoesNotBlockUnrelatedCacheRead(t *testing.T) {
 	go func() { state, _ := manager.Get("healthy"); read <- state }()
 	select {
 	case state := <-read:
-		require.Equal(t, 7, state.LastSuccessfulDiskID)
+		require.Equal(t, new(7), state.LastSuccessfulDiskID)
 	case <-time.After(time.Second):
 		t.Fatal("unrelated cache read blocked behind I/O")
 	}

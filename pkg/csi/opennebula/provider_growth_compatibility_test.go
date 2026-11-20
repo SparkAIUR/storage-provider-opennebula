@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -26,11 +27,11 @@ type growthProtocolState struct {
 }
 
 type growthFixtureConfig struct {
-	diskFacts, imagePersistent string
-	initialMB                  int64
-	versionReply               func() (bool, string, int)
-	pendingReads               int32
-	beforeObservation          func(string)
+	diskFacts, imagePersistent, extraDisk string
+	initialMB                             int64
+	versionReply                          func() (bool, string, int)
+	pendingReads                          int32
+	beforeObservation                     func(string)
 }
 
 func growthCompatibilityFixture(t *testing.T, version string, restoring bool, options ...func(*growthFixtureConfig)) (*PersistentDiskVolumeProvider, *growthProtocolState) {
@@ -50,7 +51,7 @@ func growthCompatibilityFixture(t *testing.T, version string, restoring bool, op
 		if cfg.imagePersistent != "" {
 			persistenceXML = "<PERSISTENT>" + cfg.imagePersistent + "</PERSISTENT>"
 		}
-		return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE>%s<UID>9</UID><GID>10</GID><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES><PROTECTED>YES</PROTECTED></TEMPLATE></IMAGE>`, persistenceXML, st.marker.Load())
+		return fmt.Sprintf(`<IMAGE><ID>7</ID><NAME>volume-test</NAME><STATE>8</STATE><SIZE>128</SIZE><RUNNING_VMS>1</RUNNING_VMS><CLONING_OPS>0</CLONING_OPS><VMS><ID>11</ID></VMS>%s<UID>9</UID><GID>10</GID><TEMPLATE><CSI_REQUESTED_SIZE_BYTES>%d</CSI_REQUESTED_SIZE_BYTES><PROTECTED>YES</PROTECTED></TEMPLATE></IMAGE>`, persistenceXML, st.marker.Load())
 	}
 	vmXML := func() string {
 		markers := ""
@@ -59,7 +60,7 @@ func growthCompatibilityFixture(t *testing.T, version string, restoring bool, op
 				markers = "<RESIZE>YES</RESIZE><SIZE_PREV>128</SIZE_PREV>"
 			}
 		}
-		return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE><ORIGINAL_SIZE>128</ORIGINAL_SIZE>%s%s</DISK></TEMPLATE></VM>`, st.sizeMB.Load(), cfg.diskFacts, markers)
+		return fmt.Sprintf(`<VM><ID>11</ID><NAME>node-test</NAME><STATE>3</STATE><LCM_STATE>3</LCM_STATE><TEMPLATE><DISK><IMAGE_ID>7</IMAGE_ID><DISK_ID>2</DISK_ID><TARGET>vdb</TARGET><SIZE>%d</SIZE><ORIGINAL_SIZE>128</ORIGINAL_SIZE>%s%s</DISK>%s</TEMPLATE></VM>`, st.sizeMB.Load(), cfg.diskFacts, markers, cfg.extraDisk)
 	}
 	p := lifecycleFixture(t, func(method string) (bool, string, int) {
 		if cfg.beforeObservation != nil {
@@ -70,7 +71,7 @@ func growthCompatibilityFixture(t *testing.T, version string, restoring bool, op
 			return true, "<IMAGE_POOL>" + image() + "</IMAGE_POOL>", 0
 		case "one.image.info":
 			return true, image(), 0
-		case "one.vmpool.info":
+		case "one.vmpool.info", "one.vmpool.infoextended":
 			return true, "<VM_POOL>" + vmXML() + "</VM_POOL>", 0
 		case "one.vm.info":
 			return true, vmXML(), 0
@@ -79,36 +80,57 @@ func growthCompatibilityFixture(t *testing.T, version string, restoring bool, op
 			return cfg.versionReply()
 		case "one.vm.diskresize":
 			st.resizeCalls.Add(1)
-			st.sizeMB.Store(256)
 			return true, "11", 0
 		case "one.image.update":
 			if st.resizeCalls.Load() > 0 {
 				require.Greater(t, st.completedReads.Load(), cfg.pendingReads, "metadata only after completed provider readback")
 			}
 			st.metadataWrites.Add(1)
-			st.marker.Store(256 * sizeConversion)
 			return true, "7", 0
 		default:
 			st.otherMutations.Add(1)
 			return false, "unexpected operation", 0x800
 		}
 	}, func(method string, raw []byte) {
-		if method != "one.image.update" {
+		if method != "one.vm.diskresize" && method != "one.image.update" {
 			return
 		}
 		var call struct {
 			Params []struct {
 				Value struct {
 					Text string `xml:"string"`
+					Int  int    `xml:"int"`
+					I4   int    `xml:"i4"`
+					I8   int    `xml:"i8"`
 				} `xml:"value"`
 			} `xml:"params>param"`
 		}
 		require.NoError(t, xml.Unmarshal(raw, &call))
 		require.Len(t, call.Params, 4)
-		require.Contains(t, call.Params[2].Value.Text, requestedSizeTag)
-		for _, protected := range []string{"PROTECTED", "UID", "GID", "PERSISTENT"} {
-			require.NotContains(t, call.Params[2].Value.Text, protected)
+		number := func(i int) int {
+			value := call.Params[i].Value
+			return value.Int + value.I4 + value.I8
 		}
+		if method == "one.vm.diskresize" {
+			require.Equal(t, 11, number(1))
+			require.Equal(t, 2, number(2))
+			size, err := strconv.ParseInt(call.Params[3].Value.Text, 10, 64)
+			require.NoError(t, err)
+			require.EqualValues(t, 256, size)
+			st.sizeMB.Store(size)
+			return
+		}
+		require.Equal(t, 7, number(1))
+		require.Equal(t, 1, number(3))
+		key, quoted, found := strings.Cut(strings.TrimSpace(call.Params[2].Value.Text), "=")
+		require.True(t, found)
+		require.Equal(t, requestedSizeTag, strings.TrimSpace(key))
+		value, err := strconv.Unquote(strings.TrimSpace(quoted))
+		require.NoError(t, err)
+		capacity, err := strconv.ParseInt(value, 10, 64)
+		require.NoError(t, err)
+		require.Equal(t, st.sizeMB.Load()*sizeConversion, capacity)
+		st.marker.Store(capacity)
 	})
 	return p, st
 }
@@ -161,6 +183,102 @@ func TestProviderGrowthCompatibilityVersions(t *testing.T) {
 			require.Zero(t, st.otherMutations.Load())
 		})
 	}
+}
+
+func TestProviderGrowthCompatibilityUsesSelectedDiskForAdmission(t *testing.T) {
+	provider, state := growthCompatibilityFixture(t, "7.4.1", false, func(config *growthFixtureConfig) {
+		vmReads := 0
+		config.beforeObservation = func(method string) {
+			if method == "one.vm.info" {
+				vmReads++
+			}
+			config.extraDisk = ""
+			if method == "one.vm.info" && vmReads == 2 {
+				config.extraDisk = `<DISK><TYPE>SWAP</TYPE><SIZE>1024</SIZE><DISK_ID>3</DISK_ID><TARGET>vdc</TARGET></DISK>`
+			}
+		}
+	})
+	size, err := provider.ExpandVolume(context.Background(), "volume-test", 268_435_456, false)
+	require.NoError(t, err)
+	require.EqualValues(t, 268_435_456, size)
+	require.EqualValues(t, 1, state.versionCalls.Load())
+	require.EqualValues(t, 1, state.resizeCalls.Load())
+	require.EqualValues(t, 1, state.metadataWrites.Load())
+	require.Zero(t, state.otherMutations.Load())
+}
+
+func TestProviderGrowthCompletionIgnoresUnrelatedBlankImageReference(t *testing.T) {
+	provider, state := growthCompatibilityFixture(t, "7.4.1", false, func(config *growthFixtureConfig) {
+		config.beforeObservation = func(method string) {
+			if method == "one.vm.diskresize" {
+				config.extraDisk = `<DISK><IMAGE_ID></IMAGE_ID><DISK_ID>3</DISK_ID></DISK>`
+			}
+		}
+	})
+	size, err := provider.ExpandVolume(context.Background(), "volume-test", 268_435_456, false)
+	require.NoError(t, err)
+	require.EqualValues(t, 268_435_456, size)
+	require.EqualValues(t, 1, state.resizeCalls.Load())
+	require.EqualValues(t, 1, state.metadataWrites.Load())
+	require.Zero(t, state.otherMutations.Load())
+}
+
+func TestProviderGrowthAndRestorationIgnoreUnrelatedBlankImageReference(t *testing.T) {
+	for _, restore := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restore=%t", restore), func(t *testing.T) {
+			p, st := growthCompatibilityFixture(t, "7.4.1", restore, func(c *growthFixtureConfig) {
+				c.extraDisk = `<DISK><IMAGE_ID></IMAGE_ID><DISK_ID>3</DISK_ID></DISK>`
+			})
+			ctx := context.Background()
+			if restore {
+				require.NoError(t, p.RestoreVolumeCapacity(ctx, "volume-test", 11, 7))
+			} else {
+				size, err := p.ExpandVolume(ctx, "volume-test", 268_435_456, false)
+				require.NoError(t, err)
+				require.EqualValues(t, 268_435_456, size)
+				require.EqualValues(t, 1, st.metadataWrites.Load())
+			}
+			require.EqualValues(t, 1, st.resizeCalls.Load())
+			require.EqualValues(t, 256, st.sizeMB.Load())
+			require.Zero(t, st.otherMutations.Load())
+		})
+	}
+}
+
+func TestProviderGrowthAndRestorationPersistCompletedSelectedDiskCapacity(t *testing.T) {
+	for _, restore := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restore=%t", restore), func(t *testing.T) {
+			p, st := growthCompatibilityFixture(t, "7.4.1", restore, func(c *growthFixtureConfig) {
+				c.pendingReads = 3
+				c.extraDisk = `<DISK><IMAGE_ID>8</IMAGE_ID><DISK_ID>3</DISK_ID><SIZE>256</SIZE></DISK>`
+			})
+			ctx := context.Background()
+			if restore {
+				require.NoError(t, p.RestoreVolumeCapacity(ctx, "volume-test", 11, 7))
+			} else {
+				size, err := p.ExpandVolume(ctx, "volume-test", 268_435_456, false)
+				require.NoError(t, err)
+				require.EqualValues(t, 268_435_456, size)
+			}
+			require.EqualValues(t, 1, st.resizeCalls.Load())
+			require.Greater(t, st.completedReads.Load(), int32(3))
+			require.EqualValues(t, 256, st.sizeMB.Load())
+			require.EqualValues(t, 1, st.metadataWrites.Load())
+			require.EqualValues(t, 268_435_456, st.marker.Load())
+			require.Zero(t, st.otherMutations.Load())
+		})
+	}
+}
+
+func TestProviderRestorationRejectsNonblankMalformedImageReference(t *testing.T) {
+	p, st := growthCompatibilityFixture(t, "7.4.1", true, func(c *growthFixtureConfig) {
+		c.extraDisk = `<DISK><IMAGE_ID>invalid</IMAGE_ID><DISK_ID>3</DISK_ID></DISK>`
+	})
+	err := p.RestoreVolumeCapacity(context.Background(), "volume-test", 11, 7)
+	require.ErrorContains(t, err, "malformed VM disk image identity")
+	require.Zero(t, st.resizeCalls.Load())
+	require.Zero(t, st.metadataWrites.Load())
+	require.Zero(t, st.otherMutations.Load())
 }
 
 func TestProviderGrowthCompatibilityUnknownIdentity(t *testing.T) {

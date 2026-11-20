@@ -208,6 +208,42 @@ func TestLocalDeviceRecoveryRequiresProvenAttachmentAbsence(t *testing.T) {
 	}
 }
 
+func TestLocalDeviceRecoveryRedactsPersistedSlotQuarantine(t *testing.T) {
+	driver, ns, server, provider, report := recoveryReviewFixture(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	state := HostArtifactQuarantineState{
+		Key: "vm-208.disk-2", VolumeID: "other-volume", VMID: 208, DiskID: 2, FailureCount: 1,
+		FirstObservedAt: now, LastObservedAt: now, ExpiresAt: now.Add(time.Hour),
+		Message: "private provider error lv-one-208-2", RepairHint: "private repair hint",
+	}
+	payload, err := json.Marshal(state)
+	require.NoError(t, err)
+	require.NoError(t, driver.kubeRuntime.UpsertConfigMapData(ctx, namespaceFromServiceAccount(), hostArtifactStateConfigMapName, map[string]string{state.Key: string(payload)}))
+	require.Empty(t, driver.hostArtifactQuarantine.Snapshot())
+	provider.On("NodeReady", mock.Anything, report.Node).Return(true, nil).Once()
+	provider.On("VolumeExists", mock.Anything, report.VolumeID).Return(394, 1, nil).Once()
+	provider.On("NodeExists", mock.Anything, report.Node).Return(208, nil).Once()
+	provider.On("InspectHostArtifactAttachmentTarget", mock.Anything, report.VolumeID, report.Node, mock.Anything).
+		Return(&opennebula.HostArtifactAttachmentTarget{VMID: 208, DiskID: 2}, nil).Once()
+
+	require.NoError(t, server.recoverLocalDeviceReport(ctx, localDeviceReportKey(report.Node, report.VolumeID), report))
+	current, ok := ns.currentLocalDeviceReport(ctx, report.VolumeID)
+	require.True(t, ok)
+	require.Contains(t, current.LastRecoveryError, "host artifact quarantine is active for the requested attachment slot")
+	require.NotContains(t, current.LastRecoveryError, "private")
+	require.NotContains(t, current.LastRecoveryError, "208")
+	events, err := driver.kubeRuntime.client.CoreV1().Events(report.PVCNamespace).List(ctx, metav1.ListOptions{})
+	require.NoError(t, err)
+	require.NotEmpty(t, events.Items)
+	for _, event := range events.Items {
+		require.NotContains(t, event.Message, "private")
+		require.NotContains(t, event.Message, "lv-one-208-2")
+	}
+	provider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	provider.AssertExpectations(t)
+}
+
 func TestLocalDeviceRecoveryPersistsHostArtifactQuarantineOnReattachConflict(t *testing.T) {
 	pv, pvc := newLocalPVAndPVC("vol-device-artifact", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, nil)
 	pvc.Spec.VolumeName = pv.Name
@@ -464,4 +500,146 @@ func TestNodeRecordsNewMissingDeviceEpisodeAfterConfirmation(t *testing.T) {
 	require.Equal(t, localDeviceAttachmentStateRuntimeUnconfirmed, current.AttachmentState)
 	require.True(t, current.FirstObservedAt.After(report.FirstObservedAt))
 	require.Equal(t, 1, current.Attempts)
+}
+
+func TestNodeDeviceReportPreservesOutOfOrderObservations(t *testing.T) {
+	for _, failure := range []string{"missing", "mount", "identity", "conflicting-key"} {
+		t.Run(failure, func(t *testing.T) {
+			ctx := context.Background()
+			const volume, node, namespace = "vol-1", "node-a", "default"
+			driver := newLocalDeviceRecoveryTestDriver(t, &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: localDeviceStateConfigMapName, Namespace: namespace},
+			})
+			driver.nodeID = node
+			ns := &NodeServer{Driver: driver}
+			kube := driver.kubeRuntime.client.(*fake.Clientset)
+			key := localDeviceReportKey(node, volume)
+			var newer time.Time
+			var seeded LocalDeviceMissingReport
+			kube.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+				if action.(ktesting.GetAction).GetName() != localDeviceStateConfigMapName || !newer.IsZero() {
+					return false, nil, nil
+				}
+				newer = time.Now().UTC().Add(time.Second)
+				seeded = LocalDeviceMissingReport{
+					Node: node, VolumeID: volume, FailureClass: localDeviceFailureClassRuntimeAttachmentMissing,
+					FirstObservedAt: newer, LastObservedAt: newer, Attempts: 1,
+					DeviceSerial: "newer-serial", LastError: "newer missing device",
+					AttachmentState: localDeviceAttachmentStateRuntimeUnconfirmed,
+				}
+				if failure == "conflicting-key" {
+					seeded.VolumeID = "other-volume"
+				}
+				payload, err := json.Marshal(seeded)
+				require.NoError(t, err)
+				return false, nil, kube.Tracker().Update(corev1.SchemeGroupVersion.WithResource("configmaps"), &corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{Name: localDeviceStateConfigMapName, Namespace: namespace},
+					Data:       map[string]string{key: string(payload)},
+				}, namespace)
+			})
+			failureErr := errors.New("observed failure")
+			switch failure {
+			case "missing":
+				ns.recordLocalDeviceMissing(ctx, volume, "sdd", "/stage/vol-1", nil, failureErr)
+			case "mount", "conflicting-key":
+				ns.recordLocalDeviceMountFailure(ctx, volume, "sdd", "/dev/sdd", "/stage/vol-1", "ext4", deviceResolutionResult{}, nil, failureErr)
+			case "identity":
+				session := localDiskSession{VolumeID: volume}
+				ns.recordWrongDeviceIdentityRepairState(ctx, session, nil)
+				ns.recordWrongDeviceIdentityReport(ctx, session, nil, failureErr)
+				repair, exists, err := driver.volumeRepairState.GetCurrent(ctx, volume)
+				require.NoError(t, err)
+				require.True(t, exists)
+				require.Equal(t, repairClassificationWrongDeviceIdentity, repair.Classification)
+			}
+			cm, err := kube.CoreV1().ConfigMaps(namespace).Get(ctx, localDeviceStateConfigMapName, metav1.GetOptions{})
+			require.NoError(t, err)
+			var report LocalDeviceMissingReport
+			require.NoError(t, json.Unmarshal([]byte(cm.Data[key]), &report))
+			if failure == "conflicting-key" {
+				require.Equal(t, seeded, report)
+				return
+			}
+			require.Equal(t, 2, report.Attempts)
+			require.True(t, report.FirstObservedAt.Before(newer))
+			require.True(t, report.LastObservedAt.Equal(newer))
+			require.Equal(t, seeded.FailureClass, report.FailureClass)
+			require.Equal(t, seeded.DeviceSerial, report.DeviceSerial)
+			require.Equal(t, seeded.LastError, report.LastError)
+			require.Equal(t, seeded.AttachmentState, report.AttachmentState)
+			require.Empty(t, report.DevicePath)
+			require.Empty(t, report.ConfirmationState)
+		})
+	}
+}
+
+func TestWrongDeviceObservationOrdering(t *testing.T) {
+	ctx := context.Background()
+	const volume = "vol-wrong-identity"
+	driver := newLocalDeviceRecoveryTestDriver(t)
+	driver.nodeID = "node-a"
+	ns := &NodeServer{Driver: driver}
+	staleDriver := newLocalDeviceRecoveryTestDriver(t)
+	staleDriver.nodeID = driver.nodeID
+	staleDriver.kubeRuntime = driver.kubeRuntime
+	staleDriver.volumeRepairState = NewVolumeRepairStateManager(driver.kubeRuntime, "default")
+	staleNode := &NodeServer{Driver: staleDriver}
+
+	at := time.Now().UTC().Add(-time.Minute)
+	record := func(node *NodeServer, observedAt time.Time, target, serial, wrongSerial string) {
+		session := localDiskSession{
+			VolumeID: volume, VolumeName: target, DevicePath: "/dev/" + target, DeviceSerial: serial,
+			Identity: &LocalDiskIdentity{AssertedByController: &LocalDiskControllerAssertion{DiskTarget: target, DeviceSerial: serial}},
+		}
+		observed := &LocalDiskIdentity{
+			ObservedAt: observedAt,
+			ObservedFromDevice: &LocalDiskObservedIdentity{Block: &LocalDiskObservedBlockIdentity{
+				DevicePath: session.DevicePath, DeviceSerial: wrongSerial,
+			}},
+		}
+		node.recordWrongDeviceIdentityRepairState(ctx, session, observed)
+		node.recordWrongDeviceIdentityReport(ctx, session, observed, errors.New("unexpected device "+wrongSerial))
+	}
+	read := func() (LocalDeviceMissingReport, VolumeRepairState) {
+		report, found := ns.currentLocalDeviceReport(ctx, volume)
+		require.True(t, found)
+		repair, found, err := staleDriver.volumeRepairState.GetCurrent(ctx, volume)
+		require.NoError(t, err)
+		require.True(t, found)
+		return report, repair
+	}
+	record(staleNode, at, "sdd", "onecsi-7", "onecsi-8")
+	require.NoError(t, updateLocalDeviceReport(ctx, driver.kubeRuntime, "default", localDeviceReportKey(driver.nodeID, volume), func(report *LocalDeviceMissingReport) {
+		report.RecoveryToken = "current-recovery"
+		report.ConfirmationState = localDeviceConfirmationStateInProgress
+	}))
+	record(ns, at.Add(2*time.Second), "sdf", "onecsi-9", "onecsi-10")
+	report, repair := read()
+	require.Equal(t, localDeviceFailureClassWrongIdentity, report.FailureClass)
+	require.Equal(t, repairClassificationWrongDeviceIdentity, repair.Classification)
+	require.Equal(t, "sdf", report.ExpectedTarget)
+	require.Equal(t, "sdf", repair.LastKnownTarget)
+	require.Equal(t, "onecsi-9", report.DeviceSerial)
+	require.Equal(t, "onecsi-9", repair.LastKnownDeviceSerial)
+	require.Equal(t, "onecsi-10", localDiskObservedDeviceSerial(report.ObservedIdentity))
+	require.Equal(t, report.ExpectedIdentity, repair.LastHealthyIdentity)
+	require.Equal(t, report.ObservedIdentity, repair.LastObservedIdentity)
+	require.Equal(t, "unexpected device onecsi-10", report.LastError)
+	require.Equal(t, at, report.FirstObservedAt)
+	require.Equal(t, at, repair.FirstObservedAt)
+	require.Equal(t, at.Add(2*time.Second), report.LastObservedAt)
+	require.Equal(t, report.LastObservedAt, repair.LastObservedAt)
+	require.Equal(t, 2, report.Attempts)
+	require.Equal(t, 2, repair.FailureCount)
+	require.Equal(t, "current-recovery", report.RecoveryToken)
+	require.Equal(t, localDeviceConfirmationStateInProgress, report.ConfirmationState)
+
+	record(staleNode, at.Add(time.Second), "sdg", "onecsi-11", "onecsi-12")
+	record(staleNode, at.Add(4*time.Second), "sdf", "onecsi-9", "onecsi-10")
+	record(staleNode, at.Add(3*time.Second), "sdg", "onecsi-11", "onecsi-12")
+	report.LastObservedAt = at.Add(4 * time.Second)
+	repair.LastObservedAt = report.LastObservedAt
+	unchangedReport, unchangedRepair := read()
+	require.Equal(t, report, unchangedReport)
+	require.Equal(t, repair, unchangedRepair)
 }

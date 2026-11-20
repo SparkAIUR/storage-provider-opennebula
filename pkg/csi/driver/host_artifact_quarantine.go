@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -75,7 +76,7 @@ func (m *HostArtifactQuarantineManager) LoadFromConfigMap(ctx context.Context) e
 	now := time.Now().UTC()
 	for key, raw := range cm.Data {
 		var state HostArtifactQuarantineState
-		if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		if err := unmarshalAuthorityJSON(raw, &state); err != nil {
 			klog.Warningf("failed to decode host artifact quarantine state %s: %v", key, err)
 			continue
 		}
@@ -108,45 +109,49 @@ func (m *HostArtifactQuarantineManager) GetActive(key string, now time.Time) (Ho
 	return state, true
 }
 
-func (m *HostArtifactQuarantineManager) RefreshKey(ctx context.Context, key string) error {
-	if m == nil || m.runtime == nil || !m.runtime.enabled || strings.TrimSpace(key) == "" {
-		return nil
-	}
-	key = strings.TrimSpace(key)
-	cm, err := m.runtime.GetConfigMap(ctx, m.namespace, hostArtifactStateConfigMapName)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			m.mu.Lock()
-			delete(m.entries, key)
-			m.mu.Unlock()
-			return nil
+func (m *HostArtifactQuarantineManager) activeForTarget(target opennebula.HostArtifactAttachmentTarget, persisted map[string]string, now time.Time) (HostArtifactQuarantineState, bool, error) {
+	keys := hostArtifactTargetQuarantineKeys(target)
+	if persisted == nil {
+		for _, key := range keys {
+			if state, active := m.GetActive(key, now); active {
+				return state, true, nil
+			}
 		}
-		return err
+		return HostArtifactQuarantineState{}, false, nil
 	}
-	raw := strings.TrimSpace(cm.Data[key])
-	if raw == "" {
-		m.mu.Lock()
-		delete(m.entries, key)
-		m.mu.Unlock()
-		return nil
-	}
-	var state HostArtifactQuarantineState
-	if err := json.Unmarshal([]byte(raw), &state); err != nil {
-		return err
-	}
-	if strings.TrimSpace(state.Key) == "" {
-		state.Key = key
-	}
-	if !state.ExpiresAt.IsZero() && !state.ExpiresAt.After(time.Now().UTC()) {
-		m.mu.Lock()
-		delete(m.entries, key)
-		m.mu.Unlock()
-		return nil
+
+	var active HostArtifactQuarantineState
+	observed := make(map[string]HostArtifactQuarantineState, len(keys))
+	for _, key := range keys {
+		raw, present := persisted[key]
+		if !present {
+			continue
+		}
+		var state HostArtifactQuarantineState
+		if err := decodeAttachmentQuarantine(raw, &state); err != nil {
+			return HostArtifactQuarantineState{}, false, err
+		}
+		recordTarget := opennebula.HostArtifactAttachmentTarget{VMID: state.VMID, NodeName: state.NodeName, DiskID: state.DiskID}
+		if state.Key != key || state.Key != recordTarget.Key() || strings.TrimSpace(state.VolumeID) == "" ||
+			!validQuarantineObservation(state.FailureCount, state.FirstObservedAt, state.LastObservedAt, state.ExpiresAt) {
+			return HostArtifactQuarantineState{}, false, fmt.Errorf("host artifact quarantine identity or expiry is unknown")
+		}
+		if state.ExpiresAt.IsZero() || state.ExpiresAt.After(now) {
+			observed[key] = state
+		}
+		if active.Key == "" && state.ExpiresAt.After(now) {
+			active = state
+		}
 	}
 	m.mu.Lock()
-	m.entries[key] = state
+	for _, key := range keys {
+		delete(m.entries, key)
+	}
+	for key, state := range observed {
+		m.entries[key] = state
+	}
 	m.mu.Unlock()
-	return nil
+	return active, active.Key != "", nil
 }
 
 func (m *HostArtifactQuarantineManager) RefreshVolume(ctx context.Context, volumeID string) error {
@@ -168,23 +173,9 @@ func (m *HostArtifactQuarantineManager) RefreshVolume(ctx context.Context, volum
 		}
 		return err
 	}
-	updated := map[string]HostArtifactQuarantineState{}
-	now := time.Now().UTC()
-	for key, raw := range cm.Data {
-		var state HostArtifactQuarantineState
-		if err := json.Unmarshal([]byte(raw), &state); err != nil {
-			continue
-		}
-		if strings.TrimSpace(state.Key) == "" {
-			state.Key = key
-		}
-		if strings.TrimSpace(state.VolumeID) != volumeID {
-			continue
-		}
-		if !state.ExpiresAt.IsZero() && !state.ExpiresAt.After(now) {
-			continue
-		}
-		updated[state.Key] = state
+	updated, err := hostArtifactVolumeEntries(cm.Data, volumeID, time.Now().UTC())
+	if err != nil {
+		return err
 	}
 	m.mu.Lock()
 	for key, state := range m.entries {
@@ -197,6 +188,97 @@ func (m *HostArtifactQuarantineManager) RefreshVolume(ctx context.Context, volum
 	}
 	m.mu.Unlock()
 	return nil
+}
+
+func hostArtifactVolumeEntries(persisted map[string]string, volumeID string, now time.Time) (map[string]HostArtifactQuarantineState, error) {
+	volumeID = strings.TrimSpace(volumeID)
+	updated := map[string]HostArtifactQuarantineState{}
+	for key, raw := range persisted {
+		unrelated, err := hostArtifactRecordRoutesElsewhere(key, raw, volumeID, opennebula.HostArtifactAttachmentTarget{})
+		if err != nil {
+			return nil, err
+		}
+		if unrelated {
+			continue
+		}
+		var state HostArtifactQuarantineState
+		if err := unmarshalAuthorityJSON(raw, &state); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(state.VolumeID) != volumeID {
+			continue
+		}
+		if state.ExpiresAt.IsZero() {
+			if err := decodeAttachmentQuarantine(raw, &state); err != nil {
+				return nil, err
+			}
+			target := opennebula.HostArtifactAttachmentTarget{VMID: state.VMID, NodeName: state.NodeName, DiskID: state.DiskID}
+			if state.Key != key || key != firstNonEmpty(target.Key(), volumeID) ||
+				!validQuarantineObservation(state.FailureCount, state.FirstObservedAt, state.LastObservedAt, state.ExpiresAt) {
+				return nil, fmt.Errorf("host artifact quarantine observation is invalid")
+			}
+		} else if !state.ExpiresAt.After(now) {
+			continue
+		}
+		if strings.TrimSpace(state.Key) == "" {
+			state.Key = key
+		}
+		updated[state.Key] = state
+	}
+	return updated, nil
+}
+
+func (m *HostArtifactQuarantineManager) activeForAttach(volumeID string, target *opennebula.HostArtifactAttachmentTarget, persisted map[string]string, now time.Time) (HostArtifactQuarantineState, bool, error) {
+	if target != nil {
+		if state, active, err := m.activeForTarget(*target, persisted, now); err != nil || active {
+			return state, active, err
+		}
+	}
+	if persisted != nil {
+		current, err := hostArtifactVolumeEntries(persisted, volumeID, now)
+		if err != nil {
+			return HostArtifactQuarantineState{}, false, err
+		}
+		for _, state := range current {
+			if state.ExpiresAt.After(now) {
+				return state, true, nil
+			}
+		}
+	} else {
+		for _, state := range m.Snapshot() {
+			if strings.TrimSpace(state.VolumeID) == strings.TrimSpace(volumeID) &&
+				state.ExpiresAt.After(now) {
+				return state, true, nil
+			}
+		}
+	}
+	return HostArtifactQuarantineState{}, false, nil
+}
+
+func hostArtifactRecordRoutesElsewhere(key, raw, volumeID string, target opennebula.HostArtifactAttachmentTarget) (bool, error) {
+	var route struct {
+		Key      string `json:"key"`
+		VolumeID string `json:"volumeID"`
+		VMID     int    `json:"vmID"`
+		NodeName string `json:"nodeName"`
+		DiskID   int    `json:"diskID"`
+		ImageID  int    `json:"imageID"`
+	}
+	if err := unmarshalAuthorityRoute(raw, &route, "key", "volumeID", "vmID", "nodeName", "diskID", "imageID"); err != nil {
+		return false, err
+	}
+	recordTarget := opennebula.HostArtifactAttachmentTarget{VMID: route.VMID, NodeName: route.NodeName, DiskID: route.DiskID}
+	recordVolume := strings.TrimSpace(route.VolumeID)
+	volumeID = strings.TrimSpace(volumeID)
+	expectedKey := firstNonEmpty(recordTarget.Key(), recordVolume)
+	if recordVolume == "" || recordVolume == volumeID || key == volumeID ||
+		key != expectedKey || (route.Key != "" && route.Key != key) ||
+		(route.ImageID > 0 && route.ImageID == target.ImageID) {
+		return false, nil
+	}
+	targetKeys := hostArtifactTargetQuarantineKeys(target)
+	nodeKey := (opennebula.HostArtifactAttachmentTarget{NodeName: route.NodeName, DiskID: route.DiskID}).Key()
+	return !slices.Contains(targetKeys, key) && !slices.Contains(targetKeys, nodeKey), nil
 }
 
 func (m *HostArtifactQuarantineManager) MarkFailure(ctx context.Context, state HostArtifactQuarantineState, threshold int, ttl time.Duration) (HostArtifactQuarantineState, bool, error) {

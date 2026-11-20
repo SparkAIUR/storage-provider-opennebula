@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ type KubernetesNodeIdentity struct {
 	Exists        bool
 	Ready         bool
 	Unschedulable bool
+	Deleting      bool
 }
 
 type VolumeDesiredState struct {
@@ -48,6 +50,66 @@ const (
 	volumeDemandSourceVolumeParked                 = "volume_parked"
 )
 
+func podVolumeClaimName(pod *corev1.Pod, volume corev1.Volume) string {
+	switch {
+	case volume.PersistentVolumeClaim != nil:
+		return strings.TrimSpace(volume.PersistentVolumeClaim.ClaimName)
+	case volume.Ephemeral != nil:
+		return pod.Name + "-" + volume.Name
+	default:
+		return ""
+	}
+}
+
+func podReferencesClaim(pod *corev1.Pod, claimName string, pvc *corev1.PersistentVolumeClaim) (bool, error) {
+	if claimName == "" {
+		return false, nil
+	}
+	for _, volume := range pod.Spec.Volumes {
+		if podVolumeClaimName(pod, volume) != claimName {
+			continue
+		}
+		if volume.Ephemeral != nil && (pvc == nil || pvc.Namespace != pod.Namespace || pod.UID == "" || !metav1.IsControlledBy(pvc, pod)) {
+			return false, fmt.Errorf("ephemeral PVC ownership is unverified for Pod %s/%s", pod.Namespace, pod.Name)
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func podMayUseAttachmentClaim(pod *corev1.Pod, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, replacement, settledReadback bool) (bool, error) {
+	claim := pv.Spec.ClaimRef
+	if !replacement {
+		return podReferencesClaim(pod, claim.Name, pvc)
+	}
+	owner := metav1.GetControllerOfNoCopy(pvc)
+	newer := !pvc.CreationTimestamp.IsZero() && pod.CreationTimestamp.After(pvc.CreationTimestamp.Time)
+	if settledReadback && pv.Status.Phase == corev1.VolumeReleased && pendingReplacementClaim(pv, pvc) {
+		usesClaim, err := podReferencesClaim(pod, claim.Name, pvc)
+		if err != nil || !usesClaim {
+			return usesClaim, err
+		}
+		independent := newer && pod.UID != "" && pod.Namespace == pvc.Namespace &&
+			pod.Spec.NodeName == "" && pod.DeletionTimestamp == nil && pod.Status.StartTime == nil &&
+			replacementPodPendingBeforeMount(pod)
+		return !independent, nil
+	}
+	for _, volume := range pod.Spec.Volumes {
+		if podVolumeClaimName(pod, volume) != claim.Name {
+			continue
+		}
+		if volume.Ephemeral != nil {
+			if owner == nil || owner.APIVersion != "v1" || owner.Kind != "Pod" || owner.Name != pod.Name ||
+				pvc.Namespace != pod.Namespace || pod.UID == "" || owner.UID != pod.UID {
+				return false, fmt.Errorf("ephemeral PVC ownership is unverified for Pod %s/%s", pod.Namespace, pod.Name)
+			}
+		} else if !newer {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (r *KubeRuntime) NodeIdentity(ctx context.Context, nodeName string) (KubernetesNodeIdentity, error) {
 	if r == nil || !r.enabled {
 		return KubernetesNodeIdentity{}, fmt.Errorf("kubernetes runtime is not enabled")
@@ -68,6 +130,7 @@ func (r *KubeRuntime) NodeIdentity(ctx context.Context, nodeName string) (Kubern
 		UID:           string(node.UID),
 		Exists:        true,
 		Unschedulable: node.Spec.Unschedulable,
+		Deleting:      node.DeletionTimestamp != nil,
 	}
 	for _, condition := range node.Status.Conditions {
 		if condition.Type == corev1.NodeReady {
@@ -79,6 +142,10 @@ func (r *KubeRuntime) NodeIdentity(ctx context.Context, nodeName string) (Kubern
 }
 
 func (r *KubeRuntime) DesiredNodeForVolume(ctx context.Context, volumeHandle string) (VolumeDesiredState, error) {
+	return r.desiredNodeForVolume(ctx, volumeHandle, nil)
+}
+
+func (r *KubeRuntime) desiredNodeForVolume(ctx context.Context, volumeHandle string, attachmentSnapshot *storagev1.VolumeAttachmentList) (VolumeDesiredState, error) {
 	if r == nil || !r.enabled {
 		return VolumeDesiredState{}, fmt.Errorf("kubernetes runtime is not enabled")
 	}
@@ -135,15 +202,9 @@ func (r *KubeRuntime) DesiredNodeForVolume(ctx context.Context, volumeHandle str
 		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
-		referencesPVC := false
-		for _, volume := range pod.Spec.Volumes {
-			if volume.PersistentVolumeClaim == nil {
-				continue
-			}
-			if strings.TrimSpace(volume.PersistentVolumeClaim.ClaimName) == runtimeCtx.PVCName {
-				referencesPVC = true
-				break
-			}
+		referencesPVC, err := podReferencesClaim(pod, pvc.Name, pvc)
+		if err != nil {
+			return state, err
 		}
 		if !referencesPVC {
 			continue
@@ -174,9 +235,12 @@ func (r *KubeRuntime) DesiredNodeForVolume(ctx context.Context, volumeHandle str
 		return state, nil
 	}
 
-	vas, err := r.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return state, err
+	vas := attachmentSnapshot
+	if vas == nil {
+		vas, err = r.client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return state, err
+		}
 	}
 	attachmentNames := []string{}
 	attachmentNodes := []string{}
@@ -184,7 +248,7 @@ func (r *KubeRuntime) DesiredNodeForVolume(ctx context.Context, volumeHandle str
 	now := time.Now().UTC()
 	for idx := range vas.Items {
 		va := &vas.Items[idx]
-		if !matchesVolumeAttachment(runtimeCtx.PVName, va) {
+		if pv.Spec.CSI == nil || va.Spec.Attacher != pv.Spec.CSI.Driver || !matchesVolumeAttachment(runtimeCtx.PVName, va) {
 			continue
 		}
 		if strings.TrimSpace(va.Spec.NodeName) == "" || !va.DeletionTimestamp.IsZero() {
@@ -269,4 +333,8 @@ func volumeAttachmentIsTransitional(va *storagev1.VolumeAttachment, now time.Tim
 		return false
 	}
 	return now.Sub(createdAt) < grace
+}
+
+func (s VolumeDesiredState) desiresNode(node string) bool {
+	return s.Desired && (s.NodeName == node || slices.Contains(s.ReferencedNodes, node))
 }

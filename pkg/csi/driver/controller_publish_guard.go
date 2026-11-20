@@ -10,7 +10,10 @@ import (
 )
 
 func (s *ControllerServer) rejectIfLocalDeviceReportBlocksAttachSuccess(ctx context.Context, volumeID, node, target string, params map[string]string, runtimeCtx *VolumeRuntimeContext) error {
-	report, ok := s.latestLocalDeviceReport(ctx, volumeID)
+	report, ok, err := s.latestLocalDeviceReport(ctx, volumeID)
+	if err != nil {
+		return err
+	}
 	if !ok || !localDeviceReportMatchesAttachNode(report, node) || !localDeviceReportMatchesAttachTarget(report, target) {
 		return nil
 	}

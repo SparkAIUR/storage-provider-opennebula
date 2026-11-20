@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -11,11 +12,45 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/klog/v2"
 )
 
 func (s *ControllerServer) rejectIfHostArtifactQuarantineActive(ctx context.Context, req *csi.ControllerPublishVolumeRequest) error {
 	if s == nil || s.driver == nil || req == nil || !s.hostArtifactQuarantineEnabled() {
+		return nil
+	}
+	manager := s.driver.hostArtifactQuarantine
+	if manager.runtime != nil && manager.runtime.enabled {
+		cm, err := manager.runtime.GetConfigMap(ctx, manager.namespace, hostArtifactStateConfigMapName)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return attachmentEvidenceUnavailable("host artifact quarantine is unverified", err)
+		}
+		if len(cm.Data) == 0 {
+			return nil
+		}
+	} else if len(manager.Snapshot()) == 0 {
+		return nil
+	}
+	inspector, ok := s.volumeProvider.(opennebula.HostArtifactAttachmentTargetInspector)
+	if !ok {
+		return attachmentEvidenceUnavailable("host artifact quarantine target is unverified", nil)
+	}
+	target, err := inspector.InspectHostArtifactAttachmentTarget(ctx, req.VolumeId, req.NodeId, req.GetVolumeContext())
+	if err != nil {
+		return attachmentEvidenceUnavailable("host artifact quarantine target is unverified", err)
+	}
+	if target == nil {
+		return nil
+	}
+	return s.checkHostArtifactAttachTarget(ctx, req, target)
+}
+
+func (s *ControllerServer) checkHostArtifactAttachTarget(ctx context.Context, req *csi.ControllerPublishVolumeRequest, target *opennebula.HostArtifactAttachmentTarget) error {
+	if !s.hostArtifactQuarantineEnabled() {
 		return nil
 	}
 	var runtimeCtx *VolumeRuntimeContext
@@ -28,33 +63,52 @@ func (s *ControllerServer) rejectIfHostArtifactQuarantineActive(ctx context.Cont
 	if controlErr == nil {
 		s.recordRecoveryModeExpiryWarning(ctx, runtimeCtx, recoveryControl)
 	}
-	if len(s.driver.hostArtifactQuarantine.Snapshot()) == 0 {
-		return nil
+	manager := s.driver.hostArtifactQuarantine
+	var persisted map[string]string
+	now := time.Now().UTC()
+	if manager.runtime != nil && manager.runtime.enabled {
+		cm, err := manager.runtime.GetConfigMap(ctx, manager.namespace, hostArtifactStateConfigMapName)
+		switch {
+		case apierrors.IsNotFound(err):
+			persisted = map[string]string{}
+		case err != nil:
+			return attachmentEvidenceUnavailable("host artifact quarantine is unverified", err)
+		default:
+			persisted = cm.Data
+			if persisted == nil {
+				persisted = map[string]string{}
+			}
+		}
 	}
-	inspector, ok := s.volumeProvider.(opennebula.HostArtifactAttachmentTargetInspector)
-	if !ok {
-		return nil
-	}
-	target, err := inspector.InspectHostArtifactAttachmentTarget(ctx, req.VolumeId, req.NodeId, req.GetVolumeContext())
+	state, active, err := manager.activeForAttach(req.VolumeId, target, persisted, now)
 	if err != nil {
-		klog.V(2).InfoS("Failed to inspect host artifact attachment target", "volumeID", req.VolumeId, "nodeID", req.NodeId, "err", err)
-		return nil
+		return attachmentEvidenceUnavailable("host artifact quarantine is malformed", err)
 	}
-	if target == nil {
-		return nil
-	}
-	state, active := s.activeHostArtifactQuarantineForTarget(ctx, *target)
 	if !active {
 		return nil
 	}
+	message := hostArtifactAttachHoldMessage(target, state.Key)
+	s.recordHostArtifactWarning(ctx, req.VolumeId, req.GetVolumeContext(), eventReasonHostArtifactQuarantined, message)
 	if recoveryControl.Active() && recoveryControl.SuppressRepairActions {
-		s.recordHostArtifactWarning(ctx, req.VolumeId, req.GetVolumeContext(), eventReasonHostArtifactQuarantined, state.Message)
 		return nil
 	}
-	message := hostArtifactQuarantineMessage(state)
 	s.driver.metrics.RecordHostArtifactQuarantine(state.Classification, "active")
-	s.recordHostArtifactWarning(ctx, req.VolumeId, req.GetVolumeContext(), eventReasonHostArtifactQuarantined, message)
 	return status.Error(codes.FailedPrecondition, message)
+}
+
+func hostArtifactAttachHoldMessage(target *opennebula.HostArtifactAttachmentTarget, key string) string {
+	if target != nil && slices.Contains(hostArtifactTargetQuarantineKeys(*target), key) {
+		return hostArtifactSlotBlocked
+	}
+	return "host artifact quarantine is active for the requested volume"
+}
+
+const hostArtifactSlotBlocked = "host artifact quarantine is active for the requested attachment slot"
+
+func (s *ControllerServer) authorizeHostArtifactAttach(ctx context.Context, req *csi.ControllerPublishVolumeRequest) context.Context {
+	return opennebula.WithAttachAuthorization(ctx, func(ctx context.Context, target *opennebula.HostArtifactAttachmentTarget) error {
+		return s.checkHostArtifactAttachTarget(ctx, req, target)
+	})
 }
 
 func (s *ControllerServer) rejectIfHostArtifactQuarantineActiveForVolumeNode(ctx context.Context, volumeID, node string, params map[string]string) error {
@@ -65,29 +119,12 @@ func (s *ControllerServer) rejectIfHostArtifactQuarantineActiveForVolumeNode(ctx
 	})
 }
 
-func (s *ControllerServer) activeHostArtifactQuarantineForTarget(ctx context.Context, target opennebula.HostArtifactAttachmentTarget) (HostArtifactQuarantineState, bool) {
-	if s == nil || s.driver == nil || s.driver.hostArtifactQuarantine == nil {
-		return HostArtifactQuarantineState{}, false
-	}
-	now := time.Now().UTC()
-	for _, key := range hostArtifactTargetQuarantineKeys(target) {
-		if err := s.driver.hostArtifactQuarantine.RefreshKey(ctx, key); err != nil {
-			klog.V(2).InfoS("Failed to refresh host artifact quarantine target", "key", key, "err", err)
-		}
-		if state, active := s.driver.hostArtifactQuarantine.GetActive(key, now); active {
-			return state, true
-		}
-	}
-	return HostArtifactQuarantineState{}, false
-}
-
 func hostArtifactTargetQuarantineKeys(target opennebula.HostArtifactAttachmentTarget) []string {
-	candidates := []string{target.Key()}
-	if target.VMID > 0 && target.DiskID > 0 {
-		candidates = append(candidates, fmt.Sprintf("vm-%d", target.VMID))
-	}
-	if node := strings.TrimSpace(target.NodeName); node != "" && target.DiskID > 0 {
-		candidates = append(candidates, fmt.Sprintf("node-%s", node))
+	candidates := []string{
+		target.Key(),
+		(opennebula.HostArtifactAttachmentTarget{VMID: target.VMID}).Key(),
+		(opennebula.HostArtifactAttachmentTarget{NodeName: target.NodeName}).Key(),
+		(opennebula.HostArtifactAttachmentTarget{NodeName: target.NodeName, DiskID: target.DiskID}).Key(),
 	}
 	seen := map[string]struct{}{}
 	keys := make([]string, 0, len(candidates))
@@ -192,22 +229,6 @@ func hostArtifactStateFromConflict(volumeID string, conflict *opennebula.HostArt
 		state.RepairHint = fmt.Sprintf("read-only quarantine: inspect the OpenNebula VM log and host-local LVM artifacts; after an operator confirms the artifact is stale, repair it externally, then delete ConfigMap %s key %s or wait for the TTL before retrying", hostArtifactStateConfigMapName, state.Key)
 	}
 	return state
-}
-
-func (s *ControllerServer) clearHostArtifactQuarantineForVolume(ctx context.Context, volumeID string) {
-	if s == nil || s.driver == nil || s.driver.hostArtifactQuarantine == nil || strings.TrimSpace(volumeID) == "" {
-		return
-	}
-	for key, state := range s.driver.hostArtifactQuarantine.Snapshot() {
-		if strings.TrimSpace(state.VolumeID) != strings.TrimSpace(volumeID) {
-			continue
-		}
-		if err := s.driver.hostArtifactQuarantine.Clear(ctx, key); err != nil {
-			klog.V(2).InfoS("Failed to clear host artifact quarantine after successful attach", "volumeID", volumeID, "key", key, "err", err)
-			continue
-		}
-		s.driver.metrics.RecordHostArtifactQuarantine(state.Classification, "cleared")
-	}
 }
 
 func (s *ControllerServer) recordHostArtifactWarning(ctx context.Context, volumeID string, params map[string]string, reason, message string) {
